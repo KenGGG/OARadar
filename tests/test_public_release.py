@@ -42,6 +42,7 @@ def test_public_private_git_boundary() -> None:
         ".playwright-cli/page.yml",
         ".claude/settings.local.json",
         "runtime/browser-profile/Cookies",
+        "deploy/systemd/local.service",
         "webui/tsconfig.app.tsbuildinfo",
         "src/oa_knowledge/__pycache__/module.pyc",
     )
@@ -132,6 +133,17 @@ def test_release_scanner_detects_sensitive_content_without_echoing_it(tmp_path: 
     }
     assert secret not in rendered
     assert "synthetic-session-value" not in rendered
+
+
+def test_release_scanner_rejects_embedded_source_identifiers(tmp_path: Path) -> None:
+    scanner = _load_release_scanner()
+    path = tmp_path / "src" / "module.py"
+    path.parent.mkdir(parents=True)
+    path.write_text('SELECTOR = "sectionHeaderMore1234567890123456"\n', encoding="utf-8")
+
+    assert scanner.scan_paths([path], root=tmp_path) == [
+        scanner.Finding("src/module.py", "embedded_long_identifier", 1)
+    ]
 
 
 def test_release_scanner_allows_reserved_and_loopback_examples(tmp_path: Path) -> None:

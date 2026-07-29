@@ -12,11 +12,14 @@ webui/*.tsbuildinfo
 webui/vite.config.js
 webui/vite.config.d.ts
 .worktrees/
+/package-lock.json
+tests/oa_archiver-windows/
 
 # OA runtime and sensitive material
 data/
 .claude/
 private/
+deploy/
 .playwright-cli/
 oa.html
 *.db

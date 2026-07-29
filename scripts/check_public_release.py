@@ -53,6 +53,7 @@ CONTENT_RULES = (
         re.compile(r"[?&][A-Za-z][A-Za-z0-9_-]*=[+-]?\d{12,}(?:[&#\s\"']|$)"),
     ),
 )
+LONG_IDENTIFIER_RE = re.compile(r"[+-]?\d{12,}")
 
 DOCUMENTATION_NETWORKS = tuple(
     ipaddress.ip_network(value)
@@ -125,6 +126,8 @@ def scan_paths(paths: Sequence[Path], root: Path) -> list[Finding]:
             for rule, pattern in CONTENT_RULES:
                 if pattern.search(line):
                     findings.append(Finding(relative, rule, line_number))
+            if relative.startswith("src/") and LONG_IDENTIFIER_RE.search(line):
+                findings.append(Finding(relative, "embedded_long_identifier", line_number))
     return findings
 
 
