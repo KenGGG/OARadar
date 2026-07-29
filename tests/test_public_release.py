@@ -150,3 +150,19 @@ def test_release_scanner_allows_reserved_and_loopback_examples(tmp_path: Path) -
     )
 
     assert scanner.scan_paths([path], root=tmp_path) == []
+
+
+def test_ci_enforces_release_checks() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
+    assert workflow_path.exists(), "public CI workflow is missing"
+    workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    triggers = workflow["on"]
+    steps = workflow["jobs"]["verify"]["steps"]
+    commands = "\n".join(step.get("run", "") for step in steps)
+
+    assert {"push", "pull_request"}.issubset(triggers)
+    assert "uv sync --locked --extra dev" in commands
+    assert "uv run python scripts/check_public_release.py" in commands
+    assert "uv run pytest" in commands
+    assert "npm ci" in commands
+    assert "npm run build" in commands
