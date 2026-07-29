@@ -77,7 +77,7 @@ def test_pending_discover_persists_bounded_synthetic_rows(config_file: Path, mon
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == {
-        "created": 1, "updated": 0, "unchanged": 0, "pages_scanned": 1,
+        "created": 1, "updated": 0, "unchanged": 0, "closed": 0, "reactivated": 0, "pages_scanned": 1,
         "query_count": 1, "source_total_count": 1,
     }
 

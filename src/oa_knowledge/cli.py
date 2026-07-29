@@ -113,12 +113,25 @@ def pending_discover(
                 page_delay_seconds=settings.collector.list_page_delay_seconds,
             )
         with Session(engine) as session:
-            result = sync_pending_discovery(session, list(discovery.items))
+            complete_snapshot = (
+                discovery.source_total_count is not None
+                and discovery.scanned_row_count >= discovery.source_total_count
+            ) or (
+                discovery.source_total_pages is not None
+                and discovery.pages_scanned >= discovery.source_total_pages
+            )
+            result = sync_pending_discovery(
+                session,
+                list(discovery.items),
+                authoritative=complete_snapshot,
+            )
             session.commit()
         typer.echo(json.dumps({
             "created": result.created,
             "updated": result.updated,
             "unchanged": result.unchanged,
+            "closed": result.closed,
+            "reactivated": result.reactivated,
             "pages_scanned": discovery.pages_scanned,
             "query_count": discovery.query_count,
             "source_total_count": discovery.source_total_count,

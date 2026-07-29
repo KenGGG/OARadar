@@ -51,6 +51,40 @@ def test_same_title_with_different_affair_ids_stays_separate(tmp_path: Path) -> 
         assert {row.lifecycle_status for row in session.query(LogicalItem)} == {"identity_pending"}
 
 
+def test_authoritative_pending_snapshot_closes_missing_rows_and_reactivates_rediscovery(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        original = [_item(f"affair-{index}") for index in range(33)]
+        sync_pending_discovery(session, original)
+
+        refreshed = sync_pending_discovery(session, original[:5])
+
+        assert refreshed.closed == 28
+        assert session.query(ItemOccurrence).filter_by(channel="pending", occurrence_status="active").count() == 5
+        assert session.query(ItemOccurrence).filter_by(channel="pending", occurrence_status="inactive").count() == 28
+
+        rediscovered = sync_pending_discovery(session, [*original[:5], original[5]])
+
+        assert rediscovered.reactivated == 1
+        assert session.query(ItemOccurrence).filter_by(channel="pending", occurrence_status="active").count() == 6
+
+
+def test_non_authoritative_pending_discovery_does_not_close_missing_rows(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        original = [_item(f"affair-{index}") for index in range(10)]
+        sync_pending_discovery(session, original)
+
+        result = sync_pending_discovery(session, original[:3], authoritative=False)
+
+        assert result.closed == 0
+        assert session.query(ItemOccurrence).filter_by(channel="pending", occurrence_status="active").count() == 10
+
+
 def test_pending_detail_identifiers_update_occurrence_without_merging(tmp_path: Path) -> None:
     db = tmp_path / "oa.db"
     upgrade_database(db)

@@ -21,6 +21,8 @@ class PendingSyncResult:
     created: int
     updated: int
     unchanged: int
+    closed: int = 0
+    reactivated: int = 0
 
 
 def _serialized(item: DiscoveredPendingItem) -> tuple[str, str]:
@@ -32,8 +34,14 @@ def _serialized(item: DiscoveredPendingItem) -> tuple[str, str]:
     return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def sync_pending_discovery(session: Session, items: list[DiscoveredPendingItem]) -> PendingSyncResult:
-    created = updated = unchanged = 0
+def sync_pending_discovery(
+    session: Session,
+    items: list[DiscoveredPendingItem],
+    *,
+    authoritative: bool = True,
+) -> PendingSyncResult:
+    created = updated = unchanged = closed = reactivated = 0
+    seen_keys = {item.occurrence_key for item in items}
     for item in items:
         raw, discovery_hash = _serialized(item)
         occurrence = session.scalar(
@@ -57,12 +65,16 @@ def sync_pending_discovery(session: Session, items: list[DiscoveredPendingItem])
             )
             session.add(occurrence)
             created += 1
-        elif occurrence.discovery_hash == discovery_hash:
-            occurrence.last_seen_at = utcnow()
-            unchanged += 1
-            continue
         else:
-            updated += 1
+            if occurrence.occurrence_status != "active":
+                occurrence.occurrence_status = "active"
+                reactivated += 1
+            if occurrence.discovery_hash != discovery_hash:
+                updated += 1
+            else:
+                occurrence.last_seen_at = utcnow()
+                unchanged += 1
+                continue
 
         occurrence.title = item.title
         occurrence.sender = item.sender
@@ -86,8 +98,23 @@ def sync_pending_discovery(session: Session, items: list[DiscoveredPendingItem])
                 max_attempts=5,
                 payload_json=json.dumps({"occurrence_id": occurrence.id, "baseline": False, "notify": True}),
             ))
+    if authoritative:
+        active_rows = session.scalars(select(ItemOccurrence).where(
+            ItemOccurrence.channel == "pending",
+            ItemOccurrence.occurrence_status == "active",
+        )).all()
+        for occurrence in active_rows:
+            if occurrence.occurrence_key not in seen_keys:
+                occurrence.occurrence_status = "inactive"
+                closed += 1
     session.flush()
-    return PendingSyncResult(created=created, updated=updated, unchanged=unchanged)
+    return PendingSyncResult(
+        created=created,
+        updated=updated,
+        unchanged=unchanged,
+        closed=closed,
+        reactivated=reactivated,
+    )
 
 
 def apply_pending_identifiers(
