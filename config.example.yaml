@@ -1,0 +1,80 @@
+app:
+  timezone: Asia/Shanghai
+  data_root: ./data
+  privacy_mode: local_only
+
+browser:
+  # Copy this file to config.yaml, then replace the reserved example values
+  # below with paths from your own OA installation. config.yaml is ignored.
+  base_url: https://oa.example.invalid
+  context_path: /oa
+  login_path: /oa/login
+  executable_path: /usr/bin/google-chrome
+  user_data_dir: runtime/browser-profile
+  headless: true
+  ignore_https_errors: false
+  done_list_path: /oa/done
+  navigation_timeout_seconds: 30
+
+collector:
+  overlap_days: 7
+  daily_stop_pages: 5
+  max_attachment_depth: 10
+  list_page_delay_seconds: 0.2
+  item_delay_seconds: 0.2
+  download_timeout_seconds: 300
+  attachment_total_timeout_seconds: 1500
+storage:
+  sqlite_path: state/oa.db
+  archive_dir: raw
+  journal_mode: WAL
+  compute_sha256: true
+
+archive:
+  max_recursive_depth: 2
+  max_members: 10000
+  max_member_bytes: 536870912
+  max_total_bytes: 2147483648
+  max_ratio: 200
+
+web:
+  host: 127.0.0.1
+  port: 2567
+
+mineru:
+  enabled: false
+  api_url: http://127.0.0.1:58000
+  connect_timeout_seconds: 5
+  read_timeout_seconds: 1800
+  health_timeout_seconds: 3
+  workers: 1
+  model_source: local
+  output_content_list: true
+
+# Agnes OpenAI-compatible provider. Remote calls remain subject to the
+# confidentiality and redaction gate; the API key is read from the environment.
+llm:
+  enabled: false
+  active_provider: ollama
+  ollama_base_url: http://127.0.0.1:11434/v1
+  ollama_model: qwen3.5:9b
+  agnes_base_url: https://apihub.agnes-ai.com/v1
+  agnes_model: agnes-2.0-flash
+  provider_name: ollama
+  base_url: http://127.0.0.1:11434/v1
+  api_key_env: OLLAMA_API_KEY
+  model: qwen3.5:9b
+  text_model: qwen3.5:9b
+  vision_model: agnes-2.0-flash
+  timeout_seconds: 180
+  max_tokens: 4096
+  temperature: 0.1
+  max_retries: 2
+  provider_mode: local_only
+  supports_json_schema: false
+  supports_vision: false
+  uses_local_gpu: true
+  allow_confidential: false
+  allow_restricted: false
+  require_redaction: true
+  max_concurrency: 1

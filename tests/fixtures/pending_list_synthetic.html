@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<body>
+  <span id="pending_total_number">条/共3条记录</span>
+  <span id="pending_total_page">共2页</span>
+  <input id="pending_page_number" value="1">
+  <table><thead><tr>
+    <th></th><th>标题</th><th>发起人</th><th>上一处理人</th><th>发起时间</th>
+    <th>接收时间</th><th>处理期限</th><th>催办次数</th><th>处理状态</th><th>流程日志</th><th>当前节点</th>
+  </tr></thead></table>
+  <table id="listPending"><tbody id="pending_rows">
+    <tr><td><input type="checkbox" value="922337203685477580812345"></td>
+      <td><span data-importance="important">合成待办甲</span></td><td>合成人员甲</td><td>合成人员乙</td>
+      <td>2026-07-24 09:00</td><td>2026-07-24 09:10</td><td>2026-07-25 18:00</td>
+      <td>1</td><td>待处理</td><td></td><td>部门审核</td></tr>
+    <tr><td><input type="checkbox" value="-922337203685477580812346"></td>
+      <td>合成待办乙</td><td>合成人员丙</td><td></td><td>2026-07-24</td><td>2026-07-24 10:00</td>
+      <td></td><td>0</td><td>待处理</td><td></td><td>经办人处理</td></tr>
+  </tbody></table>
+  <a class="pNext" onclick="
+    document.querySelector('#pending_page_number').value='2';
+    document.querySelector('#pending_rows').innerHTML=`
+      <tr><td><input type='checkbox' value='pending-3'></td><td>合成待办丙</td><td>合成人员丁</td><td>合成人员戊</td><td>2026-07-24 11:00</td><td>2026-07-24 11:10</td><td>3个工作日</td><td>0</td><td>待处理</td><td></td><td>负责人审批</td></tr>`;
+    this.classList.add('disabled')">下一页</a>
+</body>
+</html>

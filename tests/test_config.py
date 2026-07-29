@@ -1,0 +1,73 @@
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from oa_knowledge.config import Settings, load_settings
+
+
+def test_defaults_are_local_and_depth_ten() -> None:
+    settings = Settings()
+    assert settings.app.privacy_mode == "local_only"
+    assert settings.collector.max_attachment_depth == 10
+    assert settings.archive.max_recursive_depth == 2
+    assert settings.archive.max_members == 10_000
+    assert not settings.storage.sqlite_path.is_absolute()
+    assert settings.web.host == "127.0.0.1"
+    assert settings.web.port == 2567
+    assert settings.mineru.api_url == "http://127.0.0.1:58000"
+
+
+def test_llm_provider_choice_derives_local_gpu_and_remote_modes(tmp_path: Path) -> None:
+    local = Settings(llm={"enabled": True, "active_provider": "ollama"})
+    assert local.llm.provider_name == "ollama"
+    assert local.llm.base_url == "http://127.0.0.1:11434/v1"
+    assert local.llm.model == "qwen3.5:9b"
+    assert local.llm.provider_mode == "local_only"
+    assert local.llm.uses_local_gpu is True
+
+    remote = Settings(llm={"enabled": True, "active_provider": "agnes"})
+    assert remote.llm.provider_name == "agnes"
+    assert remote.llm.model == "agnes-2.0-flash"
+    assert remote.llm.provider_mode == "approved_remote"
+    assert remote.llm.uses_local_gpu is False
+
+
+def test_archive_depth_is_independent_and_bounded() -> None:
+    settings = Settings.model_validate({
+        "collector": {"max_attachment_depth": 10},
+        "archive": {"max_recursive_depth": 1},
+    })
+    assert settings.collector.max_attachment_depth == 10
+    assert settings.archive.max_recursive_depth == 1
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"archive": {"max_recursive_depth": 6}})
+
+
+def test_environment_overrides_data_root(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OA_APP__DATA_ROOT", str(tmp_path))
+    assert load_settings().data_root == tmp_path.resolve()
+
+
+@pytest.mark.parametrize("path", ["/tmp/oa.db", "../oa.db", "C:\\oa.db"])
+def test_absolute_or_escaping_database_path_rejected(path: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"storage": {"sqlite_path": path}})
+
+
+def test_plaintext_credentials_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text("auth:\n  password: forbidden\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="credential"):
+        load_settings(path)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.20", "oa.example.test"])  # public-release: synthetic
+def test_web_rejects_non_loopback_hosts(host: str) -> None:
+    with pytest.raises(ValidationError, match="loopback"):
+        Settings.model_validate({"web": {"host": host}})
+
+
+def test_mineru_api_rejects_non_loopback_hosts() -> None:
+    with pytest.raises(ValidationError, match="loopback"):
+        Settings.model_validate({"mineru": {"enabled": True, "api_url": "http://192.0.2.10:58000"}})
