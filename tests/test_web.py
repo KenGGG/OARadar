@@ -51,7 +51,11 @@ def test_lifecycle_endpoints_are_database_backed_and_empty_on_new_database(confi
     assert pending.status_code == knowledge.status_code == done.status_code == system.status_code == 200
     assert pending.json() == {"items": [], "total": 0}
     assert knowledge.json() == {"documents": [], "total": 0}
-    assert done.json() == {"items": [], "total": 0, "lifecycle_pilot_status": "waiting_for_user_completion"}
+    assert done.json() == {
+        "items": [], "total": 0, "page": 1, "page_size": 100,
+        "metrics": {"oa_done_total": 0, "downloaded_items": 0, "verified_attachments": 0},
+        "lifecycle_pilot_status": "waiting_for_user_completion",
+    }
     assert system.json()["counts"]["snapshots"] == 0
     assert system.json()["worker"] is None
 
@@ -88,6 +92,51 @@ def test_lifecycle_done_uses_canonical_manifest_before_local_archive(config_file
     assert payload["total"] == 1
     assert payload["items"][0]["title"] == "Newly completed"
     assert payload["items"][0]["pipeline_status"] == "pending_download"
+
+
+def test_lifecycle_done_metrics_and_pagination_use_full_dataset(config_file: Path) -> None:
+    client, data_root = _client(config_file)
+    engine = create_db_engine(data_root / "state" / "oa.db")
+    with Session(engine) as session:
+        manifests = [
+            OAManifestItem(
+                oa_item_key=f"done:{index}", workitem_id_text=str(index), title=f"Synthetic {index}",
+                processing_status="downloaded" if index < 101 else "download_failed", list_page=1,
+            )
+            for index in range(102)
+        ]
+        session.add_all(manifests)
+        archived = [
+            OAItem(oa_item_key=f"done:{index}", source_channel="done", title=f"Synthetic {index}")
+            for index in range(101)
+        ]
+        session.add_all(archived)
+        session.flush()
+        session.add_all([
+            ArchivedFile(
+                oa_item_id=item.id, original_name=f"attachment-{item.id}.pdf", attachment_key=f"a-{item.id}",
+                file_role="direct_attachment", source_container_key=f"a-{item.id}",
+                local_relpath=f"raw/{item.id}.pdf", download_status="verified", size_bytes=1,
+            )
+            for item in archived
+        ])
+        session.add(ArchivedFile(
+            oa_item_id=archived[0].id, original_name="body.html", attachment_key="body",
+            file_role="official_body", source_container_key="body", local_relpath="raw/body.html",
+            download_status="verified", size_bytes=1,
+        ))
+        session.commit()
+
+    payload = client.get("/api/lifecycle/done?page=2&page_size=20").json()
+
+    assert len(payload["items"]) == 20
+    assert payload["page"] == 2 and payload["page_size"] == 20
+    assert payload["total"] == 102
+    assert payload["metrics"] == {
+        "oa_done_total": 102,
+        "downloaded_items": 101,
+        "verified_attachments": 101,
+    }
 
 
 def test_lifecycle_system_ignores_historical_paused_jobs(config_file: Path) -> None:

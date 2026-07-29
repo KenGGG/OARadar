@@ -153,8 +153,12 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/lifecycle/done")
-    def get_lifecycle_done() -> dict:
-        return lifecycle_done_list(settings)
+    def get_lifecycle_done(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(100, ge=1, le=200),
+        query: str | None = Query(None),
+    ) -> dict:
+        return lifecycle_done_list(settings, page=page, page_size=page_size, query=query)
 
     @app.get("/api/lifecycle/knowledge")
     def get_lifecycle_knowledge() -> dict:

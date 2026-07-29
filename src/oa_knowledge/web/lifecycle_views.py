@@ -159,14 +159,41 @@ def pending_detail(settings: Settings, occurrence_id: int) -> dict:
         engine.dispose()
 
 
-def done_list(settings: Settings, limit: int = 100) -> dict:
+def done_list(
+    settings: Settings,
+    *,
+    page: int = 1,
+    page_size: int = 100,
+    query: str | None = None,
+) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
-            total = _counts(session, OAManifestItem)
-            rows = session.scalars(select(OAManifestItem).order_by(
+            statement = select(OAManifestItem)
+            if query:
+                pattern = f"%{query.strip()}%"
+                statement = statement.where(
+                    OAManifestItem.title.ilike(pattern) | OAManifestItem.sender.ilike(pattern)
+                )
+            total = session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+            oa_done_total = _counts(session, OAManifestItem)
+            downloaded_items = session.scalar(
+                select(func.count(func.distinct(OAManifestItem.id))).select_from(OAManifestItem)
+                .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key)
+                .where(OAManifestItem.processing_status == "downloaded")
+            ) or 0
+            verified_attachments = session.scalar(
+                select(func.count(ArchivedFile.id)).select_from(ArchivedFile)
+                .join(OAItem, OAItem.id == ArchivedFile.oa_item_id)
+                .where(
+                    OAItem.source_channel == "done",
+                    ArchivedFile.download_status == "verified",
+                    ArchivedFile.file_role.in_(("direct_attachment", "official_attachment", "opinion_attachment")),
+                )
+            ) or 0
+            rows = session.scalars(statement.order_by(
                 OAManifestItem.completed_at.desc(), OAManifestItem.id.desc(),
-            ).limit(limit)).all()
+            ).offset((page - 1) * page_size).limit(page_size)).all()
             items = []
             for row in rows:
                 archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == row.oa_item_key))
@@ -177,7 +204,7 @@ def done_list(settings: Settings, limit: int = 100) -> dict:
                     "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
                     "file_count": sum(
                         file.download_status == "verified" and file.file_role in {
-                            "direct_attachment", "official_attachment", "official_body",
+                            "direct_attachment", "official_attachment", "opinion_attachment",
                         }
                         for file in archived.files
                     ) if archived else None,
@@ -185,7 +212,14 @@ def done_list(settings: Settings, limit: int = 100) -> dict:
             return {
                 "items": items,
                 "total": total,
-                "lifecycle_pilot_status": "validated" if total else "waiting_for_user_completion",
+                "page": page,
+                "page_size": page_size,
+                "metrics": {
+                    "oa_done_total": oa_done_total,
+                    "downloaded_items": downloaded_items,
+                    "verified_attachments": verified_attachments,
+                },
+                "lifecycle_pilot_status": "validated" if oa_done_total else "waiting_for_user_completion",
             }
     finally:
         engine.dispose()
