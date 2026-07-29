@@ -116,10 +116,15 @@ def pending_discover(
         with Session(engine) as session:
             complete_snapshot = (
                 discovery.source_total_count is not None
+                and len(discovery.items) >= discovery.source_total_count
                 and discovery.scanned_row_count >= discovery.source_total_count
             ) or (
                 discovery.source_total_pages is not None
                 and discovery.pages_scanned >= discovery.source_total_pages
+                and (
+                    discovery.source_total_count is None
+                    or len(discovery.items) >= discovery.source_total_count
+                )
             )
             result = sync_pending_discovery(
                 session,
