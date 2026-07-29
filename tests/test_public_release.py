@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import subprocess
 import re
 from pathlib import Path
@@ -63,7 +64,8 @@ def test_example_config_is_synthetic() -> None:
     settings = load_settings(path)
 
     assert raw["browser"]["base_url"] == "https://oa.example.invalid"
-    assert "203.88.203.37" not in text  # public-release: synthetic
+    numeric_hosts = re.findall(r"https?://((?:\d{1,3}\.){3}\d{1,3})", text)
+    assert all(ipaddress.ip_address(host).is_loopback for host in numeric_hosts)
     assert re.search(r"[?&][^=]+=[0-9]{12,}", text) is None
     assert raw["app"] == {
         "timezone": "Asia/Shanghai",
