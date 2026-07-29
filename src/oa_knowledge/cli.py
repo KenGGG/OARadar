@@ -29,7 +29,7 @@ from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.archive.naming import validate_relative_path
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, OAItem, OAManifestItem, OAManifestSync, OperationEvent, OperationJob, ParseJob, ReviewEntry, Run
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, OAItem, OAManifestItem, OAManifestSync, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, Run
 from oa_knowledge.collector.done import DoneDiscovery
 from oa_knowledge.collector.pending import PENDING_LIST_PATH, PendingAdapter
 from oa_knowledge.collector.pending_detail import extract_pending_detail_identifiers
@@ -41,6 +41,7 @@ from oa_knowledge.ops.exclusion_cleanup import cleanup_excluded_archives
 from oa_knowledge.pending_sync import apply_pending_identifiers, sync_pending_discovery
 from oa_knowledge.pending_archive import persist_pending_capture
 from oa_knowledge.resources import ResourceCoordinator
+from oa_knowledge.reconcile import reconcile_done_occurrence
 
 app = typer.Typer(help="OA Knowledge Hub stage 0+1 foundation")
 db_app = typer.Typer(help="Database migration commands")
@@ -345,39 +346,65 @@ def manifest_sync(
 
 @manifest_app.command("refresh-head")
 def manifest_refresh_head(
+    max_pages: int = typer.Option(3, "--max-pages", min=1, max=20),
     headed: bool = typer.Option(False, "--headed"),
     config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
 ) -> None:
     """Refresh OA totals and the newest Done-list page without scanning all pages."""
     settings = settings_option(config); engine = require_engine(settings)
     started_at = datetime.now(timezone.utc)
-    with BrowserSession(settings, headed=headed) as browser:
-        if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
-            typer.echo("OA authentication required", err=True); raise typer.Exit(3)
-        assert browser.page
-        adapter = DoneAdapter(browser.page, f"{browser.base_url}{settings.browser.done_list_path}")
-        frame = adapter.open_list()
-        source_total, source_pages = adapter._list_stats(frame)
-        if source_total is None or source_pages is None:
-            typer.echo("OA done-list totals unavailable", err=True); raise typer.Exit(4)
-        newest = adapter._discover_frame(frame, 10_000, 1, 0)
+    coordinator = ResourceCoordinator(engine)
+    owner = f"done-incremental:{uuid4().hex}"
+    lease_id = coordinator.acquire("oa_browser", owner, ttl_seconds=900, uses_local_gpu=False)
+    if lease_id is None:
+        typer.echo("OA browser is busy", err=True); raise typer.Exit(2)
+    try:
+        with BrowserSession(settings, headed=headed) as browser:
+            if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+                typer.echo("OA authentication required", err=True); raise typer.Exit(3)
+            assert browser.page
+            adapter = DoneAdapter(browser.page, f"{browser.base_url}{settings.browser.done_list_path}")
+            discovery = adapter.discover_pages(
+                limit=10_000,
+                max_pages=max_pages,
+                page_delay_seconds=settings.collector.list_page_delay_seconds,
+            )
+            source_total, source_pages = discovery.source_total_count, discovery.source_total_pages
+            if source_total is None or source_pages is None:
+                typer.echo("OA done-list totals unavailable", err=True); raise typer.Exit(4)
+            newest = list(discovery.items)
+    finally:
+        coordinator.release(lease_id, owner)
     with Session(engine) as session:
         before = session.scalar(select(func.count()).select_from(OAManifestItem)) or 0
         upsert_manifest_page(session, newest, started_at)
         rows = session.scalars(select(OAManifestItem).where(OAManifestItem.oa_item_key.in_([item.oa_item_key for item in newest]))).all()
         classify_manifest_rows(session, rows, effective_exclusion_keywords(session), settings.data_root)
+        target_keys = [row.oa_item_key for row in rows if row.processing_status in {"pending_download", "download_failed"}]
+        active_download = session.scalar(select(OperationJob).where(
+            OperationJob.job_type == "full_manifest_retry",
+            OperationJob.status.in_(("queued", "running")),
+        ).limit(1))
+        if target_keys and active_download is None:
+            download_job = OperationJob(
+                job_key=f"done-incremental-download-{uuid4().hex[:12]}",
+                job_type="full_manifest_retry",
+                status="queued",
+                idempotency_key=f"done-incremental-download-{uuid4().hex}",
+                parameters_json=json.dumps({"oa_item_keys": target_keys, "source_status": "pending_download"}, ensure_ascii=False),
+                progress_total=len(target_keys),
+            )
+            session.add(download_job)
         local_count = session.scalar(select(func.count()).select_from(OAManifestItem)) or 0
         refresh_status = "manifest_complete" if local_count == source_total else "manifest_incomplete"
         sync = OAManifestSync(
             oa_total_count=source_total, local_manifest_count=local_count,
-            pages_scanned=1, source_total_pages=source_pages,
+            pages_scanned=discovery.pages_scanned, source_total_pages=source_pages,
             status=refresh_status,
             started_at=started_at, finished_at=datetime.now(timezone.utc),
         )
         session.add(sync); session.commit()
-    typer.echo(json.dumps({"oa_total_count": source_total, "local_manifest_count": local_count, "source_total_pages": source_pages, "new_items": max(0, local_count - before)}, ensure_ascii=False))
-    if refresh_status != "manifest_complete":
-        raise typer.Exit(4)
+    typer.echo(json.dumps({"oa_total_count": source_total, "local_manifest_count": local_count, "source_total_pages": source_pages, "pages_scanned": discovery.pages_scanned, "new_items": max(0, local_count - before)}, ensure_ascii=False))
 
 
 @manifest_app.command("run")
@@ -589,6 +616,10 @@ def manifest_download(
                         direct_error = _sanitize_operational_error(direct_exc)
                         fallback_error = _sanitize_operational_error(fallback_exc)
                         raise RuntimeError(f"direct detail failed: {direct_error}; list fallback failed: {fallback_error}") from fallback_exc
+                try:
+                    done_identifiers = extract_pending_detail_identifiers(browser.page)
+                except Exception:
+                    done_identifiers = None
                 with Session(engine) as session:
                     row = session.get(OAManifestItem, row_id); assert row is not None
                     proxy = archive_proxy(row)
@@ -603,6 +634,30 @@ def manifest_download(
                         row.retry_count += 1
                         row.last_error = proxy.last_error or _attachment_failure_summary(capture)
                         row.failure_stage = "attachment"
+                    if done_identifiers and done_identifiers.affair_id_text:
+                        candidate = session.scalar(select(ItemOccurrence.id).where(
+                            ItemOccurrence.channel == "pending",
+                            ItemOccurrence.affair_id_text == done_identifiers.affair_id_text,
+                        ).limit(1))
+                        if candidate is not None:
+                            decision = reconcile_done_occurrence(
+                                session,
+                                identifiers=done_identifiers,
+                                title=row.title,
+                                sender=row.sender,
+                                completed_at=row.completed_at,
+                            )
+                            if decision.outcome == "exact" and decision.logical_item_id is not None:
+                                task_key = f"realtime-done:{row.oa_item_key}:final-v1"
+                                if session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == task_key)) is None:
+                                    session.add(PipelineTask(
+                                        queue_name="realtime_done", priority=10,
+                                        logical_item_key=row.oa_item_key,
+                                        logical_item_id=decision.logical_item_id,
+                                        stage="attachment_inventory",
+                                        idempotency_key=task_key,
+                                        payload_json=json.dumps({"manifest_id": row.id}),
+                                    ))
                     session.commit()
             except AuthRequiredError as exc:
                 if browser.login_with_saved_credentials(30) == LoginState.AUTHENTICATED:

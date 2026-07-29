@@ -6,7 +6,7 @@ from oa_knowledge.collector.pending import DiscoveredPendingItem
 from oa_knowledge.collector.pending_detail import PendingDetailIdentifiers
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ItemOccurrence, LogicalItem
+from oa_knowledge.db.models import ItemOccurrence, LogicalItem, ReviewEntry
 from oa_knowledge.pending_sync import apply_pending_identifiers, sync_pending_discovery
 from oa_knowledge.reconcile import reconcile_done_occurrence
 
@@ -62,3 +62,14 @@ def test_reconcile_done_does_not_merge_on_title_or_partial_identity(tmp_path) ->
         )
         assert decision.outcome == "review"
         assert session.query(ItemOccurrence).filter_by(channel="done").count() == 0
+
+        reconcile_done_occurrence(
+            session,
+            identifiers=PendingDetailIdentifiers(
+                affair_id_text="affair-other", summary_id_text="summary-1", process_id_text=None,
+                activity_id_text=None, case_id_text=None, workitem_id_text="work-other",
+                form_record_id_text=None, object_id_text=None, template_id_text=None,
+            ),
+            title="Duplicate title", sender=None, completed_at=None,
+        )
+        assert session.query(ReviewEntry).filter_by(kind="pending_done_identity_review").count() == 1

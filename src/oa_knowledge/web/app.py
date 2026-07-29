@@ -26,6 +26,7 @@ from oa_knowledge.web.status import (
     full_manifest_report_path,
     full_manifest_status,
     start_full_manifest_job,
+    start_done_incremental_job,
     item_detail,
     job_progress,
     list_batches,
@@ -302,6 +303,10 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     @app.post("/api/manifest/start", status_code=202)
     def post_manifest_start() -> dict:
         return start_full_manifest_job(settings)
+
+    @app.post("/api/manifest/refresh-incremental", status_code=202)
+    def post_manifest_refresh_incremental() -> dict:
+        return start_done_incremental_job(settings)
 
     @app.get("/api/manifest/report")
     def get_manifest_report() -> FileResponse:

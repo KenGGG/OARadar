@@ -139,6 +139,23 @@ def test_lifecycle_done_metrics_and_pagination_use_full_dataset(config_file: Pat
     }
 
 
+def test_done_incremental_refresh_queues_single_three_page_job(config_file: Path) -> None:
+    client, data_root = _client(config_file)
+    client.get("/api/status")
+    csrf = client.cookies.get("oa_csrf")
+
+    first = client.post("/api/manifest/refresh-incremental", headers={"x-csrf-token": csrf})
+    second = client.post("/api/manifest/refresh-incremental", headers={"x-csrf-token": csrf})
+
+    assert first.status_code == second.status_code == 202
+    assert first.json()["job_id"] == second.json()["job_id"]
+    engine = create_db_engine(data_root / "state" / "oa.db")
+    with Session(engine) as session:
+        jobs = session.scalars(select(OperationJob).where(OperationJob.job_type == "done_incremental")).all()
+        assert len(jobs) == 1
+        assert json.loads(jobs[0].parameters_json) == {"max_pages": 3}
+
+
 def test_lifecycle_system_ignores_historical_paused_jobs(config_file: Path) -> None:
     client, data_root = _client(config_file)
     engine = create_db_engine(data_root / "state" / "oa.db")

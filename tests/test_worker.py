@@ -214,3 +214,28 @@ def test_history_without_attachment_evidence_completes_without_llm_failure(confi
         row = session.get(PipelineTask, task_id)
         assert row.status == "completed"
         assert row.error_code is None
+
+
+def test_pending_summary_with_notification_requested_never_enters_unsupported_stage(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", "1", "pending_summary", "pending-summary-notify",
+        payload={"notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr("oa_knowledge.pending_summary.summarize_pending", lambda *_args, **_kwargs: object())
+    try:
+        worker._pipeline_pending_summary(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "completed"
+        assert row.stage == "pending_summary"
+        assert row.error_code is None

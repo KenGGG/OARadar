@@ -24,6 +24,7 @@ type PendingDetail = {
   ollama_summary_status: string
 }
 type DoneItem = { id: number; item_id: string; title: string; sender: string | null; completed_at: string | null; pipeline_status: string; archive_relpath: string | null; file_count: number | null }
+type DoneMetrics = { oa_done_total: number; downloaded_items: number; verified_attachments: number }
 type KnowledgeItem = { id: number; title: string; publish_status: string; vault_relpath: string; active_parse_artifact_id: number | null; source_count: number }
 type KnowledgeDetail = KnowledgeItem & { preview: string; artifact: null | { id: number; engine: string; quality_score: number; status: string; output_relpath: string }; sources: { oa_item_id: number | null; source_file_id: number | null }[] }
 type SystemData = { web: { status: string; url: string }; worker: null | { id: number; type: string; status: string; progress_current: number; progress_total: number | null; current_title: string | null; attachment_verified: number; attachment_total: number; failure_count: number }; mineru: Record<string, unknown>; sqlite: { schema: string; integrity: string }; counts: Record<string, number> }
@@ -72,6 +73,9 @@ export function App() {
   const [pending, setPending] = useState<PendingItem[]>([])
   const [done, setDone] = useState<DoneItem[]>([])
   const [doneTotal, setDoneTotal] = useState(0)
+  const [doneMetrics, setDoneMetrics] = useState<DoneMetrics>({ oa_done_total: 0, downloaded_items: 0, verified_attachments: 0 })
+  const [donePage, setDonePage] = useState(1)
+  const [syncing, setSyncing] = useState<"incremental" | "full" | null>(null)
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([])
   const [system, setSystem] = useState<SystemData | null>(null)
   const [processing, setProcessing] = useState<ProcessingData | null>(null)
@@ -83,13 +87,13 @@ export function App() {
     setLoading(true); setError("")
     try {
       if (view === "pending") setPending((await api<{ items: PendingItem[] }>("/api/lifecycle/pending")).items)
-      if (view === "done") { const result = await api<{ items: DoneItem[]; total: number }>("/api/lifecycle/done"); setDone(result.items); setDoneTotal(result.total) }
+      if (view === "done") { const result = await api<{ items: DoneItem[]; total: number; metrics: DoneMetrics }>(`/api/lifecycle/done?page=${donePage}&page_size=100`); setDone(result.items); setDoneTotal(result.total); setDoneMetrics(result.metrics) }
       if (view === "processing") setProcessing(await api<ProcessingData>("/api/lifecycle/processing-center"))
       if (view === "knowledge") setKnowledge((await api<{ documents: KnowledgeItem[] }>("/api/lifecycle/knowledge")).documents)
       if (view === "system") { const [status, providerSettings] = await Promise.all([api<SystemData>("/api/lifecycle/system"), api<ProviderSettings>("/api/system/provider-settings")]); setSystem(status); setProviders(providerSettings) }
     } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败") }
     finally { setLoading(false) }
-  }, [view])
+  }, [view, donePage])
   useEffect(() => { void load() }, [load])
 
   const openPending = async (id: number) => {
@@ -101,6 +105,15 @@ export function App() {
     setError("")
     try { setKnowledgeDetail(await api<KnowledgeDetail>(`/api/lifecycle/knowledge/${id}`)) }
     catch (reason) { setError(reason instanceof Error ? reason.message : "详情加载失败") }
+  }
+  const startDoneSync = async (kind: "incremental" | "full") => {
+    setSyncing(kind); setError("")
+    try {
+      const csrf = document.cookie.split("; ").find(row => row.startsWith("oa_csrf="))?.split("=")[1] || ""
+      const response = await fetch(kind === "incremental" ? "/api/manifest/refresh-incremental" : "/api/manifest/start", { method: "POST", headers: { "x-csrf-token": csrf } })
+      if (!response.ok) throw new Error(`启动同步失败 (${response.status})`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "启动同步失败") }
+    finally { setSyncing(null); void load() }
   }
   const selectView = (next: View) => { setView(next); setQuery(""); setPendingDetail(null); setKnowledgeDetail(null); setMobileNav(false) }
   const filteredPending = pending.filter(item => `${item.title} ${item.sender ?? ""}`.toLowerCase().includes(query.toLowerCase()))
@@ -122,7 +135,7 @@ export function App() {
       {error && <div className="error-banner"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}
       {loading ? <div className="loading"><Loader2 className="spin"/><span>正在读取本地状态</span></div> : <>
         {view === "pending" && <PendingView rows={filteredPending} all={pending} query={query} setQuery={setQuery} open={openPending}/>}
-        {view === "done" && <DoneView rows={filteredDone} all={done} total={doneTotal} query={query} setQuery={setQuery}/>}
+        {view === "done" && <DoneView rows={filteredDone} total={doneTotal} metrics={doneMetrics} page={donePage} setPage={setDonePage} query={query} setQuery={setQuery} syncing={syncing} startSync={startDoneSync}/>}
         {view === "processing" && processing && <ProcessingView data={processing}/>}
         {view === "knowledge" && <KnowledgeView rows={filteredKnowledge} query={query} setQuery={setQuery} open={openKnowledge}/>}
         {view === "system" && system && providers && <SystemView data={system} providers={providers} reload={load}/>}
@@ -158,11 +171,13 @@ function PendingView({ rows, all, query, setQuery, open }: { rows: PendingItem[]
     </tbody></table></div>
   </section>
 }
-function DoneView({ rows, all, total, query, setQuery }: { rows: DoneItem[]; all: DoneItem[]; total: number; query: string; setQuery: (v: string) => void }) {
-  return <section><div className="metrics"><Metric label="已办事项" value={total}/><Metric label="最近100项下载成功" value={all.filter(x => x.pipeline_status === "downloaded").length}/><Metric label="最近100项附件" value={all.reduce((n, x) => n + (x.file_count || 0), 0)}/></div>
+function DoneView({ rows, total, metrics, page, setPage, query, setQuery, syncing, startSync }: { rows: DoneItem[]; total: number; metrics: DoneMetrics; page: number; setPage: (page: number) => void; query: string; setQuery: (v: string) => void; syncing: "incremental" | "full" | null; startSync: (kind: "incremental" | "full") => void }) {
+  const pages = Math.max(1, Math.ceil(total / 100))
+  return <section><div className="metrics"><Metric label="OA已办事项" value={metrics.oa_done_total}/><Metric label="成功下载事项" value={metrics.downloaded_items}/><Metric label="已验证附件" value={metrics.verified_attachments}/></div>
     <div className="notice"><CircleAlert size={17}/><span>待办到已办的稳定主键 Pilot 已验证；系统使用事项ID关联，不按标题自动合并。</span></div>
-    <div className="section-toolbar"><div><h2>最近已办</h2><p>显示真实已办记录，默认最近 100 项。</p></div><SearchBox value={query} setValue={setQuery} placeholder="搜索标题或发起人"/></div>
+    <div className="section-toolbar"><div><h2>已办归档</h2><p>列表分页显示；顶部统计覆盖全部已办事项。</p></div><div className="toolbar-actions"><button disabled={syncing !== null} onClick={() => startSync("incremental")}><RefreshCw size={16} className={syncing === "incremental" ? "spin" : ""}/>增量刷新</button><button disabled={syncing !== null} onClick={() => startSync("full")}><Database size={16} className={syncing === "full" ? "spin" : ""}/>全量核对</button><SearchBox value={query} setValue={setQuery} placeholder="搜索当前页"/></div></div>
     <div className="table-wrap"><table><thead><tr><th className="title-col">标题</th><th>发起人</th><th>办理时间</th><th>归档状态</th><th>附件数</th><th>本地目录</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td className="title-cell"><strong>{row.title}</strong><small>OA事项ID {row.item_id}</small></td><td>{row.sender || "-"}</td><td className="nowrap">{time(row.completed_at)}</td><td><Badge tone={archiveTone(row.pipeline_status)}>{archiveStatus(row.pipeline_status)}</Badge></td><td>{row.file_count == null ? "待归档" : row.file_count}</td><td className="path-cell" title={row.archive_relpath || ""}>{row.archive_relpath || "-"}</td></tr>)}</tbody></table></div>
+    <div className="pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button><span>第 {page}/{pages} 页</span><button disabled={page >= pages} onClick={() => setPage(page + 1)}>下一页</button></div>
   </section>
 }
 function KnowledgeView({ rows, query, setQuery, open }: { rows: KnowledgeItem[]; query: string; setQuery: (v: string) => void; open: (id: number) => void }) {

@@ -45,14 +45,21 @@ def reconcile_done_occurrence(
             ItemOccurrence.process_id_text == identifiers.process_id_text,
         ))
     if pending is None:
-        session.add(ReviewEntry(
-            kind="pending_done_identity_review",
-            container_key=f"done:{identifiers.affair_id_text or 'unknown'}",
-            details_json=json.dumps({
-                "reason": "stable_identity_incomplete_or_unmatched",
-                "observed_fields": [name for name, value in asdict(identifiers).items() if value],
-            }, ensure_ascii=False, sort_keys=True),
+        container_key = f"done:{identifiers.affair_id_text or 'unknown'}"
+        existing_review = session.scalar(select(ReviewEntry).where(
+            ReviewEntry.kind == "pending_done_identity_review",
+            ReviewEntry.container_key == container_key,
+            ReviewEntry.status == "pending",
         ))
+        if existing_review is None:
+            session.add(ReviewEntry(
+                kind="pending_done_identity_review",
+                container_key=container_key,
+                details_json=json.dumps({
+                    "reason": "stable_identity_incomplete_or_unmatched",
+                    "observed_fields": [name for name, value in asdict(identifiers).items() if value],
+                }, ensure_ascii=False, sort_keys=True),
+            ))
         session.flush()
         return MatchDecision("review", None, None, None, ())
 

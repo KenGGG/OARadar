@@ -138,6 +138,32 @@ def start_full_manifest_job(settings: Settings) -> dict[str, Any]:
         engine.dispose()
 
 
+def start_done_incremental_job(settings: Settings) -> dict[str, Any]:
+    """Queue one durable newest-three-pages Done refresh."""
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            active = session.scalar(select(OperationJob).where(
+                OperationJob.job_type == "done_incremental",
+                OperationJob.status.in_(("queued", "running")),
+            ).order_by(OperationJob.id.desc()).limit(1))
+            if active is not None:
+                return {"job_id": active.id, "job_key": active.job_key, "status": active.status, "created": False}
+            job = OperationJob(
+                job_key=f"done-incremental-{uuid4().hex[:12]}",
+                job_type="done_incremental",
+                status="queued",
+                idempotency_key=f"done-incremental-{uuid4().hex}",
+                parameters_json=json.dumps({"max_pages": 3}),
+            )
+            job.events.append(OperationEvent(sequence=1, event_type="created", status="queued", details_json="{}"))
+            session.add(job)
+            session.commit()
+            return {"job_id": job.id, "job_key": job.job_key, "status": job.status, "created": True}
+    finally:
+        engine.dispose()
+
+
 def full_manifest_report_path(settings: Settings) -> Path:
     engine = create_db_engine(settings.database_path)
     try:

@@ -16,7 +16,7 @@ from oa_knowledge.config import Settings
 from oa_knowledge.archive import atomic_write_bytes
 from oa_knowledge.constants import BatchStatus
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, OAItem, OAManifestItem, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemSnapshot, OAItem, OAManifestItem, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, SourceAttachment
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.ops.audit import audit_database
 from oa_knowledge.ops.capacity import capacity_report
@@ -98,11 +98,27 @@ class OperationWorker:
                 self._execute_full_manifest(job_id)
             elif job_type == "full_manifest_retry":
                 self._execute_full_manifest_retry(job_id)
+            elif job_type == "done_incremental":
+                self._execute_done_incremental(job_id)
             else:
                 self._finish(job_id, "failed", "unsupported_job_type")
         except Exception as exc:
             self._finish(job_id, "failed", f"worker_exception_{type(exc).__name__}")
         return True
+
+    def _execute_done_incremental(self, job_id: int) -> None:
+        command = [sys.executable, "-m", "oa_knowledge.cli", "manifest", "refresh-head", "--max-pages", "3"]
+        if self.config_path is not None:
+            command.extend(("--config", str(self.config_path)))
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is None:
+                return
+            job.status = "running"
+            job.started_at = job.started_at or datetime.now(timezone.utc)
+            session.commit()
+        result = subprocess.run(command, cwd=Path.cwd(), capture_output=True, text=True)
+        self._finish(job_id, "completed" if result.returncode == 0 else "failed", None if result.returncode == 0 else f"incremental_exit_{result.returncode}")
 
     def _execute_pipeline_task(self, task: PipelineTask) -> None:
         try:
@@ -114,6 +130,8 @@ class OperationWorker:
                 self._pipeline_pending_detail(task)
             elif task.stage == "pending_summary":
                 self._pipeline_pending_summary(task)
+            elif task.stage == "pending_parse":
+                self._pipeline_pending_parse(task)
             elif task.stage == "ollama_extract":
                 self._pipeline_done_knowledge(task)
             else:
@@ -226,16 +244,46 @@ class OperationWorker:
                 persist_pending_capture(session, occurrence_key, capture, self.settings.data_root); session.commit()
         finally:
             coordinator.release(lease, lease_owner)
+        self.production_queue.advance(task.id, self.owner, "pending_parse")
+
+    def _pipeline_pending_parse(self, task: PipelineTask) -> None:
+        from oa_knowledge.pipeline import ParsePipeline
+        with Session(self.engine) as session:
+            snapshot = session.scalar(select(ItemSnapshot).where(
+                ItemSnapshot.logical_item_id == task.logical_item_id,
+            ).order_by(ItemSnapshot.id.desc()).limit(1))
+            source_ids = list(session.scalars(select(SourceAttachment.source_file_id).where(
+                SourceAttachment.snapshot_id == snapshot.id,
+                SourceAttachment.source_file_id.is_not(None),
+                SourceAttachment.download_status == "verified",
+            ))) if snapshot else []
+            pipeline = ParsePipeline(self.settings, self.engine)
+            for file_id in source_ids:
+                pipeline.enqueue(file_id, session=session)
+            session.commit()
+            jobs = session.scalars(select(ParseJob).where(ParseJob.file_id.in_(source_ids)).order_by(ParseJob.id)).all() if source_ids else []
+            queued = next((job for job in jobs if job.status == "queued"), None)
+            failed = sum(job.status == "failed" for job in jobs)
+        if queued is not None:
+            try:
+                ParsePipeline(self.settings, self.engine).run(queued.id)
+            except Exception as exc:
+                if not self._nonfatal_parse_error(exc):
+                    raise
+            self.production_queue.advance(task.id, self.owner, "pending_parse")
+            return
+        if failed:
+            self.production_queue.fail(task.id, self.owner, "PARSE_FAILED", f"{failed} pending parse jobs failed", recoverable=True)
+            return
         self.production_queue.advance(task.id, self.owner, "pending_summary")
 
     def _pipeline_pending_summary(self, task: PipelineTask) -> None:
         from oa_knowledge.pending_summary import summarize_pending
         summarize_pending(self.settings, self.engine, int(task.logical_item_key))
-        payload = json.loads(task.payload_json or "{}")
-        if payload.get("notify"):
-            self.production_queue.advance(task.id, self.owner, "feishu_notify")
-        else:
-            self.production_queue.complete(task.id, self.owner)
+        # Notification delivery is intentionally decoupled from the OA capture
+        # pipeline. A requested notification must not advance into an
+        # unsupported stage and turn a valid local summary into a failed task.
+        self.production_queue.complete(task.id, self.owner)
 
     def _pipeline_done_knowledge(self, task: PipelineTask) -> None:
         from oa_knowledge.done_knowledge import NoAttachmentEvidence, generate_done_knowledge
