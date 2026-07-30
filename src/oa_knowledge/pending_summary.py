@@ -51,6 +51,10 @@ class PendingSummaryError(RuntimeError):
     pass
 
 
+def pending_evidence(payload: str, max_chars: int = 12_000) -> str:
+    return payload[:max_chars]
+
+
 def normalize_pending_response(payload: dict) -> PendingSummary:
     """Accept the strict schema or a conservative summary-only model fallback."""
     try:
@@ -137,7 +141,7 @@ def summarize_pending(settings: Settings, engine, logical_item_id: int) -> Summa
         system_prompt = ("你是本地OA待办概括器。只能依据输入，输出严格JSON；无证据的金额、日期、风险留空，不得编造。"
                          "输出必须严格符合以下JSON Schema，不得增删顶层字段：\n" +
                          json.dumps(PendingSummary.model_json_schema(), ensure_ascii=False))
-        result = client.chat(system_prompt, "请按约定字段概括以下不可变Pending快照：\n" + payload[:60000])
+        result = client.chat(system_prompt, "请按约定字段概括以下不可变Pending快照：\n" + pending_evidence(payload))
         if result.get("error"):
             raise PendingSummaryError(result.get("error"))
         summary = normalize_pending_content(result.get("content"))

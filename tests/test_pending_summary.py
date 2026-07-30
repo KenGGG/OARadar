@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from oa_knowledge.pending_summary import PendingSummary, normalize_pending_content, normalize_pending_response
+from oa_knowledge.pending_summary import PendingSummary, normalize_pending_content, normalize_pending_response, pending_evidence
 
 
 def test_pending_summary_schema_accepts_evidence_backed_empty_optional_values() -> None:
@@ -38,3 +38,9 @@ def test_pending_summary_uses_nonempty_plain_text_when_model_omits_json() -> Non
     assert result.summary == "请审阅附件并按期反馈。"
     assert result.confidence == 0.25
     assert result.amounts == []
+
+
+def test_pending_evidence_stays_within_local_model_context_budget() -> None:
+    evidence = pending_evidence("甲" * 60_000)
+
+    assert len(evidence) == 12_000
