@@ -79,7 +79,7 @@ def normalize_pending_content(content: str | None) -> PendingSummary:
             return normalize_pending_response(parsed)
         except Exception as exc:
             fallback = next((
-                parsed.get(key) for key in ("content", "problem", "overview", "description", "result")
+                parsed.get(key) for key in ("message", "content", "problem", "overview", "description", "result")
                 if isinstance(parsed.get(key), str) and parsed.get(key).strip()
             ), None)
             if fallback:

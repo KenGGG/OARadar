@@ -47,6 +47,13 @@ def test_pending_summary_uses_common_text_field_from_alternate_json_shape() -> N
     assert result.confidence == 0.25
 
 
+def test_pending_summary_uses_message_from_model_json() -> None:
+    result = normalize_pending_content('{"message":"请审阅并反馈。"}')
+
+    assert result.summary == "请审阅并反馈。"
+    assert result.confidence == 0.25
+
+
 def test_pending_evidence_stays_within_local_model_context_budget() -> None:
     evidence = pending_evidence("甲" * 60_000)
 
