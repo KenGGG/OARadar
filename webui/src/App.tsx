@@ -31,7 +31,7 @@ type SystemData = { web: { status: string; url: string }; worker: null | { id: n
 type QueueCounts = { queued: number; running: number; completed: number; failed: number }
 type ProcessingData = {
   queues: Record<"realtime_pending" | "realtime_done" | "historical_done_backfill", QueueCounts>
-  historical_paused: boolean; mock_data: false
+  historical_paused: boolean; historical_state: "paused" | "running" | "queued" | "idle"; mock_data: false
   gpu_leases: { resource: string; kind: string; owner: string; acquired_at: string; expires_at: string }[]
   tasks: { id: number; queue: string; stage: string; status: string; logical_item_key: string; title: string; progress_current: number; progress_total: number | null; attempts: number; error_code: string | null; recoverable: boolean; created_at: string }[]
 }
@@ -148,8 +148,9 @@ export function App() {
 
 function ProcessingView({ data }: { data: ProcessingData }) {
   const labels: Record<string, string> = { realtime_pending: "实时新待办", realtime_done: "实时新已办", historical_done_backfill: "历史补加工" }
+  const historyLabel = { paused: "已暂停", running: "运行中", queued: "等待中", idle: "待机" }[data.historical_state]
   return <section>
-    <div className="queue-grid">{Object.entries(data.queues).map(([name, counts]) => <div className="queue-panel" key={name}><header><strong>{labels[name]}</strong>{name === "historical_done_backfill" && <Badge tone={data.historical_paused ? "warn" : "good"}>{data.historical_paused ? "已暂停" : "运行中"}</Badge>}</header><div><Metric label="排队" value={counts.queued}/><Metric label="处理中" value={counts.running}/><Metric label="完成" value={counts.completed}/><Metric label="失败" value={counts.failed} bad={counts.failed > 0}/></div></div>)}</div>
+    <div className="queue-grid">{Object.entries(data.queues).map(([name, counts]) => <div className="queue-panel" key={name}><header><strong>{labels[name]}</strong>{name === "historical_done_backfill" && <Badge tone={data.historical_state === "paused" ? "warn" : data.historical_state === "idle" ? "neutral" : "good"}>{historyLabel}</Badge>}</header><div><Metric label="排队" value={counts.queued}/><Metric label="处理中" value={counts.running}/><Metric label="完成" value={counts.completed}/><Metric label="失败" value={counts.failed} bad={counts.failed > 0}/></div></div>)}</div>
     <div className="section-toolbar"><div><h2>GPU 资源</h2><p>MinerU 与本地 Ollama 使用数据库持久租约互斥。</p></div></div>
     {data.gpu_leases.length ? <div className="lease-strip">{data.gpu_leases.map(lease => <div key={lease.resource}><BrainCircuit size={17}/><span><strong>{lease.kind}</strong><small>{lease.owner} · 到期 {time(lease.expires_at)}</small></span></div>)}</div> : <div className="empty panel">当前没有 GPU 重型任务占用租约</div>}
     <div className="section-toolbar"><div><h2>最近任务</h2><p>状态直接来自持久队列，服务重启后继续保留。</p></div></div>

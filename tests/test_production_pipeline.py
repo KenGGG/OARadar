@@ -89,6 +89,14 @@ def test_processing_center_reports_real_queue_state(config_file: Path) -> None:
     assert result["mock_data"] is False
 
 
+def test_processing_center_reports_history_idle_without_active_work(config_file: Path) -> None:
+    _, settings = _queue(config_file)
+
+    result = processing_center(settings)
+
+    assert result["historical_state"] == "idle"
+
+
 def test_bootstrap_enqueues_pending_and_unparsed_done_without_duplicates(config_file: Path) -> None:
     queue, _ = _queue(config_file)
     with Session(queue.engine) as session:

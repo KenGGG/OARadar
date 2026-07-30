@@ -45,7 +45,13 @@ def processing_center(settings: Settings) -> dict:
                 OAManifestItem.oa_item_key.in_([task.logical_item_key for task in tasks if task.queue_name != "realtime_pending"])
             )).all()}
             leases = session.scalars(select(ResourceLease).order_by(ResourceLease.id)).all()
-            return {"queues": queues, "historical_paused": control == "paused", "mock_data": False,
+            historical_state = (
+                "paused" if control == "paused" else
+                "running" if queues["historical_done_backfill"]["running"] else
+                "queued" if queues["historical_done_backfill"]["queued"] else
+                "idle"
+            )
+            return {"queues": queues, "historical_paused": control == "paused", "historical_state": historical_state, "mock_data": False,
                     "gpu_leases": [{"resource": x.resource_key, "kind": x.resource_kind, "owner": x.owner_id,
                                     "acquired_at": x.acquired_at.isoformat(), "expires_at": x.expires_at.isoformat()} for x in leases],
                     "tasks": [{"id": x.id, "queue": x.queue_name, "stage": x.stage, "status": x.status,

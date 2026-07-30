@@ -87,6 +87,16 @@ def normalize_done_response(payload: dict) -> DoneKnowledge:
         return DoneKnowledge(problem=problem.strip()[:1000], confidence=float(confidence))
 
 
+def normalize_done_content(content: str | None) -> DoneKnowledge:
+    parsed = validate_json_response(content)
+    if isinstance(parsed, dict):
+        return normalize_done_response(parsed)
+    text = (content or "").strip()
+    if not text:
+        raise DoneKnowledgeError("OLLAMA_SCHEMA_INVALID")
+    return DoneKnowledge(problem=text[:1000], confidence=0.25)
+
+
 def find_vault_overview(root: Path, oa_item_key: str) -> Path | None:
     expected = oa_item_key.removeprefix("done:").removeprefix("pending:")
     for path in root.rglob("OA-*__事项总览.md"):
@@ -183,9 +193,8 @@ def generate_done_knowledge(settings: Settings, engine, oa_item_key: str) -> Sum
                          provider_mode=settings.llm.provider_mode).chat(
             "你是本地OA附件概括器。严格输出简洁JSON，不要解释。problem用中文概括附件的主题、主要事项和要求；confidence为0到1。输出必须符合JSON Schema：\n"+schema,
             f"标题：{title}\n\n附件头部：\n{retry_evidence(source, attempt)}", json_schema=done_generation_schema())
-        parsed=validate_json_response(result.get("content"))
-        if result.get("error") or parsed is None: raise DoneKnowledgeError(result.get("error") or "OLLAMA_SCHEMA_INVALID")
-        knowledge=normalize_done_response(parsed)
+        if result.get("error"): raise DoneKnowledgeError(result.get("error"))
+        knowledge=normalize_done_content(result.get("content"))
     finally: coordinator.release(lease,owner)
     with Session(engine) as session:
         version=(session.scalar(select(func.max(SummaryVersion.version)).where(SummaryVersion.logical_item_id==logical_id,SummaryVersion.summary_kind=="done")) or 0)+1

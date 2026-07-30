@@ -32,7 +32,7 @@ services:
     container_name: oaradar-mineru-api
     restart: unless-stopped
     ports:
-      - "127.0.0.1:58000:8000"
+      - "0.0.0.0:58000:8000"
     environment:
       MINERU_MODEL_SOURCE: local
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

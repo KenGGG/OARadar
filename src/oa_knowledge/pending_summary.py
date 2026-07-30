@@ -68,6 +68,19 @@ def normalize_pending_response(payload: dict) -> PendingSummary:
         )
 
 
+def normalize_pending_content(content: str | None) -> PendingSummary:
+    parsed = validate_json_response(content)
+    if isinstance(parsed, dict):
+        try:
+            return normalize_pending_response(parsed)
+        except Exception as exc:
+            raise PendingSummaryError("OLLAMA_SCHEMA_INVALID") from exc
+    text = (content or "").strip()
+    if not text:
+        raise PendingSummaryError("OLLAMA_SCHEMA_INVALID")
+    return PendingSummary(summary=text[:2000], confidence=0.25)
+
+
 def summarize_pending(settings: Settings, engine, logical_item_id: int) -> SummaryVersion:
     with Session(engine) as session:
         snapshot = session.scalar(select(ItemSnapshot).where(
@@ -125,13 +138,9 @@ def summarize_pending(settings: Settings, engine, logical_item_id: int) -> Summa
                          "输出必须严格符合以下JSON Schema，不得增删顶层字段：\n" +
                          json.dumps(PendingSummary.model_json_schema(), ensure_ascii=False))
         result = client.chat(system_prompt, "请按约定字段概括以下不可变Pending快照：\n" + payload[:60000])
-        parsed = validate_json_response(result.get("content"))
-        if result.get("error") or parsed is None:
-            raise PendingSummaryError(result.get("error") or "OLLAMA_SCHEMA_INVALID")
-        try:
-            summary = normalize_pending_response(parsed)
-        except Exception as exc:
-            raise PendingSummaryError("OLLAMA_SCHEMA_INVALID") from exc
+        if result.get("error"):
+            raise PendingSummaryError(result.get("error"))
+        summary = normalize_pending_content(result.get("content"))
     finally:
         coordinator.release(lease, owner)
 

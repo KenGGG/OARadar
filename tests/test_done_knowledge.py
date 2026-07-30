@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from oa_knowledge.done_knowledge import DoneKnowledge, build_attachment_evidence, done_generation_schema, done_max_tokens, find_vault_overview, normalize_done_response, retry_evidence
+from oa_knowledge.done_knowledge import DoneKnowledge, build_attachment_evidence, done_generation_schema, done_max_tokens, find_vault_overview, normalize_done_content, normalize_done_response, retry_evidence
 
 
 def test_done_knowledge_requires_evidence_for_each_conclusion() -> None:
@@ -25,6 +25,14 @@ def test_done_knowledge_rejects_conclusion_without_evidence() -> None:
 def test_done_knowledge_normalizes_summary_only_response_without_fake_evidence() -> None:
     result = normalize_done_response({"summary": "该文件明确了报送安排", "key_points": ["无来源的点"]})
     assert result.problem == "该文件明确了报送安排"
+    assert result.core_conclusions == []
+
+
+def test_done_knowledge_uses_nonempty_plain_text_when_model_omits_json() -> None:
+    result = normalize_done_content("该附件说明了项目安排和报送要求。")
+
+    assert result.problem == "该附件说明了项目安排和报送要求。"
+    assert result.confidence == 0.25
     assert result.core_conclusions == []
 
 
