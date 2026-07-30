@@ -191,14 +191,8 @@ class OperationWorker:
             try:
                 ParsePipeline(self.settings, self.engine).run(queued.id)
             except Exception as exc:
-                if not self._nonfatal_parse_error(exc):
+                if not self._handle_nonfatal_parse_error(queued.id, exc):
                     raise
-                with Session(self.engine) as session:
-                    skipped = session.get(ParseJob, queued.id)
-                    if skipped is not None:
-                        skipped.status = "skipped"
-                        skipped.error_code = "unsupported_format"
-                        session.commit()
             self.production_queue.advance(task.id, self.owner, "parse", progress_current=completed + 1, progress_total=len(jobs))
             return
         if failed:
@@ -209,6 +203,17 @@ class OperationWorker:
     @staticmethod
     def _nonfatal_parse_error(exc: Exception) -> bool:
         return type(exc).__name__ in {"UnsupportedFormatException", "FileConversionException"}
+
+    def _handle_nonfatal_parse_error(self, job_id: int, exc: Exception) -> bool:
+        if not self._nonfatal_parse_error(exc):
+            return False
+        with Session(self.engine) as session:
+            job = session.get(ParseJob, job_id)
+            if job is not None:
+                job.status = "skipped"
+                job.error_code = "unsupported_format"
+                session.commit()
+        return True
 
     def _pipeline_pending_detail(self, task: PipelineTask) -> None:
         from oa_knowledge.collector.browser import BrowserSession, LoginState
@@ -268,7 +273,7 @@ class OperationWorker:
             try:
                 ParsePipeline(self.settings, self.engine).run(queued.id)
             except Exception as exc:
-                if not self._nonfatal_parse_error(exc):
+                if not self._handle_nonfatal_parse_error(queued.id, exc):
                     raise
             self.production_queue.advance(task.id, self.owner, "pending_parse")
             return

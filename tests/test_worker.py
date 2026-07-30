@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import BatchItem, CollectionBatch, OperationJob, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, OAItem, OperationJob, ParseJob, PipelineTask, ReviewEntry
 from oa_knowledge.web.worker import OperationWorker
 from oa_knowledge.production_pipeline import ProductionQueue
 
@@ -171,6 +171,37 @@ def test_unsupported_conversion_is_nonfatal_for_an_individual_file() -> None:
     assert OperationWorker._nonfatal_parse_error(type("UnsupportedFormatException", (Exception,), {})())
     assert OperationWorker._nonfatal_parse_error(type("FileConversionException", (Exception,), {})())
     assert not OperationWorker._nonfatal_parse_error(RuntimeError("parser service down"))
+
+
+def test_nonfatal_pending_parse_error_marks_job_skipped(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="pending:synthetic", source_channel="pending", title="Synthetic")
+        session.add(item); session.flush()
+        file = ArchivedFile(
+            oa_item_id=item.id, original_name="synthetic.doc", attachment_key="synthetic",
+            file_role="direct_attachment", source_container_key="synthetic", depth=1,
+            local_relpath="raw/synthetic.doc", download_status="verified",
+        )
+        session.add(file); session.flush()
+        job = ParseJob(file_id=file.id, engine="markitdown", engine_version="test", config_hash="", status="queued")
+        session.add(job); session.commit(); job_id = job.id
+
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        handled = worker._handle_nonfatal_parse_error(
+            job_id, type("FileConversionException", (Exception,), {})(),
+        )
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        job = session.get(ParseJob, job_id)
+        assert handled is True
+        assert job.status == "skipped"
+        assert job.error_code == "unsupported_format"
 
 
 def test_historical_sources_keep_attachments_and_only_canonical_snapshots() -> None:
