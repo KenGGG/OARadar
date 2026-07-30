@@ -40,6 +40,13 @@ def test_pending_summary_uses_nonempty_plain_text_when_model_omits_json() -> Non
     assert result.amounts == []
 
 
+def test_pending_summary_uses_common_text_field_from_alternate_json_shape() -> None:
+    result = normalize_pending_content('{"content":"请审阅并反馈。"}')
+
+    assert result.summary == "请审阅并反馈。"
+    assert result.confidence == 0.25
+
+
 def test_pending_evidence_stays_within_local_model_context_budget() -> None:
     evidence = pending_evidence("甲" * 60_000)
 

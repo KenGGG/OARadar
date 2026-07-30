@@ -78,6 +78,12 @@ def normalize_pending_content(content: str | None) -> PendingSummary:
         try:
             return normalize_pending_response(parsed)
         except Exception as exc:
+            fallback = next((
+                parsed.get(key) for key in ("content", "problem", "overview", "description", "result")
+                if isinstance(parsed.get(key), str) and parsed.get(key).strip()
+            ), None)
+            if fallback:
+                return PendingSummary(summary=fallback.strip()[:2000], confidence=0.25)
             raise PendingSummaryError("OLLAMA_SCHEMA_INVALID") from exc
     text = (content or "").strip()
     if not text:
