@@ -7,14 +7,48 @@ import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from oa_knowledge.config import Settings, load_settings
-from oa_knowledge.web.provider_settings import provider_settings_view, update_provider_settings
+from oa_knowledge.online_audit import audit_view, pause_audit, resume_audit, start_audit
+from oa_knowledge.web.lifecycle_views import (
+    done_list as lifecycle_done_list,
+)
+from oa_knowledge.web.lifecycle_views import (
+    knowledge_detail as lifecycle_knowledge_detail,
+)
+from oa_knowledge.web.lifecycle_views import (
+    knowledge_list as lifecycle_knowledge_list,
+)
+from oa_knowledge.web.lifecycle_views import (
+    pending_detail as lifecycle_pending_detail,
+)
+from oa_knowledge.web.lifecycle_views import (
+    pending_list as lifecycle_pending_list,
+)
+from oa_knowledge.web.lifecycle_views import (
+    processing_center as lifecycle_processing_center,
+)
+from oa_knowledge.web.lifecycle_views import (
+    system_view as lifecycle_system_view,
+)
+from oa_knowledge.web.provider_settings import (
+    provider_settings_view,
+    update_provider_settings,
+)
+from oa_knowledge.web.schedule_views import (
+    notifications_retry,
+    notifications_status,
+    notifications_test,
+    schedule_status,
+    trigger_schedule_run,
+)
 from oa_knowledge.web.status import (
+    archive_date_status,
+    audit_all_manifest_items,
     batch_items_preview,
     cancel_archive_batch,
     create_discovery_job,
@@ -25,46 +59,34 @@ from oa_knowledge.web.status import (
     freeze_archive_batch,
     full_manifest_report_path,
     full_manifest_status,
-    start_full_manifest_job,
-    start_done_incremental_job,
     item_detail,
     job_progress,
+    latest_backfill_campaign,
     list_batches,
     list_discovery_jobs,
     list_events,
     list_items,
     list_manifest_items,
-    mark_manifest_manual_review,
-    manifest_item_detail,
-    open_archived_file,
-    latest_backfill_campaign,
     list_policies,
     list_reviews,
     maintenance_status,
+    manifest_item_detail,
+    mark_manifest_manual_review,
+    open_archived_file,
     pause_archive_batch,
     preview_policy_hits,
+    recheck_manifest_no_attachment,
+    resolve_review,
     resume_archive_batch,
     retry_batch_items,
     retry_manifest_failed_items,
-    recheck_manifest_no_attachment,
-    audit_all_manifest_items,
-    archive_date_status,
-    resolve_review,
+    set_archive_date_job_paused,
+    start_archive_date_job,
     start_archive_job,
     start_backfill_campaign,
-    start_archive_date_job,
-    set_archive_date_job_paused,
+    start_done_incremental_job,
+    start_full_manifest_job,
 )
-from oa_knowledge.web.lifecycle_views import (
-    done_list as lifecycle_done_list,
-    knowledge_detail as lifecycle_knowledge_detail,
-    knowledge_list as lifecycle_knowledge_list,
-    pending_detail as lifecycle_pending_detail,
-    pending_list as lifecycle_pending_list,
-    processing_center as lifecycle_processing_center,
-    system_view as lifecycle_system_view,
-)
-from oa_knowledge.online_audit import audit_view, pause_audit, resume_audit, start_audit
 
 
 class BulkPolicyRequest(BaseModel):
@@ -428,6 +450,47 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     def get_manifest_report() -> FileResponse:
         path = full_manifest_report_path(settings)
         return FileResponse(path, media_type="text/csv; charset=utf-8", filename="oa_manifest.csv")
+
+    # ---- 2B-4: Scheduled sync + Feishu notification status (plan-0805-02 §6) ----
+
+    @app.get("/api/schedule/status")
+    def get_schedule_status(limit: int = Query(10, ge=1, le=100)) -> dict:
+        try:
+            return schedule_status(settings, limit=limit)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail="schedule status unavailable") from exc
+
+    @app.post("/api/schedule/hourly", status_code=202)
+    def post_schedule_hourly() -> dict:
+        try:
+            return trigger_schedule_run(settings, "hourly", config_path=config_path)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail="could not start hourly scan") from exc
+
+    @app.post("/api/schedule/nightly", status_code=202)
+    def post_schedule_nightly() -> dict:
+        try:
+            return trigger_schedule_run(settings, "nightly", config_path=config_path)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail="could not start nightly sync") from exc
+
+    @app.get("/api/notifications/status")
+    def get_notifications_status() -> dict:
+        return notifications_status(settings)
+
+    @app.post("/api/notifications/test", status_code=202)
+    def post_notifications_test() -> dict:
+        result = notifications_test(settings)
+        if result.get("status") not in {"sent"}:
+            raise HTTPException(status_code=409, detail=result.get("error_code", "feishu_test_failed"))
+        return result
+
+    @app.post("/api/notifications/{delivery_id}/retry", status_code=202)
+    def post_notifications_retry(delivery_id: int) -> dict:
+        result = notifications_retry(settings, delivery_id)
+        if result.get("status") not in {"sent"}:
+            raise HTTPException(status_code=409, detail=result.get("error_code", "feishu_retry_failed"))
+        return result
 
     @app.post("/api/batches/{batch_id}/start")
     def post_batch_start(

@@ -6,7 +6,7 @@ import {
 } from "lucide-react"
 import { Progress } from "./components/ui/progress"
 
-type View = "pending" | "done" | "processing" | "knowledge" | "audit" | "system"
+type View = "pending" | "done" | "processing" | "knowledge" | "audit" | "system" | "autorun"
 type PendingItem = {
   id: number; logical_item_id: number; title: string; sender: string | null
   received_at: string | null; current_node: string | null; processing_status: string
@@ -49,6 +49,21 @@ type AuditData = {
   markdown_queue: { paused:boolean; discovered:number; queued:number; running:number; succeeded:number; failed:number; excluded:number; pdf_mineru:{paused:boolean;total:number;queued:number;running:number;succeeded:number;failed:number;skipped:number}; events:{id:number;event_type:string;level:string;message:string;created_at:string|null}[] }
   archive_dates: { total:number; dated:number; unknown:number; correct:number; pending:number; job:null|{id:number;status:string;processed?:number;total?:number;migrated?:number;failed?:number;last_error_code?:string|null} }
 }
+type AutoRunData = {
+  recent_runs: { run_key: string; stage: string; status: string; started_at: string | null; finished_at: string | null; summary: Record<string, any> }[]
+  last_scan_at: string | null
+  schedule_available: boolean
+  hourly_enabled: boolean | null
+  next_run_at: string | null
+  summary: {
+    pending_new: number; pending_changed: number; done_new: number
+    markdown_backlog: number
+    feishu: { state: string; sent: number; failed: number }
+    oa_login: { status: string; checked_at: string | null }
+    nightly: { last_at: string | null; markdown_tasks_enqueued: number; download_jobs_enqueued: number }
+  }
+  notifications: { feishu_state: string; last_success_at: string | null; last_error_code: string | null; last_error_at: string | null; counts: Record<string, number> }
+}
 
 const nav = [
   { id: "pending" as View, label: "待处理", icon: FileCheck2 },
@@ -57,6 +72,7 @@ const nav = [
   { id: "knowledge" as View, label: "知识库", icon: BookOpen },
   { id: "audit" as View, label: "审计", icon: ShieldCheck },
   { id: "system" as View, label: "系统", icon: Gauge },
+  { id: "autorun" as View, label: "自动运行", icon: Bell },
 ]
 
 async function api<T>(path: string): Promise<T> {
@@ -93,6 +109,7 @@ export function App() {
   const [providers, setProviders] = useState<ProviderSettings | null>(null)
   const [audit, setAudit] = useState<AuditData | null>(null)
   const [auditPage, setAuditPage] = useState(1)
+  const [autorun, setAutoRun] = useState<AutoRunData | null>(null)
   const [pendingDetail, setPendingDetail] = useState<PendingDetail | null>(null)
   const [knowledgeDetail, setKnowledgeDetail] = useState<KnowledgeDetail | null>(null)
 
@@ -105,6 +122,7 @@ export function App() {
       if (view === "knowledge") setKnowledge((await api<{ documents: KnowledgeItem[] }>("/api/lifecycle/knowledge")).documents)
       if (view === "audit") setAudit(await api<AuditData>(`/api/audits/online?item_page=${auditPage}&item_page_size=50`))
       if (view === "system") { const [status, providerSettings] = await Promise.all([api<SystemData>("/api/lifecycle/system"), api<ProviderSettings>("/api/system/provider-settings")]); setSystem(status); setProviders(providerSettings) }
+      if (view === "autorun") setAutoRun(await api<AutoRunData>("/api/schedule/status"))
     } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败") }
     finally { if (!silent) setLoading(false) }
   }, [view, donePage, auditPage])
@@ -155,6 +173,7 @@ export function App() {
         {view === "knowledge" && <KnowledgeView rows={filteredKnowledge} query={query} setQuery={setQuery} open={openKnowledge}/>}
         {view === "audit" && audit && <AuditView data={audit} reload={load} setError={setError} setPage={setAuditPage}/>}
         {view === "system" && system && providers && <SystemView data={system} providers={providers} reload={load}/>}
+        {view === "autorun" && autorun && <AutoRunView data={autorun} reload={load}/>}
       </>}
     </main>
     {pendingDetail && <PendingDrawer data={pendingDetail} close={() => setPendingDetail(null)}/>}
@@ -271,11 +290,70 @@ function SystemView({ data, providers, reload }: { data: SystemData; providers: 
     </div>
   </section>
 }
+function AutoRunView({ data, reload }: { data: AutoRunData; reload: () => Promise<void> }) {
+  const [acting, setActing] = useState("")
+  const [message, setMessage] = useState("")
+  const act = async (label: string, path: string) => {
+    setActing(label); setMessage("")
+    try {
+      const csrf = document.cookie.split("; ").find(row => row.startsWith("oa_csrf="))?.split("=")[1] || ""
+      const response = await fetch(path, { method: "POST", headers: { "x-csrf-token": csrf } })
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "")
+        throw new Error(`${label}失败 (${response.status})${detail ? `: ${detail}` : ""}`)
+      }
+      setMessage(`${label}已触发，后台进程启动中`)
+      await reload()
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : `${label}失败`) }
+    finally { setActing("") }
+  }
+  const s = data.summary
+  const enabledLabel = data.hourly_enabled === null ? "未知（未安装 systemd 定时器）" : data.hourly_enabled ? "已启用" : "未启用"
+  const loginLabel = { authenticated: "已登录", unknown: "未知" }[s.oa_login.status] || s.oa_login.status
+  return <section>
+    <div className="notice"><CircleAlert size={17}/><span>定时扫描与飞书通知由本机 systemd 定时器或手动触发执行；所有操作均为只读 OA 交互，不修改 OA 记录。</span></div>
+    <div className="metrics compact-metrics">
+      <Metric label="每小时扫描" value={enabledLabel}/>
+      <Metric label="下次运行" value={data.next_run_at || "未知"}/>
+      <Metric label="最近扫描" value={time(data.last_scan_at)}/>
+      <Metric label="待办新增" value={s.pending_new}/>
+      <Metric label="待办变化" value={s.pending_changed}/>
+      <Metric label="已办新增" value={s.done_new}/>
+      <Metric label="OA 登录" value={loginLabel} bad={s.oa_login.status !== "authenticated"}/>
+      <Metric label="飞书成功" value={s.feishu.sent}/>
+      <Metric label="飞书失败" value={s.feishu.failed} bad={s.feishu.failed > 0}/>
+      <Metric label="MD 队列积压" value={s.markdown_backlog} bad={s.markdown_backlog > 0}/>
+    </div>
+    <div className="section-toolbar"><div><h2>夜间补齐结果</h2><p>最近一次夜间同步的归档与知识库入队情况。</p></div></div>
+    <div className="metrics compact-metrics">
+      <Metric label="夜间运行" value={time(s.nightly.last_at)}/>
+      <Metric label="下载任务入队" value={s.nightly.download_jobs_enqueued}/>
+      <Metric label="Markdown 任务入队" value={s.nightly.markdown_tasks_enqueued}/>
+      <Metric label="飞书状态" value={s.feishu.state}/>
+    </div>
+    <div className="section-toolbar"><div><h2>手动触发</h2><p>与 systemd 定时器等效，启动后台进程执行扫描；结果记入“运行记录”。</p></div>
+      <div className="toolbar-actions">
+        <button disabled={acting !== ""} onClick={() => void act("每小时扫描", "/api/schedule/hourly")}><RefreshCw size={16} className={acting === "每小时扫描" ? "spin" : ""}/>每小时扫描</button>
+        <button disabled={acting !== ""} onClick={() => void act("夜间补齐", "/api/schedule/nightly")}><Database size={16} className={acting === "夜间补齐" ? "spin" : ""}/>夜间补齐</button>
+        <button disabled={acting !== ""} onClick={() => void act("飞书连通性测试", "/api/notifications/test")}><Bell size={16} className={acting === "飞书连通性测试" ? "spin" : ""}/>飞书连通性测试</button>
+      </div>
+    </div>
+    {message && <div className="settings-message">{message}</div>}
+    <div className="section-toolbar"><div><h2>运行记录</h2><p>最近 {data.recent_runs.length} 条定时运行（bootstrap / hourly / nightly）。</p></div></div>
+    <div className="table-wrap"><table><thead><tr><th>阶段</th><th>状态</th><th>开始</th><th>结束</th><th>待办新增</th><th>已办新增</th><th>MD 入队</th></tr></thead><tbody>
+      {data.recent_runs.map(run => {
+        const sum = run.summary || {}
+        return <tr key={run.run_key}><td>{run.stage}</td><td><Badge tone={run.status === "completed" ? "good" : run.status === "partial" ? "warn" : "bad"}>{run.status}</Badge></td><td className="nowrap">{time(run.started_at)}</td><td className="nowrap">{time(run.finished_at)}</td><td>{sum.pending?.created ?? "-"}</td><td>{sum.done?.new_items ?? "-"}</td><td>{sum.done?.markdown_tasks_enqueued ?? "-"}</td></tr>
+      })}
+      {!data.recent_runs.length && <tr><td colSpan={7} className="empty">尚无定时运行记录</td></tr>}
+    </tbody></table></div>
+  </section>
+}
 function Field({label,value,change}:{label:string;value:string;change:(v:string)=>void}){return <label className="setting-field"><span>{label}</span><input value={value} onChange={e=>change(e.target.value)}/></label>}
 function NumberField({label,value,change,step="1"}:{label:string;value:number;change:(v:number)=>void;step?:string}){return <label className="setting-field"><span>{label}</span><input type="number" step={step} value={value} onChange={e=>change(Number(e.target.value))}/></label>}
 function Toggle({label,checked,change}:{label:string;checked:boolean;change:(v:boolean)=>void}){return <label className="setting-toggle"><span>{label}</span><input type="checkbox" checked={checked} onChange={e=>change(e.target.checked)}/></label>}
 function SecretState({label,configured}:{label:string;configured:boolean}){return <div className="secret-state"><span>{label}</span><Badge tone={configured?"good":"warn"}>{configured?"已配置":"未配置"}</Badge></div>}
-function Metric({ label, value, bad }: { label: string; value: number; bad?: boolean }) { return <div className={`metric ${bad ? "metric-bad" : ""}`}><span>{label}</span><strong>{value.toLocaleString()}</strong></div> }
+function Metric({ label, value, bad }: { label: string; value: number | string; bad?: boolean }) { return <div className={`metric ${bad ? "metric-bad" : ""}`}><span>{label}</span><strong>{typeof value === "number" ? value.toLocaleString() : value}</strong></div> }
 function Service({ icon: Icon, title, status, detail }: { icon: typeof Server; title: string; status: string; detail: string }) { const healthy = ["running", "healthy", "ok", "idle"].includes(status); return <div className="service"><Icon size={21}/><div><strong>{title}</strong><small>{detail}</small></div><Badge tone={healthy ? "good" : "warn"}>{status}</Badge></div> }
 const labelFor = (key: string) => ({ pending: "当前待办", done: "已办事项", files: "文件记录", snapshots: "事项采集记录", source_attachments: "来源附件", archive_packages: "压缩包", archive_members: "压缩包成员", parse_artifacts: "解析产物", knowledge_documents: "知识文档", failed_or_retry: "失败或待重试" }[key] || key)
 
