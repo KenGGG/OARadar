@@ -138,6 +138,45 @@ class FeishuConfig(StrictModel):
     retry_attempts: int = 3
 
 
+# Official Feishu/Lark custom-bot webhook hosts. The webhook path itself is a
+# secret, so only these hosts are ever accepted.
+OFFICIAL_FEISHU_HOSTS = frozenset({"open.feishu.cn", "open.feishu.com", "www.feishu.cn"})
+
+
+def validate_feishu_runtime_config(settings: "Settings") -> str:
+    """Return the effective Feishu runtime state.
+
+    Unlike simply checking for an environment variable, this honors
+    ``feishu.enabled`` and distinguishes every misconfiguration so the caller
+    can fail loudly instead of silently treating a broken config as success
+    (plan-0805-02 §1.1). One of:
+
+    * ``disabled``        — ``feishu.enabled`` is false; never send.
+    * ``ready``           — enabled with a valid webhook and signing secret.
+    * ``missing_webhook`` — enabled but the webhook env var is empty.
+    * ``missing_secret``  — enabled and webhook present, but no signing secret.
+    * ``invalid_webhook`` — enabled but the webhook URL fails validation.
+    """
+    if not settings.feishu.enabled:
+        return "disabled"
+    webhook = os.environ.get(settings.feishu.webhook_env, "")
+    if not webhook:
+        return "missing_webhook"
+    parsed = urlparse(webhook)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in OFFICIAL_FEISHU_HOSTS
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        return "invalid_webhook"
+    secret = os.environ.get(settings.feishu.secret_env, "")
+    if not secret:
+        return "missing_secret"
+    return "ready"
+
+
 class LlmConfig(StrictModel):
     enabled: bool = False
     active_provider: str = "ollama"

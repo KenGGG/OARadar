@@ -11,9 +11,15 @@ import shutil
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from oa_knowledge.archive_paths import (
+    done_archive_directory,
+    is_current_archive_path,
+    is_legacy_archive_path,
+    markdown_tail_from_archive_path,
+    replace_archive_prefix,
+)
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import ArchivedFile, BatchItem, MarkdownExport, OAItem, OAManifestItem
-from oa_knowledge.detail_archive import done_archive_directory
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +35,7 @@ class ReconciliationResult:
 
 
 def _replace_prefix(value: str | None, old: str, new: str) -> str | None:
-    if value == old:
-        return new
-    if value and value.startswith(old + "/"):
-        return new + value[len(old):]
-    return value
+    return replace_archive_prefix(value, old, new)
 
 
 def _markdown_item_rel(raw_rel: Path) -> Path:
@@ -44,11 +46,7 @@ def _markdown_item_rel(raw_rel: Path) -> Path:
     archive lives under ``raw/`` or the unified ``archive/raw/oa/`` prefix. So a
     pure prefix migration does not move (or rewrite) any Markdown files.
     """
-    parts = raw_rel.parts
-    for index, part in enumerate(parts):
-        if part in {"done", "pending"} and index + 1 < len(parts):
-            return Path(*parts[index:])
-    raise ValueError("archive path must contain a done/ or pending/ segment")
+    return markdown_tail_from_archive_path(raw_rel)
 
 
 def _rewrite_text_tree(root: Path, old_raw: str, new_raw: str, old_md: str, new_md: str) -> None:
@@ -71,8 +69,10 @@ def reconcile_item(session: Session, settings: Settings, item_id: int) -> Reconc
     if not item or item.source_channel != "done" or not item.archive_relpath:
         raise ValueError("done archive unavailable")
     old_rel = Path(item.archive_relpath)
-    if old_rel.is_absolute() or ".." in old_rel.parts or old_rel.parts[:2] != ("raw", "done"):
-        raise ValueError("unsafe archive path")
+    if old_rel.is_absolute() or ".." in old_rel.parts or not (
+        is_legacy_archive_path(old_rel) or is_current_archive_path(old_rel)
+    ):
+        raise ValueError("review_required: unexpected archive prefix")
     new_rel = Path(done_archive_directory(item.title, item.workitem_id_text or str(item.id), item.initiated_at))
     if old_rel == new_rel:
         return ReconciliationResult(item.id, "already_correct", old_rel.as_posix(), new_rel.as_posix())
@@ -147,13 +147,20 @@ def reconciliation_counts(session: Session) -> dict[str, int]:
 
 
 def _new_archive_relpath(item: OAItem) -> Path:
-    """Compute the unified ``archive/raw/oa/...`` path for an item."""
+    """Compute the unified ``archive/raw/oa/...`` path for a legacy item.
+
+    Called only for items under the legacy ``raw/done`` or ``raw/pending``
+    prefix (the migrator guards against other prefixes). Done items get the
+    date-calibrated directory; pending items keep their logical/snapshot
+    identity under the unified prefix.
+    """
     rel = Path(item.archive_relpath)
-    if rel.parts[:2] == ("raw", "done"):
+    parts = rel.parts
+    if parts[1] == "done":
         return Path(done_archive_directory(item.title, item.workitem_id_text or str(item.id), item.initiated_at))
-    if rel.parts[:2] == ("raw", "pending"):
-        return Path("archive/raw/oa", "pending", *rel.parts[2:])
-    return rel
+    # pending: raw/pending/<logical_id>/<snapshot_id> -> archive/raw/oa/pending/<logical_id>/<snapshot_id>
+    segment_index = parts.index("pending")
+    return Path("archive/raw/oa", "pending", *parts[segment_index + 1:])
 
 
 def _migrate_one_item(session: Session, settings: Settings, item: OAItem) -> str:
@@ -164,9 +171,9 @@ def _migrate_one_item(session: Session, settings: Settings, item: OAItem) -> str
     on any failure the file move is undone and the session rolled back.
     """
     old_rel = Path(item.archive_relpath)
-    if old_rel.parts[:2] == ("archive", "raw"):
+    if is_current_archive_path(old_rel):
         return "already_correct"
-    if old_rel.parts[:2] not in (("raw", "done"), ("raw", "pending")):
+    if not is_legacy_archive_path(old_rel):
         raise ValueError("unexpected archive prefix")
     new_rel = _new_archive_relpath(item)
     if old_rel == new_rel:
@@ -223,10 +230,10 @@ def migrate_archive_paths(session: Session, settings: Settings, *, dry_run: bool
     counts: dict[str, int] = {"total": len(rows), "migrated": 0, "already_correct": 0, "skipped": 0, "failed": 0}
     for item in rows:
         rel = Path(item.archive_relpath)
-        if rel.parts[:2] == ("archive", "raw"):
+        if is_current_archive_path(rel):
             counts["already_correct"] += 1
             continue
-        if rel.parts[:2] not in (("raw", "done"), ("raw", "pending")):
+        if not is_legacy_archive_path(rel):
             counts["skipped"] += 1
             continue
         if dry_run:

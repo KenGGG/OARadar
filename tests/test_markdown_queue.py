@@ -90,3 +90,41 @@ def test_enqueue_verified_for_oa_counts_attachments(tmp_path: Path) -> None:
         # Idempotent on a second pass.
         assert enqueue_verified_for_oa(session, "ITEM-X") == 0
         assert session.query(MarkdownTask).filter_by(source_file_id=f.id).count() == 1
+
+
+def test_all_knowledge_source_roles_are_enqueued(tmp_path: Path) -> None:
+    from oa_knowledge.source_roles import KNOWLEDGE_SOURCE_ROLES
+
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        item = _make_item(session, key="ITEM-ROLES")
+        for index, role in enumerate(KNOWLEDGE_SOURCE_ROLES):
+            session.add(ArchivedFile(
+                oa_item_id=item.id,
+                original_name=f"{role}.pdf",
+                attachment_key=f"K{index}",
+                file_role=role,
+                source_container_key="container",
+                download_status="verified",
+                local_relpath=f"raw/done/2024/01/{role}.pdf",
+            ))
+        session.flush()
+        # metadata_snapshot must still be excluded.
+        session.add(ArchivedFile(
+            oa_item_id=item.id,
+            original_name="meta.json",
+            attachment_key="META",
+            file_role="metadata_snapshot",
+            source_container_key="container",
+            download_status="verified",
+            local_relpath="raw/done/2024/01/meta.json",
+        ))
+        session.flush()
+        # Every knowledge-source role should be enqueued exactly once.
+        assert enqueue_verified_for_oa(session, "ITEM-ROLES") == len(KNOWLEDGE_SOURCE_ROLES)
+        enqueued = session.query(MarkdownTask).count()
+        assert enqueued == len(KNOWLEDGE_SOURCE_ROLES)
+        # metadata_snapshot is never enqueued.
+        assert enqueue_verified_for_oa(session, "ITEM-ROLES") == 0

@@ -43,6 +43,7 @@ from oa_knowledge.pending_sync import apply_pending_identifiers, sync_pending_di
 from oa_knowledge.pending_archive import persist_pending_capture
 from oa_knowledge.resources import ResourceCoordinator
 from oa_knowledge.reconcile import reconcile_done_occurrence
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.markdown_export.service import convert_archive, markdown_status as get_markdown_status
 
 app = typer.Typer(help="OA Knowledge Hub stage 0+1 foundation")
@@ -82,7 +83,7 @@ def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:
     return bool(session.scalar(
         select(func.count()).select_from(ArchivedFile).join(OAItem).where(
             OAItem.oa_item_key == oa_item_key,
-            ArchivedFile.file_role.in_(("direct_attachment", "official_body", "official_attachment")),
+            ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
             ArchivedFile.download_status == "verified",
             ArchivedFile.local_relpath.is_not(None),
         )
@@ -94,6 +95,7 @@ def pending_discover(
     limit: int = typer.Option(3, "--limit", min=1, max=500),
     max_pages: int = typer.Option(1, "--max-pages", min=1, max=50),
     headed: bool = typer.Option(False, "--headed"),
+    notify_mode: str = typer.Option("normal", "--notify-mode", help="normal | baseline | disabled"),
     config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
 ) -> None:
     """Read Pending-list titles and metadata; never opens item details."""
@@ -134,6 +136,7 @@ def pending_discover(
                 session,
                 list(discovery.items),
                 authoritative=complete_snapshot,
+                notification_mode=notify_mode,
             )
             session.commit()
         typer.echo(json.dumps({
@@ -741,7 +744,7 @@ def verified_attachment_resolver(engine, data_root: Path):
                     ArchivedFile.download_status == "verified",
                     ArchivedFile.local_relpath.is_not(None),
                     ArchivedFile.sha256.is_not(None),
-                    ArchivedFile.file_role.in_(("direct_attachment", "official_body", "official_attachment")),
+                    ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
                 ).order_by(ArchivedFile.id.desc()).limit(3)
             ).all()
         for candidate in candidates:
@@ -1245,7 +1248,7 @@ def batch_archive_related(
             "files": sum(len(container.files) for container in manifest.containers),
             "verified_attachments": sum(
                 1 for container in manifest.containers for file in container.files
-                if file.file_role in {"direct_attachment", "official_body", "official_attachment"} and file.download_status == "verified"
+                if file.file_role in MARKDOWN_SOURCE_ROLES and file.download_status == "verified"
             ),
             "depth_limit_reached": manifest.depth_limit_reached,
         }

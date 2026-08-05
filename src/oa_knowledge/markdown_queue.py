@@ -7,8 +7,11 @@ from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import ArchivedFile, MarkdownExport, MarkdownQueueControl, MarkdownTask, MarkdownTaskEvent, OAItem
 from oa_knowledge.markdown_export.render import SCHEMA_VERSION
-ATTACHMENT_ROLES = ("direct_attachment", "official_attachment", "opinion_attachment")
-PDF_CAMPAIGN_ROLES = ATTACHMENT_ROLES + ("official_body",)
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
+
+# Kept for backward compatibility with callers importing the old names.
+ATTACHMENT_ROLES = MARKDOWN_SOURCE_ROLES
+PDF_CAMPAIGN_ROLES = MARKDOWN_SOURCE_ROLES
 
 def enqueue_file(session: Session, source_file_id: int) -> bool:
     done = session.scalar(select(MarkdownExport.id).where(MarkdownExport.source_file_id == source_file_id, MarkdownExport.schema_version == SCHEMA_VERSION, MarkdownExport.status.in_(("success", "unsupported"))))

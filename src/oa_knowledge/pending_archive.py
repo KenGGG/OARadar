@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.archive import atomic_write_bytes, inspect_file, safe_filename
+from oa_knowledge.archive_paths import pending_archive_directory
 from oa_knowledge.collector.detail import DetailCapture, DirectAttachment, PageSnapshot
 from oa_knowledge.constants import PipelineStatus
 from oa_knowledge.db.models import (
@@ -256,7 +257,7 @@ def persist_pending_capture(
         raise LookupError(f"pending occurrence not found: {occurrence_key}")
     snapshot = record_pending_snapshot(session, occurrence_key, _capture_payload(capture))
     item = _pending_item(session, occurrence)
-    base = PurePosixPath("archive/raw/oa", "pending", str(occurrence.logical_item_id), str(snapshot.id))
+    base = pending_archive_directory(occurrence.logical_item_id, snapshot.id)
     for index, row in enumerate(capture.body):
         _store_snapshot_file(session, item, data_root, base, row, "body_snapshot", index)
     for index, row in enumerate(capture.workflow):

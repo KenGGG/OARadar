@@ -19,6 +19,7 @@ from oa_knowledge.enrich.extractor import validate_json_response
 from oa_knowledge.enrich.provider import make_llm_client
 from oa_knowledge.lifecycle import record_snapshot
 from oa_knowledge.resources import ResourceCoordinator
+from oa_knowledge.source_roles import KNOWLEDGE_SOURCE_ROLES
 
 
 class EvidenceStatement(BaseModel):
@@ -138,7 +139,7 @@ def _source_text(settings: Settings, session: Session, item: OAItem) -> tuple[st
         .where(
             ArchivedFile.oa_item_id == item.id,
             ParseArtifact.lifecycle_status == "valid",
-            ArchivedFile.file_role.in_(("direct_attachment", "official_body", "official_attachment", "associated_document", "opinion_attachment")),
+            ArchivedFile.file_role.in_(KNOWLEDGE_SOURCE_ROLES),
         )
         .order_by(ParseArtifact.id)).all()
     samples: list[tuple[int, str, str]] = []

@@ -1,13 +1,14 @@
 from datetime import datetime
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.collector.pending import DiscoveredPendingItem
 from oa_knowledge.collector.pending_detail import PendingDetailIdentifiers
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ItemOccurrence, ItemSnapshot, LogicalItem
+from oa_knowledge.db.models import ItemOccurrence, ItemSnapshot, LogicalItem, PipelineTask
 from oa_knowledge.pending_sync import apply_pending_identifiers, record_pending_snapshot, sync_pending_discovery
 
 
@@ -147,3 +148,73 @@ def test_pending_snapshot_embeds_stable_occurrence_source_context(tmp_path: Path
         assert payload["source"]["occurrence_key"] == "pending:affair-1"
         assert payload["source"]["affair_id"] == "affair-1"
         assert payload["detail"] == {"attachment_count": 2}
+
+
+def _payload(session, occurrence_key: str) -> dict:
+    import json
+    from oa_knowledge.db.models import ItemOccurrence
+    occ = session.scalar(select(ItemOccurrence).where(ItemOccurrence.occurrence_key == occurrence_key))
+    task = session.scalar(select(PipelineTask).where(
+        PipelineTask.logical_item_id == occ.logical_item_id,
+        PipelineTask.stage == "detail_sync",
+    ))
+    return json.loads(task.payload_json)
+
+
+def test_baseline_discovery_never_notifies_but_still_enqueues(tmp_path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        sync_pending_discovery(session, [_item("affair-1")], notification_mode="baseline")
+        session.commit()
+        payload = _payload(session, "pending:affair-1")
+        assert payload["notify"] is False
+        assert payload["baseline"] is True
+        # A real-time task is still enqueued (archived + summarized), just not notified.
+        assert session.query(PipelineTask).filter_by(stage="detail_sync").count() == 1
+
+
+def test_normal_discovery_notifies_new_items(tmp_path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        sync_pending_discovery(session, [_item("affair-1")], notification_mode="normal")
+        session.commit()
+        payload = _payload(session, "pending:affair-1")
+        assert payload["notify"] is True
+
+
+def test_disabled_mode_syncs_state_but_enqueues_no_tasks(tmp_path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        result = sync_pending_discovery(session, [_item("affair-1")], notification_mode="disabled")
+        session.commit()
+        assert result.created == 1
+        assert session.query(ItemOccurrence).count() == 1
+        assert session.query(PipelineTask).count() == 0
+
+
+def test_unchanged_pending_creates_no_second_task(tmp_path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        sync_pending_discovery(session, [_item("affair-1")], notification_mode="normal")
+        sync_pending_discovery(session, [_item("affair-1")], notification_mode="normal")
+        session.commit()
+        assert session.query(PipelineTask).filter_by(stage="detail_sync").count() == 1
+
+
+def test_changed_pending_creates_new_task_with_notify(tmp_path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        sync_pending_discovery(session, [_item("affair-1", node="经办")], notification_mode="normal")
+        sync_pending_discovery(session, [_item("affair-1", node="复核")], notification_mode="normal")
+        session.commit()
+        assert session.query(PipelineTask).filter_by(stage="detail_sync").count() == 2

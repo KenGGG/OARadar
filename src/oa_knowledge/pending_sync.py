@@ -39,7 +39,19 @@ def sync_pending_discovery(
     items: list[DiscoveredPendingItem],
     *,
     authoritative: bool = True,
+    notification_mode: str = "normal",
 ) -> PendingSyncResult:
+    """Persist a Pending-list discovery snapshot idempotently.
+
+    ``notification_mode`` controls whether discovered items advance into the
+    Feishu notify stage (plan-0805-02 §1.2):
+
+    * ``normal``   — new and changed items are notified once.
+    * ``baseline`` — items are archived and summarized but never notified; used
+      for first-deploy bootstrapping so the existing backlog is not pushed.
+    * ``disabled`` — only the occurrence state is synced; no pipeline tasks are
+      enqueued at all.
+    """
     created = updated = unchanged = closed = reactivated = 0
     seen_keys = {item.occurrence_key for item in items}
     for item in items:
@@ -90,13 +102,21 @@ def sync_pending_discovery(
         occurrence.discovery_hash = discovery_hash
         occurrence.last_seen_at = utcnow()
         session.flush()
+        if notification_mode == "disabled":
+            # Sync occurrence state only; do not enqueue capture/summary/notify.
+            continue
+        notify = notification_mode == "normal"
         task_key = f"pending:{occurrence.occurrence_key}:{discovery_hash}:detail-v1"
         if session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == task_key)) is None:
             session.add(PipelineTask(
                 queue_name="realtime_pending", priority=0, logical_item_key=str(occurrence.logical_item_id),
                 logical_item_id=occurrence.logical_item_id, stage="detail_sync", idempotency_key=task_key,
                 max_attempts=5,
-                payload_json=json.dumps({"occurrence_id": occurrence.id, "baseline": False, "notify": True}),
+                payload_json=json.dumps({
+                    "occurrence_id": occurrence.id,
+                    "baseline": notification_mode == "baseline",
+                    "notify": notify,
+                }),
             ))
     if authoritative:
         active_rows = session.scalars(select(ItemOccurrence).where(

@@ -84,3 +84,35 @@ def test_web_rejects_non_loopback_hosts(host: str) -> None:
 def test_mineru_api_rejects_non_loopback_hosts() -> None:
     with pytest.raises(ValidationError, match="loopback"):
         Settings.model_validate({"mineru": {"enabled": True, "api_url": "http://192.0.2.10:58000"}})
+
+
+def test_validate_feishu_runtime_config_honors_enabled_flag(monkeypatch) -> None:
+    from oa_knowledge.config import validate_feishu_runtime_config
+
+    monkeypatch.setenv("FEISHU_OA_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/abc")
+    monkeypatch.setenv("FEISHU_OA_SECRET", "secret")
+
+    # enabled=False wins even when env vars are present.
+    disabled = Settings(feishu={"enabled": False})
+    assert validate_feishu_runtime_config(disabled) == "disabled"
+
+    # enabled=True with a valid webhook + secret.
+    ready = Settings(feishu={"enabled": True})
+    assert validate_feishu_runtime_config(ready) == "ready"
+
+
+def test_validate_feishu_runtime_config_detects_misconfiguration(monkeypatch) -> None:
+    from oa_knowledge.config import validate_feishu_runtime_config
+
+    # missing webhook
+    monkeypatch.delenv("FEISHU_OA_WEBHOOK", raising=False)
+    monkeypatch.delenv("FEISHU_OA_SECRET", raising=False)
+    assert validate_feishu_runtime_config(Settings(feishu={"enabled": True})) == "missing_webhook"
+
+    # webhook present, secret missing
+    monkeypatch.setenv("FEISHU_OA_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/abc")
+    assert validate_feishu_runtime_config(Settings(feishu={"enabled": True})) == "missing_secret"
+
+    # non-https / non-official host
+    monkeypatch.setenv("FEISHU_OA_WEBHOOK", "http://evil.example.com/open-apis/bot/v2/hook/abc")
+    assert validate_feishu_runtime_config(Settings(feishu={"enabled": True})) == "invalid_webhook"

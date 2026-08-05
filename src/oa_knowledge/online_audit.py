@@ -14,8 +14,9 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem, OnlineAuditEvent, OnlineAuditItem, OnlineAuditRun, OperationEvent, OperationJob
+from oa_knowledge.source_roles import AUDIT_ATTACHMENT_ROLES
 
-ATTACHMENT_ROLES = ("direct_attachment", "official_attachment", "opinion_attachment")
+ATTACHMENT_ROLES = AUDIT_ATTACHMENT_ROLES
 
 
 @dataclass(frozen=True)

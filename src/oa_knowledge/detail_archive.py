@@ -10,14 +10,10 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.archive import atomic_write_bytes, inspect_file, safe_filename, sha256_file
 from oa_knowledge.archive.manifest import ContainerManifest, FileManifest, ItemManifest
+from oa_knowledge.archive_paths import done_archive_directory
 from oa_knowledge.collector.detail import DetailCapture
 from oa_knowledge.constants import FileRole, PipelineStatus
 from oa_knowledge.db.models import ArchivedFile, BatchItem, OAItem, ReviewEntry
-
-
-def done_archive_directory(title: str, workitem_id_text: str, initiated_at: datetime | None) -> PurePosixPath:
-    period = f"{initiated_at:%Y/%m}" if initiated_at else "unknown"
-    return PurePosixPath("archive/raw/oa", "done", period, f"{safe_filename(title, 100)}_{workitem_id_text}")
 
 
 def archive_collaboration_detail(session: Session, item: BatchItem, capture: DetailCapture, data_root) -> ItemManifest:

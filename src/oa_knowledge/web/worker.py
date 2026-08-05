@@ -442,11 +442,29 @@ class OperationWorker:
 
     def _pipeline_notify_feishu(self, task: PipelineTask) -> None:
         from oa_knowledge.collector.pending import PendingAdapter
+        from oa_knowledge.config import validate_feishu_runtime_config
         from oa_knowledge.digest.feishu import FeishuNotifier
         from oa_knowledge.pending_summary import PendingSummary
 
         logical_item_id = int(task.logical_item_key)
         payload = json.loads(task.payload_json or "{}")
+
+        # Honor feishu.enabled and fail loudly on misconfiguration. Never treat
+        # a broken config as a successful send (plan-0805-02 §1.1).
+        state = validate_feishu_runtime_config(self.settings)
+        if state == "disabled":
+            self.production_queue.complete(task.id, self.owner)
+            return
+        if state != "ready":
+            safe_error = {
+                "missing_webhook": "feishu webhook not configured",
+                "missing_secret": "feishu signing secret not configured",
+                "invalid_webhook": "feishu webhook URL is invalid",
+            }.get(state, "feishu misconfigured")
+            self.production_queue.fail(
+                task.id, self.owner, "FEISHU_MISCONFIGURED", safe_error, recoverable=False
+            )
+            return
 
         notifier = FeishuNotifier(
             webhook_env=self.settings.feishu.webhook_env,
@@ -456,8 +474,11 @@ class OperationWorker:
             retry_attempts=self.settings.feishu.retry_attempts,
         )
         if not notifier.webhook_url:
-            # Feishu is not configured; keep the summary but skip delivery.
-            self.production_queue.complete(task.id, self.owner)
+            # Validate reported enabled+ready but the env var disappeared between
+            # the check and now. Treat as misconfigured rather than silent skip.
+            self.production_queue.fail(
+                task.id, self.owner, "FEISHU_MISCONFIGURED", "feishu webhook not configured", recoverable=False
+            )
             return
 
         with Session(self.engine) as session:

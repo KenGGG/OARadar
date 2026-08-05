@@ -299,10 +299,13 @@ def test_pending_summary_without_notification_completes(config_file: Path, monke
         assert row.error_code is None
 
 
-def test_notify_feishu_skips_when_webhook_unconfigured(config_file: Path, monkeypatch) -> None:
+def test_notify_feishu_skips_when_disabled_even_with_env(config_file: Path, monkeypatch) -> None:
+    # Plan §1.1: feishu.enabled=false must never send, even if env vars exist.
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
+    monkeypatch.setenv("FEISHU_OA_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/x")
+    monkeypatch.setenv("FEISHU_OA_SECRET", "secret")
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
         "realtime_pending", "1", "notify_feishu", "notify-feishu-skip",
@@ -321,7 +324,7 @@ def test_notify_feishu_skips_when_webhook_unconfigured(config_file: Path, monkey
     finally:
         worker.close()
 
-    # No webhook configured -> no delivery attempted, task completes.
+    # Disabled -> no delivery attempted, task completes.
     assert sent == []
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
@@ -342,6 +345,8 @@ def test_notify_feishu_delivers_and_records_delivery(config_file: Path, monkeypa
     )
 
     monkeypatch.setenv("FEISHU_OA_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/x")
+    monkeypatch.setenv("FEISHU_OA_SECRET", "secret")
+    settings.feishu.enabled = True
     with Session(engine) as session:
         logical = LogicalItem(logical_key="pending:1", title="待办事项")
         session.add(logical); session.flush()
@@ -391,3 +396,37 @@ def test_notify_feishu_delivers_and_records_delivery(config_file: Path, monkeypa
         assert delivery is not None
         assert delivery.status == "sent"
         assert delivery.sent_at is not None
+
+
+def test_notify_feishu_missing_webhook_fails_without_silent_success(config_file: Path, monkeypatch) -> None:
+    # Plan §1.1: feishu.enabled=true but webhook missing must fail loudly,
+    # never treated as a successful send.
+    settings = load_settings(config_file)
+    settings.feishu.enabled = True
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    monkeypatch.delenv("FEISHU_OA_WEBHOOK", raising=False)
+    monkeypatch.delenv("FEISHU_OA_SECRET", raising=False)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", "1", "notify_feishu", "notify-feishu-missing",
+        payload={"occurrence_id": -1, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    sent = []
+    monkeypatch.setattr(
+        "oa_knowledge.digest.feishu.FeishuNotifier.send_pending_summary",
+        lambda self, *args, **kwargs: sent.append(True) or True,
+    )
+    try:
+        worker._pipeline_notify_feishu(task)
+    finally:
+        worker.close()
+
+    assert sent == []
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "failed"
+        assert row.error_code == "FEISHU_MISCONFIGURED"
