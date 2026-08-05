@@ -16,6 +16,15 @@ from oa_knowledge.db.models import BatchItem, CollectionBatch
 runner = CliRunner()
 
 
+def _last_json(output: str) -> dict:
+    """Parse the last JSON document in mixed CLI output (logs may precede it)."""
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    raise AssertionError(f"no JSON line in output: {output!r}")
+
+
 def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     first = runner.invoke(app, ["init", "--config", str(config_file)])
     second = runner.invoke(app, ["init", "--config", str(config_file)])
@@ -58,6 +67,51 @@ def test_operational_errors_redact_credentials() -> None:
 def test_missing_database_has_nonzero_exit(config_file: Path) -> None:
     assert runner.invoke(app, ["status", "--config", str(config_file)]).exit_code == 1
     assert runner.invoke(app, ["audit", "--config", str(config_file)]).exit_code == 1
+
+
+def test_notifications_status_reports_state(config_file: Path) -> None:
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+    result = runner.invoke(app, ["notifications", "status", "--config", str(config_file)])
+    assert result.exit_code == 0, result.output
+    payload = _last_json(result.output)
+    assert payload["feishu_state"] in {"disabled", "missing_webhook"}
+
+
+def test_notifications_test_feishu_exits_nonzero_when_not_ready(config_file: Path) -> None:
+    # No webhook/secret and feishu disabled -> must fail closed, never send.
+    result = runner.invoke(app, ["notifications", "test-feishu", "--config", str(config_file)])
+    assert result.exit_code == 1, result.output
+    assert "feishu not ready" in result.output
+
+
+def test_notifications_test_feishu_sends_synthetic(config_file: Path, monkeypatch) -> None:
+    import yaml
+
+    from oa_knowledge.notifications.models import DeliveryResult
+    monkeypatch.setenv("FEISHU_OA_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/x")
+    monkeypatch.setenv("FEISHU_OA_SECRET", "secret")
+    # Enable Feishu so the runtime check passes before the (mocked) send.
+    cfg = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    cfg.setdefault("feishu", {})["enabled"] = True
+    config_file.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_test",
+        lambda self, **kw: DeliveryResult("sent", False),
+    )
+    result = runner.invoke(app, ["notifications", "test-feishu", "--config", str(config_file)])
+    assert result.exit_code == 0, result.output
+    assert _last_json(result.output)["status"] == "sent"
+
+
+def test_notifications_retry_reports_status(config_file: Path, monkeypatch) -> None:
+    from oa_knowledge.notifications.models import DeliveryResult
+    monkeypatch.setattr(
+        "oa_knowledge.notifications.feishu_service.retry_pending_summary_delivery",
+        lambda engine, settings, delivery_id: DeliveryResult("sent", False),
+    )
+    result = runner.invoke(app, ["notifications", "retry", "7", "--config", str(config_file)])
+    assert result.exit_code == 0, result.output
+    assert _last_json(result.output)["status"] == "sent"
 
 
 def test_doctor_does_not_contact_oa(config_file: Path) -> None:

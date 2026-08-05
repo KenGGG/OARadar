@@ -443,7 +443,7 @@ class OperationWorker:
     def _pipeline_notify_feishu(self, task: PipelineTask) -> None:
         from oa_knowledge.collector.pending import PendingAdapter
         from oa_knowledge.config import validate_feishu_runtime_config
-        from oa_knowledge.digest.feishu import FeishuNotifier
+        from oa_knowledge.notifications.feishu_service import FeishuService, apply_delivery_result
         from oa_knowledge.pending_summary import PendingSummary
 
         logical_item_id = int(task.logical_item_key)
@@ -466,20 +466,7 @@ class OperationWorker:
             )
             return
 
-        notifier = FeishuNotifier(
-            webhook_env=self.settings.feishu.webhook_env,
-            secret_env=self.settings.feishu.secret_env,
-            max_items_per_section=self.settings.feishu.max_items_per_section,
-            redact_confidential=self.settings.feishu.redact_confidential,
-            retry_attempts=self.settings.feishu.retry_attempts,
-        )
-        if not notifier.webhook_url:
-            # Validate reported enabled+ready but the env var disappeared between
-            # the check and now. Treat as misconfigured rather than silent skip.
-            self.production_queue.fail(
-                task.id, self.owner, "FEISHU_MISCONFIGURED", "feishu webhook not configured", recoverable=False
-            )
-            return
+        service = FeishuService(self.settings)
 
         with Session(self.engine) as session:
             version = session.scalar(
@@ -534,7 +521,7 @@ class OperationWorker:
             session.add(delivery)
             session.commit()
 
-        sent = notifier.send_pending_summary(
+        result = service.send_pending_summary(
             summary,
             title=title,
             sender=sender or "",
@@ -542,6 +529,7 @@ class OperationWorker:
             deadline_text=deadline_text or "",
             detail_url=detail_url or "",
         )
+        now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
             delivery = session.scalar(select(NotificationDelivery).where(
                 NotificationDelivery.idempotency_key == idem_key,
@@ -555,19 +543,19 @@ class OperationWorker:
                     idempotency_key=idem_key,
                 )
                 session.add(delivery)
-            if sent:
-                delivery.status = "sent"
-                delivery.sent_at = datetime.now(timezone.utc)
-                delivery.error_code = None
-                delivery.last_error = None
-                session.commit()
-                self.production_queue.complete(task.id, self.owner)
-            else:
-                delivery.status = "failed"
-                delivery.error_code = "feishu_send_failed"
-                delivery.last_error = "feishu webhook delivery failed after retries"
-                session.commit()
-                self.production_queue.fail(task.id, self.owner, "FEISHU_SEND_FAILED", "feishu delivery failed", recoverable=True)
+            apply_delivery_result(delivery, result, now)
+            session.commit()
+
+        # A successful send completes the task. A retryable transport error is
+        # re-queued (with backoff) by the queue; anything else is parked for
+        # manual retry so we never blindly re-push an uncertain delivery (§3.2).
+        if result.status == "sent":
+            self.production_queue.complete(task.id, self.owner)
+        else:
+            self.production_queue.fail(
+                task.id, self.owner, "FEISHU_SEND_FAILED",
+                result.safe_error or "feishu delivery failed", recoverable=result.retryable,
+            )
 
     def _pipeline_done_knowledge(self, task: PipelineTask) -> None:
         from oa_knowledge.done_knowledge import NoAttachmentEvidence, generate_done_knowledge

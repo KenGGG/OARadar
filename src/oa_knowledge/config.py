@@ -136,6 +136,11 @@ class FeishuConfig(StrictModel):
     max_items_per_section: int = 10
     redact_confidential: bool = True
     retry_attempts: int = 3
+    content_mode: str = "summary"
+    max_summary_chars: int = 500
+    max_action_chars: int = 200
+    max_risk_items: int = 3
+    include_detail_link: bool = True
 
 
 # Official Feishu/Lark custom-bot webhook hosts. The webhook path itself is a
@@ -169,6 +174,7 @@ def validate_feishu_runtime_config(settings: "Settings") -> str:
         or parsed.username
         or parsed.password
         or parsed.fragment
+        or not parsed.path.startswith("/open-apis/bot/v2/hook/")
     ):
         return "invalid_webhook"
     secret = os.environ.get(settings.feishu.secret_env, "")

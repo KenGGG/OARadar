@@ -169,14 +169,29 @@ class FeishuNotifier:
         current_node: str,
         deadline_text: str,
         detail_url: str,
+        content_mode: str = "summary",
+        max_summary_chars: int = 500,
+        max_action_chars: int = 200,
+        max_risk_items: int = 3,
+        include_detail_link: bool = True,
     ) -> dict:
         """Build an interactive card for a single Pending summary.
 
         Only high-signal fields are sent: no full body or attachment content.
+        ``content_mode`` controls how much is included (plan-0805-02 §3.5):
+
+        * ``metadata_only`` — only title/sender/current node/deadline/link.
+        * ``summary``       — also include a capped summary, required action,
+          and at most ``max_risk_items`` risks.
         """
 
         def md(text) -> str:
             return self._redact(text) if isinstance(text, str) and text else ""
+
+        def cap(value: str, limit: int) -> str:
+            if value and len(value) > limit:
+                return value[: max(0, limit - 1)] + "…"
+            return value
 
         lines = [
             f"**标题**：{md(title)}",
@@ -184,18 +199,26 @@ class FeishuNotifier:
         ]
         if current_node:
             lines.append(f"**当前节点**：{md(current_node)}")
-        lines.append(f"**简要说明**：{md(summary.summary)}")
-        if summary.required_action:
-            lines.append(f"**需要处理**：{md(summary.required_action)}")
-        deadline = deadline_text or (summary.deadlines[0].date if summary.deadlines else "")
-        if deadline:
-            lines.append(f"**截止时间**：{md(deadline)}")
-        risks = "\n".join(f"- {md(r.risk)}" for r in summary.risks if r.risk)
-        if risks:
-            lines.append(f"**主要风险**：\n{risks}")
+        if content_mode != "metadata_only":
+            summary_text = cap(md(summary.summary), max_summary_chars)
+            if summary_text:
+                lines.append(f"**简要说明**：{summary_text}")
+            action_text = cap(md(summary.required_action), max_action_chars)
+            if action_text:
+                lines.append(f"**需要处理**：{action_text}")
+            deadline = deadline_text or (summary.deadlines[0].date if summary.deadlines else "")
+            if deadline:
+                lines.append(f"**截止时间**：{md(deadline)}")
+            risks = "\n".join(f"- {md(r.risk)}" for r in summary.risks[:max_risk_items] if r.risk)
+            if risks:
+                lines.append(f"**主要风险**：\n{risks}")
+        else:
+            deadline = deadline_text or (summary.deadlines[0].date if summary.deadlines else "")
+            if deadline:
+                lines.append(f"**截止时间**：{md(deadline)}")
         content = "\n".join(lines)
         elements = [{"tag": "div", "text": {"content_type": "markdown", "content": content}}]
-        if detail_url:
+        if include_detail_link and detail_url:
             elements.append({
                 "tag": "div",
                 "text": {"content_type": "markdown", "content": f"[查看 OA 详情]({detail_url})"},

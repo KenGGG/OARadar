@@ -7,9 +7,10 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, OAItem, OperationJob, ParseJob, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, NotificationDelivery, OAItem, OperationJob, ParseJob, PipelineTask, ReviewEntry
 from oa_knowledge.web.worker import OperationWorker
 from oa_knowledge.production_pipeline import ProductionQueue
+from oa_knowledge.notifications.models import DeliveryResult
 
 
 def test_retry_progress_keeps_original_total_after_resume() -> None:
@@ -316,8 +317,8 @@ def test_notify_feishu_skips_when_disabled_even_with_env(config_file: Path, monk
     worker.owner = "worker-test"
     sent = []
     monkeypatch.setattr(
-        "oa_knowledge.digest.feishu.FeishuNotifier.send_pending_summary",
-        lambda self, *args, **kwargs: sent.append(True) or True,
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_pending_summary",
+        lambda self, *args, **kwargs: sent.append(DeliveryResult("sent", False)) or DeliveryResult("sent", False),
     )
     try:
         worker._pipeline_notify_feishu(task)
@@ -379,8 +380,8 @@ def test_notify_feishu_delivers_and_records_delivery(config_file: Path, monkeypa
     worker.owner = "worker-test"
     sent = []
     monkeypatch.setattr(
-        "oa_knowledge.digest.feishu.FeishuNotifier.send_pending_summary",
-        lambda self, *args, **kwargs: sent.append(kwargs) or True,
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_pending_summary",
+        lambda self, *args, **kwargs: sent.append(kwargs) or DeliveryResult("sent", False),
     )
     try:
         worker._pipeline_notify_feishu(task)
@@ -417,8 +418,8 @@ def test_notify_feishu_missing_webhook_fails_without_silent_success(config_file:
     worker.owner = "worker-test"
     sent = []
     monkeypatch.setattr(
-        "oa_knowledge.digest.feishu.FeishuNotifier.send_pending_summary",
-        lambda self, *args, **kwargs: sent.append(True) or True,
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_pending_summary",
+        lambda self, *args, **kwargs: sent.append(DeliveryResult("sent", False)) or DeliveryResult("sent", False),
     )
     try:
         worker._pipeline_notify_feishu(task)
@@ -430,3 +431,109 @@ def test_notify_feishu_missing_webhook_fails_without_silent_success(config_file:
         row = session.get(PipelineTask, task_id)
         assert row.status == "failed"
         assert row.error_code == "FEISHU_MISCONFIGURED"
+
+
+def _seed_pending_summary(engine, monkeypatch):
+    """Create a logical item + current pending summary and return (engine, ids, queue, task)."""
+    from oa_knowledge.db.models import (
+        ItemOccurrence,
+        ItemSnapshot,
+        LogicalItem,
+        SummaryJob,
+        SummaryVersion,
+    )
+
+    monkeypatch.setenv("FEISHU_OA_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/x")
+    monkeypatch.setenv("FEISHU_OA_SECRET", "secret")
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="pending:1", title="待办事项")
+        session.add(logical); session.flush()
+        occurrence = ItemOccurrence(
+            logical_item_id=logical.id, channel="pending", occurrence_key="pending:1",
+            affair_id_text="123", title="待办事项", sender="张三", current_node="审批中", deadline_text="2026-08-10",
+        )
+        session.add(occurrence); session.flush()
+        snapshot = ItemSnapshot(logical_item_id=logical.id, snapshot_kind="pending_initial", version=1,
+                                content_hash="0" * 64, payload_json="{}")
+        session.add(snapshot); session.flush()
+        job = SummaryJob(logical_item_id=logical.id, snapshot_id=snapshot.id, summary_kind="pending",
+                         stage="item_summary", status="completed", idempotency_key="idem-1", max_attempts=3)
+        session.add(job); session.flush()
+        version = SummaryVersion(logical_item_id=logical.id, summary_job_id=job.id, snapshot_id=snapshot.id, summary_kind="pending",
+                                 version=1, status="current", input_hash="abc123",
+                                 structured_json='{"summary":"请审批","matter_type":"报销","current_stage":"审批中","required_action":"确认","risks":[],"deadlines":[],"key_points":[],"amounts":[],"attachment_overview":[],"confidence":0.9}',
+                                 provider_name="test", model_name="test", prompt_version="pending-v1")
+        session.add(version); session.commit()
+        return logical.id, occurrence.id
+
+
+def test_notify_feishu_retryable_error_requeues_task(config_file: Path, monkeypatch) -> None:
+    # Plan §3.2: a retryable transport error must re-queue the task (not fail
+    # permanently) and record the delivery as retry_wait.
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    settings.feishu.enabled = True
+    logical_id, occurrence_id = _seed_pending_summary(engine, monkeypatch)
+
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", str(logical_id), "notify_feishu", "notify-feishu-retry",
+        payload={"occurrence_id": occurrence_id, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr(
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_pending_summary",
+        lambda self, *args, **kwargs: DeliveryResult("connect_failed", True, error_code="http_connect"),
+    )
+    try:
+        worker._pipeline_notify_feishu(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "queued"
+        assert row.recoverable is True
+        delivery = session.scalar(select(NotificationDelivery).where(
+            NotificationDelivery.idempotency_key == f"feishu:pending:{logical_id}:abc123"))
+        assert delivery.status == "retry_wait"
+        assert delivery.next_retry_at is not None
+
+
+def test_notify_feishu_unknown_outcome_parks_for_manual_retry(config_file: Path, monkeypatch) -> None:
+    # Plan §3.2: a read timeout (unknown_outcome) must NOT auto re-push; the
+    # task fails non-recoverable and the delivery is parked as unknown.
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    settings.feishu.enabled = True
+    logical_id, occurrence_id = _seed_pending_summary(engine, monkeypatch)
+
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", str(logical_id), "notify_feishu", "notify-feishu-unknown",
+        payload={"occurrence_id": occurrence_id, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr(
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_pending_summary",
+        lambda self, *args, **kwargs: DeliveryResult("unknown_outcome", False, safe_error="feishu request timed out; delivery outcome unknown"),
+    )
+    try:
+        worker._pipeline_notify_feishu(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "failed"
+        assert row.recoverable is False
+        delivery = session.scalar(select(NotificationDelivery).where(
+            NotificationDelivery.idempotency_key == f"feishu:pending:{logical_id}:abc123"))
+        assert delivery.status == "unknown"
+        assert delivery.next_retry_at is None

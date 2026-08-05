@@ -18,7 +18,7 @@ import typer
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from oa_knowledge.config import Settings, load_settings
+from oa_knowledge.config import Settings, load_settings, validate_feishu_runtime_config
 from oa_knowledge.batches import BatchPlan, apply_business_exclusions, apply_discovery, batch_dict, cancel_batch, freeze_batch, get_batch, pause_batch, plan_batch, recover_interrupted_items, resume_batch, retry_batch_item, retry_failed_items, reuse_verified_items, validate_batch
 from oa_knowledge.backfill import BackfillWindow, next_month_remainder, shrink_latest
 from oa_knowledge.collector import BrowserSession, CollaborationDetailAdapter, DoneAdapter, LoginState
@@ -71,6 +71,8 @@ app.add_typer(pending_app, name="pending")
 app.add_typer(archive_app, name="archive")
 schedule_app = typer.Typer(help="Durable scheduled Pending/Done sync orchestration")
 app.add_typer(schedule_app, name="schedule")
+notifications_app = typer.Typer(help="Feishu delivery lifecycle and operational controls")
+app.add_typer(notifications_app, name="notifications")
 
 
 def settings_option(config: Path | None) -> Settings:
@@ -2126,5 +2128,95 @@ def schedule_status(
                 "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                 "summary": json.loads(r.summary_json or "{}"),
             } for r in rows], ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@notifications_app.command("test-feishu")
+def notifications_test_feishu(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Send the synthetic connectivity-test card (no real OA data).
+
+    Exits non-zero when Feishu is not ready or the send fails.
+    """
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        state = validate_feishu_runtime_config(settings)
+        if state != "ready":
+            typer.echo(f"feishu not ready: {state}", err=True)
+            raise typer.Exit(1)
+        from oa_knowledge.notifications.feishu_service import FeishuService
+        result = FeishuService(settings).send_test()
+        typer.echo(json.dumps({
+            "status": result.status,
+            "retryable": result.retryable,
+            "error_code": result.error_code,
+        }, ensure_ascii=False))
+        if result.status != "sent":
+            raise typer.Exit(1)
+    finally:
+        engine.dispose()
+
+
+@notifications_app.command("status")
+def notifications_status(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Show Feishu delivery health: recent send/fail times, status counts, latest error."""
+    from oa_knowledge.db.models import NotificationDelivery
+
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            latest_sent = session.scalar(
+                select(NotificationDelivery.sent_at)
+                .where(NotificationDelivery.status == "sent")
+                .order_by(NotificationDelivery.sent_at.desc()).limit(1)
+            )
+            latest_error = session.scalar(
+                select(NotificationDelivery)
+                .where(NotificationDelivery.error_code.is_not(None))
+                .order_by(NotificationDelivery.updated_at.desc()).limit(1)
+            )
+            counts = dict(session.execute(
+                select(NotificationDelivery.status, func.count())
+                .group_by(NotificationDelivery.status)
+            ).all())
+        state = validate_feishu_runtime_config(settings)
+        typer.echo(json.dumps({
+            "feishu_state": state,
+            "last_success_at": latest_sent.isoformat() if latest_sent else None,
+            "last_error_code": latest_error.error_code if latest_error else None,
+            "last_error_at": latest_error.updated_at.isoformat() if latest_error else None,
+            "counts": counts,
+        }, ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@notifications_app.command("retry")
+def notifications_retry(
+    delivery_id: int = typer.Argument(..., help="NotificationDelivery id to re-send"),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Re-send a parked pending_summary delivery by id (manual retry)."""
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        from oa_knowledge.notifications.feishu_service import retry_pending_summary_delivery
+        result = retry_pending_summary_delivery(engine, settings, delivery_id)
+        typer.echo(json.dumps({
+            "status": result.status,
+            "retryable": result.retryable,
+            "error_code": result.error_code,
+        }, ensure_ascii=False))
+        if result.status != "sent":
+            raise typer.Exit(1)
     finally:
         engine.dispose()
