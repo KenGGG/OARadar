@@ -1,3 +1,4 @@
+from datetime import timedelta
 from enum import StrEnum
 
 
@@ -59,3 +60,7 @@ class ReviewKind(StrEnum):
     CLASSIFICATION_LOW_CONFIDENCE = "classification_low_confidence"
     ATTACHMENT_SAMPLE_MISSING = "attachment_sample_missing"
     COLLECTION_ISSUE = "collection_issue"
+
+
+#: Default duration a worker lease is considered valid before it may be recovered.
+LEASE_TTL = timedelta(minutes=45)

@@ -26,9 +26,30 @@ collector:
   attachment_total_timeout_seconds: 1500
 storage:
   sqlite_path: state/oa.db
-  archive_dir: raw
+  archive_dir: archive/raw/oa
   journal_mode: WAL
   compute_sha256: true
+
+markdown_export:
+  enabled: true
+  workspace_root: workspace
+  source_markdown_dir: raw/sources/oa
+  preserve_source_tree: true
+  filename_mode: append_md
+  write_frontmatter: true
+  write_assets: true
+  atomic_publish: true
+  keep_last_success_on_failure: true
+  generate_failure_stub: true
+
+conversion:
+  incremental: true
+  workers: 1
+  force_rebuild: false
+
+online_audit:
+  item_timeout_seconds: 120
+  download_timeout_seconds: 30
 
 archive:
   max_recursive_depth: 2

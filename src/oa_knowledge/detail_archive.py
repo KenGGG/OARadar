@@ -15,6 +15,11 @@ from oa_knowledge.constants import FileRole, PipelineStatus
 from oa_knowledge.db.models import ArchivedFile, BatchItem, OAItem, ReviewEntry
 
 
+def done_archive_directory(title: str, workitem_id_text: str, initiated_at: datetime | None) -> PurePosixPath:
+    period = f"{initiated_at:%Y/%m}" if initiated_at else "unknown"
+    return PurePosixPath("raw", "done", period, f"{safe_filename(title, 100)}_{workitem_id_text}")
+
+
 def archive_collaboration_detail(session: Session, item: BatchItem, capture: DetailCapture, data_root) -> ItemManifest:
     oa_item = session.scalar(select(OAItem).where(OAItem.oa_item_key == item.oa_item_key))
     if oa_item is None:
@@ -24,17 +29,15 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
             source_channel="done",
             title=item.title,
             sender=item.sender,
+            initiated_at=item.created_at,
             completed_at=item.completed_at,
             pipeline_status=PipelineStatus.DISCOVERED,
         )
         session.add(oa_item)
         session.flush()
 
-    period = item.completed_at or datetime.now(timezone.utc)
-    directory = PurePosixPath(
-        "raw", "done", f"{period:%Y}", f"{period:%m}",
-        f"{safe_filename(item.title, 100)}_{item.workitem_id_text}",
-    )
+    oa_item.initiated_at = item.created_at or oa_item.initiated_at
+    directory = done_archive_directory(item.title, item.workitem_id_text, oa_item.initiated_at)
     files: list[FileManifest] = []
     root_container_key = f"{capture.page_family}:{item.workitem_id_text}"
     metadata = {

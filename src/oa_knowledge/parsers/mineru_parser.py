@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import time
 import zipfile
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -38,14 +39,21 @@ def _client(settings: Settings, *, health: bool = False) -> httpx.Client:
     )
 
 
-def _health_payload(settings: Settings) -> dict:
-    try:
-        with _client(settings, health=True) as client:
-            response = client.get("/health")
-            response.raise_for_status()
-            payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise MineruResponseError(f"MinerU health check failed: {exc}") from exc
+def _health_payload(settings: Settings, *, attempts: int = 1) -> dict:
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with _client(settings, health=True) as client:
+                response = client.get("/health")
+                response.raise_for_status()
+                payload = response.json()
+            break
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(2 ** attempt, 2))
+    else:
+        raise MineruResponseError(f"MinerU health check failed: {last_error}") from last_error
     if not isinstance(payload, dict):
         raise MineruResponseError("MinerU health check returned an invalid payload")
     return payload
@@ -99,6 +107,28 @@ def _extract_mineru_zip(payload: bytes, destination: Path) -> Path:
     return selected
 
 
+def _request_parse(file_path: Path, settings: Settings, *, attempts: int = 3) -> httpx.Response:
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(attempts):
+        try:
+            with file_path.open("rb") as source, _client(settings) as client:
+                return client.post(
+                    "/file_parse",
+                    files={"files": (file_path.name, source, "application/octet-stream")},
+                    data={
+                        "return_md": "true",
+                        "return_content_list": str(settings.mineru.output_content_list).lower(),
+                        "response_format_zip": "true",
+                        "return_original_file": "false",
+                    },
+                )
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(2 ** attempt, 2))
+    raise MineruResponseError(f"MinerU request failed: {last_error}") from last_error
+
+
 def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | None = None) -> ParseResult:
     if not settings.mineru.enabled:
         raise RuntimeError("MinerU is not enabled in configuration")
@@ -106,7 +136,10 @@ def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | No
     if not file_path.is_file():
         raise FileNotFoundError(file_path)
 
-    health = _health_payload(settings)
+    # The local GPU service can briefly delay its health response while publishing
+    # a previous result.  Do not turn that transient condition into a document
+    # conversion failure.
+    health = _health_payload(settings, attempts=3)
     target_root = output_dir or file_path.parent / ".parse"
     target_root.mkdir(parents=True, exist_ok=True)
     final_dir = target_root / "mineru-api-v1"
@@ -114,17 +147,7 @@ def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | No
     shutil.rmtree(staging)
 
     try:
-        with file_path.open("rb") as source, _client(settings) as client:
-            response = client.post(
-                "/file_parse",
-                files={"files": (file_path.name, source, "application/octet-stream")},
-                data={
-                    "return_md": "true",
-                    "return_content_list": str(settings.mineru.output_content_list).lower(),
-                    "response_format_zip": "true",
-                    "return_original_file": "false",
-                },
-            )
+        response = _request_parse(file_path, settings)
         if response.status_code >= 400:
             raise MineruResponseError(f"MinerU HTTP {response.status_code}: {response.text[:300]}")
         content_type = response.headers.get("content-type", "").lower()
@@ -153,8 +176,6 @@ def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | No
             table_count=quality["table_count"],
             image_count=quality["image_count"],
         )
-    except httpx.HTTPError as exc:
-        raise MineruResponseError(f"MinerU request failed: {exc}") from exc
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)

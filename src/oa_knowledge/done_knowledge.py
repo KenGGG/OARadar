@@ -16,7 +16,7 @@ from oa_knowledge.archive import atomic_write_bytes
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import ArchivedFile, ContentObject, ItemSnapshot, LogicalItem, OAItem, ParseArtifact, SummaryJob, SummaryVersion
 from oa_knowledge.enrich.extractor import validate_json_response
-from oa_knowledge.enrich.llm_client import LlmClient
+from oa_knowledge.enrich.provider import make_llm_client
 from oa_knowledge.lifecycle import record_snapshot
 from oa_knowledge.resources import ResourceCoordinator
 
@@ -187,10 +187,8 @@ def generate_done_knowledge(settings: Settings, engine, oa_item_key: str) -> Sum
     if lease is None: raise RuntimeError("GPU resource is busy")
     try:
         schema=json.dumps(done_generation_schema(),ensure_ascii=False)
-        result=LlmClient(base_url=settings.llm.base_url,api_key_env=settings.llm.api_key_env,model=settings.llm.model,
-                         temperature=settings.llm.temperature,max_tokens=done_max_tokens(settings.llm.max_tokens),
-                         timeout_seconds=settings.llm.timeout_seconds,max_retries=settings.llm.max_retries,
-                         provider_mode=settings.llm.provider_mode).chat(
+        client=make_llm_client(settings.llm,max_retries=settings.llm.max_retries,max_tokens=done_max_tokens(settings.llm.max_tokens))
+        result=client.chat(
             "你是本地OA附件概括器。严格输出简洁JSON，不要解释。problem用中文概括附件的主题、主要事项和要求；confidence为0到1。输出必须符合JSON Schema：\n"+schema,
             f"标题：{title}\n\n附件头部：\n{retry_evidence(source, attempt)}", json_schema=done_generation_schema())
         if result.get("error"): raise DoneKnowledgeError(result.get("error"))

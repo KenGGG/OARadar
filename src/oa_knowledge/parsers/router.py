@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from oa_knowledge.archive.integrity import sha256_text
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -29,7 +34,7 @@ class ParseResult:
             "engine_version": self.engine_version,
             "quality_score": self.quality_score,
         }, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode()).hexdigest()
+        return sha256_text(payload)
 
 
 def preflight(file_path: Path) -> dict:
@@ -62,62 +67,63 @@ def preflight(file_path: Path) -> dict:
     try:
         import fitz  # pymupdf
 
-        doc = fitz.open(str(file_path))
-        info["page_count"] = doc.page_count
-        info["is_encrypted"] = doc.is_encrypted
+        with fitz.open(str(file_path)) as doc:
+            info["page_count"] = doc.page_count
+            info["is_encrypted"] = doc.is_encrypted
 
-        total_chars = 0
-        total_image_area = 0.0
-        total_page_area = 0.0
-        fonts: set[str] = set()
-        empty_pages = 0
+            total_chars = 0
+            total_image_area = 0.0
+            total_page_area = 0.0
+            fonts: set[str] = set()
+            empty_pages = 0
 
-        for page in doc:
-            text = page.get_text("text")
-            chars_on_page = len(text.strip())
-            total_chars += chars_on_page
-            if chars_on_page == 0:
-                empty_pages += 1
+            for page in doc:
+                text = page.get_text("text")
+                chars_on_page = len(text.strip())
+                total_chars += chars_on_page
+                if chars_on_page == 0:
+                    empty_pages += 1
 
-            # Collect fonts from blocks
-            blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
-            for block in blocks.get("blocks", []):
-                if block.get("type") == 0:  # text block
-                    for line in block.get("lines", []):
-                        for span in line.get("spans", []):
-                            font_name = span.get("font", "")
-                            if font_name:
-                                fonts.add(font_name)
+                # Collect fonts from blocks
+                blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                for block in blocks.get("blocks", []):
+                    if block.get("type") == 0:  # text block
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                font_name = span.get("font", "")
+                                if font_name:
+                                    fonts.add(font_name)
 
-            # Image area estimation
-            images = page.get_images(full=True)
-            page_area = page.rect.width * page.rect.height
-            total_page_area += page_area
-            for img in images:
-                try:
-                    rect = page.get_image_rects(img[0])
-                    for r in (rect if isinstance(rect, list) else [rect]):
-                        if isinstance(r, fitz.Rect):
-                            total_image_area += r.width * r.height
-                except Exception:
-                    pass
+                # Image area estimation
+                images = page.get_images(full=True)
+                page_area = page.rect.width * page.rect.height
+                total_page_area += page_area
+                for img in images:
+                    try:
+                        rect = page.get_image_rects(img[0])
+                        for r in (rect if isinstance(rect, list) else [rect]):
+                            if isinstance(r, fitz.Rect):
+                                total_image_area += r.width * r.height
+                    except Exception:
+                        logger.debug("failed to measure image rects", exc_info=True)
 
-        info["font_count"] = len(fonts)
-        info["has_embedded_text"] = total_chars > 0
-        info["empty_page_count"] = empty_pages
+            info["font_count"] = len(fonts)
+            info["has_embedded_text"] = total_chars > 0
+            info["empty_page_count"] = empty_pages
 
-        if total_page_area > 0:
-            info["image_area_ratio"] = round(total_image_area / total_page_area, 4)
-        if doc.page_count > 0:
-            info["text_chars_per_page"] = round(total_chars / doc.page_count, 1)
+            if total_page_area > 0:
+                info["image_area_ratio"] = round(total_image_area / total_page_area, 4)
+            if doc.page_count > 0:
+                info["text_chars_per_page"] = round(total_chars / doc.page_count, 1)
 
-        # Heuristic hints
-        info["has_tables_hint"] = total_chars > 100 and _detect_table_pattern(file_path)
-        info["has_large_images"] = (
-            info["image_area_ratio"] > 0.15 and info["has_embedded_text"] is False
-        )
+            # Heuristic hints
+            info["has_tables_hint"] = total_chars > 100 and _detect_table_pattern(file_path)
+            info["has_large_images"] = (
+                info["image_area_ratio"] > 0.15 and info["has_embedded_text"] is False
+            )
 
     except Exception:
+        logger.debug("preflight analysis failed; marking as corrupted", exc_info=True)
         info["is_corrupted"] = True
 
     return info
@@ -128,22 +134,23 @@ def _detect_table_pattern(file_path: Path) -> bool:
     try:
         import fitz
 
-        doc = fitz.open(str(file_path))
-        for page in doc:
-            text = page.get_text("text")
-            # Lines with repeated separators suggest tables
-            pipe_lines = sum(1 for line in text.split("\n") if line.count("|") >= 3)
-            if pipe_lines > 0:
-                return True
-            # Alternating dash patterns
-            dash_lines = sum(
-                1 for line in text.split("\n")
-                if re.search(r"[+-]+\s+\|[+-]+\s+\|", line)
-            )
-            if dash_lines > 0:
-                return True
-        return False
+        with fitz.open(str(file_path)) as doc:
+            for page in doc:
+                text = page.get_text("text")
+                # Lines with repeated separators suggest tables
+                pipe_lines = sum(1 for line in text.split("\n") if line.count("|") >= 3)
+                if pipe_lines > 0:
+                    return True
+                # Alternating dash patterns
+                dash_lines = sum(
+                    1 for line in text.split("\n")
+                    if re.search(r"[+-]+\s+\|[+-]+\s+\|", line)
+                )
+                if dash_lines > 0:
+                    return True
+            return False
     except Exception:
+        logger.debug("table pattern detection failed", exc_info=True)
         return False
 
 
@@ -151,6 +158,7 @@ def parse_file(
     file_path: Path,
     settings,
     engine: str | None = None,
+    output_dir: Path | None = None,
 ) -> ParseResult:
     """Route a file to the best available parser engine.
 
@@ -173,11 +181,14 @@ def parse_file(
     # Explicit engine override
     if engine:
         if engine == "markitdown":
-            return parse_with_markitdown(file_path)
+            return parse_with_markitdown(file_path, output_dir)
         if engine == "mineru":
-            if not mineru_available(settings):
-                raise RuntimeError("MinerU engine requested but not available")
-            return parse_with_mineru(file_path, settings)
+            if file_path.suffix.lower() == ".pdf" and preflight(file_path).get("is_encrypted"):
+                raise RuntimeError("encrypted_document")
+            # An explicit campaign request is authoritative. parse_with_mineru
+            # performs its own retried health check; a separate probe here used
+            # to reject healthy work whenever the GPU service was briefly busy.
+            return parse_with_mineru(file_path, settings, output_dir)
         raise ValueError(f"Unknown engine: {engine}")
 
     # Preflight analysis
@@ -193,7 +204,7 @@ def parse_file(
 
     # Office files always go to MarkItDown
     if suffix in {".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls"}:
-        return parse_with_markitdown(file_path)
+        return parse_with_markitdown(file_path, output_dir)
 
     # PDF routing
     if suffix == ".pdf":
@@ -205,20 +216,20 @@ def parse_file(
         # Scanned / image-heavy PDF -> MinerU preferred
         if has_large_images or (info.get("has_embedded_text") is False and text_per_page < 20):
             if mineru_available(settings):
-                return parse_with_mineru(file_path, settings)
+                return parse_with_mineru(file_path, settings, output_dir)
             # Fallback to MarkItDown if MinerU unavailable
-            return parse_with_markitdown(file_path)
+            return parse_with_markitdown(file_path, output_dir)
 
         # PDF with tables -> MinerU preferred for better table handling
         if has_tables and mineru_available(settings):
-            return parse_with_mineru(file_path, settings)
+            return parse_with_mineru(file_path, settings, output_dir)
 
         # Digital PDF (good text density, low image ratio) -> MarkItDown
         if text_per_page > 50 and image_ratio < 0.1:
-            return parse_with_markitdown(file_path)
+            return parse_with_markitdown(file_path, output_dir)
 
         # Default PDF -> MarkItDown
-        return parse_with_markitdown(file_path)
+        return parse_with_markitdown(file_path, output_dir)
 
     # Everything else -> MarkItDown
-    return parse_with_markitdown(file_path)
+    return parse_with_markitdown(file_path, output_dir)

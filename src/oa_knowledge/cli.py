@@ -23,7 +23,7 @@ from oa_knowledge.batches import BatchPlan, apply_business_exclusions, apply_dis
 from oa_knowledge.backfill import BackfillWindow, next_month_remainder, shrink_latest
 from oa_knowledge.collector import BrowserSession, CollaborationDetailAdapter, DoneAdapter, LoginState
 from oa_knowledge.collector.detail import AuthRequiredError
-from oa_knowledge.constants import BatchStatus
+from oa_knowledge.constants import BatchStatus, LEASE_TTL
 from oa_knowledge.detail_archive import archive_collaboration_detail
 from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.archive.naming import validate_relative_path
@@ -42,6 +42,7 @@ from oa_knowledge.pending_sync import apply_pending_identifiers, sync_pending_di
 from oa_knowledge.pending_archive import persist_pending_capture
 from oa_knowledge.resources import ResourceCoordinator
 from oa_knowledge.reconcile import reconcile_done_occurrence
+from oa_knowledge.markdown_export.service import convert_archive, markdown_status as get_markdown_status
 
 app = typer.Typer(help="OA Knowledge Hub stage 0+1 foundation")
 db_app = typer.Typer(help="Database migration commands")
@@ -763,11 +764,36 @@ def verified_attachment_resolver(engine, data_root: Path):
 def init_command(config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False)) -> None:
     settings = settings_option(config)
     secure_dir(settings.data_root)
-    for relative in ("state", "raw", "runtime", "logs", "backups"):
+    for relative in ("state", "archive/raw/oa/pending", "archive/raw/oa/done", "parse/artifacts", "parse/staging", "parse/failed", "runtime", "logs", "backups", "workspace/raw/sources/oa/pending", "workspace/raw/sources/oa/done", "workspace/wiki"):
         secure_dir(settings.data_root / relative)
     upgrade_database(settings.database_path)
     os.chmod(settings.database_path, 0o600)
     typer.echo(f"initialized: {settings.data_root}")
+
+
+@app.command("convert")
+def convert_command(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+    item: str | None = typer.Option(None, "--item"),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    settings = settings_option(config)
+    require_engine(settings).dispose()
+    typer.echo(json.dumps(convert_archive(settings, item=item, force=force), ensure_ascii=False))
+
+
+@app.command("rebuild-markdown")
+def rebuild_markdown_command(config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False)) -> None:
+    settings = settings_option(config)
+    require_engine(settings).dispose()
+    typer.echo(json.dumps(convert_archive(settings, force=True, rebuild=True), ensure_ascii=False))
+
+
+@app.command("markdown-status")
+def markdown_status_command(config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False)) -> None:
+    settings = settings_option(config)
+    require_engine(settings).dispose()
+    typer.echo(json.dumps(get_markdown_status(settings), ensure_ascii=False))
 
 
 @db_app.command("upgrade")
@@ -888,6 +914,12 @@ def web(
     import uvicorn
 
     typer.echo(f"OA Web console: http://{settings.web.host}:{settings.web.port}")
+    from oa_knowledge.web.app import _load_or_create_bootstrap_token
+    bootstrap_token = _load_or_create_bootstrap_token(settings.data_root)
+    if settings.web.require_auth:
+        typer.echo("Web API authentication is ENABLED.")
+        typer.echo(f"Console bootstrap token: {bootstrap_token}")
+        typer.echo("Paste this token into the console login screen (shown once).")
     uvicorn.run(create_web_app(settings, config_path=config), host=settings.web.host, port=settings.web.port, access_log=False)
 
 
@@ -921,6 +953,28 @@ def worker(
                 operation_worker.run_forever(poll_seconds=poll_seconds)
         finally:
             operation_worker.close()
+
+
+@app.command("markdown-worker")
+def markdown_worker_command(
+    once: bool = typer.Option(False, "--once"),
+    poll_seconds: float = typer.Option(2.0, "--poll-seconds", min=0.2, max=60),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Run the local-only Markdown conversion worker."""
+    settings = settings_option(config); require_engine(settings).dispose()
+    lock_path=settings.data_root / "runtime" / "markdown-worker.lock"; secure_dir(lock_path.parent)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try: fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc: raise typer.Exit(1) from exc
+        from oa_knowledge.markdown_worker import MarkdownWorker
+        runner=MarkdownWorker(settings)
+        try:
+            while True:
+                handled=runner.run_once()
+                if once: break
+                if not handled: Event().wait(poll_seconds)
+        finally: runner.close()
 
 
 @batch_app.command("plan")
@@ -1544,7 +1598,7 @@ def batch_run(
                             if operation_job.job_type != "backfill_campaign":
                                 operation_job.progress_current = processed
                             operation_job.heartbeat_at = now
-                            operation_job.lease_expires_at = now + timedelta(minutes=45)
+                            operation_job.lease_expires_at = now + LEASE_TTL
                             session.commit()
                 if item_failed:
                     break
@@ -1615,7 +1669,7 @@ def _operation_heartbeat_loop(engine, job_id: int, stop: Event) -> None:
                     return
                 now = datetime.now(timezone.utc)
                 job.heartbeat_at = now
-                job.lease_expires_at = now + timedelta(minutes=45)
+                job.lease_expires_at = now + LEASE_TTL
                 session.commit()
         except Exception:
             # The item transaction is authoritative; a transient SQLite lock is retried.

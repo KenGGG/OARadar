@@ -1,8 +1,15 @@
+import shutil
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import sync_playwright
 
 from oa_knowledge.collector.done import DoneAdapter
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("google-chrome") is None,
+    reason="requires a local google-chrome binary",
+)
 
 
 def test_done_adapter_parses_text_identifier_and_columns() -> None:

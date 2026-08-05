@@ -26,6 +26,7 @@ class OAItem(Base):
     sender: Mapped[str | None] = mapped_column(Text)
     department: Mapped[str | None] = mapped_column(Text)
     document_number: Mapped[str | None] = mapped_column(String)
+    initiated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     oa_status: Mapped[str | None] = mapped_column(String)
@@ -45,6 +46,7 @@ class OAManifestItem(Base):
     workitem_id_text: Mapped[str | None] = mapped_column(String)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     sender: Mapped[str | None] = mapped_column(Text)
+    initiated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     list_page: Mapped[int] = mapped_column(Integer, nullable=False)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -325,6 +327,126 @@ class ContentObject(Base):
     size_bytes: Mapped[int | None] = mapped_column(Integer)
     detected_type: Mapped[str | None] = mapped_column(String(40))
     active_parse_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("parse_artifacts.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MarkdownExport(Base):
+    __tablename__ = "markdown_exports"
+    __table_args__ = (
+        UniqueConstraint("source_file_id", "schema_version", name="uq_markdown_export_source_schema"),
+        UniqueConstraint("markdown_relpath", name="uq_markdown_export_relpath"),
+        CheckConstraint("markdown_relpath NOT LIKE '/%' AND markdown_relpath <> '..' AND markdown_relpath NOT LIKE '../%' AND markdown_relpath NOT LIKE '%/../%' AND markdown_relpath NOT LIKE '%/..'", name="ck_markdown_export_relative"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_file_id: Mapped[int | None] = mapped_column(ForeignKey("files.id", ondelete="SET NULL"))
+    content_object_id: Mapped[int | None] = mapped_column(ForeignKey("content_objects.id", ondelete="SET NULL"))
+    parse_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("parse_artifacts.id", ondelete="SET NULL"))
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_relpath: Mapped[str] = mapped_column(Text, nullable=False)
+    markdown_relpath: Mapped[str] = mapped_column(Text, nullable=False)
+    markdown_sha256: Mapped[str | None] = mapped_column(String(64))
+    assets_relpath: Mapped[str | None] = mapped_column(Text)
+    parse_engine: Mapped[str] = mapped_column(String(40), nullable=False)
+    parse_engine_version: Mapped[str] = mapped_column(String(80), nullable=False)
+    parse_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    quality_score: Mapped[float | None] = mapped_column(Float)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class MarkdownTask(Base):
+    __tablename__ = "markdown_tasks"
+    __table_args__ = (UniqueConstraint("source_file_id", "schema_version", name="uq_markdown_tasks_source_schema"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_file_id: Mapped[int] = mapped_column(ForeignKey("files.id", ondelete="CASCADE"), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    requested_engine: Mapped[str | None] = mapped_column(String(30))
+    campaign: Mapped[str] = mapped_column(String(40), nullable=False, default="standard")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(120))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+    elapsed_seconds: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class MarkdownQueueControl(Base):
+    __tablename__ = "markdown_queue_control"
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pdf_mineru_paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class MarkdownTaskEvent(Base):
+    __tablename__ = "markdown_task_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("markdown_tasks.id", ondelete="SET NULL"))
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    level: Mapped[str] = mapped_column(String(20), nullable=False, default="info")
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class OnlineAuditRun(Base):
+    __tablename__ = "online_audit_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("operation_jobs.id", ondelete="SET NULL"), unique=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="queued")
+    total_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    matched_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    mismatch_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    access_failed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pause_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_oa_item_key: Mapped[str | None] = mapped_column(String(180))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class OnlineAuditItem(Base):
+    __tablename__ = "online_audit_items"
+    __table_args__ = (UniqueConstraint("run_id", "oa_item_key", name="uq_online_audit_run_item"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("online_audit_runs.id", ondelete="CASCADE"), nullable=False)
+    manifest_item_id: Mapped[int | None] = mapped_column(ForeignKey("oa_manifest_items.id", ondelete="SET NULL"))
+    oa_item_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    workitem_id_text: Mapped[str | None] = mapped_column(String)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+    recognized_attachments: Mapped[int | None] = mapped_column(Integer)
+    database_attachments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    downloaded_attachments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    markdown_attachments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    elapsed_seconds: Mapped[float | None] = mapped_column(Float)
+
+
+class OnlineAuditEvent(Base):
+    __tablename__ = "online_audit_events"
+    __table_args__ = (UniqueConstraint("run_id", "sequence", name="uq_online_audit_event_sequence"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("online_audit_runs.id", ondelete="CASCADE"), nullable=False)
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("online_audit_items.id", ondelete="SET NULL"))
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    level: Mapped[str] = mapped_column(String(20), nullable=False, default="info")
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    details_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

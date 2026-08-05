@@ -6,7 +6,6 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,7 @@ from oa_knowledge.batches import BatchPlan, plan_batch
 from oa_knowledge.config import Settings
 from oa_knowledge.constants import BatchStatus
 from oa_knowledge.db.engine import create_db_engine
+from oa_knowledge.web.cli_runner import run_cli
 from oa_knowledge.db.models import (
     ArchivedFile,
     BatchItem,
@@ -814,6 +814,73 @@ def start_archive_job(
         engine.dispose()
 
 
+def archive_date_status(settings: Settings) -> dict[str, Any]:
+    """Counts of Done archives by initiation-date correctness plus any active job."""
+    from oa_knowledge.archive_reconciliation import reconciliation_counts
+
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            counts = reconciliation_counts(session)
+            active = session.scalar(select(OperationJob).where(
+                OperationJob.job_type == "archive_date_reconcile",
+                OperationJob.status.in_(("queued", "running", "paused")),
+            ).order_by(OperationJob.id.desc()).limit(1))
+            return {**counts, "job": job_progress(settings, active.id) if active else None}
+    finally:
+        engine.dispose()
+
+
+def start_archive_date_job(settings: Settings) -> dict[str, Any]:
+    """Queue a durable, read-only reconciliation of Done archives by initiation date."""
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            active = session.scalar(select(OperationJob).where(
+                OperationJob.job_type == "archive_date_reconcile",
+                OperationJob.status.in_(("queued", "running")),
+            ).limit(1))
+            if active is not None:
+                raise ValueError(f"an archive-date reconciliation is already active: {active.job_key}")
+            total = session.scalar(select(func.count()).select_from(OAItem).where(
+                OAItem.source_channel == "done", OAItem.archive_relpath.is_not(None))) or 0
+            job = OperationJob(
+                job_key=f"archive-date-{uuid4().hex[:10]}",
+                job_type="archive_date_reconcile",
+                status="queued",
+                idempotency_key=f"archive-date-{uuid4().hex}",
+                parameters_json=json.dumps({}),
+                progress_total=total,
+            )
+            job.events.append(OperationEvent(
+                sequence=1, event_type="created", status="queued",
+                details_json=json.dumps({"job_type": "archive_date_reconcile"}),
+            ))
+            session.add(job)
+            session.commit()
+            return {"job_id": job.id, "job_key": job.job_key, "status": job.status}
+    finally:
+        engine.dispose()
+
+
+def set_archive_date_job_paused(settings: Settings, paused: bool) -> dict[str, Any]:
+    """Pause or resume the active archive-date reconciliation job."""
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            job = session.scalar(select(OperationJob).where(
+                OperationJob.job_type == "archive_date_reconcile",
+                OperationJob.status.in_(("queued", "running", "paused")),
+            ).order_by(OperationJob.id.desc()).limit(1))
+            if job is None:
+                raise LookupError("no active archive-date reconciliation job")
+            job.status = "paused" if paused else "queued"
+            session.commit()
+            return {"job_id": job.id, "job_key": job.job_key, "status": job.status}
+    finally:
+        engine.dispose()
+
+
 def start_backfill_campaign(
     settings: Settings,
     from_date: str = "2019-01-01",
@@ -896,29 +963,20 @@ def execute_archive_job(settings: Settings, job_id: int, config_path: Path | Non
             next_sequence = (session.scalar(select(func.max(OperationEvent.sequence)).where(OperationEvent.job_id == job.id)) or 0) + 1
             job.events.append(OperationEvent(sequence=next_sequence, event_type="started", status="running"))
             session.commit()
-        command = [
-            sys.executable, "-m", "oa_knowledge.cli", "batch", "run", parameters["batch_key"],
-            "--max-items", str(parameters["max_items"]),
-            "--time-budget-seconds", str(parameters["time_budget_seconds"]),
-            "--operation-job-id", str(job_id),
-        ]
-        if config_path is not None:
-            command.extend(("--config", str(config_path)))
-        result = subprocess.run(
-            command, cwd=Path.cwd(), capture_output=True, text=True,
-            timeout=parameters["time_budget_seconds"] + 120, check=False,
+        returncode, payload = run_cli(
+            [
+                "batch", "run", parameters["batch_key"],
+                "--max-items", str(parameters["max_items"]),
+                "--time-budget-seconds", str(parameters["time_budget_seconds"]),
+                "--operation-job-id", str(job_id),
+            ],
+            config_path,
+            parameters["time_budget_seconds"] + 120,
         )
         with Session(engine) as session:
             job = session.get(OperationJob, job_id)
             if job is None:
                 return
-            payload: dict[str, Any] = {}
-            for line in reversed(result.stdout.splitlines()):
-                try:
-                    payload = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    continue
             job.progress_current = int(payload.get("processed", 0))
             run_status = str(payload.get("run_status", ""))
             if run_status == "auth_required":
@@ -928,11 +986,11 @@ def execute_archive_job(settings: Settings, job_id: int, config_path: Path | Non
             elif run_status in {"paused", "budget_exhausted"}:
                 job.status = "paused"
             else:
-                job.status = "completed" if result.returncode == 0 else "failed"
+                job.status = "completed" if returncode == 0 else "failed"
             job.last_error_code = (
                 "item_failed" if run_status == "item_failed"
-                else None if result.returncode == 0
-                else (run_status or f"exit_{result.returncode}")
+                else None if returncode == 0
+                else (run_status or f"exit_{returncode}")
             )
             job.finished_at = datetime.now(timezone.utc)
             job.heartbeat_at = job.finished_at
@@ -1340,20 +1398,6 @@ def latest_backfill_campaign(settings: Settings) -> dict[str, Any] | None:
     finally:
         engine.dispose()
     return job_progress(settings, job_id) if job_id is not None else None
-
-
-def _policy_matches(title: str, sender: str | None, policy: ExclusionPolicy) -> bool:
-    """Check if a batch item matches an exclusion policy."""
-    pattern = policy.pattern
-    if not pattern:
-        return False
-    if policy.scope == "title":
-        return pattern in title
-    elif policy.scope == "sender":
-        return sender is not None and pattern in sender
-    elif policy.scope == "full":
-        return pattern in title or (sender is not None and pattern in sender)
-    return False
 
 
 def list_batches(settings: Settings) -> dict[str, Any]:

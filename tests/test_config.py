@@ -16,6 +16,19 @@ def test_defaults_are_local_and_depth_ten() -> None:
     assert settings.web.host == "127.0.0.1"
     assert settings.web.port == 2567
     assert settings.mineru.api_url == "http://127.0.0.1:58000"
+    assert settings.online_audit.item_timeout_seconds == 120
+    assert settings.online_audit.download_timeout_seconds == 30
+    assert settings.storage.archive_dir.as_posix() == "archive/raw/oa"
+    assert settings.markdown_root == settings.data_root / "workspace/raw/sources/oa"
+    assert settings.markdown_root != settings.workspace_root / "wiki"
+
+
+def test_markdown_source_dir_cannot_escape_or_target_wiki() -> None:
+    for value in ("../wiki", "wiki", "raw/../wiki"):
+        with pytest.raises(ValidationError):
+            Settings.model_validate({
+                "markdown_export": {"workspace_root": "workspace", "source_markdown_dir": value}
+            })
 
 
 def test_llm_provider_choice_derives_local_gpu_and_remote_modes(tmp_path: Path) -> None:

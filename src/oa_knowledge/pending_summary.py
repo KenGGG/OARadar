@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import ContentObject, ItemSnapshot, LogicalItem, ParseArtifact, SourceAttachment, SummaryJob, SummaryVersion
 from oa_knowledge.enrich.extractor import validate_json_response
-from oa_knowledge.enrich.llm_client import LlmClient
+from oa_knowledge.enrich.provider import make_llm_client
 from oa_knowledge.resources import ResourceCoordinator
 
 
@@ -140,10 +140,7 @@ def summarize_pending(settings: Settings, engine, logical_item_id: int) -> Summa
     if lease is None:
         raise RuntimeError("GPU resource is busy")
     try:
-        client = LlmClient(base_url=settings.llm.base_url, api_key_env=settings.llm.api_key_env,
-                           model=settings.llm.model, temperature=settings.llm.temperature,
-                           max_tokens=settings.llm.max_tokens, timeout_seconds=settings.llm.timeout_seconds,
-                           max_retries=settings.llm.max_retries, provider_mode=settings.llm.provider_mode)
+        client = make_llm_client(settings.llm, max_retries=settings.llm.max_retries)
         system_prompt = ("你是本地OA待办概括器。只能依据输入，输出严格JSON；无证据的金额、日期、风险留空，不得编造。"
                          "输出必须严格符合以下JSON Schema，不得增删顶层字段：\n" +
                          json.dumps(PendingSummary.model_json_schema(), ensure_ascii=False))

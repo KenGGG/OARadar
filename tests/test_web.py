@@ -27,12 +27,21 @@ def _client(config_file: Path) -> tuple[TestClient, Path]:
     return TestClient(create_web_app(settings)), settings.data_root
 
 
+def _auth_client(config_file: Path) -> tuple[TestClient, str]:
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True)
+    upgrade_database(settings.database_path)
+    settings.web.require_auth = True
+    client = TestClient(create_web_app(settings))
+    return client, client.app.state.bootstrap_token
+
+
 def test_status_is_read_only_and_reports_current_schema(config_file: Path) -> None:
     client, _ = _client(config_file)
     response = client.get("/api/status")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["schema"] == "0020_production_pipeline"
+    assert payload["schema"] == "0026_initiation_archive"
     assert payload["stage"] == "2B-3"
     assert payload["oa_auth"] == {"status": "unknown", "checked_at": None, "read_only": True}
     assert payload["counts"]["items"] == 0
@@ -58,6 +67,24 @@ def test_lifecycle_endpoints_are_database_backed_and_empty_on_new_database(confi
     }
     assert system.json()["counts"]["snapshots"] == 0
     assert system.json()["worker"] is None
+    assert system.json()["markdown"]["recent_exports"] == []
+
+
+def test_online_audit_api_starts_pauses_and_resumes(config_file: Path) -> None:
+    client, data_root = _client(config_file)
+    engine = create_db_engine(data_root / "state/oa.db")
+    with Session(engine) as session:
+        session.add(OAManifestItem(oa_item_key="done:audit", workitem_id_text="audit", title="Audit", list_page=1))
+        session.commit()
+    csrf = client.get("/").cookies["oa_csrf"]
+    started = client.post("/api/audits/online", headers={"x-csrf-token": csrf})
+    assert started.status_code == 202
+    run_id = started.json()["run_id"]
+    assert client.get("/api/audits/online").json()["run"]["total_items"] == 1
+    assert client.post(f"/api/audits/online/{run_id}/pause", headers={"x-csrf-token": csrf}).json()["status"] == "paused"
+    assert client.post(f"/api/audits/online/{run_id}/resume", headers={"x-csrf-token": csrf}).json()["status"] == "queued"
+    page = client.get("/api/audits/online?item_page=1&item_page_size=10").json()
+    assert page["item_pagination"]["page_size"] == 10
 
 
 def test_lifecycle_pending_excludes_completed_occurrences(config_file: Path) -> None:
@@ -238,6 +265,9 @@ def test_session_key_is_created_with_owner_only_permissions(config_file: Path) -
     assert key.is_file()
     assert len(key.read_text(encoding="ascii")) >= 48
     assert os.stat(key).st_mode & 0o777 == 0o600
+    token = data_root / "runtime" / "web-bootstrap.token"
+    assert token.is_file()
+    assert os.stat(token).st_mode & 0o777 == 0o600
 
 
 def test_operation_job_constraints_and_event_cascade(config_file: Path) -> None:
@@ -984,7 +1014,7 @@ def test_archive_job_exposes_first_item_failure(config_file: Path, monkeypatch) 
         session.commit()
         job_id = job.id
     monkeypatch.setattr(
-        "oa_knowledge.web.status.subprocess.run",
+        "oa_knowledge.web.cli_runner.subprocess.run",
         lambda *args, **kwargs: __import__("subprocess").CompletedProcess(
             args[0], 0, stdout='{"processed":1,"run_status":"item_failed"}\n', stderr="",
         ),
@@ -995,3 +1025,38 @@ def test_archive_job_exposes_first_item_failure(config_file: Path, monkeypatch) 
         assert job is not None
         assert job.status == "failed"
         assert job.last_error_code == "item_failed"
+
+
+# ---- Web API auth gate (bootstrap token) ----
+
+
+def test_auth_status_reports_required_when_enabled(config_file: Path) -> None:
+    client, _ = _auth_client(config_file)
+    status = client.get("/api/auth/status")
+    assert status.status_code == 200
+    assert status.json() == {"required": True, "authenticated": False}
+    # API calls are rejected before login.
+    assert client.get("/api/status").status_code == 401
+
+
+def test_auth_login_rejects_wrong_token_and_accepts_bootstrap_token(config_file: Path) -> None:
+    client, token = _auth_client(config_file)
+    # A GET seeds the CSRF cookie used by the login POST.
+    client.get("/api/auth/status")
+    csrf = client.cookies.get("oa_csrf")
+
+    wrong = client.post("/api/auth/login", headers={"x-csrf-token": csrf or ""}, json={"token": "not-the-token"})
+    assert wrong.status_code == 401
+
+    ok = client.post("/api/auth/login", headers={"x-csrf-token": csrf or ""}, json={"token": token})
+    assert ok.status_code == 204
+
+    # After login the session is accepted for protected endpoints.
+    assert client.get("/api/auth/status").json()["authenticated"] is True
+    assert client.get("/api/status").status_code == 200
+
+
+def test_auth_gate_is_open_by_default_for_backwards_compatible_console(config_file: Path) -> None:
+    client, _ = _client(config_file)
+    assert client.get("/api/auth/status").json()["required"] is False
+    assert client.get("/api/status").status_code == 200

@@ -4,8 +4,9 @@ import {
   FileText, Gauge, HardDrive, Loader2, Menu, RefreshCw, Search, Server,
   ShieldCheck, X, Save, Bell, BrainCircuit, ListChecks,
 } from "lucide-react"
+import { Progress } from "./components/ui/progress"
 
-type View = "pending" | "done" | "processing" | "knowledge" | "system"
+type View = "pending" | "done" | "processing" | "knowledge" | "audit" | "system"
 type PendingItem = {
   id: number; logical_item_id: number; title: string; sender: string | null
   received_at: string | null; current_node: string | null; processing_status: string
@@ -27,7 +28,7 @@ type DoneItem = { id: number; item_id: string; title: string; sender: string | n
 type DoneMetrics = { oa_done_total: number; downloaded_items: number; verified_attachments: number }
 type KnowledgeItem = { id: number; title: string; publish_status: string; vault_relpath: string; active_parse_artifact_id: number | null; source_count: number }
 type KnowledgeDetail = KnowledgeItem & { preview: string; artifact: null | { id: number; engine: string; quality_score: number; status: string; output_relpath: string }; sources: { oa_item_id: number | null; source_file_id: number | null }[] }
-type SystemData = { web: { status: string; url: string }; worker: null | { id: number; type: string; status: string; progress_current: number; progress_total: number | null; current_title: string | null; attachment_verified: number; attachment_total: number; failure_count: number }; mineru: Record<string, unknown>; sqlite: { schema: string; integrity: string }; counts: Record<string, number> }
+type SystemData = { web: { status: string; url: string }; worker: null | { id: number; type: string; status: string; progress_current: number; progress_total: number | null; current_title: string | null; attachment_verified: number; attachment_total: number; failure_count: number }; mineru: Record<string, unknown>; sqlite: { schema: string; integrity: string }; counts: Record<string, number>; markdown: { raw_total: number; success: number; pending: number; failed: number; unsupported: number; latest_generated_at: string | null; recent_exports: { source_relpath: string; markdown_relpath: string; parse_engine: string; status: string; quality_score: number | null; updated_at: string | null }[] }; paths: { archive: string; markdown: string } }
 type QueueCounts = { queued: number; running: number; completed: number; failed: number }
 type ProcessingData = {
   queues: Record<"realtime_pending" | "realtime_done" | "historical_done_backfill", QueueCounts>
@@ -39,12 +40,22 @@ type ProviderSettings = {
   agnes: { enabled: boolean; active_provider: "ollama" | "agnes"; ollama_base_url: string; ollama_model: string; agnes_base_url: string; agnes_model: string; provider_name: string; base_url: string; model: string; timeout_seconds: number; max_tokens: number; temperature: number; max_retries: number; max_concurrency: number; api_key_env: string; api_key_configured: boolean; agnes_api_key_configured: boolean; ollama_available: boolean; uses_local_gpu: boolean; real_oa_delivery_enabled: boolean; delivery_block_reason: string }
   feishu: { enabled: boolean; message_type: string; max_items_per_section: number; redact_confidential: boolean; retry_attempts: number; webhook_env: string; secret_env: string; webhook_configured: boolean; secret_configured: boolean }
 }
+type AuditData = {
+  run: null | { id:number; status:string; total_items:number; completed_items:number; matched_items:number; mismatch_items:number; missing_download_items:number; local_extra_items:number; markdown_pending_items:number; access_failed_items:number; current_oa_item_key:string|null; started_at:string|null; finished_at:string|null }
+  items: { id:number; oa_item_key:string; title:string; status:string; recognized_attachments:number|null; database_attachments:number; downloaded_attachments:number; markdown_attachments:number; error_code:string|null; error_detail:string|null; elapsed_seconds:number|null }[]
+  errors: { error_code:string; count:number }[]
+  events: { sequence:number; event_type:string; level:string; message:string; details:Record<string,unknown>; created_at:string|null }[]
+  item_pagination: { page:number; page_size:number; total:number; pages:number }
+  markdown_queue: { paused:boolean; discovered:number; queued:number; running:number; succeeded:number; failed:number; excluded:number; pdf_mineru:{paused:boolean;total:number;queued:number;running:number;succeeded:number;failed:number;skipped:number}; events:{id:number;event_type:string;level:string;message:string;created_at:string|null}[] }
+  archive_dates: { total:number; dated:number; unknown:number; correct:number; pending:number; job:null|{id:number;status:string;processed?:number;total?:number;migrated?:number;failed?:number;last_error_code?:string|null} }
+}
 
 const nav = [
   { id: "pending" as View, label: "待处理", icon: FileCheck2 },
   { id: "done" as View, label: "已办归档", icon: Archive },
   { id: "processing" as View, label: "处理中心", icon: ListChecks },
   { id: "knowledge" as View, label: "知识库", icon: BookOpen },
+  { id: "audit" as View, label: "审计", icon: ShieldCheck },
   { id: "system" as View, label: "系统", icon: Gauge },
 ]
 
@@ -80,21 +91,25 @@ export function App() {
   const [system, setSystem] = useState<SystemData | null>(null)
   const [processing, setProcessing] = useState<ProcessingData | null>(null)
   const [providers, setProviders] = useState<ProviderSettings | null>(null)
+  const [audit, setAudit] = useState<AuditData | null>(null)
+  const [auditPage, setAuditPage] = useState(1)
   const [pendingDetail, setPendingDetail] = useState<PendingDetail | null>(null)
   const [knowledgeDetail, setKnowledgeDetail] = useState<KnowledgeDetail | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true); setError("")
+  const load = useCallback(async (silent = false) => {
+    if (!silent) { setLoading(true); setError("") }
     try {
       if (view === "pending") setPending((await api<{ items: PendingItem[] }>("/api/lifecycle/pending")).items)
       if (view === "done") { const result = await api<{ items: DoneItem[]; total: number; metrics: DoneMetrics }>(`/api/lifecycle/done?page=${donePage}&page_size=100`); setDone(result.items); setDoneTotal(result.total); setDoneMetrics(result.metrics) }
       if (view === "processing") setProcessing(await api<ProcessingData>("/api/lifecycle/processing-center"))
       if (view === "knowledge") setKnowledge((await api<{ documents: KnowledgeItem[] }>("/api/lifecycle/knowledge")).documents)
+      if (view === "audit") setAudit(await api<AuditData>(`/api/audits/online?item_page=${auditPage}&item_page_size=50`))
       if (view === "system") { const [status, providerSettings] = await Promise.all([api<SystemData>("/api/lifecycle/system"), api<ProviderSettings>("/api/system/provider-settings")]); setSystem(status); setProviders(providerSettings) }
     } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败") }
-    finally { setLoading(false) }
-  }, [view, donePage])
+    finally { if (!silent) setLoading(false) }
+  }, [view, donePage, auditPage])
   useEffect(() => { void load() }, [load])
+  useEffect(() => { if (view !== "audit") return; const timer = window.setInterval(() => void load(true), 3000); return () => window.clearInterval(timer) }, [view, load])
 
   const openPending = async (id: number) => {
     setError("")
@@ -138,6 +153,7 @@ export function App() {
         {view === "done" && <DoneView rows={filteredDone} total={doneTotal} metrics={doneMetrics} page={donePage} setPage={setDonePage} query={query} setQuery={setQuery} syncing={syncing} startSync={startDoneSync}/>}
         {view === "processing" && processing && <ProcessingView data={processing}/>}
         {view === "knowledge" && <KnowledgeView rows={filteredKnowledge} query={query} setQuery={setQuery} open={openKnowledge}/>}
+        {view === "audit" && audit && <AuditView data={audit} reload={load} setError={setError} setPage={setAuditPage}/>}
         {view === "system" && system && providers && <SystemView data={system} providers={providers} reload={load}/>}
       </>}
     </main>
@@ -187,6 +203,41 @@ function KnowledgeView({ rows, query, setQuery, open }: { rows: KnowledgeItem[];
     <div className="document-grid">{rows.map(row => <button className="document-row" key={row.id} onClick={() => open(row.id)}><FileText size={21}/><span><strong>{row.title}</strong><small>{row.vault_relpath}</small></span><Badge tone={row.publish_status.includes("draft") ? "warn" : "good"}>{row.publish_status}</Badge><span className="source-count">{row.source_count} 个来源</span><ChevronRight size={18}/></button>)}{!rows.length && <div className="empty panel">尚无符合条件的知识文档</div>}</div>
   </section>
 }
+function AuditView({ data, reload, setError, setPage }: { data: AuditData; reload: () => Promise<void>; setError: (value:string)=>void; setPage:(page:number)=>void }) {
+  const [acting, setActing] = useState(false)
+  const run = data.run
+  const action = async (kind: "start" | "pause" | "resume") => {
+    setActing(true); setError("")
+    try {
+      const csrf = document.cookie.split("; ").find(row => row.startsWith("oa_csrf="))?.split("=")[1] || ""
+      const path = kind === "start" ? "/api/audits/online" : `/api/audits/online/${run?.id}/${kind}`
+      const response = await fetch(path, { method:"POST", headers:{"x-csrf-token":csrf} })
+      if (!response.ok) throw new Error(`审计操作失败 (${response.status})`)
+      await reload()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "审计操作失败") }
+    finally { setActing(false) }
+  }
+  const progress = run?.total_items ? Math.round(run.completed_items / run.total_items * 100) : 0
+  const current = data.items.find(item => item.oa_item_key === run?.current_oa_item_key)
+  const mdAction = async (kind:"pause"|"resume"|"retry-failed") => { setActing(true); try { const csrf=document.cookie.split("; ").find(row=>row.startsWith("oa_csrf="))?.split("=")[1]||""; const response=await fetch(`/api/audits/markdown/${kind}`,{method:"POST",headers:{"x-csrf-token":csrf}}); if(!response.ok) throw new Error(`MD 化操作失败 (${response.status})`); await reload() } catch(reason) { setError(reason instanceof Error?reason.message:"MD 化操作失败") } finally { setActing(false) } }
+  const pdfAction = async (kind:"start"|"pause"|"resume"|"retry-failed") => { setActing(true); try { const csrf=document.cookie.split("; ").find(row=>row.startsWith("oa_csrf="))?.split("=")[1]||""; const path=kind==="start"?"/api/audits/pdf-mineru":`/api/audits/pdf-mineru/${kind}`; const response=await fetch(path,{method:"POST",headers:{"x-csrf-token":csrf}}); if(!response.ok) throw new Error(`PDF重转操作失败 (${response.status})`); await reload() } catch(reason) { setError(reason instanceof Error?reason.message:"PDF重转操作失败") } finally { setActing(false) } }
+  const dateAction = async (kind:"start"|"pause"|"resume") => { setActing(true); try { const csrf=document.cookie.split("; ").find(row=>row.startsWith("oa_csrf="))?.split("=")[1]||""; const path=kind==="start"?"/api/audits/archive-dates":`/api/audits/archive-dates/${kind}`; const response=await fetch(path,{method:"POST",headers:{"x-csrf-token":csrf}}); if(!response.ok) throw new Error(`归档校准操作失败 (${response.status})`); await reload() } catch(reason) { setError(reason instanceof Error?reason.message:"归档校准操作失败") } finally { setActing(false) } }
+  return <section>
+    <div className="audit-hero"><div><span className="eyebrow">只读在线复查</span><h2>已办事项审计</h2><p>逐条访问 OA 详情，核对附件识别、成功下载与 Markdown 转换结果。</p></div><div className="audit-actions">{(!run || ["completed","failed"].includes(run.status)) && <button className="button-primary" disabled={acting} onClick={()=>void action("start")}><ShieldCheck size={16}/>开始在线审计</button>}{run && ["queued","running"].includes(run.status) && <button className="button-danger" disabled={acting} onClick={()=>void action("pause")}><CircleAlert size={16}/>暂停</button>}{run && ["paused","pause_requested"].includes(run.status) && <button className="button-primary" disabled={acting} onClick={()=>void action("resume")}><RefreshCw size={16}/>继续审计</button>}</div></div>
+    {run ? <><div className="audit-progress"><div><strong>{run.completed_items.toLocaleString()} / {run.total_items.toLocaleString()}</strong><span>{progress}% · {run.status}</span></div><Progress value={progress} label="在线审计进度"/>{current && <p>当前事项：<strong>{current.title}</strong> <small>{current.oa_item_key}</small></p>}</div>
+    <div className="metrics compact-metrics"><Metric label="已复查" value={run.completed_items}/><Metric label="附件一致" value={run.matched_items}/><Metric label="附件缺失" value={run.missing_download_items} bad={run.missing_download_items>0}/><Metric label="历史附件留存" value={run.local_extra_items}/><Metric label="待MD化" value={run.markdown_pending_items}/><Metric label="OA访问失败" value={run.access_failed_items} bad={run.access_failed_items>0}/><Metric label="剩余" value={Math.max(run.total_items-run.completed_items,0)}/></div>
+    <div className="audit-hero"><div><span className="eyebrow">独立本地进程</span><h2>Markdown 化流水线</h2><p>只处理本地已验证附件，不访问 OA；与在线扫描并行推进。</p></div><div className="audit-actions">{data.markdown_queue.paused?<button className="button-primary" disabled={acting} onClick={()=>void mdAction("resume")}><RefreshCw size={16}/>继续 MD 化</button>:<button className="button-danger" disabled={acting} onClick={()=>void mdAction("pause")}><CircleAlert size={16}/>暂停 MD 化</button>}<button disabled={acting||!data.markdown_queue.failed} onClick={()=>void mdAction("retry-failed")}><RefreshCw size={16}/>重试失败</button></div></div>
+    <div className="metrics compact-metrics"><Metric label="附件任务" value={data.markdown_queue.discovered}/><Metric label="排队中" value={data.markdown_queue.queued}/><Metric label="转换中" value={data.markdown_queue.running}/><Metric label="转换成功" value={data.markdown_queue.succeeded}/><Metric label="已排除非附件" value={data.markdown_queue.excluded}/><Metric label="转换失败" value={data.markdown_queue.failed} bad={data.markdown_queue.failed>0}/></div>
+    <div className="panel audit-log">{data.markdown_queue.events.map(event=><div className={`log-${event.level}`} key={event.id}><time>{time(event.created_at)}</time><span>{event.message}</span><Badge tone={event.level==="error"?"bad":"neutral"}>{event.event_type}</Badge></div>)}</div>
+    <div className="audit-hero"><div><span className="eyebrow">GPU 优先队列</span><h2>PDF MinerU 重转</h2><p>将没有 MinerU 成功成果的已验证 PDF 原子替换为 MinerU 版本。</p></div><div className="audit-actions"><button disabled={acting||data.markdown_queue.pdf_mineru.queued>0||data.markdown_queue.pdf_mineru.running>0} onClick={()=>void pdfAction("start")}><ShieldCheck size={16}/>启动扫描</button>{data.markdown_queue.pdf_mineru.paused?<button className="button-primary" disabled={acting} onClick={()=>void pdfAction("resume")}><RefreshCw size={16}/>继续重转</button>:<button className="button-danger" disabled={acting} onClick={()=>void pdfAction("pause")}><CircleAlert size={16}/>暂停重转</button>}<button disabled={acting||!data.markdown_queue.pdf_mineru.failed} onClick={()=>void pdfAction("retry-failed")}><RefreshCw size={16}/>重试失败</button></div></div>
+    <div className="metrics compact-metrics"><Metric label="PDF总数" value={data.markdown_queue.pdf_mineru.total}/><Metric label="待重转" value={data.markdown_queue.pdf_mineru.queued}/><Metric label="转换中" value={data.markdown_queue.pdf_mineru.running}/><Metric label="MinerU成功" value={data.markdown_queue.pdf_mineru.succeeded}/><Metric label="已跳过" value={data.markdown_queue.pdf_mineru.skipped}/><Metric label="失败" value={data.markdown_queue.pdf_mineru.failed} bad={data.markdown_queue.pdf_mineru.failed>0}/></div>
+    <div className="audit-hero"><div><span className="eyebrow">本地原子迁移</span><h2>发起时间归档校准</h2><p>按 OA 发起时间重排原始文件和 Markdown；无日期事项进入 unknown。</p></div><div className="audit-actions">{data.archive_dates.job?.status==="paused"?<button className="button-primary" disabled={acting} onClick={()=>void dateAction("resume")}><RefreshCw size={16}/>继续校准</button>:data.archive_dates.job?.status==="running"?<button className="button-danger" disabled={acting} onClick={()=>void dateAction("pause")}><CircleAlert size={16}/>暂停校准</button>:<button className="button-primary" disabled={acting||data.archive_dates.pending===0} onClick={()=>void dateAction("start")}><Archive size={16}/>开始校准</button>}</div></div>
+    <div className="metrics compact-metrics"><Metric label="已归档事项" value={data.archive_dates.total}/><Metric label="有发起时间" value={data.archive_dates.dated}/><Metric label="时间未知" value={data.archive_dates.unknown} bad={data.archive_dates.unknown>0}/><Metric label="位置正确" value={data.archive_dates.correct}/><Metric label="待迁移" value={data.archive_dates.pending}/><Metric label="迁移失败" value={data.archive_dates.job?.failed||0} bad={(data.archive_dates.job?.failed||0)>0}/></div>
+    <div className="audit-lower"><div><div className="section-toolbar"><div><h2>OA 错误汇总</h2><p>仅显示脱敏后的稳定错误码。</p></div></div><div className="panel audit-errors">{data.errors.length?data.errors.map(row=><div key={row.error_code}><code>{row.error_code}</code><strong>{row.count}</strong></div>):<p>暂无 OA 访问错误</p>}</div></div><div><div className="section-toolbar"><div><h2>实施日志</h2><p>最近 200 条持久化结构化事件。</p></div></div><div className="panel audit-log">{data.events.map(event=><div className={`log-${event.level}`} key={event.sequence}><time>{time(event.created_at)}</time><span>{event.message}</span><Badge tone={event.level==="error"?"bad":event.level==="warning"?"warn":"neutral"}>{event.event_type}</Badge></div>)}</div></div></div>
+    <div className="section-toolbar"><div><h2>事项复查结果</h2><p>共 {data.item_pagination.total.toLocaleString()} 项，每页 {data.item_pagination.page_size} 项。</p></div><div className="pagination"><button disabled={data.item_pagination.page<=1} onClick={()=>setPage(data.item_pagination.page-1)}>上一页</button><span>第 {data.item_pagination.page} / {Math.max(data.item_pagination.pages,1)} 页</span><button disabled={data.item_pagination.page>=data.item_pagination.pages} onClick={()=>setPage(data.item_pagination.page+1)}>下一页</button></div></div>
+    <div className="table-wrap"><table><thead><tr><th className="title-col">OA事项</th><th>OA识别</th><th>数据库</th><th>已下载</th><th>MD化</th><th>耗时</th><th>状态</th><th>错误</th></tr></thead><tbody>{data.items.map(item=><tr key={item.id}><td className="title-cell"><strong>{item.title}</strong><small>{item.oa_item_key}</small></td><td>{item.recognized_attachments ?? "-"}</td><td>{item.database_attachments}</td><td>{item.downloaded_attachments}</td><td>{item.markdown_attachments}</td><td>{item.elapsed_seconds == null ? "-" : `${item.elapsed_seconds.toFixed(2)}s`}</td><td><Badge tone={item.status==="matched"?"good":item.status==="access_failed"?"bad":["missing_download","local_extra"].includes(item.status)?"warn":"neutral"}>{item.status}</Badge></td><td title={item.error_detail||""}>{item.error_code||"-"}</td></tr>)}{!data.items.length&&<tr><td colSpan={8} className="empty">本页没有事项</td></tr>}</tbody></table></div></>:<div className="empty panel">尚未创建在线审计。点击“开始在线审计”后，后台 Worker 将以只读方式遍历全部已办事项。</div>}
+  </section>
+}
 function SystemView({ data, providers, reload }: { data: SystemData; providers: ProviderSettings; reload: () => Promise<void> }) {
   const mineruStatus = String(data.mineru.status ?? "unknown")
   const workerDetail = data.worker ? `${data.worker.type} · ${data.worker.progress_current}/${data.worker.progress_total ?? "?"} · 失败 ${data.worker.failure_count}` : "当前无运行任务"
@@ -209,6 +260,8 @@ function SystemView({ data, providers, reload }: { data: SystemData; providers: 
   }
   return <section><div className="service-grid"><Service icon={Server} title="Web 服务" status={data.web.status} detail={data.web.url}/><Service icon={Gauge} title="Worker" status={data.worker?.status || "idle"} detail={workerDetail}/><Service icon={HardDrive} title="MinerU" status={mineruStatus} detail="127.0.0.1:58000"/><Service icon={Database} title="SQLite" status={data.sqlite.integrity === "ok" ? "healthy" : data.sqlite.integrity} detail={`Schema ${data.sqlite.schema}`}/></div>
     {data.worker && <div className="current-job"><div><span>当前事项</span><strong>{data.worker.current_title || "正在准备"}</strong></div><div><span>全部进度</span><strong>{data.worker.progress_current}/{data.worker.progress_total ?? "?"}</strong></div><div><span>当前附件</span><strong>{data.worker.attachment_verified}/{data.worker.attachment_total}</strong></div><div className={data.worker.failure_count ? "job-failed" : ""}><span>失败</span><strong>{data.worker.failure_count}</strong></div></div>}
+    <div className="section-toolbar"><div><h2>Markdown 转换</h2><p title={data.paths.archive}>原始目录：{data.paths.archive}<br/>输出目录：{data.paths.markdown}</p></div></div><div className="metrics compact-metrics"><Metric label="原始文件" value={data.markdown.raw_total}/><Metric label="已转换" value={data.markdown.success}/><Metric label="待转换" value={data.markdown.pending}/><Metric label="不支持" value={data.markdown.unsupported}/><Metric label="转换失败" value={data.markdown.failed} bad={data.markdown.failed > 0}/></div>
+    <div className="table-wrap"><table><thead><tr><th className="title-col">原始文件</th><th className="title-col">Markdown</th><th>解析引擎</th><th>质量</th><th>状态</th><th>更新时间</th></tr></thead><tbody>{data.markdown.recent_exports.map((row, index) => <tr key={`${row.markdown_relpath}-${index}`}><td className="path-cell" title={row.source_relpath}>{row.source_relpath}</td><td className="path-cell" title={row.markdown_relpath}>{row.markdown_relpath}</td><td>{row.parse_engine}</td><td>{row.quality_score == null ? "-" : row.quality_score.toFixed(2)}</td><td><Badge tone={row.status === "success" ? "good" : row.status === "failed" ? "bad" : "warn"}>{row.status}</Badge></td><td className="nowrap">{time(row.updated_at)}</td></tr>)}{!data.markdown.recent_exports.length && <tr><td colSpan={6} className="empty">尚无 Markdown 转换记录，请先运行 oa convert</td></tr>}</tbody></table></div>
     <div className="section-toolbar"><div><h2>数据状态</h2><p>当前数据库中的生命周期、文件与知识对象。</p></div></div><div className="data-grid">{Object.entries(data.counts).map(([key, value]) => <div className={key === "failed_or_retry" && value ? "data-cell data-cell-bad" : "data-cell"} key={key}><span>{labelFor(key)}</span><strong>{value.toLocaleString()}</strong></div>)}</div>
     <div className="settings-head"><div><h2>模型与通知</h2><p>凭证仅从环境变量读取，页面不会显示明文。</p></div><button className="button-primary" onClick={() => void save()} disabled={saving}><Save size={16}/>{saving ? "保存中" : "保存设置"}</button></div>
     {message && <div className="settings-message">{message}</div>}

@@ -40,6 +40,9 @@ def upsert_manifest_page(
     """Persist one OA list page before any detail work for that page starts."""
     now = synced_at or datetime.now(timezone.utc)
     for source in items:
+        archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == source.oa_item_key))
+        if archived is not None and source.created_at is not None:
+            archived.initiated_at = source.created_at
         row = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == source.oa_item_key))
         if row is None:
             row = OAManifestItem(
@@ -47,6 +50,7 @@ def upsert_manifest_page(
                 workitem_id_text=source.workitem_id_text or None,
                 title=source.title,
                 sender=source.sender,
+                initiated_at=source.created_at,
                 completed_at=source.completed_at,
                 list_page=source.list_page,
                 first_seen_at=now,
@@ -58,6 +62,7 @@ def upsert_manifest_page(
             row.workitem_id_text = source.workitem_id_text or row.workitem_id_text
             row.title = source.title
             row.sender = source.sender
+            row.initiated_at = source.created_at or row.initiated_at
             row.completed_at = source.completed_at
             row.list_page = source.list_page
             row.last_synced_at = now

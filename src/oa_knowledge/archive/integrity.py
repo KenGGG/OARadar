@@ -21,6 +21,11 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def sha256_text(text: str) -> str:
+    """SHA-256 hex digest of a string, the text counterpart of ``sha256_file``."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def inspect_file(path: Path, expected_kind: str | None = None) -> FileIntegrity:
     size = path.stat().st_size
     if size == 0:

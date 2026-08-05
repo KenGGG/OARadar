@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,13 +14,47 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
 from oa_knowledge.archive import atomic_write_bytes
-from oa_knowledge.constants import BatchStatus
+from oa_knowledge.constants import BatchStatus, LEASE_TTL
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemSnapshot, OAItem, OAManifestItem, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, SourceAttachment
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.ops.audit import audit_database
 from oa_knowledge.ops.capacity import capacity_report
+from oa_knowledge.web.cli_runner import run_cli
 from oa_knowledge.web.status import _apply_policy_to_pending, execute_archive_job
+
+
+def _pump_stream(stream, buffer: list[str]) -> None:
+    try:
+        for line in stream:
+            buffer.append(line)
+    finally:
+        stream.close()
+
+
+def _run_piped(command: list[str], cwd: Path, poll_callback, poll_interval: float = 5.0):
+    """Run a subprocess with PIPEd stdout/stderr.
+
+    The pipes are drained on background threads so a chatty child cannot fill the
+    OS pipe buffer (~64KB) and deadlock the parent while it polls. Returns
+    ``(returncode, stdout, stderr)``.
+    """
+    process = subprocess.Popen(
+        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    stdout_buf: list[str] = []
+    stderr_buf: list[str] = []
+    out_thread = threading.Thread(target=_pump_stream, args=(process.stdout, stdout_buf), daemon=True)
+    err_thread = threading.Thread(target=_pump_stream, args=(process.stderr, stderr_buf), daemon=True)
+    out_thread.start()
+    err_thread.start()
+    while process.poll() is None:
+        poll_callback()
+        time.sleep(poll_interval)
+    process.wait()
+    out_thread.join()
+    err_thread.join()
+    return process.returncode, "".join(stdout_buf), "".join(stderr_buf)
 
 
 class OperationWorker:
@@ -100,11 +134,118 @@ class OperationWorker:
                 self._execute_full_manifest_retry(job_id)
             elif job_type == "done_incremental":
                 self._execute_done_incremental(job_id)
+            elif job_type == "online_audit":
+                self._execute_online_audit(job_id)
+            elif job_type == "archive_date_reconcile":
+                self._execute_archive_date_reconcile(job_id)
             else:
                 self._finish(job_id, "failed", "unsupported_job_type")
         except Exception as exc:
             self._finish(job_id, "failed", f"worker_exception_{type(exc).__name__}")
         return True
+
+    def _execute_archive_date_reconcile(self, job_id: int) -> None:
+        from oa_knowledge.archive_reconciliation import reconcile_item
+        from oa_knowledge.db.models import OAItem
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if not job or job.status not in {"queued", "running"}:
+                return
+            job.status = "running"; job.started_at = job.started_at or datetime.now(timezone.utc); session.commit()
+        with Session(self.engine) as session:
+            ids = list(session.scalars(select(OAItem.id).where(OAItem.source_channel == "done", OAItem.archive_relpath.is_not(None)).order_by(OAItem.id)))
+        migrated = failed = processed = 0
+        for item_id in ids:
+            with Session(self.engine) as session:
+                job = session.get(OperationJob, job_id)
+                if not job or job.status == "paused":
+                    return
+                try:
+                    result = reconcile_item(session, self.settings, item_id)
+                    session.commit(); migrated += result.status == "migrated"
+                except (FileNotFoundError, FileExistsError, ValueError) as exc:
+                    session.rollback(); failed += 1
+                    job = session.get(OperationJob, job_id); job.last_error_code = type(exc).__name__.upper(); session.commit()
+                processed += 1
+                job = session.get(OperationJob, job_id)
+                job.parameters_json = json.dumps({"processed": processed, "total": len(ids), "migrated": migrated, "failed": failed})
+                job.heartbeat_at = datetime.now(timezone.utc); session.commit()
+        self._finish(job_id, "completed", None)
+
+    def _execute_online_audit(self, job_id: int) -> None:
+        from oa_knowledge.collector.browser import BrowserSession, LoginState
+        from oa_knowledge.collector.detail import CollaborationDetailAdapter
+        from oa_knowledge.cli import verified_attachment_resolver
+        from oa_knowledge.db.models import OnlineAuditRun
+        from oa_knowledge.detail_archive import archive_collaboration_detail
+        from oa_knowledge.full_manifest import archive_proxy
+        from oa_knowledge.online_audit import ATTACHMENT_ROLES, AuditObservation, canonical_downloaded_count, execute_audit, fail_audit, unique_capture_attachment_count
+        with Session(self.engine) as session:
+            run = session.scalar(select(OnlineAuditRun).where(OnlineAuditRun.job_id == job_id))
+            if run is None:
+                self._finish(job_id, "failed", "audit_run_not_found"); return
+            run_id = run.id
+            job = session.get(OperationJob, job_id)
+            if job:
+                job.status = "running"; job.started_at = job.started_at or datetime.now(timezone.utc)
+                session.commit()
+        with BrowserSession(self.settings, headed=False) as browser:
+            if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+                fail_audit(self.settings, run_id, "OA_AUTH_EXPIRED")
+                self._finish(job_id, "failed", "OA_AUTH_EXPIRED")
+                return
+            if browser.page is None:
+                raise RuntimeError("browser page is not available")
+            inventory_adapter = CollaborationDetailAdapter(browser.page, inventory_only=True)
+            download_adapter = CollaborationDetailAdapter(
+                browser.page,
+                attachment_resolver=verified_attachment_resolver(self.engine, self.settings.data_root),
+            )
+
+            def inspect(item) -> AuditObservation:
+                if not item.workitem_id_text:
+                    raise RuntimeError("OA item identifier unavailable")
+                capture = inventory_adapter.capture_direct(
+                    browser.base_url, item.workitem_id_text,
+                    max_depth=self.settings.collector.max_attachment_depth,
+                    total_timeout_seconds=self.settings.online_audit.item_timeout_seconds,
+                    download_timeout_seconds=self.settings.online_audit.download_timeout_seconds,
+                )
+                recognized = unique_capture_attachment_count(capture)
+                with Session(self.engine) as session:
+                    oa = session.scalar(select(OAItem).where(OAItem.oa_item_key == item.oa_item_key))
+                    verified_rows = session.scalar(select(func.count()).select_from(ArchivedFile).where(
+                        ArchivedFile.oa_item_id == oa.id,
+                        ArchivedFile.file_role.in_(ATTACHMENT_ROLES),
+                        ArchivedFile.download_status == "verified",
+                    )) if oa else 0
+                    unique_hashes = session.scalar(select(func.count(func.distinct(ArchivedFile.sha256))).where(
+                        ArchivedFile.oa_item_id == oa.id,
+                        ArchivedFile.file_role.in_(ATTACHMENT_ROLES), ArchivedFile.download_status == "verified",
+                        ArchivedFile.sha256.is_not(None),
+                    )) if oa else 0
+                    downloaded = canonical_downloaded_count(recognized=recognized, verified_rows=verified_rows or 0, unique_hashes=unique_hashes or 0)
+                if recognized > (downloaded or 0):
+                    full_capture = download_adapter.capture_direct(
+                        browser.base_url, item.workitem_id_text,
+                        max_depth=self.settings.collector.max_attachment_depth,
+                        total_timeout_seconds=self.settings.collector.attachment_total_timeout_seconds,
+                        download_timeout_seconds=self.settings.collector.download_timeout_seconds,
+                    )
+                    with Session(self.engine) as session:
+                        manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == item.oa_item_key))
+                        if manifest is None:
+                            raise LookupError("manifest item disappeared during audit repair")
+                        archive_collaboration_detail(session, archive_proxy(manifest), full_capture, self.settings.data_root)
+                        manifest.archive_relpath = session.scalar(select(OAItem.archive_relpath).where(OAItem.oa_item_key == manifest.oa_item_key))
+                        session.commit()
+                return AuditObservation(recognized_attachments=recognized)
+
+            try:
+                execute_audit(self.settings, run_id, inspect_item=inspect)
+            except Exception:
+                fail_audit(self.settings, run_id, "AUDIT_WORKER_ERROR")
+                raise
 
     def _execute_done_incremental(self, job_id: int) -> None:
         command = [sys.executable, "-m", "oa_knowledge.cli", "manifest", "refresh-head", "--max-pages", "3"]
@@ -238,7 +379,8 @@ class OperationWorker:
                 if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
                     self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "saved OA session is not authenticated", recoverable=True)
                     return
-                assert browser.page
+                if browser.page is None:
+                    raise RuntimeError("browser page is not available")
                 capture = CollaborationDetailAdapter(browser.page).capture(
                     affair_id, max_depth=self.settings.collector.max_attachment_depth,
                     total_timeout_seconds=self.settings.collector.attachment_total_timeout_seconds,
@@ -311,7 +453,7 @@ class OperationWorker:
             job.status = "running"
             job.started_at = job.started_at or datetime.now(timezone.utc)
             job.heartbeat_at = datetime.now(timezone.utc)
-            job.lease_expires_at = job.heartbeat_at + timedelta(minutes=45)
+            job.lease_expires_at = job.heartbeat_at + LEASE_TTL
             job.progress_current = session.scalar(select(func.count()).select_from(OAManifestItem)) or 0
             job.progress_total = 0
             self._event(session, job, "manifest_started", "running", {})
@@ -319,19 +461,19 @@ class OperationWorker:
         command = [sys.executable, "-m", "oa_knowledge.cli", "manifest", "download", "--max-items", "10000"]
         if self.config_path is not None:
             command.extend(("--config", str(self.config_path)))
-        process = subprocess.Popen(command, cwd=Path.cwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        while process.poll() is None:
+
+        def heartbeat() -> None:
             with Session(self.engine) as session:
                 job = session.get(OperationJob, job_id)
                 if job is None:
-                    process.terminate(); return
+                    return
                 job.progress_current = session.scalar(select(func.count()).select_from(OAManifestItem)) or 0
                 job.progress_total = 0
                 job.heartbeat_at = datetime.now(timezone.utc)
-                job.lease_expires_at = job.heartbeat_at + timedelta(minutes=45)
+                job.lease_expires_at = job.heartbeat_at + LEASE_TTL
                 session.commit()
-            time.sleep(5)
-        stdout, stderr = process.communicate()
+
+        returncode, stdout, _stderr = _run_piped(command, Path.cwd(), heartbeat, poll_interval=5.0)
         payload = {}
         for line in reversed(stdout.splitlines()):
             try:
@@ -343,8 +485,8 @@ class OperationWorker:
             if job is None: return
             job.progress_current = session.scalar(select(func.count()).select_from(OAManifestItem)) or 0
             job.progress_total = payload.get("oa_total_count")
-            job.last_error_code = None if process.returncode == 0 else (payload.get("manifest_status") or f"exit_{process.returncode}")
-            job.status = "completed" if process.returncode == 0 else "failed"
+            job.last_error_code = None if returncode == 0 else (payload.get("manifest_status") or f"exit_{returncode}")
+            job.status = "completed" if returncode == 0 else "failed"
             job.finished_at = datetime.now(timezone.utc); job.lease_owner = None; job.lease_expires_at = None
             self._event(session, job, "manifest_finished", job.status, {
                 "manifest_status": payload.get("manifest_status"), "progress_current": job.progress_current,
@@ -393,7 +535,7 @@ class OperationWorker:
             job.progress_current = min(job.progress_current or 0, len(keys))
             job.progress_total = total_targets
             job.heartbeat_at = datetime.now(timezone.utc)
-            job.lease_expires_at = job.heartbeat_at + timedelta(minutes=45)
+            job.lease_expires_at = job.heartbeat_at + LEASE_TTL
             self._event(session, job, "manifest_retry_started", "running", {"target_count": len(keys)})
             session.commit()
         if not keys:
@@ -418,12 +560,11 @@ class OperationWorker:
             command.append("--audit-all")
         if self.config_path is not None:
             command.extend(("--config", str(self.config_path)))
-        process = subprocess.Popen(command, cwd=Path.cwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        while process.poll() is None:
+        def heartbeat() -> None:
             with Session(self.engine) as session:
                 job = session.get(OperationJob, job_id)
                 if job is None:
-                    process.terminate(); return
+                    return
                 completed = session.scalar(select(func.count()).select_from(OAManifestItem).where(
                     OAManifestItem.oa_item_key.in_(keys),
                     OAManifestItem.last_retry_at.is_not(None),
@@ -433,14 +574,14 @@ class OperationWorker:
                 active = session.scalar(select(OAManifestItem).where(OAManifestItem.processing_status == "processing").order_by(OAManifestItem.last_retry_at.desc(), OAManifestItem.id.desc()).limit(1))
                 job.progress_current = self._retry_progress(total_targets, processed, completed)
                 job.heartbeat_at = datetime.now(timezone.utc)
-                job.lease_expires_at = job.heartbeat_at + timedelta(minutes=45)
+                job.lease_expires_at = job.heartbeat_at + LEASE_TTL
                 if active:
                     self._event(session, job, "manifest_retry_item_started", "running", {"oa_item_key": active.oa_item_key, "manifest_id": active.id, "item_id": active.workitem_id_text or active.oa_item_key, "title": active.title, "stage": "正在进入 OA 详情页并识别附件"})
                 session.commit()
-            time.sleep(2)
-        stdout, stderr = process.communicate()
-        if process.returncode != 0:
-            last_error = f"retry_exit_{process.returncode}"
+
+        _returncode, _stdout, stderr = _run_piped(command, Path.cwd(), heartbeat, poll_interval=2.0)
+        if _returncode != 0:
+            last_error = f"retry_exit_{_returncode}"
         processed = total_targets
         with Session(self.engine) as session:
             job = session.get(OperationJob, job_id)
@@ -496,7 +637,7 @@ class OperationWorker:
             if job is None:
                 return None
             job.lease_owner = self.owner
-            job.lease_expires_at = now + timedelta(minutes=45)
+            job.lease_expires_at = now + LEASE_TTL
             job.heartbeat_at = now
             session.commit()
             return job.id
@@ -719,28 +860,7 @@ class OperationWorker:
         return None
 
     def _run_cli(self, arguments: list[str], timeout: int) -> tuple[int, dict]:
-        command = [sys.executable, "-m", "oa_knowledge.cli", *arguments]
-        if self.config_path is not None:
-            command.extend(("--config", str(self.config_path)))
-        try:
-            result = subprocess.run(command, cwd=Path.cwd(), capture_output=True, text=True, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            return 124, {"reason": "timeout"}
-        except OSError as exc:
-            return 125, {"reason": type(exc).__name__}
-        payload: dict = {}
-        for line in reversed(result.stdout.splitlines()):
-            try:
-                payload = json.loads(line)
-                break
-            except json.JSONDecodeError:
-                continue
-        if result.returncode != 0 and not payload:
-            payload = {
-                "reason": f"cli_exit_{result.returncode}",
-                "stderr_sha256": hashlib.sha256(result.stderr.encode("utf-8", "replace")).hexdigest(),
-            }
-        return result.returncode, payload
+        return run_cli(arguments, self.config_path, timeout)
 
     def _record_runner_retry(self, job_id: int, result: int, payload: dict, attempt: int) -> None:
         with Session(self.engine) as session:
@@ -776,7 +896,7 @@ class OperationWorker:
     def _heartbeat(session: Session, job: OperationJob) -> None:
         now = datetime.now(timezone.utc)
         job.heartbeat_at = now
-        job.lease_expires_at = now + timedelta(minutes=45)
+        job.lease_expires_at = now + LEASE_TTL
 
     @staticmethod
     def _record_collection_issues(session: Session, batch_id: int) -> None:

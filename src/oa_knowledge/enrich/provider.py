@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from enum import StrEnum
+from typing import Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
+
+from oa_knowledge.enrich.llm_client import LlmClient
+
+logger = logging.getLogger(__name__)
 
 
 class ContentClassification(StrEnum):
@@ -94,3 +101,70 @@ def evaluate_provider_request(config: ProviderConfig, context: ProviderRequestCo
         provider_mode=config.provider_mode,
         uses_local_gpu=config.uses_local_gpu,
     )
+
+
+def build_provider_config(llm_settings) -> ProviderConfig:
+    """Build a ProviderConfig from the application LlmConfig.
+
+    The field names align 1:1, so we reuse the validated settings directly.
+    """
+    return ProviderConfig(**llm_settings.model_dump())
+
+
+class GuardedLlmClient(LlmClient):
+    """LlmClient that enforces the confidentiality policy before every call.
+
+    Every chat completion sends OA-derived content off the local machine when the
+    provider is remote. ``evaluate_provider_request`` is the single gate that honors
+    ``allow_confidential`` / ``allow_restricted`` / ``require_redaction``; previously it
+    was defined but never invoked, so confidential OA content could reach a remote LLM
+    unchecked. This wrapper routes all requests through it.
+    """
+
+    def __init__(self, config: ProviderConfig, *, max_retries: int = 2, max_tokens: Optional[int] = None) -> None:
+        super().__init__(
+            base_url=config.base_url,
+            api_key_env=config.api_key_env,
+            model=config.model,
+            temperature=config.temperature,
+            max_tokens=max_tokens if max_tokens is not None else config.max_tokens,
+            timeout_seconds=config.timeout_seconds,
+            max_retries=max_retries,
+            provider_mode=config.provider_mode,
+        )
+        self._provider_config = config
+
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        json_schema: Optional[dict] = None,
+        classification=ContentClassification.CONFIDENTIAL,
+        redacted: bool = False,
+        context_fields: Optional[list[str]] = None,
+    ) -> dict:
+        input_hash = hashlib.sha256((system_prompt + user_prompt).encode("utf-8")).hexdigest()
+        context = ProviderRequestContext(
+            input_hash=input_hash,
+            content_classification=classification,
+            redacted=redacted,
+            context_fields=list(context_fields or []),
+        )
+        decision = evaluate_provider_request(self._provider_config, context)
+        if not decision.allowed:
+            logger.warning("LLM request rejected by confidentiality policy: %s", decision.reason_code)
+            return {
+                "content": None,
+                "model": self.model,
+                "usage": None,
+                "error": "provider_rejected",
+                "reason_code": decision.reason_code,
+                "elapsed_seconds": 0.0,
+            }
+        return super().chat(system_prompt, user_prompt, json_schema=json_schema)
+
+
+def make_llm_client(llm_settings, *, max_retries: int = 2, max_tokens: Optional[int] = None) -> GuardedLlmClient:
+    """Construct a confidentiality-guarded LLM client from app settings."""
+    return GuardedLlmClient(build_provider_config(llm_settings), max_retries=max_retries, max_tokens=max_tokens)

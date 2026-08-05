@@ -1,6 +1,8 @@
 # OARadar
 
-OARadar is a local-first, read-only toolkit for archiving OA work items and attachments, validating the archive, extracting searchable content, and publishing a local knowledge base. It includes a Python CLI, a local Web console, SQLite migrations, browser-based collectors, document parsing, and synthetic tests.
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+OARadar is a local-first, read-only OA raw-file archive and faithful Markdown conversion system. It archives OA files without changing them and mirrors every source into Markdown for llm_wiki and Obsidian. OARadar does not build knowledge pages or write the llm_wiki `wiki/` directory.
 
 The repository contains only application code and synthetic fixtures. OA addresses, credentials, records, attachments, browser state, databases, logs, and generated knowledge content stay on the operator's machine.
 
@@ -41,13 +43,36 @@ uv run oa doctor --config config.yaml
 uv run oa status --config config.yaml
 ```
 
+Convert the archive incrementally and inspect the export ledger:
+
+```bash
+uv run oa convert --config config.yaml
+uv run oa convert --config config.yaml --item done:12345
+uv run oa convert --config config.yaml --force
+uv run oa rebuild-markdown --config config.yaml
+uv run oa markdown-status --config config.yaml
+```
+
+The default source archive is `data/archive/raw/oa/`. Markdown is written only to `data/workspace/raw/sources/oa/` with the same tree and an appended `.md` suffix (for example, `报告.pdf` becomes `报告.pdf.md`). See [the llm_wiki and Obsidian integration guide](docs/llm-wiki-obsidian-integration.md).
+
 Start the loopback-only Web console:
 
 ```bash
 uv run oa web --config config.yaml
 ```
 
+The Web console's Audit page can start, safely pause, and resume a full read-only online review. It compares OA-recognized attachments with database, verified-download, and successful-Markdown counts while persisting per-item timings, sanitized errors, and an implementation log. A pause request takes effect after the current item finishes.
+
 For browser login and read-only discovery, use the relevant `oa login`, `oa batch`, or `oa manifest` commands shown by `uv run oa --help`. Review the planned batch locally before any collection run.
+
+## Archive by initiation time
+
+Done-item raw files and their Markdown mirrors are organized by the OA initiation timestamp as
+`raw/done/YYYY/MM/<item>`. The audit page exposes progress and controls for historical path
+reconciliation. Items for which OA truly provides no initiation timestamp are placed under
+`raw/done/unknown/`; completion and collection timestamps are never substituted. Reconciliation
+only moves local artifacts and updates indexes—it does not mutate OA records or reconvert successful
+Markdown content.
 
 ## Local document processing
 

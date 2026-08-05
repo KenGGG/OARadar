@@ -25,7 +25,26 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     assert oct((data_root / "state" / "oa.db").stat().st_mode & 0o777) == "0o600"
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0020_production_pipeline"
+    assert json.loads(status.output)["schema"] == "0026_initiation_archive"
+
+
+def test_convert_synthetic_text_and_unsupported_file(config_file: Path) -> None:
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+    raw = config_file.parent / "data/archive/raw/oa/done/2026/07/OA-SYNTHETIC"
+    raw.mkdir(parents=True)
+    (raw / "body.html").write_text("<h1>合成正文</h1>", encoding="utf-8")
+    (raw / "example.bin").write_bytes(b"synthetic")
+    result = runner.invoke(app, ["convert", "--config", str(config_file)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["success"] == 1 and payload["unsupported"] == 1
+    output = config_file.parent / "data/workspace/raw/sources/oa/done/2026/07/OA-SYNTHETIC"
+    assert (output / "body.html.md").is_file()
+    assert "UNSUPPORTED_FILE_TYPE" in (output / "example.bin.md").read_text(encoding="utf-8")
+    wiki = config_file.parent / "data/workspace/wiki"
+    assert list(wiki.iterdir()) == []
+    again = runner.invoke(app, ["convert", "--config", str(config_file)])
+    assert json.loads(again.output)["skipped"] == 2
 
 
 def test_operational_errors_redact_credentials() -> None:

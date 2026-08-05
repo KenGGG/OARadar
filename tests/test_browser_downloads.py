@@ -103,6 +103,22 @@ def test_direct_attachment_prefers_completed_browser_download_over_api() -> None
     assert files[0].download_status == "downloaded"
 
 
+def test_inventory_only_lists_attachment_without_downloading() -> None:
+    descriptor = {"file_url": "/seeyon/fileDownload.do?id=1", "key": "file-1", "filename": "large.zip", "role": "direct_attachment"}
+    class Locator:
+        def evaluate_all(self, *_args): return [descriptor]
+        def count(self): return 0
+    class Frame:
+        def locator(self, _selector): return Locator()
+    class Page:
+        frames = [Frame()]
+        url = "https://oa.invalid/seeyon/detail"
+    adapter = CollaborationDetailAdapter(None, inventory_only=True)  # type: ignore[arg-type]
+    adapter._browser_download_payload = lambda *_args: (_ for _ in ()).throw(AssertionError("must not download"))  # type: ignore[method-assign]
+    files = adapter._download_files(Page(), "direct_attachment")
+    assert [(row.attachment_key, row.download_status, row.content) for row in files] == [("file-1", "discovered", None)]
+
+
 def test_missing_workflow_tab_is_optional() -> None:
     class Flow:
         def count(self): return 0

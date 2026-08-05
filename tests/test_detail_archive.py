@@ -10,6 +10,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, OAItem, ReviewEntry
 from oa_knowledge.detail_archive import archive_collaboration_detail
+from oa_knowledge.detail_archive import done_archive_directory
 from oa_knowledge.cli import verified_attachment_resolver
 
 
@@ -303,3 +304,8 @@ def test_successful_retry_replaces_failed_attachment_with_same_name(tmp_path: Pa
     assert len(files) == 1
     assert files[0].attachment_key == "new-widget-key"
     assert files[0].download_status == "verified"
+
+
+def test_done_archive_directory_uses_initiation_month_and_never_completion_time() -> None:
+    assert done_archive_directory("事项", "42", datetime(2022, 4, 22, 9, 0)).as_posix() == "raw/done/2022/04/事项_42"
+    assert done_archive_directory("事项", "42", None).as_posix() == "raw/done/unknown/事项_42"

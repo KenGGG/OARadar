@@ -181,6 +181,39 @@ def test_parse_file_explicit_engine(tmp_path: Path) -> None:
     assert result.engine == "markitdown"
 
 
+def test_parse_file_explicit_mineru_does_not_use_probe_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient probe failure must not reject an explicitly requested conversion."""
+    pdf = _make_synthetic_pdf(tmp_path)
+    settings = Settings(mineru={"enabled": True})
+    expected = ParseResult(tmp_path / "result.md", "mineru", "1", 1.0)
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.mineru_parser.mineru_available",
+        lambda _settings: False,
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.mineru_parser.parse_with_mineru",
+        lambda *_args, **_kwargs: expected,
+    )
+
+    assert parse_file(pdf, settings, engine="mineru") is expected
+
+
+def test_parse_file_explicit_mineru_rejects_encrypted_pdf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pdf = _make_synthetic_pdf(tmp_path)
+    settings = Settings(mineru={"enabled": True})
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.router.preflight",
+        lambda _path: {"is_encrypted": True, "is_corrupted": False},
+    )
+
+    with pytest.raises(RuntimeError, match="encrypted_document"):
+        parse_file(pdf, settings, engine="mineru")
+
+
 def test_parse_result_config_hash_deterministic() -> None:
     """ParseResult config_hash should be deterministic."""
     r1 = ParseResult(
@@ -344,6 +377,69 @@ def test_parse_with_mineru_extracts_zip_atomically(tmp_path: Path, monkeypatch: 
     assert result.output_path.read_text(encoding="utf-8").startswith("# Synthetic")
     assert (result.output_path.parent / "content_list.json").is_file()
     assert not list((tmp_path / "parse").glob(".mineru-staging-*"))
+
+
+def test_parse_with_mineru_retries_transient_health_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    pdf = _make_synthetic_pdf(tmp_path)
+    settings = Settings(mineru={"enabled": True, "api_url": "http://127.0.0.1:58000"})
+    payload = _mineru_zip({"result/document.md": "# Retried successfully"})
+    health_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal health_calls
+        if request.url.path == "/health":
+            health_calls += 1
+            if health_calls == 1:
+                raise httpx.ConnectError("busy", request=request)
+            return httpx.Response(200, json={"protocol_version": "1"})
+        return httpx.Response(200, content=payload, headers={"content-type": "application/zip"})
+
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.mineru_parser._transport_for_settings",
+        lambda _settings: httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None)
+
+    result = parse_with_mineru(pdf, settings, tmp_path / "parse")
+
+    assert result.engine == "mineru"
+    assert health_calls == 2
+
+
+def test_parse_with_mineru_retries_transient_parse_disconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    pdf = _make_synthetic_pdf(tmp_path)
+    settings = Settings(mineru={"enabled": True, "api_url": "http://127.0.0.1:58000"})
+    payload = _mineru_zip({"result/document.md": "# Request retry succeeded"})
+    parse_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal parse_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"protocol_version": "1"})
+        parse_calls += 1
+        if parse_calls == 1:
+            raise httpx.RemoteProtocolError("server disconnected", request=request)
+        request.read()
+        return httpx.Response(200, content=payload, headers={"content-type": "application/zip"})
+
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.mineru_parser._transport_for_settings",
+        lambda _settings: httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None)
+
+    result = parse_with_mineru(pdf, settings, tmp_path / "parse")
+
+    assert result.engine == "mineru"
+    assert parse_calls == 2
 
 
 # --- ParsePipeline tests ---

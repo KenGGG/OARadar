@@ -35,5 +35,5 @@ oa = "oa_knowledge.cli:app"
 packages = ["src/oa_knowledge"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --cov=oa_knowledge --cov-report=term-missing"
 testpaths = ["tests"]

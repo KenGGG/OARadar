@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 import hashlib
 import html
@@ -13,6 +14,8 @@ import zipfile
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError, Page
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -71,9 +74,11 @@ class CollaborationDetailAdapter:
         self,
         list_page: Page,
         attachment_resolver: Callable[[str], tuple[bytes | None, str | None] | None] | None = None,
+        inventory_only: bool = False,
     ):
         self.list_page = list_page
         self.attachment_resolver = attachment_resolver
+        self.inventory_only = inventory_only
         self._capture_issues: list[dict[str, object]] = []
         self._last_download_failure: str | None = None
 
@@ -242,6 +247,7 @@ class CollaborationDetailAdapter:
             try:
                 html = frame.content()
             except Exception:
+                logger.debug("collector detail: skipping item after error", exc_info=True)
                 continue
             if not html.strip():
                 continue
@@ -395,6 +401,7 @@ class CollaborationDetailAdapter:
             try:
                 count = frame.locator("[comptype='assdoc'][attsdata]").count()
             except Exception:
+                logger.debug("collector detail: skipping item after error", exc_info=True)
                 continue
             for index in range(count):
                 try:
@@ -425,6 +432,7 @@ class CollaborationDetailAdapter:
                     })"""
                 )
             except Exception:
+                logger.debug("collector detail: failed to extract collaboration links", exc_info=True)
                 links = []
             try:
                 onclick_links = frame.locator("[onclick*='openFrom=glwd'], [onclick*='openfrom=glwd']").evaluate_all(
@@ -434,6 +442,7 @@ class CollaborationDetailAdapter:
                     }))"""
                 )
             except Exception:
+                logger.debug("collector detail: failed to extract onclick links", exc_info=True)
                 onclick_links = []
             for entry in onclick_links:
                 match = re.search(r"(['\"])(/[^'\"]*?/collaboration/collaboration\.do\?[^'\"]+)\1", html.unescape(str(entry.get("onclick") or "")), re.IGNORECASE)
@@ -477,6 +486,7 @@ class CollaborationDetailAdapter:
                     default_role,
                 )
             except Exception:
+                logger.debug("collector detail: skipping item after error", exc_info=True)
                 continue
             for descriptor in descriptors:
                 file_url = descriptor.get("file_url")
@@ -486,6 +496,13 @@ class CollaborationDetailAdapter:
                 seen.add(key)
                 filename = descriptor.get("filename") or f"attachment-{key}"
                 role = descriptor.get("role") or default_role
+                if self.inventory_only:
+                    files.append(DirectAttachment(
+                        attachment_key=key, filename=filename, file_url=file_url,
+                        size_bytes=None, mime_type=None, file_role=role,
+                        content=None, download_status="discovered",
+                    ))
+                    continue
                 reused = self.attachment_resolver(key) if self.attachment_resolver is not None else None
                 if reused is not None:
                     content, mime_type = reused
@@ -548,7 +565,7 @@ class CollaborationDetailAdapter:
                 ))
         cap4_files = self._download_cap4_widgets(page, default_role, seen, deadline, download_timeout_seconds)
         files.extend(cap4_files)
-        if not any(file.download_status == "downloaded" for file in cap4_files):
+        if not self.inventory_only and not any(file.download_status == "downloaded" for file in cap4_files):
             files.extend(self._download_cap4_batches(page, default_role, seen, deadline, download_timeout_seconds))
         return tuple(files)
 
@@ -584,6 +601,14 @@ class CollaborationDetailAdapter:
                     if key in seen:
                         continue
                     seen.add(key)
+                    role = "official_body" if "正文" in (descriptor.get("field") or "") else "official_attachment"
+                    if self.inventory_only:
+                        files.append(DirectAttachment(
+                            attachment_key=key, filename=filename, file_url=None,
+                            size_bytes=None, mime_type=None, file_role=role,
+                            content=None, download_status="discovered",
+                        ))
+                        continue
                     widget.hover(timeout=1000)
                     control = widget.locator(".cap4-attach__download").first
                     payload = self._browser_download_payload(
@@ -593,7 +618,6 @@ class CollaborationDetailAdapter:
                     )
                     if payload is None and Path(filename).suffix.lower() in {".htm", ".html"}:
                         payload = frame.content().encode("utf-8")
-                    role = "official_body" if "正文" in (descriptor.get("field") or "") else "official_attachment"
                     files.append(DirectAttachment(
                         attachment_key=key,
                         filename=filename,
@@ -636,6 +660,7 @@ class CollaborationDetailAdapter:
                         })).filter(item => item.href)"""
                     )
             except Exception:
+                logger.debug("collector detail: skipping item after error", exc_info=True)
                 continue
             for descriptor in descriptors:
                 href = descriptor.get("href") or ""

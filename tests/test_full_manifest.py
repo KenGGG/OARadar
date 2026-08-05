@@ -3,16 +3,24 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from oa_knowledge.collector.done import DiscoveredDoneItem, DoneDiscovery
+from oa_knowledge.collector.done import DiscoveredDoneItem, DoneAdapter, DoneDiscovery
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import OAManifestItem
+from oa_knowledge.db.models import OAItem, OAManifestItem
 from oa_knowledge.full_manifest import classify_manifest, export_manifest_csv, manifest_counts, synchronize_manifest
 from oa_knowledge.cli import _audit_opens_detail
 
 
 def _item(identifier: str, title: str, ordinal: int) -> DiscoveredDoneItem:
     return DiscoveredDoneItem(identifier, title, None, datetime(2026, 7, 19), "合成人", None, "协同", ordinal, 1)
+
+
+def test_done_grid_structured_rows_preserve_initiation_time_when_columns_are_hidden() -> None:
+    rows = [{"id": "42", "subject": "Synthetic", "createDate": "2022-04-22 09:30", "completeTime": "2026-07-01 10:00", "createMemberName": "Tester", "categoryLabel": "协同"}]
+    item = DoneAdapter._items_from_grid_rows(rows, 3, 40)[0]
+    assert item.created_at == datetime(2022, 4, 22, 9, 30)
+    assert item.completed_at == datetime(2026, 7, 1, 10, 0)
+    assert item.ordinal == 41
 
 
 def test_manifest_requires_exact_source_reconciliation_before_classification(tmp_path: Path) -> None:
@@ -27,6 +35,18 @@ def test_manifest_requires_exact_source_reconciliation_before_classification(tmp
             assert "manifest_incomplete" in str(exc)
         else:
             raise AssertionError("incomplete manifest must block classification")
+
+
+def test_manifest_refresh_propagates_initiation_time_to_existing_archive(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"; upgrade_database(db); engine = create_db_engine(db)
+    initiated = datetime(2022, 4, 22, 9, 0)
+    source = DiscoveredDoneItem("42", "Synthetic", initiated, datetime(2026, 7, 1), None, None, None, 1, 1)
+    with Session(engine) as session:
+        session.add(OAItem(oa_item_key="done:42", workitem_id_text="42", source_channel="done", title="Synthetic"))
+        session.commit()
+        synchronize_manifest(session, DoneDiscovery((source,), 1, 1, 1, 1, 1))
+        session.commit()
+        assert session.query(OAItem).one().initiated_at == initiated
 
 
 def test_manifest_classifies_skips_and_exports_every_row(tmp_path: Path) -> None:

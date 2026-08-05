@@ -259,6 +259,7 @@ def knowledge_detail(settings: Settings, document_id: int) -> dict:
 
 
 def system_view(settings: Settings) -> dict:
+    from oa_knowledge.markdown_export.service import markdown_status
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
@@ -299,6 +300,7 @@ def system_view(settings: Settings) -> dict:
                     "attachment_total": details.get("attachment_total", 0),
                     "failure_count": failures,
                 }
-            return {"web": {"status": "running", "url": f"http://{settings.web.host}:{settings.web.port}"}, "worker": worker_payload, "mineru": mineru, "sqlite": {"schema": schema, "integrity": integrity}, "counts": counts}
+            return {"web": {"status": "running", "url": f"http://{settings.web.host}:{settings.web.port}"}, "worker": worker_payload, "mineru": mineru, "sqlite": {"schema": schema, "integrity": integrity}, "counts": counts,
+                    "markdown": markdown_status(settings), "paths": {"archive": str(settings.archive_root), "markdown": str(settings.markdown_root)}}
     finally:
         engine.dispose()

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import ArchivedFile, ContentObject, OAItem, ParseArtifact, ParseJob
 from oa_knowledge.enrich.llm_client import LlmClient
+from oa_knowledge.enrich.provider import make_llm_client
 
 
 CATEGORIES = (
@@ -320,12 +321,9 @@ def run_item_first_trial(
     if clear and vault.exists():
         shutil.rmtree(vault)
     vault.mkdir(parents=True, exist_ok=True)
-    client = LlmClient(
-        base_url=settings.llm.base_url, api_key_env=settings.llm.api_key_env,
-        model=settings.llm.model, temperature=settings.llm.temperature,
+    client = make_llm_client(
+        settings.llm, max_retries=settings.llm.max_retries,
         max_tokens=min(settings.llm.max_tokens, 1200),
-        timeout_seconds=settings.llm.timeout_seconds,
-        max_retries=settings.llm.max_retries, provider_mode=settings.llm.provider_mode,
     )
     model_available = settings.llm.enabled and client.is_available()
     results: list[dict] = []
@@ -537,17 +535,12 @@ def run_attachment_first_trial(
         shutil.rmtree(vault)
     vault.mkdir(parents=True, exist_ok=True)
 
-    client = LlmClient(
-        base_url=settings.llm.base_url,
-        api_key_env=settings.llm.api_key_env,
-        model=settings.llm.model,
-        temperature=settings.llm.temperature,
+    client = make_llm_client(
+        settings.llm,
+        max_retries=settings.llm.max_retries,
         # qwen3.5 emits its internal reasoning separately before JSON content.
         # A small cap can consume the whole response before the final object.
         max_tokens=min(settings.llm.max_tokens, 1800),
-        timeout_seconds=settings.llm.timeout_seconds,
-        max_retries=settings.llm.max_retries,
-        provider_mode=settings.llm.provider_mode,
     )
     model_available = settings.llm.enabled and client.is_available()
     classify = classifier or classify_with_llm

@@ -265,6 +265,19 @@ class DoneAdapter:
 
     @staticmethod
     def _discover_frame(frame: Frame, limit: int, page_number: int, ordinal_offset: int) -> list[DiscoveredDoneItem]:
+        # The OA grid may hide every visible column through a persisted user
+        # preference while still retaining the complete response in p.datas.
+        # Read the structured rows first instead of relying on td positions.
+        grid_rows = frame.evaluate(
+            """() => {
+                const table = document.querySelector('#moreList');
+                if (!table || !window.jQuery) return [];
+                const data = window.jQuery(table).ajaxgrid()?.p?.datas;
+                return Array.isArray(data?.rows) ? data.rows : [];
+            }"""
+        )
+        if grid_rows:
+            return DoneAdapter._items_from_grid_rows(grid_rows[:limit], page_number, ordinal_offset)
         rows = frame.locator("input[name='workitemId']")
         items: list[DiscoveredDoneItem] = []
         for index in range(min(rows.count(), limit)):
@@ -287,6 +300,20 @@ class DoneAdapter:
                 )
             )
         return items
+
+    @staticmethod
+    def _items_from_grid_rows(rows: list[dict], page_number: int, ordinal_offset: int) -> list[DiscoveredDoneItem]:
+        return [DiscoveredDoneItem(
+            workitem_id_text=str(row.get("id") or ""),
+            title=str(row.get("subject") or ""),
+            created_at=_parse_time(str(row.get("createDate") or "")),
+            completed_at=_parse_time(str(row.get("completeTime") or "")),
+            sender=(str(row.get("createMemberName") or "").strip() or None),
+            deadline_text=(str(row.get("deadLine") or "").strip() or None),
+            category=(str(row.get("categoryLabel") or "").strip() or None),
+            ordinal=ordinal_offset + index + 1,
+            list_page=page_number,
+        ) for index, row in enumerate(rows)]
 
     @staticmethod
     def _list_stats(frame: Frame) -> tuple[int | None, int | None]:

@@ -1,9 +1,15 @@
+import shutil
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import sync_playwright
 
 from oa_knowledge.collector.pending import PendingAdapter
 
+pytestmark = pytest.mark.skipif(
+    shutil.which("google-chrome") is None,
+    reason="requires a local google-chrome binary",
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pending_list_synthetic.html"
 

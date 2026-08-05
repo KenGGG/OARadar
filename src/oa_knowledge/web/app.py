@@ -48,9 +48,12 @@ from oa_knowledge.web.status import (
     retry_manifest_failed_items,
     recheck_manifest_no_attachment,
     audit_all_manifest_items,
+    archive_date_status,
     resolve_review,
     start_archive_job,
     start_backfill_campaign,
+    start_archive_date_job,
+    set_archive_date_job_paused,
 )
 from oa_knowledge.web.lifecycle_views import (
     done_list as lifecycle_done_list,
@@ -61,6 +64,7 @@ from oa_knowledge.web.lifecycle_views import (
     processing_center as lifecycle_processing_center,
     system_view as lifecycle_system_view,
 )
+from oa_knowledge.online_audit import audit_view, pause_audit, resume_audit, start_audit
 
 
 class BulkPolicyRequest(BaseModel):
@@ -85,6 +89,10 @@ class BackfillStartRequest(BaseModel):
     time_budget_seconds: int = Field(default=1800, ge=60, le=1800)
 
 
+class AuthLoginRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=200)
+
+
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -99,19 +107,25 @@ SECURITY_HEADERS = {
 
 
 def create_web_app(settings: Settings, config_path: Path | None = None) -> FastAPI:
+    """Build the read-only OA management console.
+
+    Trust boundary: this app is only ever meant to be reached over a loopback
+    address (``WebConfig.loopback_only`` enforces ``127.0.0.1`` / ``::1`` /
+    ``localhost``) and ``local_security`` rejects any non-loopback ``Host`` header.
+    Because the console is served over plain HTTP on loopback by design, the
+    session/CSRF cookies intentionally keep ``secure=False`` — flipping them on
+    would stop browsers from ever sending the cookies over ``http://127.0.0.1``.
+    Operators who front the console with TLS should set ``secure=True`` /
+    ``https_only=True`` here. Defense-in-depth for multi-user hosts is provided by
+    the optional bootstrap-token gate (``web.require_auth``), below.
+    """
     if not settings.database_path.exists():
         raise RuntimeError("database not initialized; run 'oa init' first")
     secret = _load_or_create_session_secret(settings.data_root)
+    bootstrap_token = _load_or_create_bootstrap_token(settings.data_root)
     app = FastAPI(title="OA Knowledge Hub", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
-    app.add_middleware(
-        SessionMiddleware,
-        secret_key=secret,
-        session_cookie="oa_local_session",
-        same_site="strict",
-        https_only=False,
-        max_age=8 * 60 * 60,
-    )
+    app.state.bootstrap_token = bootstrap_token
 
     @app.middleware("http")
     async def local_security(request: Request, call_next):
@@ -121,6 +135,15 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
         origin = request.headers.get("origin")
         if origin and origin not in _allowed_origins(settings):
             return JSONResponse({"detail": "cross-origin request rejected"}, status_code=403)
+        # Optional bootstrap-token gate: when enabled, every /api/* call (except the
+        # two auth endpoints themselves) must carry the session established by
+        # POST /api/auth/login. The frontend root and static assets stay open so the
+        # login page can load.
+        if settings.web.require_auth and request.url.path.startswith("/api/") and request.url.path not in {
+            "/api/auth/login", "/api/auth/status",
+        }:
+            if not request.session.get("authenticated"):
+                return JSONResponse({"detail": "authentication required"}, status_code=401)
         if request.url.path.startswith("/api/") and request.method not in SAFE_METHODS:
             csrf_cookie = request.cookies.get("oa_csrf")
             csrf_header = request.headers.get("x-csrf-token")
@@ -141,6 +164,99 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return dashboard_status(settings)
         except (OSError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail="local status unavailable") from exc
+
+    @app.get("/api/auth/status")
+    def auth_status(request: Request) -> dict:
+        return {
+            "required": settings.web.require_auth,
+            "authenticated": bool(request.session.get("authenticated")),
+        }
+
+    @app.post("/api/auth/login", status_code=204)
+    def auth_login(request: Request, payload: AuthLoginRequest) -> None:
+        expected = app.state.bootstrap_token
+        # Constant-time comparison so a wrong token does not leak timing. The
+        # token is owner-only on disk (mode 0600); a browser can only obtain it by
+        # reading the launcher's terminal output once.
+        if not secrets.compare_digest(payload.token, expected):
+            raise HTTPException(status_code=401, detail="invalid bootstrap token")
+        request.session["authenticated"] = True
+
+    @app.get("/api/audits/online")
+    def get_online_audit(
+        item_page: int = Query(1, ge=1),
+        item_page_size: int = Query(50, ge=10, le=200),
+    ) -> dict:
+        return audit_view(settings, item_page=item_page, item_page_size=item_page_size)
+
+    @app.post("/api/audits/online", status_code=202)
+    def post_online_audit() -> dict:
+        return start_audit(settings)
+
+    @app.post("/api/audits/online/{run_id}/pause")
+    def post_online_audit_pause(run_id: int) -> dict:
+        try:
+            return pause_audit(settings, run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/audits/online/{run_id}/resume")
+    def post_online_audit_resume(run_id: int) -> dict:
+        try:
+            return resume_audit(settings, run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/audits/markdown/pause")
+    def post_markdown_pause() -> dict:
+        from oa_knowledge.markdown_queue import pause_queue
+        return pause_queue(settings)
+
+    @app.post("/api/audits/markdown/resume")
+    def post_markdown_resume() -> dict:
+        from oa_knowledge.markdown_queue import resume_queue
+        return resume_queue(settings)
+
+    @app.post("/api/audits/markdown/retry-failed")
+    def post_markdown_retry() -> dict:
+        from oa_knowledge.markdown_queue import retry_failed
+        return retry_failed(settings)
+
+    @app.post("/api/audits/pdf-mineru", status_code=202)
+    def post_pdf_mineru_start() -> dict:
+        from oa_knowledge.markdown_queue import start_pdf_mineru_campaign
+        return start_pdf_mineru_campaign(settings)
+
+    @app.post("/api/audits/pdf-mineru/pause")
+    def post_pdf_mineru_pause() -> dict:
+        from oa_knowledge.markdown_queue import set_pdf_mineru_paused
+        return set_pdf_mineru_paused(settings, True)
+
+    @app.post("/api/audits/pdf-mineru/resume")
+    def post_pdf_mineru_resume() -> dict:
+        from oa_knowledge.markdown_queue import set_pdf_mineru_paused
+        return set_pdf_mineru_paused(settings, False)
+
+    @app.post("/api/audits/pdf-mineru/retry-failed")
+    def post_pdf_mineru_retry() -> dict:
+        from oa_knowledge.markdown_queue import retry_pdf_mineru_failed
+        return retry_pdf_mineru_failed(settings)
+
+    @app.get("/api/audits/archive-dates")
+    def get_archive_dates() -> dict:
+        return archive_date_status(settings)
+
+    @app.post("/api/audits/archive-dates", status_code=202)
+    def post_archive_dates() -> dict:
+        return start_archive_date_job(settings)
+
+    @app.post("/api/audits/archive-dates/pause")
+    def post_archive_dates_pause() -> dict:
+        return set_archive_date_job_paused(settings, True)
+
+    @app.post("/api/audits/archive-dates/resume")
+    def post_archive_dates_resume() -> dict:
+        return set_archive_date_job_paused(settings, False)
 
     @app.get("/api/lifecycle/pending")
     def get_lifecycle_pending() -> dict:
@@ -523,6 +639,18 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             raise HTTPException(status_code=503, detail="Web frontend has not been built")
         return FileResponse(index)
 
+    # Registered last so it is the outermost middleware: it populates
+    # ``request.session`` (used by the auth gate in ``local_security``) before any
+    # downstream middleware or route handler runs.
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=secret,
+        session_cookie="oa_local_session",
+        same_site="strict",
+        https_only=False,
+        max_age=8 * 60 * 60,
+    )
+
     return app
 
 
@@ -543,5 +671,27 @@ def _load_or_create_session_secret(data_root: Path) -> str:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", encoding="ascii") as stream:
             stream.write(secrets.token_urlsafe(48))
+    os.chmod(path, 0o600)
+    return path.read_text(encoding="ascii").strip()
+
+
+def _load_or_create_bootstrap_token(data_root: Path) -> str:
+    """One-time provisioning credential printed to the launching user's terminal.
+
+    Any local process that can read this file (owner-only, mode 0600) may exchange
+    it for a session via ``POST /api/auth/login``. The web console is bound to a
+    loopback address (see ``WebConfig.loopback_only``) and rejects non-loopback
+    ``Host`` headers, so the token only matters for processes already on the same
+    host. Treat it like a Jupyter notebook token: shown once at startup, paste it
+    into the console login screen.
+    """
+    runtime = data_root / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    os.chmod(runtime, 0o700)
+    path = runtime / "web-bootstrap.token"
+    if not path.exists():
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(secrets.token_urlsafe(32))
     os.chmod(path, 0o600)
     return path.read_text(encoding="ascii").strip()

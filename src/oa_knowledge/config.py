@@ -10,7 +10,14 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-FORBIDDEN_KEYS = {"password", "cookie", "cookies", "authorization", "token", "secret"}
+# Keys whose presence in YAML means a plaintext credential is being stored inline.
+# Credentials must come from environment variables instead (see AGENTS.md). Exact
+# lower-cased match avoids substring false-positives (e.g. "bypass").
+FORBIDDEN_KEYS = {
+    "password", "pass", "pwd", "apikey", "api_key", "access_key", "secret_key",
+    "client_secret", "private_key", "credential", "credentials", "bearer",
+    "authorization", "token", "secret", "cookie", "cookies", "auth",
+}
 
 
 class StrictModel(BaseModel):
@@ -59,7 +66,7 @@ class CollectorConfig(StrictModel):
 
 class StorageConfig(StrictModel):
     sqlite_path: Path = Path("state/oa.db")
-    archive_dir: Path = Path("raw")
+    archive_dir: Path = Path("archive/raw/oa")
     journal_mode: str = "WAL"
     compute_sha256: bool = True
 
@@ -189,9 +196,49 @@ class ProcessingConfig(StrictModel):
     pause_on_backfill_degradation: bool = True
 
 
+class MarkdownExportConfig(StrictModel):
+    enabled: bool = True
+    workspace_root: Path = Path("workspace")
+    source_markdown_dir: Path = Path("raw/sources/oa")
+    preserve_source_tree: bool = True
+    filename_mode: str = "append_md"
+    write_frontmatter: bool = True
+    write_assets: bool = True
+    atomic_publish: bool = True
+    keep_last_success_on_failure: bool = True
+    generate_failure_stub: bool = True
+
+    @field_validator("source_markdown_dir")
+    @classmethod
+    def safe_source_dir(cls, value: Path) -> Path:
+        value = ensure_relative(value, "markdown_export.source_markdown_dir")
+        if value.parts and value.parts[0].casefold() == "wiki":
+            raise ValueError("Markdown sources must not target workspace/wiki")
+        return value
+
+    @field_validator("filename_mode")
+    @classmethod
+    def append_md_only(cls, value: str) -> str:
+        if value != "append_md":
+            raise ValueError("markdown_export.filename_mode must be append_md")
+        return value
+
+
+class ConversionConfig(StrictModel):
+    incremental: bool = True
+    workers: int = Field(default=1, ge=1, le=1)
+    force_rebuild: bool = False
+
+
+class OnlineAuditConfig(StrictModel):
+    item_timeout_seconds: int = Field(default=120, ge=30, le=600)
+    download_timeout_seconds: int = Field(default=30, ge=5, le=120)
+
+
 class WebConfig(StrictModel):
     host: str = "127.0.0.1"
     port: int = Field(default=2567, ge=1024, le=65535)
+    require_auth: bool = Field(default=False, description="Gate /api/* behind a one-time bootstrap token")
 
     @field_validator("host")
     @classmethod
@@ -212,12 +259,19 @@ class Settings(StrictModel):
     feishu: FeishuConfig = FeishuConfig()
     llm: LlmConfig = LlmConfig()
     processing: ProcessingConfig = ProcessingConfig()
+    markdown_export: MarkdownExportConfig = MarkdownExportConfig()
+    conversion: ConversionConfig = ConversionConfig()
+    online_audit: OnlineAuditConfig = OnlineAuditConfig()
     web: WebConfig = WebConfig()
 
     @model_validator(mode="after")
     def local_only(self) -> "Settings":
         if self.app.privacy_mode != "local_only":
             raise ValueError("privacy_mode must be local_only")
+        if self.markdown_root == self.archive_root.resolve():
+            raise ValueError("Markdown output must not target the raw archive")
+        if self.markdown_root == (self.workspace_root / "wiki").resolve():
+            raise ValueError("OARadar must not write workspace/wiki")
         return self
 
     @property
@@ -231,6 +285,15 @@ class Settings(StrictModel):
     @property
     def archive_root(self) -> Path:
         return self.data_root / self.storage.archive_dir
+
+    @property
+    def workspace_root(self) -> Path:
+        value = self.markdown_export.workspace_root.expanduser()
+        return value.resolve() if value.is_absolute() else (self.data_root / value).resolve()
+
+    @property
+    def markdown_root(self) -> Path:
+        return (self.workspace_root / self.markdown_export.source_markdown_dir).resolve()
 
 
 def ensure_relative(value: Path, field: str) -> Path:
@@ -270,4 +333,7 @@ def load_settings(path: Path | None = None) -> Settings:
     env_web_port = os.getenv("OA_WEB__PORT")
     if env_web_port:
         raw.setdefault("web", {})["port"] = env_web_port
+    env_web_require_auth = os.getenv("OA_WEB__REQUIRE_AUTH")
+    if env_web_require_auth:
+        raw.setdefault("web", {})["require_auth"] = env_web_require_auth.strip().lower() in {"1", "true", "yes", "on"}
     return Settings.model_validate(raw)
