@@ -62,6 +62,19 @@ web:
   host: 127.0.0.1
   port: 2567
 
+# Feishu (Lark) custom-bot notifications for Pending summaries. The webhook URL
+# and signing secret MUST come from environment variables (FEISHU_OA_WEBHOOK /
+# FEISHU_OA_SECRET) — never store them inline here. The repository's secret
+# guard (FORBIDDEN_KEYS) rejects plaintext credentials in YAML.
+feishu:
+  enabled: false
+  webhook_env: FEISHU_OA_WEBHOOK
+  secret_env: FEISHU_OA_SECRET
+  message_type: interactive
+  max_items_per_section: 10
+  redact_confidential: true
+  retry_attempts: 3
+
 mineru:
   enabled: false
   api_url: http://127.0.0.1:58000

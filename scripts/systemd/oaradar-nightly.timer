@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OARadar nightly full reconciliation
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 23:30:00
+AccuracySec=5min
+Persistent=false
+Unit=oaradar-nightly.service
+
+[Install]
+WantedBy=timers.target

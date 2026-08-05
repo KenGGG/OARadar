@@ -16,7 +16,7 @@ from oa_knowledge.config import Settings
 from oa_knowledge.archive import atomic_write_bytes
 from oa_knowledge.constants import BatchStatus, LEASE_TTL
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemSnapshot, OAItem, OAManifestItem, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, SourceAttachment
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, ItemSnapshot, NotificationDelivery, OAItem, OAManifestItem, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, SourceAttachment, SummaryVersion
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.ops.audit import audit_database
 from oa_knowledge.ops.capacity import capacity_report
@@ -271,6 +271,8 @@ class OperationWorker:
                 self._pipeline_pending_detail(task)
             elif task.stage == "pending_summary":
                 self._pipeline_pending_summary(task)
+            elif task.stage == "notify_feishu":
+                self._pipeline_notify_feishu(task)
             elif task.stage == "pending_parse":
                 self._pipeline_pending_parse(task)
             elif task.stage == "ollama_extract":
@@ -427,10 +429,124 @@ class OperationWorker:
     def _pipeline_pending_summary(self, task: PipelineTask) -> None:
         from oa_knowledge.pending_summary import summarize_pending
         summarize_pending(self.settings, self.engine, int(task.logical_item_key))
-        # Notification delivery is intentionally decoupled from the OA capture
-        # pipeline. A requested notification must not advance into an
-        # unsupported stage and turn a valid local summary into a failed task.
-        self.production_queue.complete(task.id, self.owner)
+        # Notification delivery is decoupled from the OA capture pipeline. The
+        # notify flag decides whether the summary advances into the delivery
+        # stage (notify=True) or is considered complete as-is (notify=False,
+        # e.g. the first-deploy baseline). A requested notification must never
+        # advance into an unsupported stage.
+        payload = json.loads(task.payload_json or "{}")
+        if payload.get("notify", True):
+            self.production_queue.advance(task.id, self.owner, "notify_feishu")
+        else:
+            self.production_queue.complete(task.id, self.owner)
+
+    def _pipeline_notify_feishu(self, task: PipelineTask) -> None:
+        from oa_knowledge.collector.pending import PendingAdapter
+        from oa_knowledge.digest.feishu import FeishuNotifier
+        from oa_knowledge.pending_summary import PendingSummary
+
+        logical_item_id = int(task.logical_item_key)
+        payload = json.loads(task.payload_json or "{}")
+
+        notifier = FeishuNotifier(
+            webhook_env=self.settings.feishu.webhook_env,
+            secret_env=self.settings.feishu.secret_env,
+            max_items_per_section=self.settings.feishu.max_items_per_section,
+            redact_confidential=self.settings.feishu.redact_confidential,
+            retry_attempts=self.settings.feishu.retry_attempts,
+        )
+        if not notifier.webhook_url:
+            # Feishu is not configured; keep the summary but skip delivery.
+            self.production_queue.complete(task.id, self.owner)
+            return
+
+        with Session(self.engine) as session:
+            version = session.scalar(
+                select(SummaryVersion).where(
+                    SummaryVersion.logical_item_id == logical_item_id,
+                    SummaryVersion.summary_kind == "pending",
+                    SummaryVersion.status == "current",
+                ).order_by(SummaryVersion.version.desc()).limit(1)
+            )
+            if version is None:
+                self.production_queue.fail(task.id, self.owner, "PENDING_SUMMARY_MISSING", "no current pending summary", recoverable=False)
+                return
+            summary = PendingSummary.model_validate_json(version.structured_json)
+
+            occurrence = None
+            occurrence_id = payload.get("occurrence_id")
+            if occurrence_id is not None:
+                occurrence = session.get(ItemOccurrence, int(occurrence_id))
+            if occurrence is None:
+                occurrence = session.scalar(select(ItemOccurrence).where(
+                    ItemOccurrence.logical_item_id == logical_item_id,
+                    ItemOccurrence.channel == "pending",
+                ).order_by(ItemOccurrence.id.desc()).limit(1))
+            title = (occurrence.title if occurrence else None) or summary.matter_type or f"待办 {logical_item_id}"
+            sender = occurrence.sender if occurrence else None
+            current_node = occurrence.current_node if occurrence else None
+            deadline_text = occurrence.deadline_text if occurrence else None
+            detail_url = occurrence.detail_url if (occurrence and occurrence.detail_url) else None
+            if not detail_url and occurrence and occurrence.affair_id_text:
+                detail_url = PendingAdapter.detail_url(self.settings.browser.base_url, occurrence.affair_id_text)
+
+            idem_key = f"feishu:pending:{logical_item_id}:{version.input_hash}"
+            existing = session.scalar(select(NotificationDelivery).where(
+                NotificationDelivery.idempotency_key == idem_key,
+            ))
+            if existing is not None and existing.status == "sent":
+                session.expunge(existing)
+                self.production_queue.complete(task.id, self.owner)
+                return
+            delivery = existing or NotificationDelivery(
+                logical_item_id=logical_item_id,
+                snapshot_id=version.snapshot_id,
+                channel="feishu",
+                notification_type="pending_summary",
+                idempotency_key=idem_key,
+                status="queued",
+            )
+            delivery.channel = "feishu"
+            delivery.notification_type = "pending_summary"
+            delivery.attempts = (delivery.attempts or 0) + 1
+            delivery.status = "sending"
+            session.add(delivery)
+            session.commit()
+
+        sent = notifier.send_pending_summary(
+            summary,
+            title=title,
+            sender=sender or "",
+            current_node=current_node or "",
+            deadline_text=deadline_text or "",
+            detail_url=detail_url or "",
+        )
+        with Session(self.engine) as session:
+            delivery = session.scalar(select(NotificationDelivery).where(
+                NotificationDelivery.idempotency_key == idem_key,
+            ))
+            if delivery is None:
+                delivery = NotificationDelivery(
+                    logical_item_id=logical_item_id,
+                    snapshot_id=version.snapshot_id,
+                    channel="feishu",
+                    notification_type="pending_summary",
+                    idempotency_key=idem_key,
+                )
+                session.add(delivery)
+            if sent:
+                delivery.status = "sent"
+                delivery.sent_at = datetime.now(timezone.utc)
+                delivery.error_code = None
+                delivery.last_error = None
+                session.commit()
+                self.production_queue.complete(task.id, self.owner)
+            else:
+                delivery.status = "failed"
+                delivery.error_code = "feishu_send_failed"
+                delivery.last_error = "feishu webhook delivery failed after retries"
+                session.commit()
+                self.production_queue.fail(task.id, self.owner, "FEISHU_SEND_FAILED", "feishu delivery failed", recoverable=True)
 
     def _pipeline_done_knowledge(self, task: PipelineTask) -> None:
         from oa_knowledge.done_knowledge import NoAttachmentEvidence, generate_done_knowledge

@@ -256,7 +256,7 @@ def persist_pending_capture(
         raise LookupError(f"pending occurrence not found: {occurrence_key}")
     snapshot = record_pending_snapshot(session, occurrence_key, _capture_payload(capture))
     item = _pending_item(session, occurrence)
-    base = PurePosixPath("raw", "pending", str(occurrence.logical_item_id), str(snapshot.id))
+    base = PurePosixPath("archive/raw/oa", "pending", str(occurrence.logical_item_id), str(snapshot.id))
     for index, row in enumerate(capture.body):
         _store_snapshot_file(session, item, data_root, base, row, "body_snapshot", index)
     for index, row in enumerate(capture.workflow):

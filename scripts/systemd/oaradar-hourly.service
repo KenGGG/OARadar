@@ -1,0 +1,11 @@
+[Unit]
+Description=OARadar hourly Pending and Done scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/OARadar
+EnvironmentFile=%h/.config/oaradar/env
+# flock prevents a new scan from starting before the previous one finishes.
+ExecStart=/usr/bin/flock -n %t/oaradar-hourly.lock %h/OARadar/scripts/hourly-sync.sh

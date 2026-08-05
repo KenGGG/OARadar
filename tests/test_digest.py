@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -9,6 +14,7 @@ import pytest
 from oa_knowledge.digest.feishu import FeishuNotifier
 from oa_knowledge.digest.tasks import TaskExtractor
 from oa_knowledge.enrich.extractor import ExtractedTask, extract_task_candidates
+from oa_knowledge.pending_summary import PendingSummary, Risk
 
 
 # --- Task extraction tests ---
@@ -120,18 +126,78 @@ def test_feishu_digest_sections() -> None:
 
 
 def test_feishu_signature_generation() -> None:
-    """Signature should be generated correctly when secret is set."""
-    notifier = FeishuNotifier(secret_env="__TEST_SIGN")
-    os_mock = __import__("os")
-    os_mock.environ["__TEST_SIGN"] = "my-secret-key"
+    """Signature must match Feishu's HMAC-SHA256 + Base64 algorithm."""
+    os.environ["__TEST_SIGN"] = "my-secret-key"
     try:
-        import os as real_os
-        real_os.environ["__TEST_SIGN"] = "my-secret-key"
-        notifier2 = FeishuNotifier(webhook_env="__TEST_SIGN_WEBHOOK", secret_env="__TEST_SIGN")
-        # Sign should produce valid HMAC
-        sig = notifier2._sign(1234567890)
-        assert isinstance(sig, str)
-        assert len(sig) > 0
+        notifier = FeishuNotifier(webhook_env="__TEST_SIGN_WEBHOOK", secret_env="__TEST_SIGN")
+        sig = notifier._sign(1234567890)
+        expected = base64.b64encode(hmac.new(
+            f"1234567890\nmy-secret-key".encode("utf-8"), msg=b"", digestmod=hashlib.sha256,
+        ).digest()).decode("utf-8")
+        assert sig == expected
+        # Empty secret yields an empty signature (no signing).
+        notifier_no_secret = FeishuNotifier(secret_env="__TEST_SIGN_MISSING")
+        assert notifier_no_secret._sign(1234567890) == ""
     finally:
-        if "__TEST_SIGN" in real_os.environ:
-            del real_os.environ["__TEST_SIGN"]
+        del os.environ["__TEST_SIGN"]
+
+
+def test_feishu_pending_summary_card_fields() -> None:
+    """Pending summary card carries only high-signal fields."""
+    notifier = FeishuNotifier(webhook_env="__NONEXISTENT", secret_env="__NONEXIST")
+    summary = PendingSummary(
+        summary="请审批预算", matter_type="报销", current_stage="审批中",
+        required_action="确认金额", risks=[Risk(risk="超期未批")], confidence=0.9,
+    )
+    msg = notifier._build_pending_summary_message(
+        summary, title="测试事项", sender="张三", current_node="部门审批",
+        deadline_text="2026-08-10", detail_url="https://oa.invalid/detail/1",
+    )
+    assert msg["msg_type"] == "interactive"
+    text = json.dumps(msg["card"]["elements"], ensure_ascii=False)
+    assert "测试事项" in text
+    assert "张三" in text
+    assert "请审批预算" in text
+    assert "确认金额" in text
+    assert "2026-08-10" in text
+    assert "超期未批" in text
+    assert "https://oa.invalid/detail/1" in text
+
+
+def test_feishu_send_pending_summary_posts_card(monkeypatch) -> None:
+    os.environ["__TEST_SUMMARY_WEBHOOK"] = "https://open.feishu.cn/open-apis/bot/v2/hook/x"
+    notifier = FeishuNotifier(webhook_env="__TEST_SUMMARY_WEBHOOK", secret_env="__NONEXIST")
+    captured = {}
+
+    def fake_post(message, *, timeout=30) -> None:
+        captured["message"] = message
+
+    monkeypatch.setattr(notifier, "_post", fake_post)
+    summary = PendingSummary(summary="s", confidence=0.9)
+    ok = notifier.send_pending_summary(
+        summary, title="t", sender="s", current_node="", deadline_text="", detail_url="",
+    )
+    assert ok is True
+    assert captured["message"]["msg_type"] == "interactive"
+
+
+def test_feishu_post_raises_on_nonzero_code(monkeypatch) -> None:
+    """A non-zero Feishu business code must raise RuntimeError."""
+    os.environ["__TEST_WEBHOOK_NZ"] = "https://open.feishu.cn/open-apis/bot/v2/hook/x"
+    notifier = FeishuNotifier(webhook_env="__TEST_WEBHOOK_NZ", secret_env="__NONEXIST")
+
+    import httpx
+
+    def handler(request):
+        return httpx.Response(200, json={"code": 19021, "msg": "sign match fail"})
+
+    real_client = httpx.Client
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", fake_client)
+    with pytest.raises(RuntimeError, match="Feishu rejected"):
+        notifier._post({"msg_type": "text", "content": {"text": "x"}})
+    del os.environ["__TEST_WEBHOOK_NZ"]

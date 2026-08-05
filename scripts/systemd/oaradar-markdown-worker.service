@@ -1,0 +1,14 @@
+[Unit]
+Description=OARadar Markdown conversion worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/OARadar
+ExecStart=%h/.local/bin/uv run oa markdown-worker --poll-seconds 2 --config config.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

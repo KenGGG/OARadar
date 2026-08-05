@@ -119,7 +119,8 @@ class ProductionQueue:
                 (PipelineTask.stage == "attachment_inventory", 0),
                 (PipelineTask.stage == "parse", 1),
                 (PipelineTask.stage == "ollama_extract", 2),
-                else_=3,
+                (PipelineTask.stage == "notify_feishu", 3),
+                else_=4,
             )
             row = session.scalar(select(PipelineTask).where(*conditions).order_by(
                 PipelineTask.priority, history_wave, history_stage, PipelineTask.created_at, PipelineTask.id,

@@ -17,7 +17,7 @@ from oa_knowledge.db.models import ArchivedFile, BatchItem, OAItem, ReviewEntry
 
 def done_archive_directory(title: str, workitem_id_text: str, initiated_at: datetime | None) -> PurePosixPath:
     period = f"{initiated_at:%Y/%m}" if initiated_at else "unknown"
-    return PurePosixPath("raw", "done", period, f"{safe_filename(title, 100)}_{workitem_id_text}")
+    return PurePosixPath("archive/raw/oa", "done", period, f"{safe_filename(title, 100)}_{workitem_id_text}")
 
 
 def archive_collaboration_detail(session: Session, item: BatchItem, capture: DetailCapture, data_root) -> ItemManifest:
@@ -156,6 +156,12 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
                 details_json=json.dumps(issue, ensure_ascii=False),
             ))
     session.flush()
+    # Newly archived Done items should join the Markdown conversion queue in the
+    # same transaction, so the knowledge base stays current without waiting for a
+    # later full online audit. Enqueueing is idempotent per verified attachment.
+    if item.archive_status == "archived":
+        from oa_knowledge.markdown_queue import enqueue_verified_for_oa
+        enqueue_verified_for_oa(session, item.oa_item_key)
     return manifest
 
 

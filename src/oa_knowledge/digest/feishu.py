@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import time
@@ -42,14 +41,21 @@ class FeishuNotifier:
                 raise ValueError(f"Feishu webhook must point to official domain, got: {self.webhook_url}")
 
     def _sign(self, timestamp: int) -> str:
-        """Generate Feishu webhook signature."""
+        """Generate Feishu webhook signature.
+
+        Feishu custom bots require HMAC-SHA256 over ``timestamp + "\\n" + secret``
+        with an empty message body, then Base64-encoded (not hex). See the Feishu
+        open-platform signing spec.
+        """
         if not self.secret:
             return ""
         string_to_sign = f"{timestamp}\n{self.secret}"
-        return hmac.new(
+        digest = hmac.new(
             string_to_sign.encode("utf-8"),
+            msg=b"",
             digestmod=hashlib.sha256,
-        ).hexdigest()
+        ).digest()
+        return base64.b64encode(digest).decode("utf-8")
 
     def _build_digest_message(self, date_str: str, stats: dict) -> dict:
         """Build an interactive card message for the daily digest."""
@@ -134,6 +140,108 @@ class FeishuNotifier:
             text = text.replace(pattern, pattern[0] + "*" * (len(pattern) - 1))
         return text
 
+    def _post(self, message: dict, *, timeout: float = 30) -> None:
+        """POST a message to the Feishu webhook, raising on rejection or transport error.
+
+        Raises ``httpx.RequestError`` / ``httpx.HTTPStatusError`` for transport problems
+        and ``RuntimeError`` when Feishu returns a non-zero business code.
+        """
+        timestamp = int(time.time())
+        sign = self._sign(timestamp)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                self.webhook_url,
+                json={"timestamp": timestamp, "sign": sign, **message},
+            )
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, dict) and result.get("code") not in (0, None):
+                raise RuntimeError(
+                    f"Feishu rejected message: {result.get('code')} {result.get('msg')}"
+                )
+
+    def _build_pending_summary_message(
+        self,
+        summary,
+        *,
+        title: str,
+        sender: str,
+        current_node: str,
+        deadline_text: str,
+        detail_url: str,
+    ) -> dict:
+        """Build an interactive card for a single Pending summary.
+
+        Only high-signal fields are sent: no full body or attachment content.
+        """
+
+        def md(text) -> str:
+            return self._redact(text) if isinstance(text, str) and text else ""
+
+        lines = [
+            f"**标题**：{md(title)}",
+            f"**发起人**：{md(sender)}",
+        ]
+        if current_node:
+            lines.append(f"**当前节点**：{md(current_node)}")
+        lines.append(f"**简要说明**：{md(summary.summary)}")
+        if summary.required_action:
+            lines.append(f"**需要处理**：{md(summary.required_action)}")
+        deadline = deadline_text or (summary.deadlines[0].date if summary.deadlines else "")
+        if deadline:
+            lines.append(f"**截止时间**：{md(deadline)}")
+        risks = "\n".join(f"- {md(r.risk)}" for r in summary.risks if r.risk)
+        if risks:
+            lines.append(f"**主要风险**：\n{risks}")
+        content = "\n".join(lines)
+        elements = [{"tag": "div", "text": {"content_type": "markdown", "content": content}}]
+        if detail_url:
+            elements.append({
+                "tag": "div",
+                "text": {"content_type": "markdown", "content": f"[查看 OA 详情]({detail_url})"},
+            })
+        header_title = md(title)[:20] or "待办摘要"
+        return {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"待办摘要｜{header_title}"},
+                    "template": "blue",
+                },
+                "elements": elements,
+            },
+        }
+
+    def send_pending_summary(
+        self,
+        summary,
+        *,
+        title: str,
+        sender: str,
+        current_node: str,
+        deadline_text: str,
+        detail_url: str,
+    ) -> bool:
+        """Send one Pending item's summary as a Feishu card. Returns True if delivered."""
+        if not self.webhook_url:
+            logger.info("Feishu webhook not configured; skipping pending summary")
+            return False
+
+        message = self._build_pending_summary_message(
+            summary, title=title, sender=sender,
+            current_node=current_node, deadline_text=deadline_text, detail_url=detail_url,
+        )
+        for attempt in range(self.retry_attempts):
+            try:
+                self._post(message, timeout=30)
+                return True
+            except (httpx.RequestError, httpx.HTTPStatusError, RuntimeError) as exc:
+                logger.warning("Feishu pending summary attempt %d failed: %s", attempt + 1, exc)
+                if attempt < self.retry_attempts - 1:
+                    time.sleep(2 ** attempt)
+        logger.error("Feishu pending summary failed after %d attempts", self.retry_attempts)
+        return False
+
     def send_digest(self, date_str: str, stats: dict) -> bool:
         """Send the daily digest to Feishu. Returns True if sent successfully."""
         if not self.webhook_url:
@@ -141,23 +249,14 @@ class FeishuNotifier:
             return False
 
         message = self._build_digest_message(date_str, stats)
-        payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
-
-        timestamp = int(time.time())
-        sign = self._sign(timestamp)
 
         for attempt in range(self.retry_attempts):
             try:
-                with httpx.Client(timeout=30) as client:
-                    response = client.post(
-                        self.webhook_url,
-                        json={"timestamp": timestamp, "sign": sign, **message},
-                    )
-                    response.raise_for_status()
-                    logger.info("Feishu digest sent successfully: %s", date_str)
-                    return True
-            except httpx.RequestError as exc:
-                logger.warning("Feishu send attempt %d failed: %s", attempt + 1, exc)
+                self._post(message, timeout=30)
+                logger.info("Feishu digest sent successfully: %s", date_str)
+                return True
+            except (httpx.RequestError, httpx.HTTPStatusError, RuntimeError) as exc:
+                logger.warning("Feishu digest attempt %d failed: %s", attempt + 1, exc)
                 if attempt < self.retry_attempts - 1:
                     time.sleep(2 ** attempt)
 
@@ -174,17 +273,9 @@ class FeishuNotifier:
             "content": {"text": f"⚠️ OA 系统告警｜{alert_type}\n{message}"},
         }
 
-        timestamp = int(time.time())
-        sign = self._sign(timestamp)
-
         try:
-            with httpx.Client(timeout=10) as client:
-                response = client.post(
-                    self.webhook_url,
-                    json={"timestamp": timestamp, "sign": sign, **payload},
-                )
-                response.raise_for_status()
-                return True
-        except Exception as exc:
+            self._post(payload, timeout=10)
+            return True
+        except (httpx.RequestError, httpx.HTTPStatusError, RuntimeError) as exc:
             logger.error("Feishu alert failed: %s", exc)
             return False

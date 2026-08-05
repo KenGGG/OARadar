@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import load_settings
@@ -247,7 +248,7 @@ def test_history_without_attachment_evidence_completes_without_llm_failure(confi
         assert row.error_code is None
 
 
-def test_pending_summary_with_notification_requested_never_enters_unsupported_stage(config_file: Path, monkeypatch) -> None:
+def test_pending_summary_with_notification_requested_advances_to_notify_stage(config_file: Path, monkeypatch) -> None:
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
@@ -267,6 +268,126 @@ def test_pending_summary_with_notification_requested_never_enters_unsupported_st
 
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
+        # notify=True advances into the delivery stage rather than completing.
+        assert row.status == "queued"
+        assert row.stage == "notify_feishu"
+        assert row.error_code is None
+
+
+def test_pending_summary_without_notification_completes(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", "1", "pending_summary", "pending-summary-no-notify",
+        payload={"notify": False},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr("oa_knowledge.pending_summary.summarize_pending", lambda *_args, **_kwargs: object())
+    try:
+        worker._pipeline_pending_summary(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
         assert row.status == "completed"
         assert row.stage == "pending_summary"
         assert row.error_code is None
+
+
+def test_notify_feishu_skips_when_webhook_unconfigured(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", "1", "notify_feishu", "notify-feishu-skip",
+        payload={"occurrence_id": -1, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    sent = []
+    monkeypatch.setattr(
+        "oa_knowledge.digest.feishu.FeishuNotifier.send_pending_summary",
+        lambda self, *args, **kwargs: sent.append(True) or True,
+    )
+    try:
+        worker._pipeline_notify_feishu(task)
+    finally:
+        worker.close()
+
+    # No webhook configured -> no delivery attempted, task completes.
+    assert sent == []
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "completed"
+
+
+def test_notify_feishu_delivers_and_records_delivery(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    from oa_knowledge.db.models import (
+        ItemOccurrence,
+        ItemSnapshot,
+        LogicalItem,
+        NotificationDelivery,
+        SummaryJob,
+        SummaryVersion,
+    )
+
+    monkeypatch.setenv("FEISHU_OA_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/x")
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="pending:1", title="待办事项")
+        session.add(logical); session.flush()
+        occurrence = ItemOccurrence(
+            logical_item_id=logical.id, channel="pending", occurrence_key="pending:1",
+            affair_id_text="123", title="待办事项", sender="张三", current_node="审批中", deadline_text="2026-08-10",
+        )
+        session.add(occurrence); session.flush()
+        snapshot = ItemSnapshot(logical_item_id=logical.id, snapshot_kind="pending_initial", version=1,
+                                content_hash="0" * 64, payload_json="{}")
+        session.add(snapshot); session.flush()
+        job = SummaryJob(logical_item_id=logical.id, snapshot_id=snapshot.id, summary_kind="pending",
+                         stage="item_summary", status="completed", idempotency_key="idem-1", max_attempts=3)
+        session.add(job); session.flush()
+        version = SummaryVersion(logical_item_id=logical.id, summary_job_id=job.id, snapshot_id=snapshot.id, summary_kind="pending",
+                                 version=1, status="current", input_hash="abc123",
+                                 structured_json='{"summary":"请审批","matter_type":"报销","current_stage":"审批中","required_action":"确认","risks":[],"deadlines":[],"key_points":[],"amounts":[],"attachment_overview":[],"confidence":0.9}',
+                                 provider_name="test", model_name="test", prompt_version="pending-v1")
+        session.add(version); session.commit()
+        logical_id = logical.id
+        occurrence_id = occurrence.id
+
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", str(logical_id), "notify_feishu", "notify-feishu-deliver",
+        payload={"occurrence_id": occurrence_id, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    sent = []
+    monkeypatch.setattr(
+        "oa_knowledge.digest.feishu.FeishuNotifier.send_pending_summary",
+        lambda self, *args, **kwargs: sent.append(kwargs) or True,
+    )
+    try:
+        worker._pipeline_notify_feishu(task)
+    finally:
+        worker.close()
+
+    assert len(sent) == 1
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "completed"
+        delivery = session.scalar(select(NotificationDelivery).where(
+            NotificationDelivery.idempotency_key == f"feishu:pending:{logical_id}:abc123"))
+        assert delivery is not None
+        assert delivery.status == "sent"
+        assert delivery.sent_at is not None

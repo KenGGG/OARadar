@@ -24,6 +24,7 @@ from oa_knowledge.backfill import BackfillWindow, next_month_remainder, shrink_l
 from oa_knowledge.collector import BrowserSession, CollaborationDetailAdapter, DoneAdapter, LoginState
 from oa_knowledge.collector.detail import AuthRequiredError
 from oa_knowledge.constants import BatchStatus, LEASE_TTL
+from oa_knowledge.archive_reconciliation import migrate_archive_paths
 from oa_knowledge.detail_archive import archive_collaboration_detail
 from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.archive.naming import validate_relative_path
@@ -51,12 +52,14 @@ backfill_app = typer.Typer(help="Stage 2A-7 gated historical backfill")
 parse_app = typer.Typer(help="Stage 3 document parsing pipeline")
 manifest_app = typer.Typer(help="Canonical full Done-list synchronization and selective download")
 pending_app = typer.Typer(help="Read-only Pending-list discovery")
+archive_app = typer.Typer(help="Local archive path reconciliation and migration")
 app.add_typer(db_app, name="db")
 app.add_typer(batch_app, name="batch")
 app.add_typer(backfill_app, name="backfill")
 app.add_typer(parse_app, name="parse")
 app.add_typer(manifest_app, name="manifest")
 app.add_typer(pending_app, name="pending")
+app.add_typer(archive_app, name="archive")
 
 
 def settings_option(config: Path | None) -> Settings:
@@ -1847,6 +1850,31 @@ def wiki_lint(
 
     if errors:
         raise typer.Exit(1)
+
+
+@archive_app.command("migrate-paths")
+def migrate_paths(
+    dry_run: bool = typer.Option(True, "--dry-run/--yes", help="Preview changes (default) or apply them"),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Unify legacy ``raw/done`` and ``raw/pending`` archives under ``archive/raw/oa``.
+
+    Defaults to a dry run. Pass ``--yes`` to apply. STOP the OA worker and
+    markdown-worker and BACK UP ``oa.db`` first — this moves directories on disk
+    and rewrites stored relative paths. The operation is idempotent: items
+    already under the unified prefix are skipped.
+    """
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            counts = migrate_archive_paths(session, settings, dry_run=dry_run)
+    finally:
+        engine.dispose()
+    typer.echo(json.dumps(counts, ensure_ascii=False))
+    if dry_run and counts["migrated"]:
+        typer.echo("Above items would be migrated. Re-run with --yes after backing up the database.", err=True)
 
 
 if __name__ == "__main__":

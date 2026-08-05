@@ -29,7 +29,7 @@ def test_reconcile_item_moves_raw_tree_and_updates_database(config_file: Path) -
         session.commit()
 
     assert result.status == "migrated"
-    target = Path("raw/done/2022/04/Synthetic_42")
+    target = Path("archive/raw/oa/done/2022/04/Synthetic_42")
     assert (settings.data_root / target / "attachments/source.pdf").is_file()
     assert not (settings.data_root / old).exists()
     with Session(engine) as session:
@@ -48,4 +48,4 @@ def test_reconcile_item_places_missing_date_under_unknown(config_file: Path) -> 
         session.add(item); session.commit(); item_id=item.id
     with Session(engine) as session:
         result = reconcile_item(session, settings, item_id); session.commit()
-    assert result.new_relpath == "raw/done/unknown/Unknown_9"
+    assert result.new_relpath == "archive/raw/oa/done/unknown/Unknown_9"
