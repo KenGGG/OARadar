@@ -152,6 +152,22 @@ class DoneAdapter:
             page_delay_seconds=page_delay_seconds,
         )
 
+    def discover_page(self, page_number: int, page_delay_seconds: float = 0) -> "DoneDiscovery":
+        """Read a single Done-list page by navigating from page 1.
+
+        Used by the scheduled known-boundary scan (plan-0805-02 §2.3) which must
+        walk pages one at a time and stop early when a stable boundary of known,
+        unchanged items is reached.
+        """
+        frame = self.open_list()
+        total_count, total_pages = self._list_stats(frame)
+        for _ in range(max(0, page_number - 1)):
+            if not self._next_page(frame, page_delay_seconds):
+                break
+        rows = self._discover_frame(frame, 10_000, page_number, 0)
+        last_page = bool(total_pages and page_number >= total_pages)
+        return DoneDiscovery(tuple(rows), 1, len(rows), len(rows), total_count, total_pages, is_last_page=last_page)
+
     def apply_deal_time_filter(self, frame: Frame, start: datetime, end_exclusive: datetime) -> None:
         if end_exclusive <= start:
             raise ValueError("deal time end must be after start")
@@ -366,6 +382,7 @@ class DoneDiscovery:
     scanned_row_count: int
     source_total_count: int | None
     source_total_pages: int | None
+    is_last_page: bool = False
 
 
 def _parse_time(value: str) -> datetime | None:

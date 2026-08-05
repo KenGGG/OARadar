@@ -17,24 +17,16 @@ cd "$PROJECT_ROOT" || exit 1
 
 CONFIG="${OA_CONFIG:-config.yaml}"
 
-pending_status=0
-done_status=0
-
-# Scan all current Pending items. Only new or changed matters enqueue work.
-uv run oa pending discover \
-  --limit 500 \
-  --max-pages 50 \
+# The orchestration lives in Python (oa schedule hourly): it takes a full
+# Pending snapshot, notifies new/changed items once, and walks the Done list
+# with a known-boundary algorithm instead of a fixed page count. Every run is
+# recorded in the runs table.
+hourly_status=0
+uv run oa schedule hourly \
   --config "$CONFIG" \
-  || pending_status=$?
+  || hourly_status=$?
 
-# Scan the latest three Done-list pages and create archive-download tasks for
-# any newly discovered items.
-uv run oa manifest refresh-head \
-  --max-pages 3 \
-  --config "$CONFIG" \
-  || done_status=$?
-
-if (( pending_status != 0 || done_status != 0 )); then
-  echo "OARadar hourly scan failed: pending=$pending_status done=$done_status" >&2
+if (( hourly_status != 0 )); then
+  echo "OARadar hourly scan failed: hourly=$hourly_status" >&2
   exit 1
 fi

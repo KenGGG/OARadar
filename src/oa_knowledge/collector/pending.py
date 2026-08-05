@@ -85,6 +85,38 @@ class PendingAdapter:
                 break
         return PendingDiscovery(tuple(accepted), pages, len(accepted), scanned, total_count, total_pages)
 
+    def discover_all_pages(self, page_delay_seconds: float = 0) -> PendingDiscovery:
+        """Read the complete Pending list and deduplicate by ``affair_id``.
+
+        Unlike ``discover_pages`` there is no ``limit`` cutoff: every page up to
+        OA's reported total is scanned so the caller can treat the result as a
+        full snapshot and safely close locally-missing items. ``pages_scanned``
+        reflects pages actually read; the caller compares it against
+        ``source_total_pages`` to decide whether the snapshot is complete
+        (plan-0805-02 §2.2).
+        """
+        frame = self.open_list()
+        total_count, total_pages = self._list_stats(frame)
+        accepted: list[DiscoveredPendingItem] = []
+        seen: set[str] = set()
+        scanned = 0
+        pages = 0
+        upper = total_pages or 1
+        for page_number in range(1, upper + 1):
+            rows = self._discover_frame(frame, 10_000, page_number, scanned)
+            pages += 1
+            scanned += len(rows)
+            for item in rows:
+                if item.affair_id_text in seen:
+                    continue
+                seen.add(item.affair_id_text)
+                accepted.append(item)
+            if total_pages and page_number >= total_pages:
+                break
+            if not self._next_page(frame, page_delay_seconds):
+                break
+        return PendingDiscovery(tuple(accepted), pages, len(accepted), scanned, total_count, total_pages)
+
     @staticmethod
     def detail_url(base_url: str, affair_id_text: str) -> str:
         query = urlencode({
