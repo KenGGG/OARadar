@@ -1,64 +1,78 @@
 # OARadar systemd 用户服务
 
-这些 unit 让用户级 systemd (`systemctl --user`) 在登录会话中运行 OARadar 的
-常驻 worker 与定时扫描。路径中的 `%h` 会被展开为对应用户的家目录根。
+这些 unit 让 `systemctl --user` 在登录会话中运行 OARadar 的常驻 worker 与
+定时扫描。模板文件位于 `scripts/systemd/templates/`，里面用占位符
+（`{{PROJECT_ROOT}}`、`{{UV_BIN}}`、`{{CONFIG_PATH}}`、`{{ENV_FILE}}`、
+`{{TIMEZONE}}`）表示机器相关路径；安装脚本会把它们替换为本机的绝对路径，
+因此仓库里的模板不再写死某一台机器的路径（plan-0805-02 §5）。
 
 ## 安装
 
-将 unit 文件软链（或复制）到用户 systemd 目录：
-
 ```bash
-mkdir -p ~/.config/systemd/user
-ln -s "$PWD"/oaradar-*.service ~/.config/systemd/user/
-ln -s "$PWD"/oaradar-*.timer   ~/.config/systemd/user/
+./scripts/install-systemd-user.sh \
+  --project-root "$PWD" \
+  --config "$PWD/config.yaml" \
+  --timezone Asia/Shanghai
 ```
 
-> 注意：unit 文件中 `WorkingDirectory=%h/OARadar` 与 `ExecStart` 里的
-> `%h/.local/bin/uv` 是占位路径，请按你的实际仓库位置与 `uv` 安装路径修改。
+脚本会自动检测：**项目绝对路径、uv 绝对路径、Python 环境、config.yaml、
+data_root、systemd 用户目录、环境变量文件**，并据此渲染 6 个 unit 文件到
+`~/.config/systemd/user/`，然后 `daemon-reload` 并启用/启动：
 
-## 环境变量
+- `oaradar-worker.service`        —— OA 操作 worker（常驻）
+- `oaradar-markdown-worker.service` —— Markdown 转换 worker（常驻）
+- `oaradar-hourly.service` / `.timer` —— 工作时段每小时扫描
+- `oaradar-nightly.service` / `.timer` —— 工作日晚间全量核对
 
-飞书 webhook/secret 等敏感值通过 env 文件注入，不要写进 YAML：
+环境变量文件 `~/.config/oaradar/env`（chmod 600）用于注入飞书 webhook/secret
+等敏感值，**不要写进 YAML**。若不存在，安装脚本会创建一个空文件，请手动填写。
+
+## 调度时间
+
+使用广州业务时区 `Asia/Shanghai`，通过 `OnCalendar=TZ=Asia/Shanghai ...` 固定，
+不受宿主机时区影响：
+
+- 每小时：周一至周五 `09:05 / 10:05 / … / 17:05`
+- 夜间：周一至周五 `23:30`
+
+安装脚本会用 `systemd-analyze calendar` 打印最终触发时间。
+
+## 安全要求
+
+service 单元包含：`Restart=always`、`RestartSec=5`、`NoNewPrivileges=true`、
+`PrivateTmp=true`、`UMask=0077`。未加入会阻止 Chrome / Playwright / GPU /
+Unix socket / 本地文件访问的过度沙箱。
+
+## 防重复运行
+
+定时扫描同时依赖三层防护，任一层检测到已有任务都会正常退出、不视为故障：
+
+1. systemd 单实例 service；
+2. `flock`（`%t/oaradar-*.lock`）；
+3. Python 侧 `ResourceLease`（浏览器/数据库租约）。
+
+## 健康检查
 
 ```bash
-mkdir -p ~/.config/oaradar && chmod 700 ~/.config/oaradar
-cat > ~/.config/oaradar/env <<'EOF'
-FEISHU_OA_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/替换为真实值
-FEISHU_OA_SECRET=替换为真实签名密钥
-EOF
-chmod 600 ~/.config/oaradar/env
+./scripts/healthcheck.sh            # 使用当前目录 config.yaml
+OA_CONFIG=/path/config.yaml ./scripts/healthcheck.sh
 ```
 
-## 启用
+检查项：worker / markdown-worker 是否 active、timer 是否已安排下次运行、
+最近一次 hourly / nightly Run 是否成功、数据库是否可读、OA 登录是否过期
+（由最近一次成功 hourly 的时间推断）、Markdown 队列是否积压、飞书是否配置、
+磁盘剩余空间。FAIL 时退出码非 0，WARN 仅为提示。
+
+## 卸载
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now \
-  oaradar-worker.service \
-  oaradar-markdown-worker.service \
-  oaradar-hourly.timer \
-  oaradar-nightly.timer
+./scripts/uninstall-systemd-user.sh
 ```
 
-## 巡检
-
-```bash
-systemctl --user status oaradar-worker.service oaradar-markdown-worker.service
-systemctl --user list-timers 'oaradar-*'
-```
+仅禁用并删除生成的 unit；`~/.config/oaradar/env` 中的密钥不会被删除。
 
 ## 登出后继续运行
-
-若希望服务器登出后 worker 仍运行：
 
 ```bash
 sudo loginctl enable-linger "$USER"
 ```
-
-## 调度说明
-
-- `oaradar-hourly`：工作日上午 09:05 至 17:05 每小时触发
-  `scripts/hourly-sync.sh`（Pending discover + Done refresh-head），用 `flock`
-  防止上一次未结束时重复启动。
-- `oaradar-nightly`：工作日晚 23:30 跑一次 `oa manifest sync` 全量核对，
-  弥补每小时只扫最新三页可能遗漏的异常变化。

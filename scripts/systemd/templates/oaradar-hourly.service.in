@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/OARadar
-EnvironmentFile=%h/.config/oaradar/env
+WorkingDirectory={{PROJECT_ROOT}}
+EnvironmentFile={{ENV_FILE}}
+Environment=OA_CONFIG={{CONFIG_PATH}}
 # flock prevents a new scan from starting before the previous one finishes.
-ExecStart=/usr/bin/flock -n %t/oaradar-hourly.lock %h/OARadar/scripts/hourly-sync.sh
+ExecStart=/usr/bin/flock -n %t/oaradar-hourly.lock {{PROJECT_ROOT}}/scripts/hourly-sync.sh

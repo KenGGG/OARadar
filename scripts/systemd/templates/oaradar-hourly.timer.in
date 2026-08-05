@@ -3,7 +3,9 @@ Description=Run OARadar hourly scan during working hours
 
 [Timer]
 # Workdays 09:05 .. 17:05, on the :05 minute to avoid the top-of-hour rush.
-OnCalendar=Mon..Fri *-*-* 09..17:05:00
+# Timezone is pinned so the trigger follows the Guangzhou business calendar
+# regardless of the host's local timezone.
+OnCalendar=TZ={{TIMEZONE}} Mon..Fri *-*-* 09..17:05:00
 AccuracySec=1min
 Persistent=false
 Unit=oaradar-hourly.service

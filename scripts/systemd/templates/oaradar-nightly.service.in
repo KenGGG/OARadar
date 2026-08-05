@@ -1,0 +1,11 @@
+[Unit]
+Description=OARadar nightly full Done-list reconciliation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={{PROJECT_ROOT}}
+EnvironmentFile={{ENV_FILE}}
+# flock + the Python ResourceLease both guard against overlapping nightly runs.
+ExecStart=/usr/bin/flock -n %t/oaradar-nightly.lock {{UV_BIN}} run oa schedule nightly --config {{CONFIG_PATH}}
