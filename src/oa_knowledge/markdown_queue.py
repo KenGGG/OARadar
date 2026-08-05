@@ -24,6 +24,72 @@ def enqueue_verified_for_oa(session: Session, oa_item_key: str) -> int:
     ids = session.scalars(select(ArchivedFile.id).join(OAItem).where(OAItem.oa_item_key == oa_item_key, ArchivedFile.file_role.in_(ATTACHMENT_ROLES), ArchivedFile.download_status == "verified", ArchivedFile.local_relpath.is_not(None))).all()
     return sum(enqueue_file(session, file_id) for file_id in ids)
 
+
+def enqueue_missing_markdown_tasks(engine) -> int:
+    """Backfill MarkdownTask rows for every verified source file that lacks one.
+
+    Used by the nightly run (plan-0805-02 §4.2) to repair the archive→Markdown
+    handoff for items archived before the automatic enqueue existed, or where
+    the enqueue was interrupted. ``enqueue_file`` is idempotent: files with a
+    successful/unsupported export or an existing task are skipped, so already
+    converted files are never re-queued.
+    """
+    with Session(engine) as session:
+        file_ids = session.scalars(select(ArchivedFile.id).where(
+            ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+            ArchivedFile.download_status == "verified",
+            ArchivedFile.local_relpath.is_not(None),
+        )).all()
+        queued = 0
+        for file_id in file_ids:
+            if enqueue_file(session, file_id):
+                queued += 1
+        session.commit()
+        return queued
+
+
+def audit_handoff(engine, settings: Settings) -> dict:
+    """Report the health of the archive→Markdown handoff (plan-0805-02 §4.4).
+
+    Counts verified source files, Markdown task coverage, successful exports,
+    pending/failed tasks, orphan exports (no backing ArchivedFile), and
+    references whose on-disk file is missing.
+    """
+    with Session(engine) as session:
+        files = session.scalars(select(ArchivedFile).where(
+            ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+            ArchivedFile.download_status == "verified",
+            ArchivedFile.local_relpath.is_not(None),
+        )).all()
+        verified_source_files = len(files)
+        all_file_ids = {row[0] for row in session.execute(select(ArchivedFile.id)).all()}
+        tasks = session.scalars(select(MarkdownTask)).all()
+        markdown_tasks = len(tasks)
+        markdown_success = session.scalar(
+            select(func.count()).select_from(MarkdownExport).where(MarkdownExport.status == "success")
+        ) or 0
+        pending = sum(1 for t in tasks if t.status in ("queued", "running"))
+        failed = sum(1 for t in tasks if t.status == "failed")
+        exports = session.scalars(select(MarkdownExport)).all()
+        orphan_exports = sum(1 for e in exports if e.source_file_id is None or e.source_file_id not in all_file_ids)
+        missing_paths = 0
+        for t in tasks:
+            f = session.get(ArchivedFile, t.source_file_id) if t.source_file_id is not None else None
+            if f is None or not f.local_relpath or not (settings.data_root / f.local_relpath).exists():
+                missing_paths += 1
+        for e in exports:
+            if not e.source_relpath or not (settings.archive_root / e.source_relpath).exists():
+                missing_paths += 1
+    return {
+        "verified_source_files": verified_source_files,
+        "markdown_tasks": markdown_tasks,
+        "markdown_success": markdown_success,
+        "pending": pending,
+        "failed": failed,
+        "orphan_exports": orphan_exports,
+        "missing_paths": missing_paths,
+    }
+
 def exclude_non_attachment_tasks(settings: Settings) -> dict:
     engine=create_db_engine(settings.database_path)
     try:

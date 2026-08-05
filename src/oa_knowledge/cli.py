@@ -73,6 +73,8 @@ schedule_app = typer.Typer(help="Durable scheduled Pending/Done sync orchestrati
 app.add_typer(schedule_app, name="schedule")
 notifications_app = typer.Typer(help="Feishu delivery lifecycle and operational controls")
 app.add_typer(notifications_app, name="notifications")
+knowledge_app = typer.Typer(help="Done-archive to Markdown knowledge handoff")
+app.add_typer(knowledge_app, name="knowledge")
 
 
 def settings_option(config: Path | None) -> Settings:
@@ -2091,11 +2093,14 @@ def schedule_nightly(
                 for row in pending:
                     created, _ = enqueue_realtime_done(engine, row.oa_item_key, manifest_id=row.id)
                     enqueued += int(created)
+                from oa_knowledge.markdown_queue import enqueue_missing_markdown_tasks
+                markdown_enqueued = enqueue_missing_markdown_tasks(engine)
                 done_summary = {
                     "source_total": discovery.source_total_count,
                     "pages_scanned": discovery.pages_scanned,
                     "new_items": len(pending),
                     "download_jobs_enqueued": enqueued,
+                    "markdown_tasks_enqueued": markdown_enqueued,
                     "manifest_sync_id": sync.id,
                 }
                 run = session.get(Run, run_id)
@@ -2218,5 +2223,21 @@ def notifications_retry(
         }, ensure_ascii=False))
         if result.status != "sent":
             raise typer.Exit(1)
+    finally:
+        engine.dispose()
+
+
+@knowledge_app.command("audit-handoff")
+def knowledge_audit_handoff(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Audit the Done-archive → Markdown knowledge handoff (plan-0805-02 §4.4)."""
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        from oa_knowledge.markdown_queue import audit_handoff
+        report = audit_handoff(engine, settings)
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
     finally:
         engine.dispose()
