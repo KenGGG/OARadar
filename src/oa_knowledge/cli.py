@@ -1894,8 +1894,6 @@ def migrate_paths(
         typer.echo("Above items would be migrated. Re-run with --yes after backing up the database.", err=True)
 
 
-if __name__ == "__main__":
-    app()
 
 
 # --------------------------------------------------------------------------- #
@@ -2241,3 +2239,7 @@ def knowledge_audit_handoff(
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
     finally:
         engine.dispose()
+
+
+if __name__ == "__main__":
+    app()
