@@ -20,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 TEMPLATE_DIR = REPO_ROOT / "scripts" / "systemd" / "templates"
 
 UNIT_FILES = (
+    "oaradar-web.service",
     "oaradar-worker.service",
     "oaradar-markdown-worker.service",
     "oaradar-hourly.service",
@@ -139,8 +140,8 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"  {path.name}")
     print("Next triggers (Asia/Shanghai):")
     for cal in (
-        f"TZ={ctx.timezone} Mon..Fri *-*-* 09..17:05:00",
-        f"TZ={ctx.timezone} Mon..Fri *-*-* 23:30:00",
+        f"Mon..Fri *-*-* 09..17:05:00 {ctx.timezone}",
+        f"Mon..Fri *-*-* 23:30:00 {ctx.timezone}",
     ):
         print(f"  {cal} -> {next_trigger(cal) or '(systemd-analyze unavailable)'}")
     return 0

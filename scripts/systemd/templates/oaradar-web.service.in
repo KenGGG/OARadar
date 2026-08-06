@@ -1,0 +1,21 @@
+[Unit]
+Description=OARadar local Web management console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_ROOT}}
+EnvironmentFile={{ENV_FILE}}
+Environment=OA_CONFIG={{CONFIG_PATH}}
+# The loopback-only console. On first start it prints a one-time bootstrap
+# token to the journal (local-only); restart only when config changes.
+ExecStart={{UV_BIN}} run oa web --config {{CONFIG_PATH}}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
