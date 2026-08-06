@@ -43,12 +43,9 @@ from oa_knowledge.pending_sync import apply_pending_identifiers, sync_pending_di
 from oa_knowledge.pending_archive import persist_pending_capture
 from oa_knowledge.resources import ResourceCoordinator
 from oa_knowledge.scheduled_sync import (
-    close_scheduled_run,
-    enqueue_realtime_done,
-    ensure_manifest_item,
-    record_scheduled_run,
-    run_pending_scan,
-    scan_done_known_boundary,
+    run_bootstrap_scan,
+    run_hourly_scan,
+    run_nightly_scan,
 )
 from oa_knowledge.reconcile import reconcile_done_occurrence
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
@@ -1897,29 +1894,11 @@ def migrate_paths(
 
 
 # --------------------------------------------------------------------------- #
-# Scheduled sync orchestration (plan-0805-02 §2)
+# Scheduled sync orchestration (plan-0806-1 §2.3 / §4)
 # --------------------------------------------------------------------------- #
-def _done_signature(item) -> str:
-    import hashlib
-    payload = "|".join((
-        item.title or "",
-        item.sender or "",
-        item.created_at.isoformat() if getattr(item, "created_at", None) else "",
-        item.completed_at.isoformat() if getattr(item, "completed_at", None) else "",
-    ))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
-
-
-def _done_is_known_unchanged(session: Session, item) -> bool:
-    row = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == item.oa_item_key))
-    if row is None:
-        return False
-    expected = _done_signature(item)
-    if getattr(row, "discovery_hash", None) and row.discovery_hash != expected:
-        return False
-    return True
-
-
+# The actual scan logic lives in ``oa_knowledge.scheduled_sync`` so the CLI and
+# the worker daemon share one implementation. These commands only set up the
+# engine/config and delegate.
 @schedule_app.command("bootstrap")
 def schedule_bootstrap(
     headed: bool = typer.Option(False, "--headed"),
@@ -1933,53 +1912,9 @@ def schedule_bootstrap(
     settings = settings_option(config)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    coordinator = ResourceCoordinator(engine)
-    owner = f"schedule-bootstrap:{uuid4().hex}"
-    lease_id = coordinator.acquire("oa_browser", owner, ttl_seconds=1800, uses_local_gpu=False)
-    if lease_id is None:
-        typer.echo("OA browser is busy", err=True)
-        raise typer.Exit(2)
-    pending_summary: dict = {}
-    done_summary: dict = {}
-    try:
-        with BrowserSession(settings, headed=headed) as browser:
-            if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
-                typer.echo("OA authentication required", err=True)
-                raise typer.Exit(3)
-            assert browser.page
-            with Session(engine) as session:
-                run = record_scheduled_run(session, "scheduled_bootstrap")
-                session.commit(); run_id = run.id
-            adapter = PendingAdapter(browser.page, f"{browser.base_url}{PENDING_LIST_PATH}")
-            with Session(engine) as session:
-                _, pending_summary = run_pending_scan(session, adapter, notification_mode="baseline")
-                session.commit()
-            done_adapter = DoneAdapter(browser.page, f"{browser.base_url}{settings.browser.done_list_path}")
-            discovery = done_adapter.discover_all_pages()
-            with Session(engine) as session:
-                sync = synchronize_manifest(session, discovery)
-                session.commit()
-                new_items = [row.oa_item_key for row in session.scalars(
-                    select(OAManifestItem).where(OAManifestItem.processing_status.in_(("discovered", "pending_download", "download_failed")))
-                ).all()]
-                enqueued = 0
-                for key in new_items:
-                    created, _ = enqueue_realtime_done(engine, key)
-                    enqueued += int(created)
-                done_summary = {
-                    "source_total": discovery.source_total_count,
-                    "pages_scanned": discovery.pages_scanned,
-                    "new_items": len(new_items),
-                    "download_jobs_enqueued": enqueued,
-                    "manifest_sync_id": sync.id,
-                }
-                run = session.get(Run, run_id)
-                close_scheduled_run(session, run, "completed", pending=pending_summary, done=done_summary)
-                session.commit()
-    finally:
-        coordinator.release(lease_id, owner)
-        engine.dispose()
-    typer.echo(json.dumps({"pending": pending_summary, "done": done_summary}, ensure_ascii=False))
+    result = run_bootstrap_scan(engine, settings, headed=headed)
+    engine.dispose()
+    typer.echo(json.dumps(result, ensure_ascii=False))
 
 
 @schedule_app.command("hourly")
@@ -1991,67 +1926,9 @@ def schedule_hourly(
     settings = settings_option(config)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    coordinator = ResourceCoordinator(engine)
-    owner = f"schedule-hourly:{uuid4().hex}"
-    lease_id = coordinator.acquire("oa_browser", owner, ttl_seconds=600, uses_local_gpu=False)
-    if lease_id is None:
-        typer.echo("OA browser is busy", err=True)
-        raise typer.Exit(2)
-    pending_summary: dict = {}
-    done_summary: dict = {}
-    status = "completed"
-    try:
-        with BrowserSession(settings, headed=headed) as browser:
-            if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
-                typer.echo("OA authentication required", err=True)
-                raise typer.Exit(3)
-            assert browser.page
-            with Session(engine) as session:
-                run = record_scheduled_run(session, "scheduled_hourly")
-                session.commit(); run_id = run.id
-            adapter = PendingAdapter(browser.page, f"{browser.base_url}{PENDING_LIST_PATH}")
-            with Session(engine) as session:
-                _, pending_summary = run_pending_scan(session, adapter, notification_mode="normal")
-                session.commit()
-            done_adapter = DoneAdapter(browser.page, f"{browser.base_url}{settings.browser.done_list_path}")
-            boundary = scan_done_known_boundary(
-                lambda page_number: done_adapter.discover_page(page_number, settings.collector.list_page_delay_seconds),
-                is_known_unchanged=lambda item: _done_is_known_unchanged(_session_for(engine), item),
-                known_boundary_count=20,
-                max_pages=20,
-            )
-            new_keys = [item.oa_item_key for item in boundary.new_items]
-            enqueued = 0
-            with Session(engine) as session:
-                for item in boundary.new_items:
-                    row = ensure_manifest_item(session, item.oa_item_key, title=item.title)
-                    row.discovery_hash = _done_signature(item)
-                    session.flush()
-                    created, _ = enqueue_realtime_done(engine, item.oa_item_key, manifest_id=row.id)
-                    enqueued += int(created)
-                done_summary = {
-                    "source_total_pages": boundary.source_total_pages,
-                    "pages_scanned": boundary.pages_scanned,
-                    "new_items": len(new_keys),
-                    "known_items": boundary.pages_scanned and (boundary.reached_boundary or boundary.reached_max_pages),
-                    "download_jobs_enqueued": enqueued,
-                    "reached_boundary": boundary.reached_boundary,
-                    "reached_max_pages": boundary.reached_max_pages,
-                }
-                # A partial scan (hit the safety ceiling) is reported but not faked as complete.
-                status = "partial" if boundary.reached_max_pages else "completed"
-                run = session.get(Run, run_id)
-                close_scheduled_run(session, run, status, pending=pending_summary, done=done_summary)
-                session.commit()
-    finally:
-        coordinator.release(lease_id, owner)
-        engine.dispose()
-    typer.echo(json.dumps({"status": status, "pending": pending_summary, "done": done_summary}, ensure_ascii=False))
-
-
-def _session_for(engine):
-    """Short-lived session factory used by the known-boundary predicate."""
-    return Session(engine)
+    result = run_hourly_scan(engine, settings, headed=headed)
+    engine.dispose()
+    typer.echo(json.dumps(result, ensure_ascii=False))
 
 
 @schedule_app.command("nightly")
@@ -2063,51 +1940,9 @@ def schedule_nightly(
     settings = settings_option(config)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    coordinator = ResourceCoordinator(engine)
-    owner = f"schedule-nightly:{uuid4().hex}"
-    lease_id = coordinator.acquire("oa_browser", owner, ttl_seconds=1800, uses_local_gpu=False)
-    if lease_id is None:
-        typer.echo("OA browser is busy", err=True)
-        raise typer.Exit(2)
-    done_summary: dict = {}
-    try:
-        with BrowserSession(settings, headed=headed) as browser:
-            if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
-                typer.echo("OA authentication required", err=True)
-                raise typer.Exit(3)
-            assert browser.page
-            with Session(engine) as session:
-                run = record_scheduled_run(session, "scheduled_nightly")
-                session.commit(); run_id = run.id
-            done_adapter = DoneAdapter(browser.page, f"{browser.base_url}{settings.browser.done_list_path}")
-            discovery = done_adapter.discover_all_pages()
-            with Session(engine) as session:
-                sync = synchronize_manifest(session, discovery)
-                session.commit()
-                pending = session.scalars(select(OAManifestItem).where(
-                    OAManifestItem.processing_status.in_(("pending_download", "download_failed"))
-                )).all()
-                enqueued = 0
-                for row in pending:
-                    created, _ = enqueue_realtime_done(engine, row.oa_item_key, manifest_id=row.id)
-                    enqueued += int(created)
-                from oa_knowledge.markdown_queue import enqueue_missing_markdown_tasks
-                markdown_enqueued = enqueue_missing_markdown_tasks(engine)
-                done_summary = {
-                    "source_total": discovery.source_total_count,
-                    "pages_scanned": discovery.pages_scanned,
-                    "new_items": len(pending),
-                    "download_jobs_enqueued": enqueued,
-                    "markdown_tasks_enqueued": markdown_enqueued,
-                    "manifest_sync_id": sync.id,
-                }
-                run = session.get(Run, run_id)
-                close_scheduled_run(session, run, "completed", done=done_summary)
-                session.commit()
-    finally:
-        coordinator.release(lease_id, owner)
-        engine.dispose()
-    typer.echo(json.dumps(done_summary, ensure_ascii=False))
+    result = run_nightly_scan(engine, settings, headed=headed)
+    engine.dispose()
+    typer.echo(json.dumps(result, ensure_ascii=False))
 
 
 @schedule_app.command("status")

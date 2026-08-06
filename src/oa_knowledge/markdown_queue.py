@@ -25,7 +25,7 @@ def enqueue_verified_for_oa(session: Session, oa_item_key: str) -> int:
     return sum(enqueue_file(session, file_id) for file_id in ids)
 
 
-def enqueue_missing_markdown_tasks(engine) -> int:
+def enqueue_missing_markdown_tasks(engine, *, session: Session | None = None) -> int:
     """Backfill MarkdownTask rows for every verified source file that lacks one.
 
     Used by the nightly run (plan-0805-02 §4.2) to repair the archive→Markdown
@@ -33,19 +33,30 @@ def enqueue_missing_markdown_tasks(engine) -> int:
     the enqueue was interrupted. ``enqueue_file`` is idempotent: files with a
     successful/unsupported export or an existing task are skipped, so already
     converted files are never re-queued.
+
+    When ``session`` is supplied it is reused (no nested write transaction,
+    plan-0806-1 §4) and the caller owns the commit; otherwise a short-lived
+    session is opened and committed.
     """
-    with Session(engine) as session:
-        file_ids = session.scalars(select(ArchivedFile.id).where(
-            ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
-            ArchivedFile.download_status == "verified",
-            ArchivedFile.local_relpath.is_not(None),
-        )).all()
-        queued = 0
-        for file_id in file_ids:
-            if enqueue_file(session, file_id):
-                queued += 1
-        session.commit()
-        return queued
+    if session is None:
+        with Session(engine) as session:
+            queued = _enqueue_missing_markdown_tasks_in_session(session)
+            session.commit()
+            return queued
+    return _enqueue_missing_markdown_tasks_in_session(session)
+
+
+def _enqueue_missing_markdown_tasks_in_session(session: Session) -> int:
+    file_ids = session.scalars(select(ArchivedFile.id).where(
+        ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+        ArchivedFile.download_status == "verified",
+        ArchivedFile.local_relpath.is_not(None),
+    )).all()
+    queued = 0
+    for file_id in file_ids:
+        if enqueue_file(session, file_id):
+            queued += 1
+    return queued
 
 
 def audit_handoff(engine, settings: Settings) -> dict:

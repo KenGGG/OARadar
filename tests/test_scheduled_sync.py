@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from oa_knowledge.collector import LoginState
 from oa_knowledge.collector.pending import DiscoveredPendingItem
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
@@ -15,6 +18,7 @@ from oa_knowledge.scheduled_sync import (
     enqueue_realtime_done,
     ensure_manifest_item,
     record_scheduled_run,
+    run_nightly_scan,
     run_pending_scan,
     scan_done_known_boundary,
 )
@@ -144,16 +148,23 @@ def test_enqueue_realtime_done_is_idempotent(tmp_path: Path) -> None:
     db = tmp_path / "oa.db"
     upgrade_database(db)
     engine = create_db_engine(db)
-    created_first, task_id = enqueue_realtime_done(engine, "done:123")
-    assert created_first is True
     with Session(engine) as session:
+        created_first, task_id = enqueue_realtime_done(session, "done:123", manifest_id=1, discovery_hash="h1")
+        session.commit()
+        assert created_first is True
         task = session.get(PipelineTask, task_id)
         assert task.queue_name == "realtime_done"
         assert task.stage == "attachment_inventory"
-        assert task.idempotency_key == "realtime-done:done:123:archive-v1"
-    created_second, same_id = enqueue_realtime_done(engine, "done:123")
-    assert created_second is False
-    assert same_id == task_id
+        # Single write Session: the task is visible in the same session (no nested tx).
+        assert task.idempotency_key == "realtime-done:done:123:h1:archive-v2"
+        created_second, same_id = enqueue_realtime_done(session, "done:123", manifest_id=1, discovery_hash="h1")
+        assert created_second is False
+        assert same_id == task_id
+        # A different discovery hash creates a new (retry) version.
+        created_third, retry_id = enqueue_realtime_done(session, "done:123", manifest_id=1, discovery_hash="h2")
+        assert created_third is True
+        assert retry_id != task_id
+        session.commit()
 
 
 def test_ensure_manifest_item_is_idempotent(tmp_path: Path) -> None:
@@ -167,3 +178,39 @@ def test_ensure_manifest_item_is_idempotent(tmp_path: Path) -> None:
         session.flush()
         assert first.id == second.id
         assert session.query(OAManifestItem).filter_by(oa_item_key="done:abc").count() == 1
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration wiring (plan-0806-1 §2.3 / §4): single write Session end-to-end
+# --------------------------------------------------------------------------- #
+class _EmptyDiscovery:
+    items: list = []
+    source_total_count = 0
+    source_total_pages = 1
+    scanned_row_count = 0
+    pages_scanned = 1
+
+
+def test_run_nightly_scan_records_run_without_nested_session(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+
+    with patch("oa_knowledge.scheduled_sync.ResourceCoordinator") as RC, \
+         patch("oa_knowledge.scheduled_sync.BrowserSession") as BS, \
+         patch("oa_knowledge.scheduled_sync.DoneAdapter") as DA:
+        coordinator = RC.return_value
+        coordinator.acquire.return_value = 1
+        browser = BS.return_value.__enter__.return_value
+        browser.login_with_saved_credentials.return_value = LoginState.AUTHENTICATED
+        browser.page = MagicMock()
+        browser.base_url = "http://oa"
+        DA.return_value.discover_all_pages.return_value = _EmptyDiscovery()
+
+        result = run_nightly_scan(engine, MagicMock())
+
+    assert result["source_total"] == 0
+    with Session(engine) as session:
+        runs = session.scalars(select(Run).where(Run.stage == "scheduled_nightly")).all()
+        assert len(runs) == 1
+        assert runs[0].status == "completed"
