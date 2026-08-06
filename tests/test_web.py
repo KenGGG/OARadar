@@ -501,6 +501,19 @@ def test_static_assets_are_served(config_file: Path) -> None:
     assert resp.status_code in (200, 404)
 
 
+def test_built_console_exposes_autorun_strings(config_file: Path) -> None:
+    """Plan-0806-1 §9 (test five): the built bundle must surface the auto-run console."""
+    import glob
+
+    static_dir = Path(__file__).resolve().parents[1] / "src" / "oa_knowledge" / "web" / "static"
+    bundle_files = glob.glob(str(static_dir / "assets" / "*.js")) if static_dir.exists() else []
+    if not bundle_files:
+        pytest.skip("WebUI bundle not built; run `npm ci && npm run build` in webui/")
+    blob = "\n".join(Path(p).read_text(encoding="utf-8", errors="ignore") for p in bundle_files)
+    for required in ("自动运行", "立即扫描", "每小时定时器", "飞书通知"):
+        assert required in blob, f"built bundle missing required string: {required}"
+
+
 def test_security_headers_present_on_all_responses(config_file: Path) -> None:
     client, _ = _client(config_file)
     resp = client.get("/")

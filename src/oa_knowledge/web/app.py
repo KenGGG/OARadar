@@ -43,6 +43,8 @@ from oa_knowledge.web.schedule_views import (
     notifications_retry,
     notifications_status,
     notifications_test,
+    schedule_control,
+    schedule_job_status,
     schedule_status,
     trigger_schedule_run,
 )
@@ -473,6 +475,26 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return trigger_schedule_run(settings, "nightly", config_path=config_path)
         except (OSError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail="could not start nightly sync") from exc
+
+    @app.get("/api/schedule/job/{job_id}")
+    def get_schedule_job(job_id: int) -> dict:
+        try:
+            return schedule_job_status(settings, job_id)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail="schedule job status unavailable") from exc
+
+    @app.post("/api/schedule/control")
+    def post_schedule_control(payload: dict) -> dict:
+        action = payload.get("action") if isinstance(payload, dict) else None
+        try:
+            result = schedule_control(settings, action)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail="schedule control failed") from exc
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=result.get("detail", "schedule control failed"))
+        return result
 
     @app.get("/api/notifications/status")
     def get_notifications_status() -> dict:

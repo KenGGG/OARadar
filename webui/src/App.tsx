@@ -49,9 +49,23 @@ type AuditData = {
   markdown_queue: { paused:boolean; discovered:number; queued:number; running:number; succeeded:number; failed:number; excluded:number; pdf_mineru:{paused:boolean;total:number;queued:number;running:number;succeeded:number;failed:number;skipped:number}; events:{id:number;event_type:string;level:string;message:string;created_at:string|null}[] }
   archive_dates: { total:number; dated:number; unknown:number; correct:number; pending:number; job:null|{id:number;status:string;processed?:number;total?:number;migrated?:number;failed?:number;last_error_code?:string|null} }
 }
+type ServiceStatus = {
+  installed: boolean; enabled: boolean; active: boolean
+  last_started_at: string | null; last_error: string | null; next_run_at: string | null
+}
+type JobStatus = {
+  job_id: number; found: boolean; status: string; stage: string
+  progress_current: number; progress_total: number | null
+  last_error_code: string | null; started_at: string | null; finished_at: string | null
+  current_event: string | null
+  run: null | { run_key: string; stage: string; status: string; started_at: string | null; finished_at: string | null; summary: Record<string, any> }
+}
 type AutoRunData = {
   recent_runs: { run_key: string; stage: string; status: string; started_at: string | null; finished_at: string | null; summary: Record<string, any> }[]
   last_scan_at: string | null
+  overall_status: string
+  services: Record<"web" | "worker" | "markdown_worker" | "hourly_timer" | "nightly_timer", ServiceStatus>
+  system_info: { git_commit: string | null; build_time: string | null }
   schedule_available: boolean
   hourly_enabled: boolean | null
   next_run_at: string | null
@@ -290,30 +304,147 @@ function SystemView({ data, providers, reload }: { data: SystemData; providers: 
     </div>
   </section>
 }
+function ServiceCard({ title, svc }: { title: string; svc: ServiceStatus }) {
+  return <div className={`service-card ${svc.active ? "service-on" : svc.installed ? "service-idle" : "service-off"}`}>
+    <header><strong>{title}</strong>{svc.active ? <Badge tone="good">运行中</Badge> : svc.installed ? <Badge tone="warn">未运行</Badge> : <Badge tone="neutral">未安装</Badge>}</header>
+    <div className="service-flags">
+      <span>安装 <Badge tone={svc.installed ? "good" : "neutral"}>{svc.installed ? "是" : "否"}</Badge></span>
+      <span>启用 <Badge tone={svc.enabled ? "good" : "neutral"}>{svc.enabled ? "是" : "否"}</Badge></span>
+    </div>
+    <dl>
+      <div><dt>最近启动</dt><dd>{time(svc.last_started_at)}</dd></div>
+      <div><dt>下次运行</dt><dd>{svc.next_run_at || "—"}</dd></div>
+      <div><dt>最近错误</dt><dd className={svc.last_error ? "bad-text" : ""}>{svc.last_error || "无"}</dd></div>
+    </dl>
+  </div>
+}
+
+const OVERALL_TONE: Record<string, "good" | "warn" | "bad" | "neutral"> = {
+  正常: "good", 未安装: "warn", 已暂停: "warn", 登录失效: "bad", 配置异常: "bad",
+}
+
 function AutoRunView({ data, reload }: { data: AutoRunData; reload: () => Promise<void> }) {
   const [acting, setActing] = useState("")
   const [message, setMessage] = useState("")
-  const act = async (label: string, path: string) => {
+  const [confirming, setConfirming] = useState<null | { label: string; action: string }>(null)
+  const [activeJob, setActiveJob] = useState<JobStatus | null>(null)
+
+  // Plan §6.5: auto-refresh the panel every 5s.
+  useEffect(() => {
+    const timer = window.setInterval(() => void reload(), 5000)
+    return () => window.clearInterval(timer)
+  }, [reload])
+
+  // Plan §6.4: poll the live job every 2s until it leaves the running state.
+  useEffect(() => {
+    if (!activeJob) return
+    if (!["queued", "running"].includes(activeJob.status)) return
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await fetch(`/api/schedule/job/${activeJob.job_id}`, { headers: { Accept: "application/json" } })
+        if (res.ok) {
+          const next = await res.json() as JobStatus
+          setActiveJob(next)
+          if (!["queued", "running"].includes(next.status)) void reload()
+        }
+      } catch { /* transient; keep polling */ }
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [activeJob, reload])
+
+  const csrfToken = () => document.cookie.split("; ").find(row => row.startsWith("oa_csrf="))?.split("=")[1] || ""
+
+  const runPath = async (path: string, label: string, body?: object) => {
     setActing(label); setMessage("")
     try {
-      const csrf = document.cookie.split("; ").find(row => row.startsWith("oa_csrf="))?.split("=")[1] || ""
-      const response = await fetch(path, { method: "POST", headers: { "x-csrf-token": csrf } })
+      const headers: Record<string, string> = { "x-csrf-token": csrfToken() }
+      if (body) headers["Content-Type"] = "application/json"
+      const response = await fetch(path, { method: "POST", headers, body: body ? JSON.stringify(body) : undefined })
       if (!response.ok) {
         const detail = await response.text().catch(() => "")
         throw new Error(`${label}失败 (${response.status})${detail ? `: ${detail}` : ""}`)
       }
-      setMessage(`${label}已触发，后台进程启动中`)
+      if (path.endsWith("/schedule/hourly") || path.endsWith("/schedule/nightly")) {
+        const job = await response.json() as { job_id: number; status: string; stage: string }
+        setActiveJob({ job_id: job.job_id, found: true, status: job.status, stage: job.stage, progress_current: 0, progress_total: null, last_error_code: null, started_at: null, finished_at: null, current_event: null, run: null })
+      } else {
+        setMessage(`${label}已触发`)
+      }
       await reload()
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : `${label}失败`) }
     finally { setActing("") }
   }
+
+  const controls: { label: string; action: string; danger: boolean }[] = [
+    { label: "立即扫描", action: "hourly", danger: false },
+    { label: "立即夜间补齐", action: "nightly", danger: false },
+    { label: "测试飞书", action: "test", danger: false },
+    { label: "安装自动运行", action: "install", danger: true },
+    { label: "启用自动运行", action: "enable", danger: true },
+    { label: "暂停自动运行", action: "disable", danger: true },
+    { label: "重启Worker", action: "restart_worker", danger: true },
+    { label: "重新登录OA", action: "relogin", danger: true },
+  ]
+  const onControl = (c: { label: string; action: string; danger: boolean }) => {
+    if (c.danger) { setConfirming(c); return }
+    void dispatch(c)
+  }
+  const dispatch = (c: { label: string; action: string }) => {
+    if (c.action === "hourly") return void runPath("/api/schedule/hourly", c.label)
+    if (c.action === "nightly") return void runPath("/api/schedule/nightly", c.label)
+    if (c.action === "test") return void runPath("/api/notifications/test", c.label)
+    return void runPath("/api/schedule/control", c.label, { action: c.action })
+  }
+
   const s = data.summary
-  const enabledLabel = data.hourly_enabled === null ? "未知（未安装 systemd 定时器）" : data.hourly_enabled ? "已启用" : "未启用"
+  const overall = data.overall_status
+  const overallTone = OVERALL_TONE[overall] || "neutral"
   const loginLabel = { authenticated: "已登录", unknown: "未知" }[s.oa_login.status] || s.oa_login.status
+  const serviceTitles: [keyof typeof data.services, string][] = [
+    ["web", "Web 服务"], ["worker", "OA Worker"], ["markdown_worker", "Markdown Worker"],
+    ["hourly_timer", "每小时定时器"], ["nightly_timer", "夜间定时器"],
+  ]
+
   return <section>
+    <div className={`overall-banner status-${overallTone}`}>
+      <strong>自动运行总状态：{overall}</strong>
+      <span className="overall-meta">构建 {data.system_info.git_commit || "?"}{data.system_info.build_time ? ` · ${time(data.system_info.build_time)}` : ""}</span>
+    </div>
     <div className="notice"><CircleAlert size={17}/><span>定时扫描与飞书通知由本机 systemd 定时器或手动触发执行；所有操作均为只读 OA 交互，不修改 OA 记录。</span></div>
+
+    <div className="section-toolbar"><div><h2>服务状态</h2><p>五项独立服务：是否安装 / 启用 / 运行 / 最近启动 / 最近错误 / 下次运行（plan §6.2）。</p></div></div>
+    <div className="service-grid-5">
+      {serviceTitles.map(([key, title]) => <ServiceCard key={key} title={title} svc={data.services[key]} />)}
+    </div>
+
+    {activeJob && activeJob.found && <div className="job-progress">
+      <div className="section-toolbar"><div><h2>手动扫描进度</h2><p>任务 #{activeJob.job_id} · {activeJob.stage} · <Badge tone={activeJob.status === "completed" ? "good" : activeJob.status === "failed" || activeJob.status === "auth_required" ? "bad" : "warn"}>{activeJob.status}</Badge></p></div></div>
+      <div className="metrics compact-metrics">
+        <Metric label="当前阶段" value={activeJob.current_event || activeJob.status}/>
+        <Metric label="进度" value={`${activeJob.progress_current}/${activeJob.progress_total ?? "?"}`}/>
+        <Metric label="待办扫描" value={activeJob.run?.summary?.pending?.source_total ?? "-"} />
+        <Metric label="待办新增" value={activeJob.run?.summary?.pending?.created ?? "-"} />
+        <Metric label="已办新增" value={activeJob.run?.summary?.done?.new_items ?? "-"} />
+        <Metric label="开始" value={time(activeJob.started_at)}/>
+        <Metric label="结束" value={time(activeJob.finished_at)}/>
+      </div>
+      {activeJob.last_error_code && <div className="error-banner"><CircleAlert size={18}/><span>错误码：{activeJob.last_error_code}</span></div>}
+    </div>}
+
+    <div className="section-toolbar"><div><h2>控制</h2><p>危险操作（安装 / 启用 / 暂停 / 重启 / 重新登录）需要二次确认。</p></div>
+      <div className="toolbar-actions">
+        {controls.map(c => <button key={c.action} disabled={acting !== ""} className={c.danger ? "button-danger" : ""} onClick={() => onControl(c)}>
+          {c.action === "hourly" && <RefreshCw size={16} className={acting === c.label ? "spin" : ""}/>}
+          {c.action === "nightly" && <Database size={16} className={acting === c.label ? "spin" : ""}/>}
+          {c.action === "test" && <Bell size={16} className={acting === c.label ? "spin" : ""}/>}
+          {c.label}
+        </button>)}
+      </div>
+    </div>
+    {message && <div className="settings-message">{message}</div>}
+
     <div className="metrics compact-metrics">
-      <Metric label="每小时扫描" value={enabledLabel}/>
+      <Metric label="每小时扫描" value={data.hourly_enabled === null ? "未知" : data.hourly_enabled ? "已启用" : "未启用"}/>
       <Metric label="下次运行" value={data.next_run_at || "未知"}/>
       <Metric label="最近扫描" value={time(data.last_scan_at)}/>
       <Metric label="待办新增" value={s.pending_new}/>
@@ -331,14 +462,7 @@ function AutoRunView({ data, reload }: { data: AutoRunData; reload: () => Promis
       <Metric label="Markdown 任务入队" value={s.nightly.markdown_tasks_enqueued}/>
       <Metric label="飞书状态" value={s.feishu.state}/>
     </div>
-    <div className="section-toolbar"><div><h2>手动触发</h2><p>与 systemd 定时器等效，启动后台进程执行扫描；结果记入“运行记录”。</p></div>
-      <div className="toolbar-actions">
-        <button disabled={acting !== ""} onClick={() => void act("每小时扫描", "/api/schedule/hourly")}><RefreshCw size={16} className={acting === "每小时扫描" ? "spin" : ""}/>每小时扫描</button>
-        <button disabled={acting !== ""} onClick={() => void act("夜间补齐", "/api/schedule/nightly")}><Database size={16} className={acting === "夜间补齐" ? "spin" : ""}/>夜间补齐</button>
-        <button disabled={acting !== ""} onClick={() => void act("飞书连通性测试", "/api/notifications/test")}><Bell size={16} className={acting === "飞书连通性测试" ? "spin" : ""}/>飞书连通性测试</button>
-      </div>
-    </div>
-    {message && <div className="settings-message">{message}</div>}
+
     <div className="section-toolbar"><div><h2>运行记录</h2><p>最近 {data.recent_runs.length} 条定时运行（bootstrap / hourly / nightly）。</p></div></div>
     <div className="table-wrap"><table><thead><tr><th>阶段</th><th>状态</th><th>开始</th><th>结束</th><th>待办新增</th><th>已办新增</th><th>MD 入队</th></tr></thead><tbody>
       {data.recent_runs.map(run => {
@@ -347,6 +471,8 @@ function AutoRunView({ data, reload }: { data: AutoRunData; reload: () => Promis
       })}
       {!data.recent_runs.length && <tr><td colSpan={7} className="empty">尚无定时运行记录</td></tr>}
     </tbody></table></div>
+
+    {confirming && <div className="drawer-layer" role="dialog" aria-modal="true"><button className="drawer-scrim" aria-label="取消" onClick={() => setConfirming(null)}/><aside className="drawer confirm-drawer"><header><div><small>二次确认</small><h2>{confirming.label}</h2></div><button className="icon-button" onClick={() => setConfirming(null)}><X size={19}/></button></header><div className="drawer-body"><p>该操作会改动本机 systemd 服务状态，确定要继续吗？</p><div className="toolbar-actions"><button className="button-danger" disabled={acting !== ""} onClick={() => { const c = confirming; setConfirming(null); void dispatch(c) }}>{acting || "确认执行"}</button><button onClick={() => setConfirming(null)}>取消</button></div></div></aside></div>}
   </section>
 }
 function Field({label,value,change}:{label:string;value:string;change:(v:string)=>void}){return <label className="setting-field"><span>{label}</span><input value={value} onChange={e=>change(e.target.value)}/></label>}

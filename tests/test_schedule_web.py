@@ -48,6 +48,14 @@ def test_schedule_status_empty_on_new_database(config_file: Path) -> None:
     payload = client.get("/api/schedule/status").json()
     assert payload["recent_runs"] == []
     assert payload["last_scan_at"] is None
+    assert payload["overall_status"] in {"正常", "未安装", "已暂停", "登录失效", "配置异常"}
+    assert set(payload["services"]) == {
+        "web", "worker", "markdown_worker", "hourly_timer", "nightly_timer"}
+    for svc in payload["services"].values():
+        assert set(svc) == {
+            "installed", "enabled", "active", "last_started_at", "last_error", "next_run_at"}
+    assert "git_commit" in payload["system_info"]
+    assert "build_time" in payload["system_info"]
     assert payload["summary"]["pending_new"] == 0
     assert payload["summary"]["done_new"] == 0
     assert payload["summary"]["markdown_backlog"] == 0
@@ -203,6 +211,64 @@ def test_worker_runs_scheduled_hourly_job(config_file: Path) -> None:
                 assert run.status == "completed"
         finally:
             worker.close()
+
+
+def test_schedule_job_status_polls_real_progress(config_file: Path) -> None:
+    """Plan-0806-1 §6.4: the job endpoint returns live status/progress/run."""
+    engine = _engine(config_file)
+    now = datetime.now(UTC)
+    with Session(engine) as session:
+        job = OperationJob(
+            job_key="poll1", job_type="scheduled_hourly", idempotency_key="scheduled:hourly:poll1",
+            status="running", progress_current=2, progress_total=10, started_at=now,
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+        session.add(Run(
+            run_key="scheduled_hourly:poll1", stage="scheduled_hourly", status="completed",
+            summary_json='{"pending": {"created": 2}, "done": {"new_items": 1}}',
+            started_at=now, finished_at=now,
+        ))
+        session.commit()
+
+    client = _client(config_file)
+    payload = client.get(f"/api/schedule/job/{job_id}").json()
+    assert payload["found"] is True
+    assert payload["status"] == "running"
+    assert payload["progress_current"] == 2
+    assert payload["progress_total"] == 10
+    assert payload["run"] is not None
+    assert payload["run"]["status"] == "completed"
+    assert payload["run"]["summary"]["pending"]["created"] == 2
+
+    missing = client.get("/api/schedule/job/999999").json()
+    assert missing["found"] is False
+
+
+def test_schedule_control_rejects_unknown_action(config_file: Path) -> None:
+    client = _client(config_file)
+    response = client.post(
+        "/api/schedule/control",
+        headers={"x-csrf-token": _csrf(client)},
+        json={"action": "explode"},
+    )
+    assert response.status_code == 400
+
+
+def test_schedule_control_reports_missing_systemctl(config_file: Path) -> None:
+    """When systemd is absent the control action degrades gracefully (no 500)."""
+    from unittest.mock import patch
+
+    client = _client(config_file)
+    with patch("shutil.which", return_value=None):
+        response = client.post(
+            "/api/schedule/control",
+            headers={"x-csrf-token": _csrf(client)},
+            json={"action": "enable"},
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]
 
 
 def test_notifications_status_reports_counts(config_file: Path) -> None:
