@@ -138,6 +138,8 @@ class OperationWorker:
                 self._execute_online_audit(job_id)
             elif job_type == "archive_date_reconcile":
                 self._execute_archive_date_reconcile(job_id)
+            elif job_type in ("scheduled_bootstrap", "scheduled_hourly", "scheduled_nightly"):
+                self._execute_scheduled_scan(job_id)
             else:
                 self._finish(job_id, "failed", "unsupported_job_type")
         except Exception as exc:
@@ -171,6 +173,102 @@ class OperationWorker:
                 job.parameters_json = json.dumps({"processed": processed, "total": len(ids), "migrated": migrated, "failed": failed})
                 job.heartbeat_at = datetime.now(timezone.utc); session.commit()
         self._finish(job_id, "completed", None)
+
+    def _execute_scheduled_scan(self, job_id: int) -> None:
+        """Run a scheduled Pending/Done scan as a durable worker job (plan-0806-1 §2.3).
+
+        Delegates to the shared orchestration in ``oa_knowledge.scheduled_sync``
+        (the same code the ``oa schedule`` CLI uses) so the browser/lease logic
+        lives in exactly one place. The orchestration records a ``Run`` row and
+        the worker maps the result into the job's progress/counts.
+        """
+        from oa_knowledge.db.engine import create_db_engine
+        from oa_knowledge.scheduled_sync import (
+            run_bootstrap_scan,
+            run_hourly_scan,
+            run_nightly_scan,
+        )
+
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is None or job.status not in {"queued", "running"}:
+                return
+            job_type = job.job_type
+            job.status = "running"
+            job.started_at = job.started_at or datetime.now(timezone.utc)
+            job.heartbeat_at = datetime.now(timezone.utc)
+            job.lease_expires_at = job.heartbeat_at + LEASE_TTL
+            self._event(session, job, "scheduled_scan_started", "running", {"job_type": job_type})
+            session.commit()
+
+        scan_func = {
+            "scheduled_bootstrap": run_bootstrap_scan,
+            "scheduled_hourly": run_hourly_scan,
+            "scheduled_nightly": run_nightly_scan,
+        }[job_type]
+
+        # Use a throwaway engine so the orchestration's engine.dispose() does not
+        # tear down the worker's shared engine.
+        scan_engine = create_db_engine(self.settings.database_path)
+        try:
+            try:
+                result = scan_func(scan_engine, self.settings, headed=False)
+            except RuntimeError as exc:
+                message = str(exc)
+                if "authentication" in message.lower():
+                    self._finish_scheduled(job_id, "auth_required", "OA_AUTH_EXPIRED", {})
+                else:
+                    self._finish_scheduled(job_id, "failed", "SCAN_FAILED", {})
+                return
+            except Exception as exc:
+                self._finish_scheduled(job_id, "failed", f"scheduled_exception_{type(exc).__name__}", {})
+                return
+
+            pending = result.get("pending", {})
+            done = result.get("done", {})
+            raw_status = result.get("status", "completed")
+            if raw_status == "partial":
+                final_status, error = "partial", None
+            elif raw_status == "failed":
+                final_status, error = "failed", "SCAN_FAILED"
+            else:
+                final_status, error = "completed", None
+
+            counts = {
+                "pending_scanned": pending.get("source_total", 0),
+                "pending_created": pending.get("created", 0),
+                "pending_updated": pending.get("updated", 0),
+                "done_new": done.get("new_items", 0),
+                "done_archive_jobs": done.get("download_jobs_enqueued", 0),
+                "markdown_tasks": done.get("markdown_tasks_enqueued", 0),
+                "feishu_notify_tasks": pending.get("tasks_enqueued", pending.get("created", 0) + pending.get("updated", 0)),
+            }
+            progress_total = (counts["pending_scanned"] or 0) + (done.get("source_total", 0) or 0)
+            progress_current = (counts["pending_created"] + counts["pending_updated"]) + counts["done_new"]
+            self._finish_scheduled(job_id, final_status, error, counts, progress_current, progress_total)
+        finally:
+            scan_engine.dispose()
+
+    def _finish_scheduled(
+        self, job_id: int, status: str, error: str | None, counts: dict,
+        progress_current: int = 0, progress_total: int | None = None,
+    ) -> None:
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is None:
+                return
+            job.status = status
+            job.last_error_code = error
+            job.finished_at = datetime.now(timezone.utc)
+            job.progress_current = progress_current
+            job.progress_total = progress_total
+            job.lease_owner = None
+            job.lease_expires_at = None
+            self._event(session, job, "scheduled_scan_finished", status, {
+                "error": error,
+                "counts": counts,
+            })
+            session.commit()
 
     def _execute_online_audit(self, job_id: int) -> None:
         from oa_knowledge.collector.browser import BrowserSession, LoginState

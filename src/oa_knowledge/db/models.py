@@ -49,6 +49,7 @@ class OAManifestItem(Base):
     initiated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     list_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    discovery_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     processing_status: Mapped[str] = mapped_column(String, nullable=False, default="discovered")

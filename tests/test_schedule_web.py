@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from oa_knowledge.collector import LoginState
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
@@ -15,6 +18,7 @@ from oa_knowledge.db.models import (
     MarkdownTask,
     NotificationDelivery,
     OAItem,
+    OperationJob,
     Run,
 )
 from oa_knowledge.web import create_web_app
@@ -118,34 +122,87 @@ def test_schedule_status_is_reachable_via_shared_function(config_file: Path) -> 
     assert payload["summary"]["markdown_backlog"] == 0
 
 
-def test_schedule_hourly_triggers_scan(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = {}
-
-    def fake_trigger(settings, stage, config_path=None):
-        captured["stage"] = stage
-        captured["config_path"] = config_path
-        return {"triggered": True, "stage": stage, "mode": "background_process"}
-
-    monkeypatch.setattr("oa_knowledge.web.app.trigger_schedule_run", fake_trigger)
+def test_schedule_hourly_triggers_scan(config_file: Path) -> None:
     client = _client(config_file)
     response = client.post("/api/schedule/hourly", headers={"x-csrf-token": _csrf(client)})
     assert response.status_code == 202
-    assert response.json()["triggered"] is True
-    assert captured["stage"] == "hourly"
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["stage"] == "hourly"
+    assert isinstance(body["job_id"], int)
+    engine = _engine(config_file)
+    with Session(engine) as session:
+        job = session.get(OperationJob, body["job_id"])
+        assert job is not None
+        assert job.job_type == "scheduled_hourly"
+        assert job.status == "queued"
 
 
-def test_schedule_nightly_triggers_scan(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = {}
-
-    def fake_trigger(settings, stage, config_path=None):
-        captured["stage"] = stage
-        return {"triggered": True, "stage": stage, "mode": "background_process"}
-
-    monkeypatch.setattr("oa_knowledge.web.app.trigger_schedule_run", fake_trigger)
+def test_schedule_nightly_triggers_scan(config_file: Path) -> None:
     client = _client(config_file)
     response = client.post("/api/schedule/nightly", headers={"x-csrf-token": _csrf(client)})
     assert response.status_code == 202
-    assert captured["stage"] == "nightly"
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["stage"] == "nightly"
+    engine = _engine(config_file)
+    with Session(engine) as session:
+        job = session.get(OperationJob, body["job_id"])
+        assert job is not None
+        assert job.job_type == "scheduled_nightly"
+        assert job.status == "queued"
+
+
+def test_worker_runs_scheduled_hourly_job(config_file: Path) -> None:
+    """Plan-0806-1 §9 (test two): POST enqueues a real job the worker executes into a real Run."""
+    from oa_knowledge.web.worker import OperationWorker
+
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        job = OperationJob(job_key="test1", job_type="scheduled_hourly", idempotency_key="scheduled:hourly:test1")
+        session.add(job)
+        session.commit()
+        job_id = job.id
+    engine.dispose()
+
+    class _PendingDiscovery:
+        items = []
+        pages_scanned = 1
+        source_total_pages = 1
+        source_total_count = 0
+
+    class _DonePage:
+        items = []
+        is_last_page = True
+        source_total_pages = 1
+
+    with patch("oa_knowledge.scheduled_sync.ResourceCoordinator") as RC, \
+         patch("oa_knowledge.scheduled_sync.BrowserSession") as BS, \
+         patch("oa_knowledge.scheduled_sync.DoneAdapter") as DA, \
+         patch("oa_knowledge.scheduled_sync.PendingAdapter") as PA:
+        coordinator = RC.return_value
+        coordinator.acquire.return_value = 1
+        browser = BS.return_value.__enter__.return_value
+        browser.login_with_saved_credentials.return_value = LoginState.AUTHENTICATED
+        browser.page = MagicMock()
+        browser.base_url = "http://oa"
+        DA.return_value.discover_page.return_value = _DonePage()
+        PA.return_value.discover_all_pages.return_value = _PendingDiscovery()
+
+        worker = OperationWorker(settings, config_path=config_file)
+        try:
+            assert worker.run_once() is True
+            with Session(create_db_engine(settings.database_path)) as s2:
+                finished = s2.get(OperationJob, job_id)
+                assert finished.status == "completed"
+                run = s2.scalar(select(Run).where(Run.stage == "scheduled_hourly"))
+                assert run is not None
+                assert run.status == "completed"
+        finally:
+            worker.close()
 
 
 def test_notifications_status_reports_counts(config_file: Path) -> None:

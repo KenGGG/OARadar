@@ -10,16 +10,15 @@ subprocess the systemd timers use, so no browser logic is duplicated here.
 from __future__ import annotations
 
 import json
-import threading
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import validate_feishu_runtime_config
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import MarkdownTask, NotificationDelivery, Run
-from oa_knowledge.web.cli_runner import run_cli
+from oa_knowledge.db.models import MarkdownTask, NotificationDelivery, OperationJob, Run
 
 SCHEDULED_STAGES = ("scheduled_bootstrap", "scheduled_hourly", "scheduled_nightly")
 SCHEDULE_TIMER_UNIT = "oaradar-hourly.timer"
@@ -157,22 +156,31 @@ def schedule_status(settings, limit: int = 10) -> dict:
 
 
 def trigger_schedule_run(settings, stage: str, config_path: Path | None = None) -> dict:
-    """Kick off an ``oa schedule <stage>`` scan in a background process.
+    """Enqueue a durable ``OperationJob`` for the worker to execute (plan-0806-1 §2.2).
 
-    The spawned CLI records its own run into the ``runs`` table (which the
-    status endpoint reads), so the web layer only has to launch it and return a
-    handle. ``stage`` is one of ``hourly`` / ``nightly``.
+    The Web layer no longer spawns an unmanaged background thread. The job is
+    persisted in ``operation_jobs`` and picked up by the always-on ``oa worker``
+    daemon, which runs the same scan the ``oa schedule <stage>`` CLI uses and
+    records a ``Run`` row. We only return after the job row is confirmed in the
+    database, so the caller never sees a false "已触发". ``stage`` is one of
+    ``hourly`` / ``nightly``.
     """
-    if stage not in ("hourly", "nightly"):
+    job_type = {"hourly": "scheduled_hourly", "nightly": "scheduled_nightly"}.get(stage)
+    if job_type is None:
         raise ValueError(f"unsupported schedule stage: {stage}")
-    target = config_path
-
-    def _run() -> None:
-        run_cli([stage], config_path=target, timeout=None)
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    return {"triggered": True, "stage": stage, "mode": "background_process"}
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            job_key = uuid4().hex
+            idem = f"scheduled:{stage}:{job_key}"
+            job = OperationJob(job_key=job_key, job_type=job_type, idempotency_key=idem)
+            session.add(job)
+            session.flush()
+            job_id = job.id
+            session.commit()
+    finally:
+        engine.dispose()
+    return {"job_id": job_id, "status": "queued", "stage": stage}
 
 
 def notifications_status(settings) -> dict:

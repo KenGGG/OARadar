@@ -34,7 +34,7 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     assert oct((data_root / "state" / "oa.db").stat().st_mode & 0o777) == "0o600"
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0026_initiation_archive"
+    assert json.loads(status.output)["schema"] == "0027_manifest_discovery_hash"
 
 
 def test_convert_synthetic_text_and_unsupported_file(config_file: Path) -> None:
