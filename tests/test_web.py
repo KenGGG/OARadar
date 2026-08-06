@@ -104,6 +104,49 @@ def test_lifecycle_pending_excludes_completed_occurrences(config_file: Path) -> 
     assert client.get("/api/lifecycle/pending").json() == {"items": [], "total": 0}
 
 
+def test_lifecycle_pending_exposes_discovery_summary_and_feishu_fields(config_file: Path) -> None:
+    """Plan-0806-1 §7: the pending list must surface discovery/summary/feishu columns."""
+    client, data_root = _client(config_file)
+    engine = create_db_engine(data_root / "state/oa.db")
+    from oa_knowledge.db.models import (
+        ItemOccurrence, ItemSnapshot, LogicalItem, NotificationDelivery, SummaryVersion,
+    )
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="feishu-pending", title="Feishu pending", lifecycle_status="pending")
+        session.add(logical)
+        session.flush()
+        session.add(ItemOccurrence(
+            logical_item_id=logical.id, occurrence_key="pending:feishu", channel="pending",
+            title="Feishu pending", occurrence_status="active", last_seen_at=datetime.now(timezone.utc),
+        ))
+        session.flush()
+        snapshot = ItemSnapshot(
+            logical_item_id=logical.id, occurrence_id=None, snapshot_kind="pending", version=1,
+            content_hash="y" * 64, payload_json="{}",
+        )
+        session.add(snapshot)
+        session.flush()
+        session.add(SummaryVersion(
+            logical_item_id=logical.id, snapshot_id=snapshot.id, summary_kind="pending", version=1,
+            status="current", input_hash="x" * 64, structured_json="{}",
+            provider_name="ollama", model_name="m", prompt_version="v1",
+            created_at=datetime.now(timezone.utc),
+        ))
+        session.add(NotificationDelivery(
+            logical_item_id=logical.id, channel="feishu", notification_type="pending_summary",
+            idempotency_key="nd:1", status="failed", error_code="connect_failed",
+            updated_at=datetime.now(timezone.utc),
+        ))
+        session.commit()
+
+    item = client.get("/api/lifecycle/pending").json()["items"][0]
+    assert item["last_discovered_at"] is not None
+    assert item["last_summary_at"] is not None
+    assert item["feishu_status"] == "failed"
+    assert item["notify_error_code"] == "connect_failed"
+    assert item["last_notified_at"] is not None
+
+
 def test_lifecycle_done_uses_canonical_manifest_before_local_archive(config_file: Path) -> None:
     client, data_root = _client(config_file)
     engine = create_db_engine(data_root / "state" / "oa.db")

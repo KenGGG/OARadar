@@ -13,7 +13,9 @@ type PendingItem = {
   identity_captured: boolean; snapshot_kind: string | null; snapshot_id: number | null
   body_status: string; workflow_status: string; opinion_status: string
   attachment_total: number; attachment_verified: number; attachment_failed: number
-  last_synced_at: string | null; ollama_summary_status: string
+  last_synced_at: string | null; last_discovered_at: string | null; last_summary_at: string | null
+  feishu_status: string | null; last_notified_at: string | null; notify_error_code: string | null
+  ollama_summary_status: string
 }
 type PendingDetail = {
   id: number; logical_item_id: number; title: string; sender: string | null; current_node: string | null
@@ -215,8 +217,13 @@ function PendingView({ rows, all, query, setQuery, open }: { rows: PendingItem[]
   return <section>
     <div className="metrics compact-metrics"><Metric label="当前待办" value={all.length}/><Metric label="身份已采集" value={all.filter(x => x.identity_captured).length}/><Metric label="采集记录" value={captured}/><Metric label="附件已验证" value={attachments}/><Metric label="附件异常" value={failures} bad={failures > 0}/></div>
     <div className="section-toolbar"><div><h2>待办事项</h2><p>列表发现不等于归档完成，各证据阶段独立显示。</p></div><SearchBox value={query} setValue={setQuery} placeholder="搜索标题或发起人"/></div>
-    <div className="table-wrap"><table><thead><tr><th className="title-col">标题</th><th>发起人</th><th>当前节点</th><th>身份</th><th>采集记录</th><th>Ollama概括</th><th>附件</th><th>最近同步</th><th aria-label="详情"/></tr></thead><tbody>
-      {rows.map(row => <tr key={row.id} onClick={() => open(row.id)} tabIndex={0} onKeyDown={e => e.key === "Enter" && open(row.id)}><td className="title-cell"><strong>{row.title}</strong><small>逻辑事项 #{row.logical_item_id}</small></td><td>{row.sender || "-"}</td><td>{row.current_node || "-"}</td><td><Badge tone={row.identity_captured ? "good" : "warn"}>{row.identity_captured ? "已采集" : "待采集"}</Badge></td><td><Badge tone={row.snapshot_id ? "good" : "neutral"}>{row.snapshot_id ? captureLabel(row.snapshot_kind) : "未采集"}</Badge></td><td><Badge tone={row.ollama_summary_status === "current" ? "good" : "neutral"}>{row.ollama_summary_status === "current" ? "已生成" : "待生成"}</Badge></td><td><Badge tone={row.attachment_failed ? "bad" : row.attachment_verified ? "good" : "neutral"}>{row.attachment_verified}/{row.attachment_total}{row.attachment_failed ? ` · 失败 ${row.attachment_failed}` : ""}</Badge></td><td className="nowrap">{time(row.last_synced_at)}</td><td><ChevronRight size={17}/></td></tr>)}
+    <div className="table-wrap"><table style={{ minWidth: 1180 }}><thead><tr><th className="title-col">标题</th><th>发起人</th><th>当前节点</th><th>身份</th><th>采集记录</th><th>Ollama概括</th><th>附件</th><th>最近发现</th><th>最近摘要</th><th>最近同步</th><th>飞书通知</th><th>最近通知</th><th aria-label="详情"/></tr></thead><tbody>
+      {rows.map(row => {
+        const fs = row.feishu_status
+        const fTone = fs == null ? "neutral" : fs === "sent" ? "good" : fs === "failed" ? "bad" : "warn"
+        const fLabel = fs == null ? "未通知" : ({ sent: "已发送", failed: "失败", queued: "待发送", pending: "待发送", retry_wait: "重试中", unknown: "未知" } as Record<string, string>)[fs] || fs
+        return <tr key={row.id} onClick={() => open(row.id)} tabIndex={0} onKeyDown={e => e.key === "Enter" && open(row.id)}><td className="title-cell"><strong>{row.title}</strong><small>逻辑事项 #{row.logical_item_id}</small></td><td>{row.sender || "-"}</td><td>{row.current_node || "-"}</td><td><Badge tone={row.identity_captured ? "good" : "warn"}>{row.identity_captured ? "已采集" : "待采集"}</Badge></td><td><Badge tone={row.snapshot_id ? "good" : "neutral"}>{row.snapshot_id ? captureLabel(row.snapshot_kind) : "未采集"}</Badge></td><td><Badge tone={row.ollama_summary_status === "current" ? "good" : "neutral"}>{row.ollama_summary_status === "current" ? "已生成" : "待生成"}</Badge></td><td><Badge tone={row.attachment_failed ? "bad" : row.attachment_verified ? "good" : "neutral"}>{row.attachment_verified}/{row.attachment_total}{row.attachment_failed ? ` · 失败 ${row.attachment_failed}` : ""}</Badge></td><td className="nowrap">{time(row.last_discovered_at)}</td><td className="nowrap">{time(row.last_summary_at)}</td><td className="nowrap">{time(row.last_synced_at)}</td><td><Badge tone={fTone}>{fLabel}</Badge>{row.notify_error_code && <small className="cell-error">{row.notify_error_code}</small>}</td><td className="nowrap">{time(row.last_notified_at)}</td><td><ChevronRight size={17}/></td></tr>
+      })}
       {!rows.length && <tr><td colSpan={9} className="empty">没有符合条件的待办事项</td></tr>}
     </tbody></table></div>
   </section>

@@ -13,7 +13,7 @@ from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
     ArchivedFile, ArchiveMember, ArchivePackage, ContentObject, ItemOccurrence, ItemSnapshot,
-    KnowledgeDocument, LogicalItem, OAItem, OAItemDocumentRelation, OperationJob, ParseArtifact,
+    KnowledgeDocument, LogicalItem, NotificationDelivery, OAItem, OAItemDocumentRelation, OperationJob, ParseArtifact,
     SourceAttachment, SourceReference, OperationEvent, OAManifestItem, PipelineTask, ResourceLease, SummaryVersion,
 )
 
@@ -84,6 +84,11 @@ def pending_list(settings: Settings) -> dict:
                 summary = session.scalar(select(SummaryVersion).where(
                     SummaryVersion.logical_item_id == row.logical_item_id, SummaryVersion.summary_kind == "pending",
                 ).order_by(SummaryVersion.id.desc()).limit(1))
+                delivery = session.scalar(select(NotificationDelivery).where(
+                    NotificationDelivery.logical_item_id == row.logical_item_id,
+                    NotificationDelivery.channel == "feishu",
+                    NotificationDelivery.notification_type == "pending_summary",
+                ).order_by(NotificationDelivery.id.desc()).limit(1))
                 items.append({
                     "id": row.id, "logical_item_id": row.logical_item_id, "title": row.title,
                     "sender": row.sender, "received_at": row.received_at.isoformat() if row.received_at else None,
@@ -99,6 +104,11 @@ def pending_list(settings: Settings) -> dict:
                     "attachment_verified": sum(source.download_status == "verified" for source in sources),
                     "attachment_failed": sum(source.download_status != "verified" for source in sources),
                     "last_synced_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+                    "last_discovered_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+                    "last_summary_at": summary.created_at.isoformat() if summary and summary.created_at else None,
+                    "feishu_status": delivery.status if delivery else None,
+                    "last_notified_at": (delivery.sent_at or delivery.updated_at).isoformat() if delivery and (delivery.sent_at or delivery.updated_at) else None,
+                    "notify_error_code": delivery.error_code if delivery else None,
                     "ollama_summary_status": summary.status if summary else "queued" if _counts(session, PipelineTask, PipelineTask.logical_item_id == row.logical_item_id, PipelineTask.stage == "pending_summary") else "pending",
                 })
             return {"items": items, "total": len(items)}
