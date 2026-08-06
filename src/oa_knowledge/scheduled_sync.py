@@ -268,7 +268,7 @@ def enqueue_realtime_done(
         queue_name="realtime_done",
         priority=QUEUE_PRIORITY["realtime_done"],
         logical_item_key=oa_item_key,
-        stage="attachment_inventory",
+        stage="done_capture_and_archive",
         idempotency_key=key,
         payload_json=json.dumps({"manifest_id": manifest_id}, ensure_ascii=False),
     )

@@ -154,7 +154,7 @@ def test_enqueue_realtime_done_is_idempotent(tmp_path: Path) -> None:
         assert created_first is True
         task = session.get(PipelineTask, task_id)
         assert task.queue_name == "realtime_done"
-        assert task.stage == "attachment_inventory"
+        assert task.stage == "done_capture_and_archive"
         # Single write Session: the task is visible in the same session (no nested tx).
         assert task.idempotency_key == "realtime-done:done:123:h1:archive-v2"
         created_second, same_id = enqueue_realtime_done(session, "done:123", manifest_id=1, discovery_hash="h1")

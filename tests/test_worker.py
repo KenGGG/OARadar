@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -399,7 +400,101 @@ def test_notify_feishu_delivers_and_records_delivery(config_file: Path, monkeypa
         assert delivery.sent_at is not None
 
 
-def test_notify_feishu_missing_webhook_fails_without_silent_success(config_file: Path, monkeypatch) -> None:
+def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Path, monkeypatch) -> None:
+    # Plan-0806-1 §3 / §9 (test four): a newly discovered Done item is captured,
+    # archived, yields a verified ArchivedFile + MarkdownTask, and advances.
+    from types import SimpleNamespace
+
+    from oa_knowledge.collector import LoginState
+    from oa_knowledge.constants import FileRole
+    from oa_knowledge.db.models import ArchivedFile, MarkdownTask, OAItem, OAManifestItem
+    from oa_knowledge.production_pipeline import ProductionQueue
+
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OAManifestItem(
+            oa_item_key="done:abc", workitem_id_text="abc", title="已办事项",
+            list_page=0, processing_status="pending_download",
+        ))
+        session.commit()
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue("realtime_done", "done:abc", "done_capture_and_archive", "realtime-done:done:abc:na:archive-v2")
+
+    # Fake a DownloadedAttachment whose content passes integrity (stub inspect_file).
+    attachment = SimpleNamespace(
+        file_role=FileRole.DIRECT_ATTACHMENT, attachment_key="att-1", filename="doc.pdf",
+        mime_type="application/pdf", size_bytes=10, content=b"%PDF-1.4 fake",
+    )
+    fake_capture = SimpleNamespace(
+        page_family="done", detail_url="http://oa/done/abc", capture_issues=[],
+        body=[SimpleNamespace(name="body.html", html="<html>body</html>")],
+        workflow=[SimpleNamespace(name="wf.html", html="<html>wf</html>")],
+        attachments=[attachment], related_containers=[],
+    )
+
+    class _FakeAdapter:
+        def __init__(self, *args, **kwargs):
+            pass
+        def capture_direct(self, *args, **kwargs):
+            return fake_capture
+
+    class _FakeBrowser:
+        page = MagicMock()
+        base_url = "http://oa"
+        def login_with_saved_credentials(self, *a, **k):
+            return LoginState.AUTHENTICATED
+
+    class _FakeBrowserCtx:
+        def __enter__(self):
+            return _FakeBrowser()
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("oa_knowledge.detail_archive.inspect_file",
+                        lambda *a, **k: SimpleNamespace(status="verified", valid=True, size_bytes=10, sha256="a" * 64))
+    monkeypatch.setattr("oa_knowledge.collector.detail.CollaborationDetailAdapter", _FakeAdapter)
+    monkeypatch.setattr("oa_knowledge.cli.verified_attachment_resolver", lambda *a, **k: object())
+    monkeypatch.setattr("oa_knowledge.collector.browser.BrowserSession", lambda *a, **k: _FakeBrowserCtx())
+    monkeypatch.setattr("oa_knowledge.resources.ResourceCoordinator",
+                        lambda *a, **k: SimpleNamespace(acquire=lambda *a, **k: 1, release=lambda *a, **k: None))
+
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    worker._pipeline_done_capture_and_archive(task)
+    worker.close()
+
+    with Session(engine) as session:
+        item = session.scalar(select(OAItem).where(OAItem.oa_item_key == "done:abc"))
+        assert item is not None
+        assert item.source_channel == "done"
+        assert session.scalar(select(ArchivedFile).where(
+            ArchivedFile.oa_item_id == item.id, ArchivedFile.download_status == "verified",
+            ArchivedFile.file_role == str(FileRole.DIRECT_ATTACHMENT),
+        )) is not None
+        assert session.scalar(select(MarkdownTask).where(MarkdownTask.source_file_id.is_not(None))) is not None
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "queued"
+        assert row.stage == "attachment_inventory"
+
+
+def test_pipeline_done_capture_and_archive_fails_when_manifest_missing(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue("realtime_done", "done:ghost", "done_capture_and_archive", "realtime-done:done:ghost:na:archive-v2")
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    worker._pipeline_done_capture_and_archive(task)
+    worker.close()
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "failed"
+        assert row.error_code == "MANIFEST_MISSING"
     # Plan §1.1: feishu.enabled=true but webhook missing must fail loudly,
     # never treated as a successful send.
     settings = load_settings(config_file)

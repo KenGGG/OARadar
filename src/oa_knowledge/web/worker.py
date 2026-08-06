@@ -19,6 +19,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, ItemSnapshot, NotificationDelivery, OAItem, OAManifestItem, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, SourceAttachment, SummaryVersion
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.ops.audit import audit_database
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.ops.capacity import capacity_report
 from oa_knowledge.web.cli_runner import run_cli
 from oa_knowledge.web.status import _apply_policy_to_pending, execute_archive_job
@@ -30,6 +31,18 @@ def _pump_stream(stream, buffer: list[str]) -> None:
             buffer.append(line)
     finally:
         stream.close()
+
+
+def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:
+    """True when the OA item already has at least one verified source attachment."""
+    item = session.scalar(select(OAItem.id).where(OAItem.oa_item_key == oa_item_key))
+    if item is None:
+        return False
+    return session.scalar(select(func.count()).select_from(ArchivedFile).where(
+        ArchivedFile.oa_item_id == item,
+        ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+        ArchivedFile.download_status == "verified",
+    ).exists()) or False
 
 
 def _run_piped(command: list[str], cwd: Path, poll_callback, poll_interval: float = 5.0):
@@ -371,6 +384,8 @@ class OperationWorker:
                 self._pipeline_pending_summary(task)
             elif task.stage == "notify_feishu":
                 self._pipeline_notify_feishu(task)
+            elif task.stage == "done_capture_and_archive" and task.queue_name == "realtime_done":
+                self._pipeline_done_capture_and_archive(task)
             elif task.stage == "pending_parse":
                 self._pipeline_pending_parse(task)
             elif task.stage == "ollama_extract":
@@ -654,6 +669,95 @@ class OperationWorker:
                 task.id, self.owner, "FEISHU_SEND_FAILED",
                 result.safe_error or "feishu delivery failed", recoverable=result.retryable,
             )
+
+    def _pipeline_done_capture_and_archive(self, task: PipelineTask) -> None:
+        """Capture + archive a newly discovered Done item, then hand off (plan-0806-1 §3).
+
+        Reuses the existing read-only archive stack (``CollaborationDetailAdapter``,
+        ``archive_collaboration_detail``, ``archive_proxy``, ``verified_attachment_resolver``)
+        instead of reimplementing archiving. The item is captured, attachments are
+        downloaded and verified, the ``OAItem``/``OAManifestItem`` are updated, verified
+        files are queued for Markdown export, and the task advances to
+        ``attachment_inventory`` for parsing/knowledge extraction.
+        """
+        from oa_knowledge.cli import verified_attachment_resolver
+        from oa_knowledge.collector.browser import BrowserSession, LoginState
+        from oa_knowledge.collector.detail import AuthRequiredError, CollaborationDetailAdapter
+        from oa_knowledge.detail_archive import archive_collaboration_detail
+        from oa_knowledge.full_manifest import archive_proxy
+        from oa_knowledge.markdown_queue import enqueue_verified_for_oa
+        from oa_knowledge.resources import ResourceCoordinator
+
+        oa_item_key = task.logical_item_key
+        with Session(self.engine) as session:
+            manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == oa_item_key))
+            if manifest is None:
+                self.production_queue.fail(task.id, self.owner, "MANIFEST_MISSING", "manifest item disappeared", recoverable=False)
+                return
+            workitem_id = manifest.workitem_id_text
+            manifest_id = manifest.id
+        if not workitem_id:
+            self.production_queue.fail(task.id, self.owner, "WORKITEM_ID_MISSING", "no workitem id on manifest", recoverable=False)
+            return
+
+        coordinator = ResourceCoordinator(self.engine)
+        lease_owner = f"{self.owner}:done:{task.id}"
+        lease = coordinator.acquire("oa_browser", lease_owner, ttl_seconds=600, uses_local_gpu=False)
+        if lease is None:
+            raise RuntimeError("OA browser is busy")
+        try:
+            with BrowserSession(self.settings, headed=False) as browser:
+                if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+                    self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "saved OA session is not authenticated", recoverable=True)
+                    return
+                if browser.page is None:
+                    raise RuntimeError("browser page is not available")
+                detail_adapter = CollaborationDetailAdapter(
+                    browser.page,
+                    attachment_resolver=verified_attachment_resolver(self.engine, self.settings.data_root),
+                )
+                try:
+                    capture = detail_adapter.capture_direct(
+                        browser.base_url, workitem_id, max_depth=self.settings.collector.max_attachment_depth,
+                        total_timeout_seconds=self.settings.collector.attachment_total_timeout_seconds,
+                        download_timeout_seconds=self.settings.collector.download_timeout_seconds,
+                    )
+                except AuthRequiredError:
+                    self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "auth required during detail capture", recoverable=True)
+                    return
+                attachments = list(capture.attachments) + [a for container in capture.related_containers for a in container.attachments]
+                with Session(self.engine) as session:
+                    manifest = session.get(OAManifestItem, manifest_id)
+                    assert manifest is not None
+                    proxy = archive_proxy(manifest)
+                    archive_collaboration_detail(session, proxy, capture, self.settings.data_root)
+                    manifest.archive_relpath = session.scalar(
+                        select(OAItem.archive_relpath).where(OAItem.oa_item_key == oa_item_key)
+                    )
+                    if proxy.archive_status == "archived":
+                        manifest.processing_status = (
+                            "downloaded" if (attachments or _has_verified_attachment(session, oa_item_key)) else "no_attachment"
+                        )
+                        manifest.last_error = None
+                        manifest.failure_stage = None
+                    else:
+                        manifest.processing_status = "download_failed"
+                        manifest.retry_count += 1
+                        manifest.last_error = proxy.last_error
+                        manifest.failure_stage = "attachment"
+                    markdown_enqueued = enqueue_verified_for_oa(session, oa_item_key)
+                    session.commit()
+                if proxy.archive_status != "archived":
+                    self.production_queue.fail(
+                        task.id, self.owner, "ARCHIVE_FAILED", proxy.last_error or "archive failed", recoverable=True
+                    )
+                    return
+                self.production_queue.advance(
+                    task.id, self.owner, "attachment_inventory",
+                    progress_current=markdown_enqueued, progress_total=len(attachments) if attachments else 0,
+                )
+        finally:
+            coordinator.release(lease, lease_owner)
 
     def _pipeline_done_knowledge(self, task: PipelineTask) -> None:
         from oa_knowledge.done_knowledge import NoAttachmentEvidence, generate_done_knowledge
