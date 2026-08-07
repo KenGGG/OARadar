@@ -95,7 +95,16 @@ async function api<T>(path: string): Promise<T> {
   const response = await fetch(path, { headers: { Accept: "application/json" } })
   const text = await response.text()
   if (!response.ok) throw new Error(`请求失败 (${response.status})`)
-  try { return JSON.parse(text) as T } catch { throw new Error("服务返回了非 JSON 内容，请刷新服务") }
+  try { return JSON.parse(text) as T } catch {
+    // A non-JSON body on a 2xx response almost always means the request hit
+    // the SPA fallback because the backend is an older build without this
+    // route (e.g. /api/schedule/status). Tell the operator to restart the
+    // backend rather than the unhelpful "请刷新服务" message.
+    if (text.trimStart().startsWith("<")) {
+      throw new Error("后端返回了网页而非接口数据，可能是后端版本未更新，请重启 oaradar-web 服务后重试")
+    }
+    throw new Error("服务返回了非 JSON 内容，请刷新服务")
+  }
 }
 const time = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "-"
 const size = (value: number | null) => value == null ? "-" : value < 1024 * 1024 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB`

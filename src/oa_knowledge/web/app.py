@@ -459,8 +459,8 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     def get_schedule_status(limit: int = Query(10, ge=1, le=100)) -> dict:
         try:
             return schedule_status(settings, limit=limit)
-        except (OSError, RuntimeError) as exc:
-            raise HTTPException(status_code=503, detail="schedule status unavailable") from exc
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=f"schedule status unavailable: {exc}") from exc
 
     @app.post("/api/schedule/hourly", status_code=202)
     def post_schedule_hourly() -> dict:
@@ -719,6 +719,12 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
 
     @app.get("/{path:path}", include_in_schema=False)
     def frontend(path: str):
+        # Unmatched API routes must return JSON, never the SPA fallback HTML.
+        # Otherwise the console shows the opaque "非 JSON 内容" error and an
+        # operator cannot tell a stale/old backend (missing route) from a real
+        # fault. A JSON 404 points straight at "restart/rebuild the backend".
+        if path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API route not found")
         index = static_dir / "index.html"
         if not index.is_file():
             raise HTTPException(status_code=503, detail="Web frontend has not been built")
