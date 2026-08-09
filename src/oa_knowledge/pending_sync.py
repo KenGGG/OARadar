@@ -77,17 +77,23 @@ def sync_pending_discovery(
             )
             session.add(occurrence)
             created += 1
+            enqueue_pipeline = True
         else:
             if occurrence.occurrence_status != "active":
                 occurrence.occurrence_status = "active"
                 reactivated += 1
-            if occurrence.discovery_hash != discovery_hash:
+            changed = occurrence.discovery_hash != discovery_hash
+            if changed:
                 updated += 1
+                enqueue_pipeline = True
             else:
-                occurrence.last_seen_at = utcnow()
                 unchanged += 1
-                continue
+                enqueue_pipeline = False
 
+        # Always refresh display columns from the latest OA snapshot so a
+        # re-discovery restores titles the post-send cleanup erased, keeping the
+        # local 待办 list in sync with OA without re-running the pipeline for
+        # unchanged items.
         occurrence.title = item.title
         occurrence.sender = item.sender
         occurrence.previous_approver = item.previous_approver
@@ -105,7 +111,8 @@ def sync_pending_discovery(
         if notification_mode == "disabled":
             # Sync occurrence state only; do not enqueue capture/summary/notify.
             continue
-        notify = notification_mode == "normal"
+        if enqueue_pipeline:
+            notify = notification_mode == "normal"
         task_key = f"pending:{occurrence.occurrence_key}:{discovery_hash}:detail-v1"
         if session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == task_key)) is None:
             session.add(PipelineTask(
@@ -216,3 +223,58 @@ def record_pending_snapshot(
         "pending_updated" if has_snapshot is not None else "pending_initial",
         payload,
     )
+
+
+def resync_pending_item_from_oa(
+    settings,
+    engine,
+    occurrence_id: int,
+    *,
+    discovery=None,
+) -> bool:
+    """Re-fetch one cleaned Pending item's display columns from OA.
+
+    Used by the web console's "与 OA 同步" action (plan-0807-1 §sync). Opens the
+    OA pending list, finds the row whose ``affair_id`` matches the occurrence,
+    and refreshes only the display columns (title/sender/current_node/deadline)
+    via ``sync_pending_discovery(..., notification_mode="disabled")`` — this
+    restores the title without re-running capture/summary/notify or persisting
+    any business body.
+
+    Returns ``True`` when the item was found in OA (and its columns refreshed),
+    ``False`` when it is no longer present (in which case ``oa_gone_at`` is set so
+    the UI can report it as unrecoverable). ``discovery`` may be injected for
+    tests to avoid a real browser session.
+    """
+    from oa_knowledge.collector.pending import PendingAdapter
+
+    with Session(engine) as session:
+        occurrence = session.get(ItemOccurrence, occurrence_id)
+        if occurrence is None or occurrence.channel != "pending":
+            return False
+        affair_id = occurrence.affair_id_text
+        if not affair_id:
+            return False
+
+        if discovery is None:
+            from oa_knowledge.collector import BrowserSession, LoginState
+            with BrowserSession(settings, headed=False) as browser:
+                if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+                    raise RuntimeError("OA login required for pending re-sync")
+                assert browser.page
+                adapter = PendingAdapter(browser.page, f"{browser.base_url}{PendingAdapter.list_path}")
+                discovery = adapter.discover_all_pages()
+
+        matched = next(
+            (it for it in discovery.items if it.affair_id_text == affair_id), None
+        )
+        if matched is None:
+            occurrence.oa_gone_at = utcnow()
+            session.commit()
+            return False
+
+        occurrence.oa_gone_at = None
+        sync_pending_discovery(session, [matched], authoritative=False, notification_mode="disabled")
+        session.commit()
+        return True
+

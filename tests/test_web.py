@@ -41,7 +41,7 @@ def test_status_is_read_only_and_reports_current_schema(config_file: Path) -> No
     response = client.get("/api/status")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["schema"] == "0027_manifest_discovery_hash"
+    assert payload["schema"] == "0029_oa_gone"
     assert payload["stage"] == "2B-3"
     assert payload["oa_auth"] == {"status": "unknown", "checked_at": None, "read_only": True}
     assert payload["counts"]["items"] == 0

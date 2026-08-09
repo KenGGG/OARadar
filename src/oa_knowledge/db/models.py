@@ -597,6 +597,17 @@ class ItemOccurrence(Base):
     raw_fields_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Pending-notification data cleanup ledger (plan-0807-1 §6).
+    cleanup_status: Mapped[str | None] = mapped_column(String(30))
+    cleanup_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_error_code: Mapped[str | None] = mapped_column(String(80))
+    cleanup_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notify_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    allow_renotify: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Set when an on-demand OA re-sync confirmed the item is no longer present
+    # in OA's pending list (so no title can be recovered). plan-0807-1 §sync.
+    oa_gone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ItemSnapshot(Base):

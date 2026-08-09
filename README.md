@@ -61,7 +61,7 @@ Start the loopback-only Web console:
 uv run oa web --config config.yaml
 ```
 
-The Web console's Audit page can start, safely pause, and resume a full read-only online review. It compares OA-recognized attachments with database, verified-download, and successful-Markdown counts while persisting per-item timings, sanitized errors, and an implementation log. A pause request takes effect after the current item finishes.
+The Web console is organized around the product's business chains. The primary navigation is Overview / Pending Notifications / Done Archives / Markdown Output, with Settings at the bottom of the sidebar. "Overview" aggregates the three automation chains (pending notification, done archive, Markdown delivery) and surfaces only the issues needing human attention. "Pending Notifications" is a short-lived notification console: once Feishu confirms a successful send, the business payload is erased and only a minimal de-duplication ledger is kept. "Done Archives" shows whether original attachments are fully, permanently saved and turned into Markdown. "Markdown Output" lists files successfully converted and handed off to the llm_wiki source directory. "Settings → Maintenance" provides the read-only online review, Markdown queue, PDF MinerU re-conversion, archive-date calibration, and local service controls. See [plan-0807-1](docs/plan-0807-1.md).
 
 For browser login and read-only discovery, use the relevant `oa login`, `oa batch`, or `oa manifest` commands shown by `uv run oa --help`. Review the planned batch locally before any collection run.
 

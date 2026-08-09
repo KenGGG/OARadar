@@ -280,6 +280,24 @@ class OnlineAuditConfig(StrictModel):
     download_timeout_seconds: int = Field(default=30, ge=5, le=120)
 
 
+class PendingCleanupConfig(StrictModel):
+    """Retention policy for short-lived pending (待办) notification data (plan-0807-1 §6.5).
+
+    Pending items are not permanent knowledge assets. Once Feishu confirms a
+    successful delivery the business payload (body, opinion text, page snapshots,
+    temporary attachments, summaries) is erased, leaving only the minimal ledger
+    required to prevent duplicate notifications.
+    """
+
+    auto_cleanup_after_success: bool = True
+    cleanup_delay_hours: float = Field(default=0.0, ge=0, le=720)
+    failed_retention_days: int = Field(default=30, ge=1, le=3650)
+    keep_summary_body: bool = False
+    keep_page_snapshot: bool = False
+    keep_temp_attachments: bool = False
+    allow_force_cleanup: bool = True
+
+
 class WebConfig(StrictModel):
     host: str = "127.0.0.1"
     port: int = Field(default=2567, ge=1024, le=65535)
@@ -307,6 +325,7 @@ class Settings(StrictModel):
     markdown_export: MarkdownExportConfig = MarkdownExportConfig()
     conversion: ConversionConfig = ConversionConfig()
     online_audit: OnlineAuditConfig = OnlineAuditConfig()
+    pending_cleanup: PendingCleanupConfig = PendingCleanupConfig()
     web: WebConfig = WebConfig()
 
     @model_validator(mode="after")

@@ -105,8 +105,13 @@ def test_e2e_new_pending_notifies_exactly_once(config_file: Path) -> None:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
-            sv = session.scalar(select(SummaryVersion).where(SummaryVersion.logical_item_id == lid))
-            assert sv is not None and sv.status == "current"
+            # After a successful Feishu send the business payload is cleaned and
+            # only the minimal de-duplication ledger remains (plan-0807-1 §6).
+            occ = session.scalar(select(ItemOccurrence).where(ItemOccurrence.logical_item_id == lid))
+            assert occ is not None
+            assert occ.cleanup_status == "cleaned"
+            assert occ.notify_fingerprint is not None
+            assert occ.title is None, "business title must be erased after cleanup"
             deliveries = session.scalars(select(NotificationDelivery).where(
                 NotificationDelivery.logical_item_id == lid,
                 NotificationDelivery.channel == "feishu",

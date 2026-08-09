@@ -33,6 +33,8 @@ storage:
 markdown_export:
   enabled: true
   workspace_root: workspace
+  # The generated Markdown is atomically published here and picked up by the
+  # external llm_wiki project as its OA source directory (plan-0807-1 §9.4 交接).
   source_markdown_dir: raw/sources/oa
   preserve_source_tree: true
   filename_mode: append_md
@@ -50,6 +52,19 @@ conversion:
 online_audit:
   item_timeout_seconds: 120
   download_timeout_seconds: 30
+
+# Pending (待办) notification data retention. Pending items are short-lived
+# notification records, not permanent knowledge assets. After Feishu confirms a
+# successful delivery the business payload is erased and only the minimal
+# de-duplication ledger is retained. See docs/plan-0807-1.md §6.
+pending_cleanup:
+  auto_cleanup_after_success: true
+  cleanup_delay_hours: 0
+  failed_retention_days: 30
+  keep_summary_body: false
+  keep_page_snapshot: false
+  keep_temp_attachments: false
+  allow_force_cleanup: true
 
 archive:
   max_recursive_depth: 2

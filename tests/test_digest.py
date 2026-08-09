@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from oa_knowledge.digest.feishu import FeishuNotifier
+from oa_knowledge.digest.feishu import FeishuNotifier, feishu_escape
 from oa_knowledge.digest.tasks import TaskExtractor
 from oa_knowledge.enrich.extractor import ExtractedTask, extract_task_candidates
 from oa_knowledge.pending_summary import PendingSummary, Risk
@@ -143,25 +143,53 @@ def test_feishu_signature_generation() -> None:
 
 
 def test_feishu_pending_summary_card_fields() -> None:
-    """Pending summary card carries only high-signal fields."""
+    """Pending summary card carries exactly 标题/发起人/简要内容 (+ optional link).
+
+    Uses Feishu's official Markdown component (``"tag": "markdown"``), not the
+    unsupported ``"content_type": "markdown"`` text element.
+    """
     notifier = FeishuNotifier(webhook_env="__NONEXISTENT", secret_env="__NONEXIST")
+
+    # Case 1: with a generated brief_content, the card shows the three blocks and
+    # no longer renders the raw required_action / deadline / risk fields.
     summary = PendingSummary(
         summary="请审批预算", matter_type="报销", current_stage="审批中",
         required_action="确认金额", risks=[Risk(risk="超期未批")], confidence=0.9,
+        brief_content="这是一份报销审批事项，附件为预算表，需你审批后归档。",
     )
     msg = notifier._build_pending_summary_message(
         summary, title="测试事项", sender="张三", current_node="部门审批",
         deadline_text="2026-08-10", detail_url="https://oa.invalid/detail/1",
     )
     assert msg["msg_type"] == "interactive"
-    text = json.dumps(msg["card"]["elements"], ensure_ascii=False)
+    elements = msg["card"]["elements"]
+    assert all(el["tag"] == "markdown" for el in elements), "card must use markdown components"
+    text = json.dumps(elements, ensure_ascii=False)
     assert "测试事项" in text
     assert "张三" in text
-    assert "请审批预算" in text
-    assert "确认金额" in text
-    assert "2026-08-10" in text
-    assert "超期未批" in text
+    assert "这是一份报销审批事项" in text
+    # Raw required_action / deadline / risk must NOT be rendered as separate blocks.
+    assert "确认金额" not in text
+    assert "2026-08-10" not in text
+    assert "超期未批" not in text
     assert "https://oa.invalid/detail/1" in text
+
+    # Case 2: without brief_content the card falls back to the plain summary so
+    # it is never empty, still as a markdown component.
+    summary_no_brief = PendingSummary(summary="请审批预算", confidence=0.8)
+    msg2 = notifier._build_pending_summary_message(
+        summary_no_brief, title="测试事项", sender="张三", detail_url="",
+    )
+    body = json.dumps(msg2["card"]["elements"], ensure_ascii=False)
+    assert "请审批预算" in body
+    assert "https://oa.invalid/detail/1" not in body
+
+
+def test_feishu_escape_angles() -> None:
+    """Angle brackets are entity-escaped so Feishu does not read them as tags."""
+    assert feishu_escape("a < b and c > d") == "a &#60; b and c &#62; d"
+    assert feishu_escape("") == ""
+    assert feishu_escape("无特殊符号") == "无特殊符号"
 
 
 def test_feishu_send_pending_summary_posts_card(monkeypatch) -> None:

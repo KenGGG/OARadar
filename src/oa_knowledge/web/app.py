@@ -48,6 +48,23 @@ from oa_knowledge.web.schedule_views import (
     schedule_status,
     trigger_schedule_run,
 )
+from oa_knowledge.web.console_views import (
+    build_dashboard,
+    cleanup_eligible_pending,
+    cleanup_pending,
+    done_archives_list,
+    maintenance_action,
+    markdown_outputs_list,
+    pending_notification_detail,
+    pending_notifications_list,
+    rebuild_markdown_export,
+    retry_done_archive,
+    retry_pending_delivery,
+    retry_pending_summary,
+    sync_pending_occurrence,
+    settings_view,
+    update_settings,
+)
 from oa_knowledge.web.status import (
     archive_date_status,
     audit_all_manifest_items,
@@ -319,6 +336,121 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     @app.get("/api/lifecycle/processing-center")
     def get_lifecycle_processing_center() -> dict:
         return lifecycle_processing_center(settings)
+
+    # ---- Product-aligned console routes (plan-0807-1 §3-§10) ----
+
+    @app.get("/api/dashboard")
+    def get_dashboard() -> dict:
+        try:
+            return build_dashboard(settings)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail=f"dashboard unavailable: {exc}") from exc
+
+    @app.get("/api/pending-notifications")
+    def get_pending_notifications(
+        filter: str | None = Query(None, description="processing|summary_failed|feishu_failed|awaiting_cleanup|cleanup_failed|recent_success"),
+    ) -> dict:
+        return pending_notifications_list(settings, filter_kind=filter)
+
+    @app.get("/api/pending-notifications/{occurrence_id}")
+    def get_pending_notification_detail(occurrence_id: int) -> dict:
+        try:
+            return pending_notification_detail(settings, occurrence_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/pending-notifications/{occurrence_id}/retry-summary", status_code=202)
+    def post_pending_retry_summary(occurrence_id: int) -> dict:
+        try:
+            return retry_pending_summary(settings, occurrence_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/pending-notifications/{occurrence_id}/retry-delivery", status_code=202)
+    def post_pending_retry_delivery(occurrence_id: int) -> dict:
+        try:
+            return retry_pending_delivery(settings, occurrence_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/pending-notifications/{occurrence_id}/cleanup", status_code=202)
+    def post_pending_cleanup(occurrence_id: int, payload: dict | None = None) -> dict:
+        force = bool((payload or {}).get("force"))
+        try:
+            return cleanup_pending(settings, occurrence_id, force=force)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/pending-notifications/cleanup-eligible", status_code=202)
+    def post_pending_cleanup_eligible() -> dict:
+        try:
+            return cleanup_eligible_pending(settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/pending-notifications/{occurrence_id}/sync-oa", status_code=202)
+    def post_pending_sync_oa(occurrence_id: int) -> dict:
+        try:
+            return sync_pending_occurrence(settings, occurrence_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/done-archives")
+    def get_done_archives(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(100, ge=1, le=200),
+        query: str | None = Query(None),
+        archive_status: str | None = Query(None),
+        markdown_status: str | None = Query(None),
+        handoff_status: str | None = Query(None),
+    ) -> dict:
+        return done_archives_list(
+            settings, page=page, page_size=page_size, query=query,
+            archive_status=archive_status, markdown_status=markdown_status, handoff_status=handoff_status,
+        )
+
+    @app.get("/api/markdown-outputs")
+    def get_markdown_outputs() -> dict:
+        return markdown_outputs_list(settings)
+
+    @app.post("/api/done-archives/{manifest_id}/retry-archive", status_code=202)
+    def post_done_archive_retry(manifest_id: int) -> dict:
+        try:
+            return retry_done_archive(settings, manifest_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/markdown-outputs/{export_id}/rebuild", status_code=202)
+    def post_markdown_rebuild(export_id: int) -> dict:
+        try:
+            return rebuild_markdown_export(settings, export_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/settings")
+    def get_settings() -> dict:
+        return settings_view(settings)
+
+    @app.patch("/api/settings")
+    def patch_settings(payload: dict) -> dict:
+        try:
+            return update_settings(config_path, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/maintenance")
+    def get_maintenance_view(target_items: int = Query(500, ge=1, le=100000)) -> dict:
+        return maintenance_status(settings, target_items)
+
+    @app.post("/api/maintenance/actions")
+    def post_maintenance_action(payload: dict) -> dict:
+        action = payload.get("action") if isinstance(payload, dict) else None
+        try:
+            return maintenance_action(settings, config_path, action, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/system/provider-settings")
     def get_provider_settings() -> dict:

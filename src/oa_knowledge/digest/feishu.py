@@ -16,6 +16,20 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+def feishu_escape(text: str) -> str:
+    """Escape angle brackets Feishu cards would misinterpret as inline tags.
+
+    Feishu markdown supports a small subset and treats ``<``/``>`` as the start
+    of inline tags such as ``<at>``/``<font>``. Literal angle brackets must be
+    HTML-entity escaped per the official card spec. We never emit those tags, so
+    escaping ``<``/``>`` is sufficient. ``&`` is left untouched because our
+    content contains no pre-existing entities and we must not double-escape.
+    """
+    if not text:
+        return ""
+    return text.replace("<", "&#60;").replace(">", "&#62;")
+
+
 class FeishuNotifier:
     """Sends daily digests and alerts via Feishu Webhook."""
 
@@ -58,7 +72,11 @@ class FeishuNotifier:
         return base64.b64encode(digest).decode("utf-8")
 
     def _build_digest_message(self, date_str: str, stats: dict) -> dict:
-        """Build an interactive card message for the daily digest."""
+        """Build an interactive card message for the daily digest.
+
+        Uses Feishu's official Markdown component (``"tag": "markdown"``) and
+        escapes angle brackets so the content renders as formatted text.
+        """
         sections = []
 
         # Section 1: Priority items
@@ -68,7 +86,7 @@ class FeishuNotifier:
                 f"{i+1}. [高] {self._redact(item['title'])}\n   截止：{item.get('deadline', '未知')}\n   来源：{item.get('source', '')}"
                 for i, item in enumerate(high_priority[:self.max_items])
             )
-            sections.append({"tag": "div", "text": {"content_type": "markdown", "content": f"一、需要优先处理\n{items_text}"}})
+            sections.append({"tag": "markdown", "content": feishu_escape(f"一、需要优先处理\n{items_text}")})
 
         # Section 2: New tasks summary
         new_count = stats.get("new_tasks", 0)
@@ -76,25 +94,22 @@ class FeishuNotifier:
         due_3days = stats.get("due_3days", 0)
         overdue = stats.get("overdue", 0)
         sections.append({
-            "tag": "div",
-            "text": {
-                "content_type": "markdown",
-                "content": (
-                    f"二、新增待办\n"
-                    f"- 新增 {new_count} 项\n"
-                    f"- 今日截止 {due_today} 项\n"
-                    f"- 3日内截止 {due_3days} 项\n"
-                    f"- 已逾期 {overdue} 项"
-                ),
-            },
+            "tag": "markdown",
+            "content": feishu_escape(
+                f"二、新增待办\n"
+                f"- 新增 {new_count} 项\n"
+                f"- 今日截止 {due_today} 项\n"
+                f"- 3日内截止 {due_3days} 项\n"
+                f"- 已逾期 {overdue} 项"
+            ),
         })
 
         # Section 3: Official documents
         official_docs = stats.get("official_documents", 0)
         if official_docs > 0:
             sections.append({
-                "tag": "div",
-                "text": {"content_type": "markdown", "content": f"三、新增红头文件\n- {official_docs} 份"},
+                "tag": "markdown",
+                "content": feishu_escape(f"三、新增红头文件\n- {official_docs} 份"),
             })
 
         # Section 4: Attention needed
@@ -107,17 +122,14 @@ class FeishuNotifier:
             attention_items.append(f"- {downloads_failed} 项附件下载失败")
         if attention_items:
             sections.append({
-                "tag": "div",
-                "text": {"content_type": "markdown", "content": f"四、需要人工关注\n" + "\n".join(attention_items)},
+                "tag": "markdown",
+                "content": feishu_escape(f"四、需要人工关注\n" + "\n".join(attention_items)),
             })
 
         # Section 5: System status
         sections.append({
-            "tag": "div",
-            "text": {
-                "content_type": "markdown",
-                "content": "五、系统状态\n- OA 登录正常\n- 最近成功同步完成",
-            },
+            "tag": "markdown",
+            "content": feishu_escape("五、系统状态\n- OA 登录正常\n- 最近成功同步完成"),
         })
 
         return {
@@ -166,9 +178,9 @@ class FeishuNotifier:
         *,
         title: str,
         sender: str,
-        current_node: str,
-        deadline_text: str,
-        detail_url: str,
+        current_node: str = "",
+        deadline_text: str = "",
+        detail_url: str = "",
         content_mode: str = "summary",
         max_summary_chars: int = 500,
         max_action_chars: int = 200,
@@ -177,51 +189,44 @@ class FeishuNotifier:
     ) -> dict:
         """Build an interactive card for a single Pending summary.
 
-        Only high-signal fields are sent: no full body or attachment content.
-        ``content_mode`` controls how much is included (plan-0805-02 §3.5):
+        The card uses Feishu's official Markdown component (``"tag": "markdown"``)
+        — Feishu does **not** accept ``"content_type": "markdown"`` inside a
+        ``text`` element, which is why earlier cards rendered as plain text.
 
-        * ``metadata_only`` — only title/sender/current node/deadline/link.
-        * ``summary``       — also include a capped summary, required action,
-          and at most ``max_risk_items`` risks.
+        Per the agreed notification structure the card carries exactly three
+        blocks (plan-0807-1 / user request): 标题、发起人、简要内容. ``brief_content``
+        is an LLM paragraph that, together with the title, states whether this is
+        a document-circulation (文件传阅) or an action-required (需要处理) item and
+        summarizes the attachment(s). The remaining signals (current node,
+        deadline, required action, risks) are folded into that paragraph by the
+        summarizer, so they are intentionally not rendered as separate blocks
+        here. ``content_mode``/caps are retained only for call-signature
+        compatibility and no longer change the rendered layout.
         """
 
         def md(text) -> str:
             return self._redact(text) if isinstance(text, str) and text else ""
 
-        def cap(value: str, limit: int) -> str:
-            if value and len(value) > limit:
-                return value[: max(0, limit - 1)] + "…"
-            return value
-
-        lines = [
-            f"**标题**：{md(title)}",
-            f"**发起人**：{md(sender)}",
-        ]
-        if current_node:
-            lines.append(f"**当前节点**：{md(current_node)}")
-        if content_mode != "metadata_only":
-            summary_text = cap(md(summary.summary), max_summary_chars)
-            if summary_text:
-                lines.append(f"**简要说明**：{summary_text}")
-            action_text = cap(md(summary.required_action), max_action_chars)
-            if action_text:
-                lines.append(f"**需要处理**：{action_text}")
-            deadline = deadline_text or (summary.deadlines[0].date if summary.deadlines else "")
-            if deadline:
-                lines.append(f"**截止时间**：{md(deadline)}")
-            risks = "\n".join(f"- {md(r.risk)}" for r in summary.risks[:max_risk_items] if r.risk)
-            if risks:
-                lines.append(f"**主要风险**：\n{risks}")
-        else:
-            deadline = deadline_text or (summary.deadlines[0].date if summary.deadlines else "")
-            if deadline:
-                lines.append(f"**截止时间**：{md(deadline)}")
-        content = "\n".join(lines)
-        elements = [{"tag": "div", "text": {"content_type": "markdown", "content": content}}]
+        blocks: list[str] = [f"**标题**：{md(title)}"]
+        if sender:
+            blocks.append(f"**发起人**：{md(sender)}")
+        brief = md(getattr(summary, "brief_content", "") or "")
+        if brief:
+            blocks.append(brief)
+        elif content_mode != "metadata_only":
+            # Fallback when the summarizer produced no brief_content: keep a
+            # capped plain summary so the card is never empty.
+            fallback = md(summary.summary)
+            if len(fallback) > max_summary_chars:
+                fallback = fallback[: max(0, max_summary_chars - 1)] + "…"
+            if fallback:
+                blocks.append(fallback)
+        content = "\n".join(blocks)
+        elements = [{"tag": "markdown", "content": feishu_escape(content)}]
         if include_detail_link and detail_url:
             elements.append({
-                "tag": "div",
-                "text": {"content_type": "markdown", "content": f"[查看 OA 详情]({detail_url})"},
+                "tag": "markdown",
+                "content": feishu_escape(f"[查看 OA 详情]({detail_url})"),
             })
         header_title = md(title)[:20] or "待办摘要"
         return {

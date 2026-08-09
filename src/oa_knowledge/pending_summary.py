@@ -44,6 +44,7 @@ class PendingSummary(BaseModel):
     deadlines: list[Deadline] = Field(default_factory=list)
     risks: list[Risk] = Field(default_factory=list)
     attachment_overview: list[AttachmentOverview] = Field(default_factory=list)
+    brief_content: str = ""
     confidence: float = Field(ge=0, le=1)
 
 
@@ -68,7 +69,7 @@ def normalize_pending_response(payload: dict) -> PendingSummary:
             initiator=str(payload.get("initiator") or ""), current_stage=str(payload.get("current_stage") or ""),
             key_points=[str(x) for x in payload.get("key_points", []) if isinstance(x, str)],
             required_action=str(payload.get("required_action") or ""), amounts=[], deadlines=[], risks=[],
-            attachment_overview=[], confidence=0.5,
+            attachment_overview=[], brief_content=str(payload.get("brief_content") or ""), confidence=0.5,
         )
 
 
@@ -143,7 +144,11 @@ def summarize_pending(settings: Settings, engine, logical_item_id: int) -> Summa
         client = make_llm_client(settings.llm, max_retries=settings.llm.max_retries)
         system_prompt = ("你是本地OA待办概括器。只能依据输入，输出严格JSON；无证据的金额、日期、风险留空，不得编造。"
                          "输出必须严格符合以下JSON Schema，不得增删顶层字段：\n" +
-                         json.dumps(PendingSummary.model_json_schema(), ensure_ascii=False))
+                         json.dumps(PendingSummary.model_json_schema(), ensure_ascii=False) +
+                         "\n\n额外要求——字段 brief_content："
+                         "写一段不超过200字的口播式摘要，用于飞书卡片。必须结合标题判断这是「文件传阅/阅知类」还是「需要处理/审批类」事项；"
+                         "若提供了附件 Markdown，须概括其大致内容（如主题、关键结论、涉及金额或时限等，但只能依据证据，不得编造）；"
+                         "如无可概括附件，则只说明事项性质与当前所处节点/截止等关键信息。无证据时泛泛说明，不要补充细节。")
         result = client.chat(system_prompt, "请按约定字段概括以下不可变Pending快照：\n" + pending_evidence(payload))
         if result.get("error"):
             raise PendingSummaryError(result.get("error"))
