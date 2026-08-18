@@ -1,21 +1,599 @@
+import hashlib
+import json
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, NotificationDelivery, OAItem, OperationJob, ParseJob, PipelineTask, ReviewEntry
-from oa_knowledge.web.worker import OperationWorker
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ContentObject, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
+from oa_knowledge.online_audit import start_audit
+from oa_knowledge.web.worker import OperationWorker, _has_verified_attachment
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.notifications.models import DeliveryResult
+from oa_knowledge.archive_migration_campaign import ensure_verified_archive_migration
+
+
+def _record_full_manifest_sync(session: Session, count: int) -> None:
+    now = datetime.now(timezone.utc)
+    session.add(OAManifestSync(
+        oa_total_count=count, local_manifest_count=count,
+        pages_scanned=max(1, count), source_total_pages=max(1, count),
+        status="manifest_complete", started_at=now, finished_at=now,
+    ))
 
 
 def test_retry_progress_keeps_original_total_after_resume() -> None:
     assert OperationWorker._retry_progress(total_targets=2393, resumed=1118, completed_after_resume=1) == 1119
+
+
+def test_completed_scheduled_scan_progress_is_never_greater_than_total() -> None:
+    assert OperationWorker._completed_scan_progress(
+        {"source_total": 13, "created": 13, "updated": 0},
+        {"new_items": 25},
+    ) == (38, 38)
+
+
+def test_oa_login_writes_a_live_logging_in_status_before_browser_access(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    worker = OperationWorker(settings, config_path=config_file)
+
+    class Browser:
+        def login_with_saved_credentials(self, _timeout: int) -> str:
+            payload = json.loads((settings.data_root / "runtime" / "operation-worker.json").read_text(encoding="utf-8"))
+            assert payload["status"] == "logging_in"
+            assert payload["activity"] == "正在验证 OA 登录"
+            return "authenticated"
+
+    try:
+        assert worker._verify_oa_login(Browser()) == "authenticated"
+        payload = json.loads((settings.data_root / "runtime" / "operation-worker.json").read_text(encoding="utf-8"))
+        assert payload["status"] == "working"
+    finally:
+        worker.close()
+
+
+def test_long_pipeline_stage_refreshes_its_database_lease(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    queue.enqueue("realtime_pending", "synthetic-lease", "pending_parse", "lease-heartbeat")
+    task = queue.claim("worker-test")
+    initial_expiry = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task.id)
+        row.lease_expires_at = initial_expiry
+        session.commit()
+
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr("oa_knowledge.web.worker.PIPELINE_HEARTBEAT_SECONDS", 0.01, raising=False)
+    observed = {"refreshed": False}
+
+    def slow_stage(_task) -> None:
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            with Session(engine) as session:
+                expiry = session.get(PipelineTask, task.id).lease_expires_at
+                if expiry and expiry.replace(tzinfo=timezone.utc) > initial_expiry:
+                    observed["refreshed"] = True
+                    return
+            time.sleep(0.01)
+
+    monkeypatch.setattr(worker, "_pipeline_pending_parse", slow_stage)
+    try:
+        worker._execute_pipeline_task(task)
+    finally:
+        worker.close()
+
+    assert observed["refreshed"] is True
+
+
+def test_has_verified_attachment_returns_boolean_for_empty_and_existing_sources(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:no-new-attachments", source_channel="done", title="合成事项")
+        session.add(item); session.flush()
+        assert _has_verified_attachment(session, item.oa_item_key) is False
+        session.add(ArchivedFile(
+            oa_item_id=item.id, attachment_key="synthetic", original_name="synthetic.txt",
+            file_role="direct_attachment", source_container_key="root",
+            download_status="verified",
+        ))
+        session.flush()
+        assert _has_verified_attachment(session, item.oa_item_key) is True
+
+
+def test_online_audit_browser_start_failure_updates_run_and_job_together(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    run_id = start_audit(settings)["run_id"]
+
+    class BrokenBrowser:
+        def __init__(self, *_args, **_kwargs): pass
+        def __enter__(self): raise RuntimeError("synthetic browser start failure")
+        def __exit__(self, *_args): return None
+
+    monkeypatch.setattr("oa_knowledge.collector.browser.BrowserSession", BrokenBrowser)
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        run = session.get(OnlineAuditRun, run_id)
+        job = session.get(OperationJob, run.job_id)
+        assert run.status == "failed"
+        assert job.status == "failed"
+
+
+def test_online_audit_uses_bounded_audit_timeouts_for_each_oa_item(config_file: Path, monkeypatch) -> None:
+    """A slow audit item must not inherit the much longer archive timeouts."""
+    from oa_knowledge.collector import LoginState
+
+    settings = load_settings(config_file)
+    settings.online_audit.item_timeout_seconds = 73
+    settings.online_audit.download_timeout_seconds = 17
+    settings.collector.attachment_total_timeout_seconds = 901
+    settings.collector.download_timeout_seconds = 181
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OAManifestItem(
+            oa_item_key="done:bounded-audit", workitem_id_text="bounded-audit",
+            title="合成已办", list_page=1, processing_status="downloaded",
+        ))
+        session.commit()
+    run_id = start_audit(settings)["run_id"]
+    observed: dict[str, int] = {}
+
+    class FakeBrowser:
+        page = MagicMock()
+        base_url = "http://oa.invalid"
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def login_with_saved_credentials(self, _timeout):
+            return LoginState.AUTHENTICATED
+
+    class FakeAdapter:
+        def __init__(self, _page):
+            pass
+
+        def capture_direct(self, _base_url, _workitem_id, **kwargs):
+            observed.update(kwargs)
+            return SimpleNamespace(
+                attachments=(), related_containers=(), capture_issues=(),
+            )
+
+    monkeypatch.setattr("oa_knowledge.collector.browser.BrowserSession", FakeBrowser)
+    monkeypatch.setattr("oa_knowledge.collector.detail.CollaborationDetailAdapter", FakeAdapter)
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+
+    assert observed["total_timeout_seconds"] == 73
+    assert observed["download_timeout_seconds"] == 17
+    with Session(engine) as session:
+        assert session.get(OnlineAuditRun, run_id).status == "completed"
+
+
+def test_online_audit_rejects_partial_evidence_after_capture_timeout(config_file: Path, monkeypatch) -> None:
+    """Timed-out capture bytes cannot be treated as complete online evidence."""
+    from oa_knowledge.collector import LoginState
+
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OAManifestItem(
+            oa_item_key="done:timed-out-audit", workitem_id_text="timed-out-audit",
+            title="合成已办", list_page=1, processing_status="downloaded",
+        ))
+        session.commit()
+    run_id = start_audit(settings)["run_id"]
+
+    class FakeBrowser:
+        page = MagicMock()
+        base_url = "http://oa.invalid"
+        def __init__(self, *_args, **_kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def login_with_saved_credentials(self, _timeout): return LoginState.AUTHENTICATED
+
+    class FakeAdapter:
+        def __init__(self, _page): pass
+        def capture_direct(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                attachments=(), related_containers=(),
+                capture_issues=({"kind": "capture_timeout", "stage": "attachments"},),
+            )
+
+    monkeypatch.setattr("oa_knowledge.collector.browser.BrowserSession", FakeBrowser)
+    monkeypatch.setattr("oa_knowledge.collector.detail.CollaborationDetailAdapter", FakeAdapter)
+    monkeypatch.setattr("oa_knowledge.web.worker.ONLINE_AUDIT_YIELD", timedelta(0))
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_once() is True
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        run = session.get(OnlineAuditRun, run_id)
+        item = session.scalar(select(OnlineAuditItem).where(OnlineAuditItem.run_id == run_id))
+        assert run.status == "completed"
+        assert run.access_failed_items == 1
+        assert item.status == "access_failed"
+
+
+def test_verified_archive_migration_waits_for_completed_audit(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:synthetic-migration", source_channel="done",
+            title="合成已办", archive_relpath="raw/done/unknown/synthetic",
+        )
+        session.add(item)
+        session.add(OnlineAuditRun(status="running", total_items=1))
+        session.commit()
+    assert ensure_verified_archive_migration(engine) is None
+
+
+def test_verified_archive_migration_waits_for_fresh_full_manifest(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:stale-manifest", source_channel="done",
+            title="stale-manifest",
+            archive_relpath="raw/done/unknown/stale-manifest",
+        )
+        session.add(item)
+        session.add(OAManifestItem(
+            oa_item_key=item.oa_item_key, workitem_id_text="stale-manifest",
+            title="stale-manifest", list_page=1,
+            processing_status="downloaded",
+        ))
+        audit = OnlineAuditRun(
+            status="completed", total_items=1, completed_items=1,
+            started_at=datetime.now(timezone.utc),
+        )
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id, oa_item_key=item.oa_item_key,
+            title="stale-manifest", status="matched",
+            comparison_reason="exact_match",
+        ))
+        old = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        session.add(OAManifestSync(
+            oa_total_count=1, local_manifest_count=1,
+            pages_scanned=1, source_total_pages=1,
+            status="manifest_complete", started_at=old, finished_at=old,
+        ))
+        session.commit()
+
+    assert ensure_verified_archive_migration(engine) is None
+    with Session(engine) as session:
+        assert session.scalar(select(OperationJob.id).where(
+            OperationJob.job_type == "verified_archive_migration",
+        )) is None
+
+
+def test_verified_archive_migration_waits_for_audit_supplement(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:supplement", source_channel="done", title="supplement",
+            archive_relpath="raw/done/unknown/supplement",
+        )
+        session.add(item)
+        audit = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id, oa_item_key=item.oa_item_key, title="supplement",
+            status="matched", comparison_reason="exact_match",
+        ))
+        session.add(PipelineTask(
+            queue_name="realtime_done", priority=10,
+            logical_item_key=item.oa_item_key,
+            stage="done_capture_and_archive",
+            idempotency_key=f"online-audit:{audit.id}:synthetic:supplement-v1",
+            status="queued",
+        ))
+        session.commit()
+
+    assert ensure_verified_archive_migration(engine) is None
+
+
+def test_verified_archive_migration_reopens_audit_for_new_manifest(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:audited", source_channel="done", title="audited",
+            archive_relpath="raw/done/unknown/audited",
+        )
+        session.add(item)
+        job = OperationJob(
+            job_key="completed-audit-with-late-manifest", job_type="online_audit",
+            status="completed", idempotency_key="completed-audit-with-late-manifest",
+        )
+        session.add(job); session.flush()
+        audit = OnlineAuditRun(
+            job_id=job.id, status="completed", total_items=1, completed_items=1,
+        )
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id, oa_item_key=item.oa_item_key, title="audited",
+            status="matched", comparison_reason="exact_match",
+        ))
+        session.add(OAManifestItem(
+            oa_item_key="done:late-manifest", workitem_id_text="late",
+            title="late", list_page=9, processing_status="pending_download",
+        ))
+        audit_id = audit.id
+        session.commit()
+
+    assert ensure_verified_archive_migration(engine) is None
+    with Session(engine) as session:
+        audit = session.get(OnlineAuditRun, audit_id)
+        assert audit.status == "queued"
+        assert audit.total_items == 2
+        assert session.get(OperationJob, audit.job_id).status == "queued"
+        assert session.scalar(select(func.count()).select_from(OnlineAuditItem).where(
+            OnlineAuditItem.run_id == audit_id,
+            OnlineAuditItem.status == "pending",
+        )) == 1
+
+
+def test_archive_migration_pauses_and_resumes_when_audit_reopens(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:migration-resume", source_channel="done",
+            title="migration-resume",
+            archive_relpath="raw/done/unknown/migration-resume",
+        )
+        session.add(item)
+        audit_job = OperationJob(
+            job_key="reopened-audit-job", job_type="online_audit",
+            status="queued", idempotency_key="reopened-audit-job",
+        )
+        session.add(audit_job); session.flush()
+        audit = OnlineAuditRun(
+            job_id=audit_job.id, status="queued", total_items=1,
+            completed_items=1,
+        )
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id, oa_item_key=item.oa_item_key,
+            title="migration-resume", status="matched",
+            comparison_reason="exact_match",
+        ))
+        session.add(OAManifestItem(
+            oa_item_key=item.oa_item_key, workitem_id_text="migration-resume",
+            title="migration-resume", list_page=1,
+            processing_status="downloaded",
+        ))
+        _record_full_manifest_sync(session, 1)
+        migration = OperationJob(
+            job_key=f"archive-migration-{audit.id}",
+            job_type="verified_archive_migration", status="queued",
+            idempotency_key=f"archive-migration:{audit.id}:verified-archive-path-v1",
+            parameters_json=json.dumps({
+                "audit_run_id": audit.id,
+                "migration_version": "verified-archive-path-v1",
+                "processed": 0, "migrated": 0, "failed": 0,
+                "failed_item_ids": [],
+            }),
+        )
+        session.add(migration); session.flush()
+        audit_id, migration_id = audit.id, migration.id
+        session.commit()
+
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        worker._execute_verified_archive_migration(migration_id)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        migration = session.get(OperationJob, migration_id)
+        assert migration.status == "paused"
+        assert migration.last_error_code == "WAITING_FOR_ONLINE_AUDIT"
+        audit = session.get(OnlineAuditRun, audit_id)
+        audit.status = "completed"
+        session.get(OperationJob, audit.job_id).status = "completed"
+        session.commit()
+
+    assert ensure_verified_archive_migration(engine) == migration_id
+    with Session(engine) as session:
+        migration = session.get(OperationJob, migration_id)
+        assert migration.status == "queued"
+        assert migration.last_error_code is None
+
+
+def test_worker_migrates_only_online_verified_legacy_archives(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    safe_rel = "raw/done/unknown/safe"
+    review_rel = "raw/done/unknown/review"
+    (settings.data_root / safe_rel).mkdir(parents=True)
+    (settings.data_root / safe_rel / "source.txt").write_bytes(b"safe immutable source")
+    (settings.data_root / review_rel).mkdir(parents=True)
+    (settings.data_root / review_rel / "source.txt").write_bytes(b"review immutable source")
+    with Session(engine) as session:
+        safe = OAItem(
+            oa_item_key="done:safe", source_channel="done", title="safe",
+            archive_relpath=safe_rel,
+        )
+        review = OAItem(
+            oa_item_key="done:review", source_channel="done", title="review",
+            archive_relpath=review_rel,
+        )
+        session.add_all((safe, review)); session.flush()
+        session.add_all((
+            ArchivedFile(
+                oa_item_id=safe.id, original_name="source.txt", attachment_key="safe",
+                file_role="direct_attachment", source_container_key="root", depth=1,
+                local_relpath=f"{safe_rel}/source.txt", download_status="verified",
+            ),
+            ArchivedFile(
+                oa_item_id=review.id, original_name="source.txt", attachment_key="review",
+                file_role="direct_attachment", source_container_key="root", depth=1,
+                local_relpath=f"{review_rel}/source.txt", download_status="verified",
+            ),
+        ))
+        session.add_all((
+            OAManifestItem(
+                oa_item_key=safe.oa_item_key, workitem_id_text="safe",
+                title="safe", list_page=1, processing_status="downloaded",
+            ),
+            OAManifestItem(
+                oa_item_key=review.oa_item_key, workitem_id_text="review",
+                title="review", list_page=1, processing_status="downloaded",
+            ),
+        ))
+        audit = OnlineAuditRun(status="completed", total_items=2, completed_items=2)
+        session.add(audit); session.flush()
+        session.add_all((
+            OnlineAuditItem(
+                run_id=audit.id, oa_item_key=safe.oa_item_key, title="safe",
+                status="matched", comparison_reason="exact_match",
+                depth_limit_reached=False,
+            ),
+            OnlineAuditItem(
+                run_id=audit.id, oa_item_key=review.oa_item_key, title="review",
+                status="historical_retained", comparison_reason="inventory_changed",
+                depth_limit_reached=False,
+            ),
+        ))
+        _record_full_manifest_sync(session, 2)
+        session.add(MarkdownQueueControl(id=1, paused=True))
+        session.commit()
+
+    safe_task_id = ProductionQueue(engine).enqueue(
+        "historical_done_backfill", "done:safe", "attachment_inventory",
+        "history:done:safe:knowledge-v2",
+    )
+    review_task_id = ProductionQueue(engine).enqueue(
+        "historical_done_backfill", "done:review", "attachment_inventory",
+        "history:done:review:knowledge-v2",
+    )
+
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        safe = session.scalar(select(OAItem).where(OAItem.oa_item_key == "done:safe"))
+        review = session.scalar(select(OAItem).where(OAItem.oa_item_key == "done:review"))
+        job = session.scalar(select(OperationJob).where(
+            OperationJob.job_type == "verified_archive_migration",
+        ))
+        assert safe.archive_relpath.startswith("archive/raw/oa/done/")
+        assert review.archive_relpath == review_rel
+        assert job.status == "completed"
+        parameters = json.loads(job.parameters_json)
+        assert parameters["review_required"] == 1
+        assert parameters["historical_released_tasks"] == 0
+        assert parameters["historical_review_tasks"] == 1
+        assert session.get(PipelineTask, safe_task_id).status == "queued"
+        review_task = session.get(PipelineTask, review_task_id)
+        assert review_task.status == "failed"
+        assert review_task.error_code == "ONLINE_AUDIT_REVIEW_REQUIRED"
+        assert review_task.recoverable is False
+        assert session.get(MarkdownQueueControl, 1).paused is True
+    assert (settings.data_root / safe.archive_relpath / "source.txt").read_bytes() == b"safe immutable source"
+    assert (settings.data_root / review_rel / "source.txt").read_bytes() == b"review immutable source"
+
+
+def test_verified_archive_migration_waits_for_active_markdown_reader(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    legacy_rel = "raw/done/unknown/active-reader"
+    source_path = settings.data_root / legacy_rel / "source.txt"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"active reader source")
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:active-reader", source_channel="done", title="active-reader",
+            archive_relpath=legacy_rel,
+        )
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, original_name="source.txt", attachment_key="active",
+            file_role="direct_attachment", source_container_key="root", depth=1,
+            local_relpath=f"{legacy_rel}/source.txt", download_status="verified",
+        )
+        session.add(source); session.flush()
+        session.add(MarkdownTask(
+            source_file_id=source.id, schema_version="synthetic-v1", status="running",
+            campaign="standard", lease_owner="markdown-worker-test",
+        ))
+        audit = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id, oa_item_key=item.oa_item_key, title="active-reader",
+            status="matched", comparison_reason="exact_match",
+            depth_limit_reached=False,
+        ))
+        session.add(OAManifestItem(
+            oa_item_key=item.oa_item_key, workitem_id_text="active-reader",
+            title="active-reader", list_page=1,
+            processing_status="downloaded",
+        ))
+        _record_full_manifest_sync(session, 1)
+        session.commit()
+
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        job = session.scalar(select(OperationJob).where(
+            OperationJob.job_type == "verified_archive_migration",
+        ))
+        assert job.status == "queued"
+        assert session.get(MarkdownQueueControl, 1).paused is True
+        item = session.scalar(select(OAItem).where(OAItem.oa_item_key == "done:active-reader"))
+        assert item.archive_relpath == legacy_rel
+    assert source_path.read_bytes() == b"active reader source"
 
 
 def test_worker_claims_one_job_and_records_unsupported_type(config_file: Path) -> None:
@@ -170,6 +748,126 @@ def test_worker_consumes_production_queue_when_operation_queue_is_empty(config_f
     assert len(handled) == 1
 
 
+def test_recent_online_audit_yield_allows_realtime_pipeline_work(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OperationJob(
+            job_key="online-yield", job_type="online_audit", status="queued",
+            idempotency_key="online-yield-idem", heartbeat_at=datetime.now(timezone.utc),
+        ))
+        session.commit()
+    task_id = ProductionQueue(engine).enqueue(
+        "realtime_pending", "pending-1", "detail_sync", "realtime-during-audit",
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    handled = []
+    monkeypatch.setattr(worker, "_execute_pipeline_task", lambda task: handled.append(task.id))
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+    assert handled == [task_id]
+
+
+def test_recent_online_audit_yield_does_not_start_historical_rebuild(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OperationJob(
+            job_key="online-yield-before-history", job_type="online_audit", status="queued",
+            idempotency_key="online-yield-before-history-idem", heartbeat_at=datetime.now(timezone.utc),
+        ))
+        session.commit()
+    ProductionQueue(engine).enqueue(
+        "historical_done_backfill", "done-1", "attachment_inventory", "history-waits-for-audit",
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    handled = []
+    monkeypatch.setattr(worker, "_execute_pipeline_task", lambda task: handled.append(task.id))
+    try:
+        assert worker.run_once() is False
+    finally:
+        worker.close()
+    assert handled == []
+
+
+def test_ready_realtime_task_preempts_online_audit_even_after_cooldown(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OperationJob(
+            job_key="online-stale-yield", job_type="online_audit", status="queued",
+            idempotency_key="online-stale-yield-idem",
+            heartbeat_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
+        ))
+        session.commit()
+    task_id = ProductionQueue(engine).enqueue(
+        "realtime_done", "done-1", "attachment_inventory", "realtime-preempts-audit",
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    handled = []
+    monkeypatch.setattr(worker, "_execute_pipeline_task", lambda task: handled.append(task.id))
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+    assert handled == [task_id]
+
+
+def test_ready_realtime_task_preempts_filesystem_governance_job(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OperationJob(
+            job_key="integrity-audit-waits", job_type="data_governance", status="queued",
+            idempotency_key="integrity-audit-waits-idem",
+            parameters_json='{"action":"integrity_audit"}',
+        ))
+        session.commit()
+    task_id = ProductionQueue(engine).enqueue(
+        "realtime_pending", "pending-1", "pending_summary", "realtime-preempts-governance",
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    handled = []
+    monkeypatch.setattr(worker, "_execute_pipeline_task", lambda task: handled.append(task.id))
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+    assert handled == [task_id]
+
+
+def test_ready_realtime_task_preempts_archive_migration(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OperationJob(
+            job_key="migration-waits-for-realtime",
+            job_type="verified_archive_migration", status="queued",
+            idempotency_key="migration-waits-for-realtime-idem",
+            parameters_json='{"audit_run_id":999}',
+        ))
+        session.commit()
+    task_id = ProductionQueue(engine).enqueue(
+        "realtime_pending", "pending-1", "pending_summary",
+        "realtime-preempts-migration",
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    handled = []
+    monkeypatch.setattr(worker, "_execute_pipeline_task", lambda task: handled.append(task.id))
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+    assert handled == [task_id]
+
+
 def test_unsupported_conversion_is_nonfatal_for_an_individual_file() -> None:
     assert OperationWorker._nonfatal_parse_error(type("UnsupportedFormatException", (Exception,), {})())
     assert OperationWorker._nonfatal_parse_error(type("FileConversionException", (Exception,), {})())
@@ -217,11 +915,14 @@ def test_historical_sources_keep_attachments_and_only_canonical_snapshots() -> N
         SimpleNamespace(id=4, file_role="workflow_snapshot", original_name="workflow-03-iframeright.html"),
         SimpleNamespace(id=5, file_role="direct_attachment", original_name="合同.pdf"),
         SimpleNamespace(id=6, file_role="official_attachment", original_name="批复.pdf"),
+        SimpleNamespace(id=7, file_role="official_body", original_name="正文.pdf"),
+        SimpleNamespace(id=8, file_role="associated_document", original_name="关联文件.pdf"),
+        SimpleNamespace(id=9, file_role="opinion_attachment", original_name="意见.pdf"),
     ]
 
     selected = OperationWorker._historical_source_files(files)
 
-    assert [file.id for file in selected] == [5, 6]
+    assert [file.id for file in selected] == [5, 6, 7, 8, 9]
 
 
 def test_history_without_attachment_evidence_completes_without_llm_failure(config_file: Path, monkeypatch) -> None:
@@ -248,6 +949,315 @@ def test_history_without_attachment_evidence_completes_without_llm_failure(confi
         row = session.get(PipelineTask, task_id)
         assert row.status == "completed"
         assert row.error_code is None
+
+
+def test_done_parse_advances_to_source_publish_before_curation(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:source-stage", source_channel="done", title="Synthetic")
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, original_name="source.pdf", attachment_key="source-stage",
+            file_role="direct_attachment", source_container_key="root", depth=1,
+            local_relpath="archive/raw/oa/done/source.pdf", download_status="verified",
+        )
+        session.add(source); session.flush()
+        session.add(ParseJob(
+            file_id=source.id, engine="synthetic", engine_version="1",
+            config_hash="c" * 64, status="completed",
+        ))
+        session.commit()
+        source_id = source.id
+    task_id = queue.enqueue("historical_done_backfill", "done:source-stage", "parse", "source-stage-task")
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file); worker.owner = "worker-test"
+    try:
+        worker._pipeline_parse(task)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "queued"
+        assert row.stage == "source_publish"
+
+
+def test_source_publish_advances_to_curation_and_missing_artifact_stops(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:publish", source_channel="done", title="Synthetic")
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, original_name="source.pdf", attachment_key="publish",
+            file_role="direct_attachment", source_container_key="root", depth=1,
+            local_relpath="archive/raw/oa/done/source.pdf", download_status="verified",
+        )
+        session.add(source); session.commit(); source_id = source.id
+    task_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-task")
+    task = queue.claim("worker-test")
+    called: list[int] = []
+    monkeypatch.setattr(
+        "oa_knowledge.source_markdown.service.publish_active_artifact",
+        lambda _session, _settings, file_id: called.append(file_id),
+    )
+    worker = OperationWorker(settings, config_path=config_file); worker.owner = "worker-test"
+    try:
+        worker._pipeline_source_publish(task)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert called == [source_id]
+        assert row.stage == "curation" and row.status == "queued"
+
+    missing_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-missing")
+    missing = queue.claim("worker-test")
+    monkeypatch.setattr(
+        "oa_knowledge.source_markdown.service.publish_active_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("valid parse artifact unavailable")),
+    )
+    worker = OperationWorker(settings, config_path=config_file); worker.owner = "worker-test"
+    try:
+        worker._pipeline_source_publish(missing)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        row = session.get(PipelineTask, missing_id)
+        assert row.status == "queued"
+        assert row.stage == "attachment_inventory"
+        assert row.error_code is None
+
+
+def test_source_publish_parks_unsupported_source_for_review_instead_of_looping(
+    config_file: Path,
+) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.wps"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"synthetic unsupported source")
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:unsupported", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        session.add(ArchivedFile(
+            oa_item_id=item.id,
+            original_name="source.wps",
+            attachment_key="unsupported",
+            file_role="direct_attachment",
+            source_container_key="root",
+            depth=1,
+            local_relpath="archive/raw/oa/done/synthetic/source.wps",
+            download_status="verified",
+        ))
+        session.commit()
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "historical_done_backfill", "done:unsupported", "source_publish", "unsupported-source",
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_source_publish(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        review = session.query(ReviewEntry).filter_by(
+            kind="source_markdown_incomplete", status="pending",
+        ).one()
+        assert row.status == "failed"
+        assert row.error_code == "UNSUPPORTED_SOURCE_FORMAT"
+        assert review.file_id is not None
+        assert "source.wps" not in review.details_json
+
+
+def test_source_publish_parks_parser_skipped_source_for_review(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.doc"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"synthetic legacy document")
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:skipped", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, original_name="source.doc", attachment_key="skipped",
+            file_role="direct_attachment", source_container_key="root", depth=1,
+            local_relpath="archive/raw/oa/done/synthetic/source.doc",
+            download_status="verified",
+        )
+        session.add(source)
+        session.flush()
+        session.add(ParseJob(
+            file_id=source.id, engine="markitdown", engine_version="test",
+            config_hash="", status="skipped", error_code="unsupported_format",
+        ))
+        session.commit()
+        source_id = source.id
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "historical_done_backfill", "done:skipped", "source_publish", "skipped-source",
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_source_publish(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "failed"
+        assert row.error_code == "UNSUPPORTED_SOURCE_FORMAT"
+        assert session.query(ReviewEntry).filter_by(
+            kind="source_markdown_incomplete", file_id=source_id,
+        ).count() == 1
+
+
+def test_source_publish_parks_rejected_quality_artifact_for_review(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.docx"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"synthetic low-quality document")
+    digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:rejected", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        content = ContentObject(sha256=digest, size_bytes=source_path.stat().st_size)
+        session.add(content)
+        session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, original_name="source.docx", attachment_key="rejected",
+            file_role="direct_attachment", source_container_key="root", depth=1,
+            local_relpath="archive/raw/oa/done/synthetic/source.docx",
+            download_status="verified", sha256=digest, content_object_id=content.id,
+        )
+        session.add(source)
+        session.flush()
+        job = ParseJob(
+            file_id=source.id, engine="markitdown", engine_version="test",
+            config_hash="c" * 64, status="completed",
+        )
+        session.add(job)
+        session.flush()
+        session.add(ParseArtifact(
+            parse_job_id=job.id, content_object_id=content.id, engine="markitdown",
+            engine_version="test", output_relpath="synthetic/rejected.md",
+            source_sha256=digest, product_sha256="d" * 64,
+            config_hash="c" * 64, quality_score=0.2,
+            lifecycle_status="rejected",
+        ))
+        session.commit()
+        source_id = source.id
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "historical_done_backfill", "done:rejected", "source_publish", "rejected-source",
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_source_publish(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "failed"
+        assert row.error_code == "PARSE_QUALITY_REJECTED"
+        assert session.query(ReviewEntry).filter_by(
+            kind="source_markdown_incomplete", file_id=source_id,
+        ).count() == 1
+
+
+def test_source_publish_detects_review_blocker_before_writing_any_derivative(
+    config_file: Path, monkeypatch,
+) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    root = settings.data_root / "archive/raw/oa/done/synthetic"
+    root.mkdir(parents=True)
+    (root / "first.docx").write_bytes(b"synthetic eligible source")
+    (root / "second.wps").write_bytes(b"synthetic unsupported source")
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:preflight", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        first = ArchivedFile(
+            oa_item_id=item.id, original_name="first.docx", attachment_key="first",
+            file_role="direct_attachment", source_container_key="root", depth=1,
+            local_relpath="archive/raw/oa/done/synthetic/first.docx", download_status="verified",
+        )
+        second = ArchivedFile(
+            oa_item_id=item.id, original_name="second.wps", attachment_key="second",
+            file_role="official_attachment", source_container_key="root", depth=1,
+            local_relpath="archive/raw/oa/done/synthetic/second.wps", download_status="verified",
+        )
+        session.add_all([first, second])
+        session.commit()
+        second_id = second.id
+    calls: list[int] = []
+
+    def publish(_session, _settings, file_id: int):
+        calls.append(file_id)
+        if file_id == second_id:
+            raise FileNotFoundError("valid parse artifact unavailable")
+
+    monkeypatch.setattr("oa_knowledge.source_markdown.service.publish_active_artifact", publish)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "historical_done_backfill", "done:preflight", "source_publish", "preflight-source",
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_source_publish(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        assert calls == []
+        assert session.get(PipelineTask, task_id).status == "failed"
+
+
+def test_curation_stage_completes_after_local_model_success(config_file: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue("historical_done_backfill", "done:curate", "curation", "curation-task")
+    task = queue.claim("worker-test")
+    monkeypatch.setattr(
+        "oa_knowledge.curation.service.run_curation",
+        lambda *_args, **_kwargs: SimpleNamespace(failed=0, completed=1, needs_review=0),
+    )
+    worker = OperationWorker(settings, config_path=config_file); worker.owner = "worker-test"
+    try:
+        worker._pipeline_curation(task)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "completed"
 
 
 def test_pending_summary_with_notification_requested_advances_to_notify_stage(config_file: Path, monkeypatch) -> None:
@@ -401,8 +1411,8 @@ def test_notify_feishu_delivers_and_records_delivery(config_file: Path, monkeypa
 
 
 def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Path, monkeypatch) -> None:
-    # Plan-0806-1 §3 / §9 (test four): a newly discovered Done item is captured,
-    # archived, yields a verified ArchivedFile + MarkdownTask, and advances.
+    # A newly discovered Done item is archived and enters the unified parse
+    # flow. The old MarkdownTask path must not reparse the original attachment.
     from types import SimpleNamespace
 
     from oa_knowledge.collector import LoginState
@@ -418,9 +1428,28 @@ def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Pa
             oa_item_key="done:abc", workitem_id_text="abc", title="已办事项",
             list_page=0, processing_status="pending_download",
         ))
+        audit_job = OperationJob(
+            job_key="audit-supplement-callback", job_type="online_audit",
+            status="completed", idempotency_key="audit-supplement-callback",
+        )
+        session.add(audit_job); session.flush()
+        audit = OnlineAuditRun(
+            job_id=audit_job.id, status="completed", total_items=1,
+            completed_items=1, mismatch_items=1,
+        )
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id, oa_item_key="done:abc", title="已办事项",
+            status="missing_download", comparison_reason="inventory_changed",
+        ))
+        audit_id = audit.id
         session.commit()
     queue = ProductionQueue(engine)
-    task_id = queue.enqueue("realtime_done", "done:abc", "done_capture_and_archive", "realtime-done:done:abc:na:archive-v2")
+    task_id = queue.enqueue(
+        "realtime_done", "done:abc", "done_capture_and_archive",
+        "realtime-done:done:abc:na:archive-v2",
+        payload={"online_audit_run_id": audit_id},
+    )
 
     # Fake a DownloadedAttachment whose content passes integrity (stub inspect_file).
     attachment = SimpleNamespace(
@@ -474,10 +1503,18 @@ def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Pa
             ArchivedFile.oa_item_id == item.id, ArchivedFile.download_status == "verified",
             ArchivedFile.file_role == str(FileRole.DIRECT_ATTACHMENT),
         )) is not None
-        assert session.scalar(select(MarkdownTask).where(MarkdownTask.source_file_id.is_not(None))) is not None
+        assert session.scalar(select(MarkdownTask).where(MarkdownTask.source_file_id.is_not(None))) is None
         row = session.get(PipelineTask, task_id)
         assert row.status == "queued"
         assert row.stage == "attachment_inventory"
+        refreshed_audit = session.get(OnlineAuditRun, audit_id)
+        refreshed_item = session.scalar(select(OnlineAuditItem).where(
+            OnlineAuditItem.run_id == audit_id,
+            OnlineAuditItem.oa_item_key == "done:abc",
+        ))
+        assert refreshed_audit.status == "queued"
+        assert refreshed_audit.completed_items == 0
+        assert refreshed_item.status == "pending"
 
 
 def test_pipeline_done_capture_and_archive_fails_when_manifest_missing(config_file: Path, monkeypatch) -> None:

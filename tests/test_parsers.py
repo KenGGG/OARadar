@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import zipfile
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import (
     ArchivedFile,
+    ContentObject,
     OAItem,
     ParseArtifact,
     ParseJob,
@@ -536,6 +538,106 @@ def test_pipeline_enqueue_idempotent(tmp_path: Path) -> None:
     job_id1 = pipeline.enqueue(file_id)
     job_id2 = pipeline.enqueue(file_id)
     assert job_id1 == job_id2
+
+
+def test_pipeline_requeues_completed_job_when_active_product_is_missing(tmp_path: Path) -> None:
+    settings = Settings(app={"data_root": str(tmp_path)})
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    source_path = raw / "regenerate.txt"
+    source_path.write_text("synthetic source", encoding="utf-8")
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:regenerate", source_channel="done", title="Regenerate")
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, attachment_key="regenerate", original_name="regenerate.txt",
+            local_relpath="raw/regenerate.txt", file_role="direct_attachment",
+            source_container_key="root", depth=1, download_status="verified",
+            sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        )
+        session.add(source); session.commit(); source_id = source.id
+    pipeline = ParsePipeline(settings, engine)
+    job_id = pipeline.enqueue(source_id)
+    pipeline.run(job_id)
+    with Session(engine) as session:
+        source = session.get(ArchivedFile, source_id)
+        artifact_id = session.get(ContentObject, source.content_object_id).active_parse_artifact_id
+        artifact = session.get(ParseArtifact, artifact_id)
+        product = tmp_path / "parse" / artifact.output_relpath
+    product.unlink()
+
+    assert pipeline.enqueue(source_id) == job_id
+    with Session(engine) as session:
+        assert session.get(ParseJob, job_id).status == "queued"
+
+    pipeline.run(job_id)
+
+    with Session(engine) as session:
+        source = session.get(ArchivedFile, source_id)
+        content = session.get(ContentObject, source.content_object_id)
+        assert session.get(ParseJob, job_id).status == "completed"
+        assert content.active_parse_artifact_id == artifact_id
+        assert session.query(ParseArtifact).filter_by(parse_job_id=job_id).count() == 1
+
+
+def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A low-quality result is terminal while its derivative remains intact."""
+    settings = Settings(app={"data_root": str(tmp_path)})
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    source_path = raw / "low-quality.txt"
+    source_path.write_text("x", encoding="utf-8")
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:low-quality", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id,
+            attachment_key="low-quality",
+            original_name="low-quality.txt",
+            local_relpath="raw/low-quality.txt",
+            file_role="direct_attachment",
+            source_container_key="root",
+            depth=1,
+            download_status="verified",
+            sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        )
+        session.add(source)
+        session.commit()
+        source_id = source.id
+
+    pipeline = ParsePipeline(settings, engine)
+    job_id = pipeline.enqueue(source_id)
+
+    def low_quality_parse(_source: Path, output_dir: Path) -> ParseResult:
+        product = output_dir / "markitdown-test" / "low-quality.md"
+        product.parent.mkdir(parents=True)
+        product.write_text("synthetic low-quality derivative", encoding="utf-8")
+        return ParseResult(
+            output_path=product,
+            engine="markitdown",
+            engine_version="test",
+            quality_score=0.3,
+        )
+
+    monkeypatch.setattr("oa_knowledge.pipeline.parse_with_markitdown", low_quality_parse)
+    pipeline.run(job_id)
+
+    with Session(engine) as session:
+        artifact = session.scalar(select(ParseArtifact).where(ParseArtifact.parse_job_id == job_id))
+        assert artifact is not None
+        assert artifact.lifecycle_status == "rejected"
+        assert (tmp_path / "parse" / artifact.output_relpath).is_file()
+
+    assert pipeline.enqueue(source_id) == job_id
+    with Session(engine) as session:
+        assert session.get(ParseJob, job_id).status == "completed"
 
 
 def test_pipeline_does_not_silently_fallback_when_mineru_is_unavailable(

@@ -17,12 +17,11 @@ cd "$PROJECT_ROOT" || exit 1
 
 CONFIG="${OA_CONFIG:-config.yaml}"
 
-# The orchestration lives in Python (oa schedule hourly): it takes a full
-# Pending snapshot, notifies new/changed items once, and walks the Done list
-# with a known-boundary algorithm instead of a fixed page count. Every run is
-# recorded in the runs table.
+# Only enqueue the durable operation. The single OA Worker owns the persistent
+# browser profile and performs the real read-only scan, preventing Chromium
+# profile corruption when an online verification batch is active.
 hourly_status=0
-uv run oa schedule hourly \
+uv run oa schedule enqueue hourly \
   --config "$CONFIG" \
   || hourly_status=$?
 

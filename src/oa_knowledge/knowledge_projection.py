@@ -155,7 +155,7 @@ def publish_pending_projection(session: Session, logical_item_id: int, data_root
         if logical.lifecycle_status == "identity_pending" else
         ["> [!info] 已办已确认", "> Pending 与 Done 已通过稳定主键对账；done_final 下载与正式知识准入仍可继续完善。"]
     )
-    lines = [f"# {logical.title}", "", *notice, "", "## 事项概括", "", "待 Agnes 摘要任务生成。", "", "## 附件"]
+    lines = [f"# {logical.title}", "", *notice, "", "## 事项概括", "", "待本地 qwen3.5:9b 摘要任务生成。", "", "## 附件"]
     if links:
         for source, document, _ in links:
             lines.append(f"{source.ordinal}. [[知识文档/kd-{document.id}|{source.display_title or source.original_name}]]")

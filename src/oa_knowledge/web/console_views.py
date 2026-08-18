@@ -19,8 +19,8 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings, load_settings, validate_feishu_runtime_config
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
-    ArchivedFile, ContentObject, ItemOccurrence, KnowledgeDocument, LogicalItem,
-    MarkdownExport, NotificationDelivery, OAItem, OAManifestItem, ParseArtifact,
+    ArchivedFile, ContentObject, CuratedDecision, CuratedRun, ItemOccurrence, KnowledgeDocument, LogicalItem,
+    MarkdownExport, NotificationDelivery, OAItem, OAManifestItem, OnlineAuditItem, ParseArtifact,
     PipelineTask, SourceAttachment, SummaryVersion,
 )
 from oa_knowledge.notifications.feishu_service import retry_pending_summary_delivery
@@ -33,6 +33,11 @@ from oa_knowledge.web.lifecycle_views import (
     pending_list as lifecycle_pending_list,
 )
 from oa_knowledge.web.provider_settings import provider_settings_view
+from oa_knowledge.web.simple_status import (
+    _classify_done_item,
+    _done_simple_status_map,
+    _SIMPLE_DONE_LABELS,
+)
 from oa_knowledge.web.status import dashboard_status, maintenance_status, retry_manifest_failed_items
 
 # ---------------------------------------------------------------------------
@@ -87,6 +92,59 @@ def _delivery_status(session: Session, occurrence: ItemOccurrence) -> str | None
         NotificationDelivery.notification_type == "pending_summary",
     ).order_by(NotificationDelivery.id.desc()).limit(1))
     return delivery.status if delivery else None
+
+
+_OA_JOB_ACTIVITY = {
+    "online_audit": "正在逐项核验已办",
+    "scheduled_bootstrap": "正在执行初始化扫描",
+    "scheduled_hourly": "正在扫描待办与新增已办",
+    "scheduled_nightly": "正在执行夜间归档检查",
+    "full_manifest": "正在同步 OA 已办清单",
+    "full_manifest_retry": "正在重试已办清单同步",
+    "done_incremental": "正在增量检查已办",
+    "archive_batch": "正在下载并归档已办",
+    "backfill_campaign": "正在补齐历史已办",
+    "verified_archive_migration": "正在迁移已核验历史原件",
+}
+
+
+def _oa_activity(base: dict, schedule: dict) -> dict:
+    """Return a privacy-safe live OA activity card without titles or credentials."""
+    runtime = base.get("worker_runtime") or {}
+    if runtime.get("status") == "logging_in":
+        return {
+            "status": "logging_in", "label": "正在登录 OA",
+            "detail": runtime.get("activity") or "正在验证 OA 登录",
+            "heartbeat_at": runtime.get("heartbeat_at"), "progress_current": None,
+            "progress_total": None,
+        }
+    if runtime.get("status") == "idle":
+        return {
+            "status": "disconnected", "label": "OA 已退出",
+            "detail": runtime.get("activity") or "当前未登录 OA，等待下次定时任务",
+            "heartbeat_at": runtime.get("heartbeat_at"), "progress_current": None,
+            "progress_total": None,
+        }
+    worker = base.get("worker") or {}
+    activity = runtime.get("activity") or _OA_JOB_ACTIVITY.get(worker.get("type"))
+    if activity:
+        return {
+            "status": "working", "label": "正在处理 OA 工作",
+            "detail": activity, "heartbeat_at": runtime.get("heartbeat_at") or worker.get("heartbeat_at"),
+            "progress_current": worker.get("progress_current"), "progress_total": worker.get("progress_total"),
+        }
+    login = schedule.get("oa_login") or {}
+    if login.get("status") == "authenticated":
+        return {
+            "status": "authenticated", "label": "OA 登录已验证",
+            "detail": "当前没有 OA 任务，等待下次定时检查", "heartbeat_at": login.get("checked_at"),
+            "progress_current": None, "progress_total": None,
+        }
+    return {
+        "status": "unknown", "label": "OA 登录状态尚未确认",
+        "detail": "Worker 正在等待任务或下一次定时检查", "heartbeat_at": runtime.get("heartbeat_at"),
+        "progress_current": None, "progress_total": None,
+    }
 
 
 def _summary_status(session: Session, occurrence: ItemOccurrence) -> str:
@@ -171,6 +229,7 @@ def build_dashboard(settings: Settings) -> dict:
                     "source_dir_exists": settings.markdown_root.exists(),
                     "source_dir_writable": os.access(settings.markdown_root, os.W_OK),
                 },
+                "oa_activity": _oa_activity(base, schedule),
                 "needs_attention": attention,
             }
     finally:
@@ -263,17 +322,91 @@ def pending_notification_detail(settings: Settings, occurrence_id: int) -> dict:
         with Session(engine) as session:
             occurrence = session.get(ItemOccurrence, occurrence_id)
             if occurrence is not None:
+                delivery = delivery_for_occurrence(session, occurrence)
+                delivery_status = delivery.status if delivery is not None else "pending"
                 detail["cleanup_status"] = occurrence.cleanup_status or "not_eligible"
                 detail["cleaned_at"] = occurrence.cleaned_at.isoformat() if occurrence.cleaned_at else None
                 detail["notify_fingerprint"] = occurrence.notify_fingerprint
                 detail["allow_renotify"] = occurrence.allow_renotify
                 detail["discovery_hash"] = occurrence.discovery_hash
                 detail["occurrence_status"] = occurrence.occurrence_status
-                detail["feishu_status"] = _delivery_status(session, occurrence) or "pending"
+                detail["feishu_status"] = delivery_status
+                detail["can_retry_delivery"] = delivery_status == "failed"
+                detail["requires_delivery_reconciliation"] = delivery_status == "unknown"
+                detail["can_cleanup"] = (
+                    delivery_status == "sent"
+                    and settings.pending_cleanup.auto_cleanup_after_success
+                    and detail["cleanup_status"] not in {"cleaned", "cleaning"}
+                )
                 detail["oa_gone_at"] = occurrence.oa_gone_at.isoformat() if occurrence.oa_gone_at else None
+                detail["stages"] = _pending_pipeline_stages(session, occurrence, detail)
     finally:
         engine.dispose()
     return detail
+
+
+_PENDING_STAGE_ORDER = {
+    "detail_sync": 0,
+    "pending_parse": 1,
+    "pending_summary": 2,
+    "notify_feishu": 3,
+}
+
+
+def _pending_pipeline_stages(
+    session: Session,
+    occurrence: ItemOccurrence,
+    detail: dict,
+) -> dict[str, str]:
+    tasks = list(session.scalars(select(PipelineTask).where(
+        PipelineTask.queue_name == "realtime_pending",
+        PipelineTask.logical_item_id == occurrence.logical_item_id,
+        PipelineTask.stage.in_(tuple(_PENDING_STAGE_ORDER)),
+    )))
+    status_rank = {"running": 0, "queued": 1, "failed": 2, "completed": 3}
+    tasks.sort(key=lambda row: (status_rank.get(row.status, 4), -row.id))
+    task = tasks[0] if tasks else None
+
+    def state(target: int) -> str:
+        if task is None:
+            return "pending"
+        current = _PENDING_STAGE_ORDER.get(task.stage, -1)
+        if current > target or (current == target and task.status == "completed"):
+            return "done"
+        if current < target:
+            return "pending"
+        if task.status == "running":
+            return "running"
+        if task.status == "failed":
+            return "review" if not task.recoverable else "failed"
+        return "pending"
+
+    download = "done" if detail.get("snapshot") is not None or (task and _PENDING_STAGE_ORDER.get(task.stage, -1) > 0) else state(0)
+    markdown = "done" if detail.get("ollama_summary_status") == "current" or (task and _PENDING_STAGE_ORDER.get(task.stage, -1) > 1) else state(1)
+    summary = "done" if detail.get("ollama_summary_status") == "current" else state(2)
+    delivery = detail.get("feishu_status")
+    if delivery == "sent":
+        feishu = "done"
+    elif delivery in {"failed", "rejected", "misconfigured"}:
+        feishu = "failed"
+    elif delivery in {"unknown", "unknown_outcome"}:
+        feishu = "review"
+    else:
+        feishu = state(3)
+    cleanup_status = detail.get("cleanup_status")
+    cleanup = (
+        "done" if cleanup_status == "cleaned"
+        else "failed" if cleanup_status == "cleanup_failed"
+        else "pending"
+    )
+    return {
+        "discovery": "done",
+        "download": download,
+        "markdown": markdown,
+        "summary": summary,
+        "feishu": feishu,
+        "cleanup": cleanup,
+    }
 
 
 def retry_pending_summary(settings: Settings, occurrence_id: int) -> dict:
@@ -309,6 +442,8 @@ def retry_pending_delivery(settings: Settings, occurrence_id: int) -> dict:
             ).order_by(NotificationDelivery.id.desc()).limit(1))
             if delivery is None:
                 raise LookupError("no delivery to retry")
+            if delivery.status != "failed":
+                raise ValueError(f"delivery retry requires confirmed failure: {delivery.status}")
             result = retry_pending_summary_delivery(engine, settings, delivery.id)
             return {"delivery_id": delivery.id, "status": result.status}
     finally:
@@ -397,34 +532,278 @@ def done_archives_list(
     settings: Settings, *, page: int = 1, page_size: int = 100,
     query: str | None = None, archive_status: str | None = None,
     markdown_status: str | None = None, handoff_status: str | None = None,
+    simple_status: str | None = None,
 ) -> dict:
-    base = lifecycle_done_list(settings, page=page, page_size=page_size, query=query)
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
+            if simple_status is not None:
+                # 服务端按简化状态筛选：先算出候选 manifest id 集合，再正确分页
+                # 与计数，避免“先分页后过滤”导致 total / 页数错误（plan Task 2）。
+                status_map = _done_simple_status_map(session)
+                candidate_ids = [mid for mid, (state, _label, _reason) in status_map.items() if state == simple_status]
+                stmt = select(OAManifestItem)
+                if query:
+                    pattern = f"%{query.strip()}%"
+                    stmt = stmt.where(
+                        OAManifestItem.title.ilike(pattern) | OAManifestItem.sender.ilike(pattern)
+                    )
+                if candidate_ids:
+                    stmt = stmt.where(OAManifestItem.id.in_(candidate_ids))
+                else:
+                    stmt = stmt.where(False)
+                total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+                rows = session.scalars(
+                    stmt.order_by(OAManifestItem.completed_at.desc(), OAManifestItem.id.desc())
+                    .offset((page - 1) * page_size).limit(page_size)
+                ).all()
+                items = []
+                verified_roles = {"direct_attachment", "official_attachment", "opinion_attachment"}
+                for row in rows:
+                    archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == row.oa_item_key))
+                    file_count = (
+                        sum(
+                            f.download_status == "verified" and f.file_role in verified_roles
+                            for f in archived.files
+                        )
+                        if archived else None
+                    )
+                    simple = _enrich_done_item(session, settings, row, archived, None, None)
+                    if simple is None:
+                        continue
+                    items.append({
+                        "id": row.id,
+                        "item_id": row.workitem_id_text,
+                        "title": row.title,
+                        "sender": row.sender,
+                        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                        "pipeline_status": row.processing_status,
+                        "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
+                        "file_count": file_count,
+                        "simple_status": simple["state"],
+                        "simple_status_label": simple["label"],
+                        "attention_reason": simple["reason"],
+                        "updated_at": simple["updated_at"],
+                    })
+                return {
+                    "items": items,
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                    "metrics": _done_list_metrics(session),
+                    "lifecycle_pilot_status": "validated" if total else "waiting_for_user_completion",
+                }
+
+            base = lifecycle_done_list(settings, page=page, page_size=page_size, query=query)
             enriched = []
             for it in base["items"]:
                 manifest = session.get(OAManifestItem, it["id"])
                 archive_status_label = _ARCHIVE_STATUS_MAP.get(manifest.processing_status, manifest.processing_status) if manifest else None
                 md = _markdown_status_for_item(session, it, manifest)
                 handoff = _handoff_status_for_item(settings, md)
+                archived = session.scalar(select(OAItem).where(
+                    OAItem.oa_item_key == manifest.oa_item_key
+                )) if manifest else None
+                stages = _done_pipeline_stages(session, manifest, archived, md)
                 if archive_status and archive_status_label != archive_status:
                     continue
                 if markdown_status and md["label"] != markdown_status:
                     continue
                 if handoff_status and handoff["label"] != handoff_status:
                     continue
+                single = _enrich_done_item(session, settings, manifest, archived, md, stages)
+                if single is None:
+                    continue
                 enriched.append({
                     **it,
                     "archive_status_label": archive_status_label,
                     "markdown": md,
                     "handoff": handoff,
+                    "stages": stages,
                     "local_dir": str(settings.archive_root / manifest.archive_relpath) if manifest and manifest.archive_relpath else None,
+                    "simple_status": single["state"],
+                    "simple_status_label": single["label"],
+                    "attention_reason": single["reason"],
+                    "updated_at": manifest.last_synced_at.isoformat() if manifest and manifest.last_synced_at else None,
                 })
             base["items"] = enriched
             return base
     finally:
         engine.dispose()
+
+
+def _done_list_metrics(session: Session) -> dict:
+    oa_done_total = _counts(session, OAManifestItem)
+    downloaded_items = session.scalar(
+        select(func.count(func.distinct(OAManifestItem.id))).select_from(OAManifestItem)
+        .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key)
+        .where(OAManifestItem.processing_status == "downloaded")
+    ) or 0
+    verified_attachments = session.scalar(
+        select(func.count(ArchivedFile.id)).select_from(ArchivedFile)
+        .join(OAItem, OAItem.id == ArchivedFile.oa_item_id)
+        .where(
+            OAItem.source_channel == "done",
+            ArchivedFile.download_status == "verified",
+            ArchivedFile.file_role.in_(("direct_attachment", "official_attachment", "opinion_attachment")),
+        )
+    ) or 0
+    return {
+        "oa_done_total": oa_done_total,
+        "downloaded_items": downloaded_items,
+        "verified_attachments": verified_attachments,
+    }
+
+
+def _simple_done_state(
+    session: Session, manifest: OAManifestItem | None, archived: OAItem | None, markdown: dict,
+) -> dict[str, str | None]:
+    """为单个已办事项计算简化状态（spec §4.1）。"""
+    processing_status = manifest.processing_status if manifest is not None else "discovered"
+    has_success_markdown = bool(markdown) and markdown.get("status") == "success"
+    logical_item_id = archived.logical_item_id if archived is not None else None
+    curation = _resolve_curation(session, logical_item_id)
+    depth_limited = (
+        session.scalar(
+            select(func.count()).select_from(OnlineAuditItem)
+            .where(OnlineAuditItem.oa_item_key == manifest.oa_item_key, OnlineAuditItem.depth_limit_reached == True)  # noqa: E712
+        ) or 0
+    ) > 0 if manifest is not None else False
+    state, reason = _classify_done_item(
+        processing_status=processing_status,
+        has_success_markdown=has_success_markdown,
+        curation=curation,
+        depth_limited=depth_limited,
+    )
+    return {"state": state, "label": _SIMPLE_DONE_LABELS[state], "reason": reason}
+
+
+def _resolve_curation(session: Session, logical_item_id: int | None) -> dict | None:
+    if logical_item_id is None:
+        return None
+    curated = session.scalar(
+        select(CuratedRun).where(CuratedRun.logical_item_id == logical_item_id)
+        .order_by(CuratedRun.id.desc()).limit(1)
+    )
+    if curated is None:
+        return None
+    decisions = list(session.scalars(
+        select(CuratedDecision).where(CuratedDecision.curated_run_id == curated.id)
+    ))
+    n = len(decisions)
+    published = sum(1 for d in decisions if d.status == "published")
+    return {"status": curated.status, "decision_count": n, "all_published": n > 0 and n == published}
+
+
+def _enrich_done_item(
+    session: Session, settings: Settings, manifest: OAManifestItem | None,
+    archived: OAItem | None, md: dict | None, stages: dict | None,
+) -> dict | None:
+    """计算单个已办事项的简化状态字段（供两种分页路径复用）。"""
+    if manifest is None:
+        return None
+    markdown = md or _markdown_status_for_item(session, {"id": manifest.id}, manifest)
+    single = _simple_done_state(session, manifest, archived, markdown)
+    return {
+        "state": single["state"],
+        "label": single["label"],
+        "reason": single["reason"],
+        "updated_at": manifest.last_synced_at.isoformat() if manifest.last_synced_at else None,
+    }
+
+
+_DONE_STAGE_ORDER = {
+    "done_capture_and_archive": 0,
+    "attachment_inventory": 1,
+    "parse": 2,
+    "source_publish": 3,
+    "curation": 4,
+}
+
+
+def _task_stage_state(task: PipelineTask | None, target: int) -> str:
+    if task is None:
+        return "pending"
+    current = _DONE_STAGE_ORDER.get(task.stage, -1)
+    if current > target or (current == target and task.status == "completed"):
+        return "done"
+    if current < target:
+        return "pending"
+    if task.status == "running":
+        return "running"
+    if task.status == "failed":
+        return "review" if not task.recoverable else "failed"
+    return "pending"
+
+
+def _done_pipeline_stages(
+    session: Session,
+    manifest: OAManifestItem | None,
+    archived: OAItem | None,
+    markdown: dict,
+) -> dict[str, str]:
+    tasks = list(session.scalars(select(PipelineTask).where(
+        PipelineTask.logical_item_key == (manifest.oa_item_key if manifest else ""),
+        PipelineTask.stage.in_(tuple(_DONE_STAGE_ORDER)),
+    )))
+    status_rank = {"running": 0, "queued": 1, "failed": 2, "completed": 3}
+    tasks.sort(key=lambda row: (
+        status_rank.get(row.status, 4), row.priority, -row.id,
+    ))
+    task = tasks[0] if tasks else None
+    manifest_status = manifest.processing_status if manifest else "discovered"
+    if manifest_status in {"downloaded", "no_attachment"}:
+        download = "done"
+    elif manifest_status == "scanning":
+        download = "running"
+    elif manifest_status in {"partial", "download_failed"}:
+        download = "failed"
+    else:
+        download = _task_stage_state(task, 0)
+    verification = (
+        "done" if manifest_status in {"downloaded", "no_attachment"}
+        else "failed" if manifest_status in {"partial", "download_failed"}
+        else _task_stage_state(task, 1)
+    )
+    task_index = _DONE_STAGE_ORDER.get(task.stage, -1) if task else -1
+    if task and task_index > 3:
+        markdown_state = "done"
+    elif task and task_index in {2, 3}:
+        markdown_state = _task_stage_state(task, task_index)
+    elif markdown["status"] == "success":
+        markdown_state = "done"
+    elif markdown["status"] == "failed":
+        markdown_state = "failed"
+    else:
+        markdown_state = "pending"
+
+    curation = _task_stage_state(task, 4)
+    publication = "done" if task and task.stage == "curation" and task.status == "completed" else "pending"
+    if archived is not None and archived.logical_item_id is not None:
+        curated = session.scalar(select(CuratedRun).where(
+            CuratedRun.logical_item_id == archived.logical_item_id,
+        ).order_by(CuratedRun.id.desc()).limit(1))
+        if curated is not None:
+            if curated.status == "running":
+                curation, publication = "running", "pending"
+            elif curated.status == "failed":
+                curation, publication = "failed", "pending"
+            elif curated.status == "needs_review":
+                curation, publication = "review", "review"
+            elif curated.status == "completed":
+                curation = "done"
+                decisions = list(session.scalars(select(CuratedDecision).where(
+                    CuratedDecision.curated_run_id == curated.id,
+                )))
+                publication = "done" if all(row.status == "published" for row in decisions) else "failed"
+    return {
+        "discovery": "done" if manifest is not None else "pending",
+        "download": download,
+        "verification": verification,
+        "markdown": markdown_state,
+        "curation": curation,
+        "publication": publication,
+    }
 
 
 def _markdown_status_for_item(session: Session, it: dict, manifest: OAManifestItem | None) -> dict:
@@ -462,13 +841,19 @@ def _handoff_status_for_item(settings: Settings, md: dict) -> dict:
 # Markdown outputs (§8)
 # ---------------------------------------------------------------------------
 
-def markdown_outputs_list(settings: Settings) -> dict:
+def markdown_outputs_list(
+    settings: Settings, *, page: int = 1, page_size: int = 50,
+) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
-            exports = session.scalars(select(MarkdownExport).order_by(
-                MarkdownExport.generated_at.desc(), MarkdownExport.id.desc()
-            )).all()
+            total = _counts(session, MarkdownExport)
+            exports = session.scalars(
+                select(MarkdownExport)
+                .order_by(MarkdownExport.generated_at.desc(), MarkdownExport.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            ).all()
             docs = []
             for export in exports:
                 source_file = session.get(ArchivedFile, export.source_file_id) if export.source_file_id else None
@@ -490,7 +875,7 @@ def markdown_outputs_list(settings: Settings) -> dict:
                     "llm_wiki_path": str(settings.markdown_root / export.markdown_relpath),
                     "delivery_status": "exported" if export.status == "success" else export.status,
                 })
-            return {"documents": docs, "total": len(docs)}
+            return {"documents": docs, "total": total, "page": page, "page_size": page_size}
     finally:
         engine.dispose()
 
@@ -500,8 +885,8 @@ def markdown_outputs_list(settings: Settings) -> dict:
 # ---------------------------------------------------------------------------
 
 SETTINGS_SECTIONS = {
-    "llm": {"enabled", "active_provider", "ollama_base_url", "ollama_model", "agnes_base_url",
-            "agnes_model", "timeout_seconds", "max_tokens", "temperature", "max_retries", "max_concurrency"},
+    "llm": {"enabled", "active_provider", "ollama_base_url", "ollama_model",
+            "timeout_seconds", "max_tokens", "temperature", "max_retries", "max_concurrency"},
     "feishu": {"enabled", "message_type", "max_items_per_section", "redact_confidential", "retry_attempts",
                "webhook_env", "secret_env"},
     "pending_cleanup": {"auto_cleanup_after_success", "cleanup_delay_hours", "failed_retention_days",
@@ -518,7 +903,7 @@ def settings_view(settings: Settings) -> dict:
             "feishu_enabled": settings.feishu.enabled,
             "llm_enabled": settings.llm.enabled,
         },
-        "summary_model": provider["agnes"],
+        "summary_model": provider["local_llm"],
         "feishu": provider["feishu"],
         "data_cleanup": {name: getattr(settings.pending_cleanup, name) for name in sorted(SETTINGS_SECTIONS["pending_cleanup"])},
         "done_archive": {
@@ -580,8 +965,12 @@ def maintenance_action(settings: Settings, config_path: Path | None, action: str
     if action == "schedule_control":
         return schedule_control(settings, (payload or {}).get("target"))
     if action == "retry_failed":
-        from oa_knowledge.markdown_queue import retry_failed
-        return retry_failed(settings)
+        from oa_knowledge.production_pipeline import ProductionQueue
+        engine = create_db_engine(settings.database_path)
+        try:
+            return {"retried": ProductionQueue(engine).retry_failed()}
+        finally:
+            engine.dispose()
     if action == "notify_test":
         return notifications_test(settings)
     raise ValueError(f"unsupported maintenance action: {action}")

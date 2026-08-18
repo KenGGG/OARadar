@@ -7,5 +7,5 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory={{PROJECT_ROOT}}
 EnvironmentFile={{ENV_FILE}}
-# flock + the Python ResourceLease both guard against overlapping nightly runs.
-ExecStart=/usr/bin/flock -n %t/oaradar-nightly.lock {{UV_BIN}} run oa schedule nightly --config {{CONFIG_PATH}}
+# The oneshot only enqueues; the single OA Worker owns the browser profile.
+ExecStart=/usr/bin/flock -n %t/oaradar-nightly.lock {{UV_BIN}} run oa schedule enqueue nightly --config {{CONFIG_PATH}}

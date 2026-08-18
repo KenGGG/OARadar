@@ -80,7 +80,12 @@ def test_schedule_status_reports_runs_and_summary(config_file: Path) -> None:
             run_key="scheduled_nightly:def",
             stage="scheduled_nightly",
             status="completed",
-            summary_json='{"done": {"markdown_tasks_enqueued": 7, "download_jobs_enqueued": 6}}',
+            summary_json=(
+                '{"done": {"source_total": 8078, "pages_scanned": 404, '
+                '"new_items": 2, "changed_items": 3, "baseline_hashes": 7653, '
+                '"retry_items": 1, "markdown_tasks_enqueued": 7, '
+                '"download_jobs_enqueued": 6}}'
+            ),
             started_at=now - timedelta(hours=12),
             finished_at=now - timedelta(hours=12, minutes=5),
         ))
@@ -115,8 +120,14 @@ def test_schedule_status_reports_runs_and_summary(config_file: Path) -> None:
     assert payload["summary"]["feishu"]["sent"] == 1
     assert payload["summary"]["feishu"]["failed"] == 1
     assert payload["summary"]["oa_login"]["status"] == "authenticated"
-    assert payload["summary"]["nightly"]["markdown_tasks_enqueued"] == 7
+    assert payload["summary"]["nightly"]["knowledge_tasks_enqueued"] == 7
     assert payload["summary"]["nightly"]["download_jobs_enqueued"] == 6
+    assert payload["summary"]["nightly"]["source_total"] == 8078
+    assert payload["summary"]["nightly"]["pages_scanned"] == 404
+    assert payload["summary"]["nightly"]["new_items"] == 2
+    assert payload["summary"]["nightly"]["changed_items"] == 3
+    assert payload["summary"]["nightly"]["baseline_hashes"] == 7653
+    assert payload["summary"]["nightly"]["retry_items"] == 1
     assert payload["notifications"]["last_success_at"] is not None
     assert payload["notifications"]["last_error_code"] == "connect_failed"
 

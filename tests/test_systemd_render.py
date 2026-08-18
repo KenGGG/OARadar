@@ -56,9 +56,12 @@ def test_render_includes_security_options_and_flock(tmp_path: Path) -> None:
     rendered = render_units(ctx)
     for svc in ("oaradar-worker.service", "oaradar-markdown-worker.service"):
         assert "NoNewPrivileges=true" in rendered[svc]
-        assert "PrivateTmp=true" in rendered[svc]
         assert "UMask=0077" in rendered[svc]
         assert "Restart=always" in rendered[svc]
+    # Chromium persistent profiles need the host user /tmp namespace for
+    # navigation and singleton IPC. Non-browser workers retain isolation.
+    assert "PrivateTmp=false" in rendered["oaradar-worker.service"]
+    assert "PrivateTmp=true" in rendered["oaradar-markdown-worker.service"]
     # Both scheduled oneshots are guarded by flock.
     assert "flock -n %t/oaradar-hourly.lock" in rendered["oaradar-hourly.service"]
     assert "flock -n %t/oaradar-nightly.lock" in rendered["oaradar-nightly.service"]
@@ -69,8 +72,10 @@ def test_render_points_at_schedule_nightly(tmp_path: Path) -> None:
     rendered = render_units(ctx)
     # The nightly unit must drive the durable orchestration, not the old
     # bare manifest sync.
-    assert "oa schedule nightly" in rendered["oaradar-nightly.service"]
-    assert "oa schedule hourly" not in rendered["oaradar-nightly.service"]
+    assert "oa schedule enqueue nightly" in rendered["oaradar-nightly.service"]
+    assert "oa schedule enqueue hourly" not in rendered["oaradar-nightly.service"]
+    hourly_script = (REPO_ROOT / "scripts" / "hourly-sync.sh").read_text(encoding="utf-8")
+    assert "oa schedule enqueue hourly" in hourly_script
 
 
 def test_write_units_creates_files(tmp_path: Path) -> None:

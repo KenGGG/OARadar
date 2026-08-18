@@ -89,6 +89,20 @@ PY
 )"
 echo "  data_root    : $DATA_ROOT"
 
+WEB_ENDPOINT="$(python3 - "$CONFIG" <<'PY'
+import sys, yaml
+try:
+    cfg = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+    web = cfg.get("web", {})
+    host = web.get("host", "127.0.0.1")
+    if host in {"localhost", "::1"}:
+        host = "127.0.0.1"
+    print(f"http://{host}:{int(web.get('port', 8000))}")
+except Exception:
+    print("http://127.0.0.1:8000")
+PY
+)"
+
 # Server timezone sanity check.
 if command -v timedatectl >/dev/null 2>&1; then
   SERVER_TZ="$(timedatectl show --property=TimeZone --value 2>/dev/null || true)"
@@ -121,7 +135,8 @@ echo "Verifying database schema..."
 "$UV_BIN" run python - <<PY || { echo "Database verification failed" >&2; exit 1; }
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.migrate import upgrade_database
-upgrade_database(load_settings("$CONFIG").database_path)
+from pathlib import Path
+upgrade_database(load_settings(Path("$CONFIG")).database_path)
 PY
 
 # Render and write the unit files.
@@ -167,5 +182,5 @@ if [[ "$verify_failed" -ne 0 ]]; then
   exit 1
 fi
 echo "All services active, timers enabled. Install complete."
-echo "Web console: http://127.0.0.1:8000  (or the configured host/port)"
+echo "Web console: $WEB_ENDPOINT"
 echo "Next run (hourly): $("$UV_BIN" run python -m oa_knowledge.ops.systemd_render --help >/dev/null 2>&1; systemctl --user list-timers --no-pager 'oaradar-hourly.timer' | awk 'NR==2{print $1" "$2" "$3}')"

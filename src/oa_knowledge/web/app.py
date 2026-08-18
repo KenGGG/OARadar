@@ -13,7 +13,9 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from oa_knowledge.config import Settings, load_settings
+from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.online_audit import audit_view, pause_audit, resume_audit, start_audit
+from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.web.lifecycle_views import (
     done_list as lifecycle_done_list,
 )
@@ -48,6 +50,12 @@ from oa_knowledge.web.schedule_views import (
     schedule_status,
     trigger_schedule_run,
 )
+from oa_knowledge.web.data_governance_views import (
+    data_governance_view,
+    enqueue_data_governance_action,
+    enqueue_data_governance_plan,
+    enqueue_integrity_audit,
+)
 from oa_knowledge.web.console_views import (
     build_dashboard,
     cleanup_eligible_pending,
@@ -65,6 +73,7 @@ from oa_knowledge.web.console_views import (
     settings_view,
     update_settings,
 )
+from oa_knowledge.web.simple_status import simple_status, _ALLOWED_SIMPLE_STATES
 from oa_knowledge.web.status import (
     archive_date_status,
     audit_all_manifest_items,
@@ -96,6 +105,7 @@ from oa_knowledge.web.status import (
     preview_policy_hits,
     recheck_manifest_no_attachment,
     resolve_review,
+    retry_source_review,
     resume_archive_batch,
     retry_batch_items,
     retry_manifest_failed_items,
@@ -132,6 +142,14 @@ class BackfillStartRequest(BaseModel):
 
 class AuthLoginRequest(BaseModel):
     token: str = Field(min_length=1, max_length=200)
+
+
+class DataGovernancePlanRequest(BaseModel):
+    categories: list[str] = Field(min_length=1, max_length=6)
+
+
+class DataGovernanceActionRequest(BaseModel):
+    confirmation: str | None = Field(default=None, max_length=100)
 
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -337,6 +355,61 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     def get_lifecycle_processing_center() -> dict:
         return lifecycle_processing_center(settings)
 
+    @app.post("/api/knowledge/rebuild", status_code=202)
+    def post_knowledge_rebuild() -> dict:
+        engine = create_db_engine(settings.database_path)
+        try:
+            result = ProductionQueue(engine).start_historical_rebuild()
+            return {"status": "running", **result}
+        finally:
+            engine.dispose()
+
+    @app.post("/api/knowledge/rebuild/pause")
+    def post_knowledge_rebuild_pause() -> dict:
+        engine = create_db_engine(settings.database_path)
+        try:
+            ProductionQueue(engine).set_historical_paused(True)
+            return {"status": "paused"}
+        finally:
+            engine.dispose()
+
+    @app.post("/api/knowledge/rebuild/resume")
+    def post_knowledge_rebuild_resume() -> dict:
+        engine = create_db_engine(settings.database_path)
+        try:
+            ProductionQueue(engine).set_historical_paused(False)
+            return {"status": "running"}
+        finally:
+            engine.dispose()
+
+    @app.get("/api/data-governance")
+    def get_data_governance() -> dict:
+        return data_governance_view(settings)
+
+    @app.post("/api/data-governance/plans", status_code=202)
+    def post_data_governance_plan(payload: DataGovernancePlanRequest) -> dict:
+        try:
+            return enqueue_data_governance_plan(settings, set(payload.categories))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/data-governance/integrity-audits", status_code=202)
+    def post_integrity_audit() -> dict:
+        return enqueue_integrity_audit(settings)
+
+    @app.post("/api/data-governance/runs/{run_id}/{action}", status_code=202)
+    def post_data_governance_action(
+        run_id: int, action: str, payload: DataGovernanceActionRequest,
+    ) -> dict:
+        try:
+            return enqueue_data_governance_action(
+                settings, run_id, action, confirmation=payload.confirmation,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # ---- Product-aligned console routes (plan-0807-1 §3-§10) ----
 
     @app.get("/api/dashboard")
@@ -345,6 +418,13 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return build_dashboard(settings)
         except (OSError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail=f"dashboard unavailable: {exc}") from exc
+
+    @app.get("/api/simple-status")
+    def get_simple_status() -> dict:
+        try:
+            return simple_status(settings)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=f"simple status unavailable: {exc}") from exc
 
     @app.get("/api/pending-notifications")
     def get_pending_notifications(
@@ -372,6 +452,8 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return retry_pending_delivery(settings, occurrence_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/pending-notifications/{occurrence_id}/cleanup", status_code=202)
     def post_pending_cleanup(occurrence_id: int, payload: dict | None = None) -> dict:
@@ -400,20 +482,27 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     @app.get("/api/done-archives")
     def get_done_archives(
         page: int = Query(1, ge=1),
-        page_size: int = Query(100, ge=1, le=200),
+        page_size: int = Query(50, ge=1, le=200),
         query: str | None = Query(None),
         archive_status: str | None = Query(None),
         markdown_status: str | None = Query(None),
         handoff_status: str | None = Query(None),
+        simple_status: str | None = Query(None),
     ) -> dict:
+        if simple_status is not None and simple_status not in _ALLOWED_SIMPLE_STATES:
+            raise HTTPException(status_code=422, detail=f"unsupported simple_status: {simple_status}")
         return done_archives_list(
             settings, page=page, page_size=page_size, query=query,
             archive_status=archive_status, markdown_status=markdown_status, handoff_status=handoff_status,
+            simple_status=simple_status,
         )
 
     @app.get("/api/markdown-outputs")
-    def get_markdown_outputs() -> dict:
-        return markdown_outputs_list(settings)
+    def get_markdown_outputs(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+    ) -> dict:
+        return markdown_outputs_list(settings, page=page, page_size=page_size)
 
     @app.post("/api/done-archives/{manifest_id}/retry-archive", status_code=202)
     def post_done_archive_retry(manifest_id: int) -> dict:
@@ -825,9 +914,12 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     # ---- 2B-3: Review and local maintenance ----
 
     @app.get("/api/reviews")
-    def get_reviews(status: str = Query("pending")) -> list[dict]:
+    def get_reviews(
+        status: str = Query("pending"),
+        kind: str | None = Query(None),
+    ) -> list[dict]:
         try:
-            return list_reviews(settings, status)
+            return list_reviews(settings, status, kind)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -835,6 +927,15 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     def post_review_resolution(review_id: int, payload: ReviewResolutionRequest) -> dict:
         try:
             return resolve_review(settings, review_id, payload.resolution)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/reviews/{review_id}/retry-source", status_code=202)
+    def post_source_review_retry(review_id: int) -> dict:
+        try:
+            return retry_source_review(settings, review_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

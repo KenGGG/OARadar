@@ -11,7 +11,7 @@ from oa_knowledge.collector import LoginState
 from oa_knowledge.collector.pending import DiscoveredPendingItem, PendingDiscovery
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import BatchItem, CollectionBatch
+from oa_knowledge.db.models import BatchItem, CollectionBatch, OperationJob
 
 runner = CliRunner()
 
@@ -34,7 +34,37 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     assert oct((data_root / "state" / "oa.db").stat().st_mode & 0o777) == "0o600"
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0028_pending_cleanup"
+    assert json.loads(status.output)["schema"] == "0033_online_attachment_evidence"
+
+
+def test_schedule_enqueue_creates_worker_job_without_opening_browser(config_file: Path) -> None:
+    result = runner.invoke(app, [
+        "schedule", "enqueue", "hourly", "--config", str(config_file),
+    ])
+    assert result.exit_code == 0, result.output
+    payload = _last_json(result.output)
+    assert payload["status"] == "queued"
+    settings = load_settings(config_file)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        job = session.get(OperationJob, payload["job_id"])
+        assert job.job_type == "scheduled_hourly"
+        assert job.status == "queued"
+
+
+def test_curate_plan_is_read_only_and_commands_are_registered(config_file: Path) -> None:
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+    help_result = runner.invoke(app, ["curate", "--help"])
+    assert help_result.exit_code == 0
+    for command in ("plan", "run", "retry", "validate", "report"):
+        assert command in help_result.output
+
+    planned = runner.invoke(app, ["curate", "plan", "--config", str(config_file), "--limit", "2"])
+    reported = runner.invoke(app, ["curate", "report", "--config", str(config_file)])
+
+    assert planned.exit_code == 0, planned.output
+    assert _last_json(planned.output)["packages"] == 0
+    assert _last_json(reported.output)["runs"] == 0
 
 
 def test_convert_synthetic_text_and_unsupported_file(config_file: Path) -> None:

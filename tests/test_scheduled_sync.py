@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.collector import LoginState
+from oa_knowledge.collector.done import DiscoveredDoneItem, DoneDiscovery
 from oa_knowledge.collector.pending import DiscoveredPendingItem
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
@@ -21,6 +22,7 @@ from oa_knowledge.scheduled_sync import (
     run_nightly_scan,
     run_pending_scan,
     scan_done_known_boundary,
+    sync_done_versions_and_enqueue,
 )
 
 
@@ -180,6 +182,76 @@ def test_ensure_manifest_item_is_idempotent(tmp_path: Path) -> None:
         assert session.query(OAManifestItem).filter_by(oa_item_key="done:abc").count() == 1
 
 
+def test_nightly_versions_baseline_without_redownload_and_enqueue_changes(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+
+    def done(identifier: str, title: str) -> DiscoveredDoneItem:
+        return DiscoveredDoneItem(
+            identifier, title, None, datetime(2026, 8, 17), "合成发送人",
+            None, "协同", 1,
+        )
+
+    baseline = done("baseline", "首次建立签名")
+    unchanged = done("unchanged", "保持不变")
+    changed = done("changed", "已经变化")
+    retry = done("retry", "失败重试")
+    new = done("new", "新增事项")
+    from oa_knowledge.scheduled_sync import _done_signature
+    known = {
+        baseline.oa_item_key: None,
+        unchanged.oa_item_key: _done_signature(unchanged),
+        changed.oa_item_key: "old-signature",
+        retry.oa_item_key: None,
+    }
+    with Session(engine) as session:
+        session.add_all((
+            OAManifestItem(
+                oa_item_key=baseline.oa_item_key, workitem_id_text="baseline",
+                title=baseline.title, list_page=1, processing_status="downloaded",
+            ),
+            OAManifestItem(
+                oa_item_key=unchanged.oa_item_key, workitem_id_text="unchanged",
+                title=unchanged.title, list_page=1, processing_status="downloaded",
+                discovery_hash=known[unchanged.oa_item_key],
+            ),
+            OAManifestItem(
+                oa_item_key=changed.oa_item_key, workitem_id_text="changed",
+                title="变化前", list_page=1, processing_status="downloaded",
+                discovery_hash="old-signature",
+            ),
+            OAManifestItem(
+                oa_item_key=retry.oa_item_key, workitem_id_text="retry",
+                title=retry.title, list_page=1, processing_status="download_failed",
+            ),
+        ))
+        session.flush()
+        from oa_knowledge.full_manifest import synchronize_manifest
+        discovery = DoneDiscovery(
+            (baseline, unchanged, changed, retry, new),
+            pages_scanned=1, query_count=5, scanned_row_count=5,
+            source_total_count=5, source_total_pages=1,
+        )
+        synchronize_manifest(session, discovery)
+        summary = sync_done_versions_and_enqueue(
+            session, discovery.items, known,
+        )
+        session.commit()
+
+        assert summary == {
+            "new_items": 1, "changed_items": 1, "baseline_hashes": 2,
+            "retry_items": 1, "download_jobs_enqueued": 3,
+        }
+        tasks = session.scalars(select(PipelineTask).order_by(PipelineTask.id)).all()
+        assert {task.logical_item_key for task in tasks} == {
+            changed.oa_item_key, retry.oa_item_key, new.oa_item_key,
+        }
+        assert session.query(OAManifestItem).filter(
+            OAManifestItem.discovery_hash.is_(None),
+        ).count() == 0
+
+
 # --------------------------------------------------------------------------- #
 # Orchestration wiring (plan-0806-1 §2.3 / §4): single write Session end-to-end
 # --------------------------------------------------------------------------- #
@@ -210,6 +282,8 @@ def test_run_nightly_scan_records_run_without_nested_session(tmp_path: Path) -> 
         result = run_nightly_scan(engine, MagicMock())
 
     assert result["source_total"] == 0
+    assert result["knowledge_tasks_enqueued"] == 0
+    assert "markdown_tasks_enqueued" not in result
     with Session(engine) as session:
         runs = session.scalars(select(Run).where(Run.stage == "scheduled_nightly")).all()
         assert len(runs) == 1

@@ -311,7 +311,7 @@ def test_done_archive_directory_uses_initiation_month_and_never_completion_time(
     assert done_archive_directory("事项", "42", None).as_posix() == "archive/raw/oa/done/unknown/事项_42"
 
 
-def test_successful_archive_enqueues_markdown_task(tmp_path: Path) -> None:
+def test_successful_archive_does_not_enqueue_legacy_markdown_task(tmp_path: Path) -> None:
     db = tmp_path / "state" / "oa.db"
     upgrade_database(db)
     engine = create_db_engine(db)
@@ -329,9 +329,9 @@ def test_successful_archive_enqueues_markdown_task(tmp_path: Path) -> None:
     with Session(engine) as session:
         archive_collaboration_detail(session, session.get(BatchItem, item_id), capture, tmp_path)
         session.commit()
-        assert session.scalar(select(func.count()).select_from(MarkdownTask)) == 1
-    # Re-running the same archive must not duplicate the Markdown task.
+        assert session.scalar(select(func.count()).select_from(MarkdownTask)) == 0
+    # Re-running archive persistence must remain decoupled from the retired queue.
     with Session(engine) as session:
         archive_collaboration_detail(session, session.get(BatchItem, item_id), capture, tmp_path)
         session.commit()
-        assert session.scalar(select(func.count()).select_from(MarkdownTask)) == 1
+        assert session.scalar(select(func.count()).select_from(MarkdownTask)) == 0

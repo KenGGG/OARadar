@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import (
     ArchivedFile, ItemOccurrence, LogicalItem, MarkdownExport, OAItem, OAManifestItem, ParseArtifact,
+    NotificationDelivery, PipelineTask,
 )
 
 
@@ -35,6 +37,44 @@ def test_dashboard_reports_three_chains(config_file: Path) -> None:
         assert chain in payload
         assert payload[chain]["status"] in {"normal", "abnormal"}
     assert isinstance(payload["needs_attention"], list)
+
+
+def test_dashboard_surfaces_a_live_oa_login_activity_without_oa_content(config_file: Path) -> None:
+    """Regression: the overview must expose a current login state, not only past scans."""
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    runtime = settings.data_root / "runtime"
+    runtime.mkdir()
+    (runtime / "operation-worker.json").write_text(json.dumps({
+        "owner": "worker-synthetic", "pid": 1, "status": "logging_in",
+        "activity": "正在验证 OA 登录", "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+
+    payload = _client(config_file).get("/api/dashboard").json()
+
+    assert payload["oa_activity"]["status"] == "logging_in"
+    assert payload["oa_activity"]["label"] == "正在登录 OA"
+    assert payload["oa_activity"]["detail"] == "正在验证 OA 登录"
+    assert "title" not in payload["oa_activity"]
+
+
+def test_dashboard_reports_that_oa_session_is_closed_between_scheduled_tasks(config_file: Path) -> None:
+    """The overview must not present an idle worker as an active OA session."""
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    runtime = settings.data_root / "runtime"
+    runtime.mkdir()
+    (runtime / "operation-worker.json").write_text(json.dumps({
+        "owner": "worker-synthetic", "pid": 1, "status": "idle",
+        "activity": "当前未登录 OA，等待下次定时任务",
+        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+
+    payload = _client(config_file).get("/api/dashboard").json()
+
+    assert payload["oa_activity"]["status"] == "disconnected"
+    assert payload["oa_activity"]["label"] == "OA 已退出"
+    assert payload["oa_activity"]["detail"] == "当前未登录 OA，等待下次定时任务"
 
 
 def test_dashboard_markdown_delivery_counts_success(config_file: Path) -> None:
@@ -96,6 +136,73 @@ def test_pending_notifications_list_and_detail(config_file: Path) -> None:
     assert detail.json()["id"] == occ_id
 
 
+def test_pending_detail_exposes_six_durable_pipeline_stages(config_file: Path) -> None:
+    client = _client(config_file)
+    engine = create_db_engine(load_settings(config_file).database_path)
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="pend:stages", title="Synthetic", lifecycle_status="pending")
+        session.add(logical)
+        session.flush()
+        occurrence = ItemOccurrence(
+            logical_item_id=logical.id, occurrence_key="pending:stages", channel="pending",
+            title="Synthetic", occurrence_status="active",
+        )
+        session.add(occurrence)
+        session.add(PipelineTask(
+            queue_name="realtime_pending", priority=10,
+            logical_item_key=str(logical.id), logical_item_id=logical.id,
+            stage="pending_parse", status="running", idempotency_key="pending-six-stages",
+        ))
+        session.commit()
+        occurrence_id = occurrence.id
+
+    stages = client.get(f"/api/pending-notifications/{occurrence_id}").json()["stages"]
+
+    assert stages == {
+        "discovery": "done",
+        "download": "done",
+        "markdown": "running",
+        "summary": "pending",
+        "feishu": "pending",
+        "cleanup": "pending",
+    }
+
+
+def test_unknown_delivery_requires_reconciliation_and_rejects_plain_retry(config_file: Path) -> None:
+    client = _client(config_file)
+    engine = create_db_engine(load_settings(config_file).database_path)
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="pend:unknown", title="Synthetic", lifecycle_status="pending")
+        session.add(logical); session.flush()
+        occurrence = ItemOccurrence(
+            logical_item_id=logical.id, occurrence_key="pending:unknown", channel="pending",
+            title="Synthetic", occurrence_status="active",
+        )
+        session.add(occurrence)
+        session.add(NotificationDelivery(
+            logical_item_id=logical.id, channel="feishu", notification_type="pending_summary",
+            idempotency_key="synthetic-unknown-delivery", status="unknown", attempts=1,
+        ))
+        session.commit()
+        occurrence_id = occurrence.id
+
+    detail = client.get(f"/api/pending-notifications/{occurrence_id}")
+    retry = client.post(
+        f"/api/pending-notifications/{occurrence_id}/retry-delivery",
+        headers={"x-csrf-token": dict(client.cookies)["oa_csrf"]},
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["can_retry_delivery"] is False
+    assert detail.json()["requires_delivery_reconciliation"] is True
+    assert detail.json()["can_cleanup"] is False
+    assert retry.status_code == 409
+    with Session(engine) as session:
+        delivery = session.scalar(select(NotificationDelivery))
+        assert delivery.status == "unknown"
+        assert delivery.attempts == 1
+
+
 def test_settings_read_and_write_cleanup_policy(config_file: Path) -> None:
     client = _client(config_file)
     get = client.get("/api/settings")
@@ -122,11 +229,66 @@ def test_done_archives_endpoint_returns_status_labels(config_file: Path) -> None
     assert "items" in resp.json()
 
 
+def test_done_archives_exposes_six_durable_pipeline_stages(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(OAManifestItem(
+            oa_item_key="oa:stages", title="Synthetic stages", list_page=1,
+            processing_status="downloaded",
+        ))
+        session.add(OAItem(
+            oa_item_key="oa:stages", source_channel="done", title="Synthetic stages",
+            pipeline_status="archived",
+        ))
+        session.add(PipelineTask(
+            queue_name="historical_done_backfill", priority=30,
+            logical_item_key="oa:stages", stage="source_publish", status="running",
+            idempotency_key="synthetic-six-stages",
+        ))
+        session.commit()
+
+    item = _client(config_file).get("/api/done-archives").json()["items"][0]
+
+    assert item["stages"] == {
+        "discovery": "done",
+        "download": "done",
+        "verification": "done",
+        "markdown": "running",
+        "curation": "pending",
+        "publication": "pending",
+    }
+
+
 def test_markdown_outputs_endpoint(config_file: Path) -> None:
     client = _client(config_file)
     resp = client.get("/api/markdown-outputs")
     assert resp.status_code == 200
     assert "documents" in resp.json()
+
+
+def test_markdown_outputs_endpoint_returns_only_the_requested_page(config_file: Path) -> None:
+    """Regression: the knowledge screen must not download every Markdown row."""
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        for index in range(3):
+            session.add(MarkdownExport(
+                source_sha256=f"{index:064x}", source_relpath=f"source-{index}.pdf",
+                markdown_relpath=f"source-{index}.pdf.md", parse_engine="markitdown",
+                parse_engine_version="v1", parse_config_hash="cfg", schema_version=1,
+                status="success", generated_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            ))
+        session.commit()
+
+    payload = _client(config_file).get("/api/markdown-outputs?page=2&page_size=2").json()
+
+    assert payload["total"] == 3
+    assert payload["page"] == 2
+    assert payload["page_size"] == 2
+    assert len(payload["documents"]) == 1
 
 
 def test_maintenance_endpoint(config_file: Path) -> None:

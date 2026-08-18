@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from oa_knowledge.enrich.context_budget import ContextBudget, discover_ollama_profile, estimate_tokens
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +34,9 @@ class LlmClient:
         timeout_seconds: int = 180,
         max_retries: int = 2,
         provider_mode: str = "local_only",
+        context_window_fallback: int = 8192,
+        context_window_cap: int = 131072,
+        context_safety_margin: int = 1024,
     ) -> None:
         self._validate_security(base_url, provider_mode)
         self.base_url = base_url
@@ -41,7 +46,11 @@ class LlmClient:
         self.max_tokens = max_tokens
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
-        self.local_context_window = 8192
+        self.local_context_window = context_window_fallback
+        self.context_window_fallback = context_window_fallback
+        self.context_window_cap = context_window_cap
+        self.context_safety_margin = context_safety_margin
+        self._profile_discovered = False
         parsed = urlparse(base_url)
         self.uses_ollama_native = (
             parsed.hostname in {"localhost", "127.0.0.1", "::1"}
@@ -65,14 +74,19 @@ class LlmClient:
             return
         if parsed.scheme == "unix":
             return
-        if parsed.scheme == "https" and provider_mode == "approved_remote":
-            return
         raise ValueError(
             f"LLM base_url must be loopback-only, got: {base_url}. "
             "Public network addresses are prohibited for privacy."
         )
 
     def _request_payload(self, system_prompt: str, user_prompt: str, *, json_schema: dict | None = None) -> dict:
+        budget = ContextBudget(
+            context_window=self.local_context_window,
+            max_output_tokens=self.max_tokens,
+            system_tokens=estimate_tokens(system_prompt),
+            safety_margin=self.context_safety_margin,
+        )
+        budget.ensure_fits(user_prompt)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -119,40 +133,59 @@ class LlmClient:
         usage: dict | None = None
 
         try:
+            if self.uses_ollama_native and not self._profile_discovered:
+                profile = discover_ollama_profile(
+                    self.base_url,
+                    self.model,
+                    fallback_context_window=self.context_window_fallback,
+                    context_window_cap=self.context_window_cap,
+                )
+                self.local_context_window = profile.context_window
+                self._profile_discovered = True
             request_base = self.base_url
             request_path = "/chat/completions"
             payload = self._request_payload(system_prompt, user_prompt, json_schema=json_schema)
             if self.uses_ollama_native:
                 request_base = self.base_url.removesuffix("/v1")
                 request_path = "/api/chat"
-            with httpx.Client(
-                base_url=request_base,
-                headers=self.headers,
-                timeout=self.timeout_seconds,
-                follow_redirects=False,
-            ) as client:
-                response = client.post(request_path, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                if self.uses_ollama_native:
-                    result_content = data.get("message", {}).get("content")
-                else:
-                    choices = data.get("choices", [])
-                    if choices:
-                        result_content = choices[0].get("message", {}).get("content")
-                model_used = data.get("model", self.model)
-                usage_data = data.get("usage", {})
-                if usage_data:
-                    usage = {
-                        "prompt_tokens": usage_data.get("prompt_tokens"),
-                        "completion_tokens": usage_data.get("completion_tokens"),
-                        "total_tokens": usage_data.get("total_tokens"),
-                    }
-        except httpx.RequestError as exc:
-            error_code = f"http_request_error"
-            logger.warning("LLM request failed: %s", type(exc).__name__)
+            for attempt in range(self.max_retries + 1):
+                try:
+                    with httpx.Client(
+                        base_url=request_base,
+                        headers=self.headers,
+                        timeout=self.timeout_seconds,
+                        follow_redirects=False,
+                    ) as client:
+                        response = client.post(request_path, json=payload)
+                        response.raise_for_status()
+                        data = response.json()
+                    if self.uses_ollama_native:
+                        result_content = data.get("message", {}).get("content")
+                    else:
+                        choices = data.get("choices", [])
+                        if choices:
+                            result_content = choices[0].get("message", {}).get("content")
+                    model_used = data.get("model", self.model)
+                    usage_data = data.get("usage", {})
+                    if usage_data:
+                        usage = {
+                            "prompt_tokens": usage_data.get("prompt_tokens"),
+                            "completion_tokens": usage_data.get("completion_tokens"),
+                            "total_tokens": usage_data.get("total_tokens"),
+                        }
+                    error_code = None
+                    break
+                except httpx.RequestError as exc:
+                    error_code = "http_request_error"
+                    logger.warning(
+                        "LLM request failed: %s attempt=%s/%s",
+                        type(exc).__name__, attempt + 1, self.max_retries + 1,
+                    )
+                    if attempt >= self.max_retries:
+                        break
+                    time.sleep(min(2 ** attempt, 5))
         except Exception as exc:
-            error_code = f"unexpected_error"
+            error_code = "unexpected_error"
             logger.warning("LLM unexpected error: %s", type(exc).__name__)
 
         elapsed = time.monotonic() - start

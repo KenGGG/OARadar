@@ -34,6 +34,36 @@ class ReconciliationResult:
     markdown_updated: int = 0
 
 
+def _tree_fingerprint(root: Path) -> str:
+    """Hash a directory tree without following links or exposing file names.
+
+    Archive migration is a location change, not a content migration.  Including
+    relative paths and file bytes in one digest proves that the same tree arrived
+    at the destination.  Links are rejected because following one could escape
+    ``data_root`` and copying link text would not prove preservation of evidence.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda candidate: candidate.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError("review_required: archive contains symbolic link")
+        if path.is_dir():
+            digest.update(b"D\0")
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            continue
+        if not path.is_file():
+            raise ValueError("review_required: archive contains unsupported filesystem entry")
+        digest.update(b"F\0")
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _replace_prefix(value: str | None, old: str, new: str) -> str | None:
     return replace_archive_prefix(value, old, new)
 
@@ -187,13 +217,17 @@ def _migrate_one_item(session: Session, settings: Settings, item: OAItem) -> str
         raise FileExistsError("archive target collision")
 
     new_raw.parent.mkdir(parents=True, exist_ok=True)
+    if old_raw.stat().st_dev != new_raw.parent.stat().st_dev:
+        raise OSError("archive migration must stay on one filesystem")
+    source_fingerprint = _tree_fingerprint(old_raw)
     raw_moved = False
     try:
         old_raw.rename(new_raw)
         raw_moved = True
+        if _tree_fingerprint(new_raw) != source_fingerprint:
+            raise OSError("archive fingerprint changed during migration")
         old_md_rel = _markdown_item_rel(old_rel)
         new_md_rel = _markdown_item_rel(new_rel)
-        _rewrite_text_tree(new_raw, old_rel.as_posix(), new_rel.as_posix(), old_md_rel.as_posix(), new_md_rel.as_posix())
         files = session.scalars(select(ArchivedFile).where(ArchivedFile.oa_item_id == item.id)).all()
         for row in files:
             row.local_relpath = _replace_prefix(row.local_relpath, old_rel.as_posix(), new_rel.as_posix())
@@ -205,6 +239,7 @@ def _migrate_one_item(session: Session, settings: Settings, item: OAItem) -> str
         for row in batches:
             row.archive_manifest_relpath = _replace_prefix(row.archive_manifest_relpath, old_rel.as_posix(), new_rel.as_posix())
         session.flush()
+        session.commit()
         return "migrated"
     except Exception:
         session.rollback()
@@ -212,6 +247,14 @@ def _migrate_one_item(session: Session, settings: Settings, item: OAItem) -> str
             old_raw.parent.mkdir(parents=True, exist_ok=True)
             new_raw.rename(old_raw)
         raise
+
+
+def migrate_archive_item_by_id(session: Session, settings: Settings, item_id: int) -> str:
+    """Migrate one local archive row and commit the filesystem/DB unit together."""
+    item = session.get(OAItem, item_id)
+    if item is None or item.source_channel != "done" or not item.archive_relpath:
+        raise ValueError("done archive unavailable")
+    return _migrate_one_item(session, settings, item)
 
 
 def migrate_archive_paths(session: Session, settings: Settings, *, dry_run: bool = False) -> dict[str, int]:
@@ -246,5 +289,4 @@ def migrate_archive_paths(session: Session, settings: Settings, *, dry_run: bool
             logger.warning("archive path migration failed for item %s: %s", item.id, exc)
             continue
         counts[status] = counts.get(status, 0) + 1
-        session.commit()
     return counts

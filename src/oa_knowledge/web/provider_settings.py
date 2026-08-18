@@ -11,17 +11,16 @@ import yaml
 from oa_knowledge.config import Settings, load_settings
 
 
-LLM_FIELDS = {"enabled", "active_provider", "ollama_base_url", "ollama_model", "agnes_base_url", "agnes_model", "timeout_seconds", "max_tokens", "temperature", "max_retries", "max_concurrency"}
+LLM_FIELDS = {"enabled", "active_provider", "ollama_base_url", "ollama_model", "timeout_seconds", "max_tokens", "temperature", "max_retries", "max_concurrency"}
 FEISHU_FIELDS = {"enabled", "message_type", "max_items_per_section", "redact_confidential", "retry_attempts"}
 
 
 def provider_settings_view(settings: Settings) -> dict[str, Any]:
     return {
-        "agnes": {
+        "local_llm": {
             **{name: getattr(settings.llm, name) for name in sorted(LLM_FIELDS)},
             "api_key_env": settings.llm.api_key_env,
             "api_key_configured": bool(os.environ.get(settings.llm.api_key_env)),
-            "agnes_api_key_configured": bool(os.environ.get("AGNES_API_KEY")),
             "ollama_available": _ollama_available(settings.llm.ollama_base_url),
             "provider_name": settings.llm.provider_name,
             "base_url": settings.llm.base_url,
@@ -57,7 +56,7 @@ def update_provider_settings(config_path: Path | None, payload: dict[str, Any]) 
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
     for section, allowed in (("llm", LLM_FIELDS), ("feishu", FEISHU_FIELDS)):
-        incoming = payload.get("agnes" if section == "llm" else section, {})
+        incoming = payload.get("local_llm" if section == "llm" else section, {})
         if not isinstance(incoming, dict):
             raise ValueError(f"{section} settings must be a mapping")
         unknown = set(incoming) - allowed

@@ -82,6 +82,14 @@ class CollaborationDetailAdapter:
         self._capture_issues: list[dict[str, object]] = []
         self._last_download_failure: str | None = None
 
+    def _capture_timed_out(self, deadline: float | None, stage: str) -> bool:
+        if deadline is None or monotonic() < deadline:
+            return False
+        issue = {"kind": "capture_timeout", "stage": stage}
+        if issue not in self._capture_issues:
+            self._capture_issues.append(issue)
+        return True
+
     @staticmethod
     def _read_download_payload(path: Path | None) -> bytes | None:
         """Accept a non-empty binary browser download, never an OA HTML response."""
@@ -319,6 +327,8 @@ class CollaborationDetailAdapter:
         captures: list[RelatedContainerCapture] = []
         associations = self._associated_documents(page)
         for association in associations:
+            if self._capture_timed_out(deadline, "associated_containers"):
+                break
             key = association["key"]
             if key in visited:
                 continue
@@ -462,6 +472,8 @@ class CollaborationDetailAdapter:
         files: list[DirectAttachment] = []
         seen: set[str] = set()
         for frame in page.frames:
+            if self._capture_timed_out(deadline, "attachments"):
+                break
             try:
                 links = frame.locator("a[_temp*='fileDownload.do?method=download']")
                 descriptors = links.evaluate_all(
@@ -489,6 +501,8 @@ class CollaborationDetailAdapter:
                 logger.debug("collector detail: skipping item after error", exc_info=True)
                 continue
             for descriptor in descriptors:
+                if self._capture_timed_out(deadline, "attachments"):
+                    break
                 file_url = descriptor.get("file_url")
                 key = descriptor.get("key") or ""
                 if not file_url or not key or key in seen:
@@ -563,9 +577,15 @@ class CollaborationDetailAdapter:
                     mime_type=content_type, file_role=role,
                     content=content, download_status="downloaded" if content is not None else "download_failed",
                 ))
+        if self._capture_timed_out(deadline, "attachments"):
+            return tuple(files)
         cap4_files = self._download_cap4_widgets(page, default_role, seen, deadline, download_timeout_seconds)
         files.extend(cap4_files)
-        if not self.inventory_only and not any(file.download_status == "downloaded" for file in cap4_files):
+        if (
+            not self.inventory_only
+            and not any(file.download_status == "downloaded" for file in cap4_files)
+            and not self._capture_timed_out(deadline, "attachments")
+        ):
             files.extend(self._download_cap4_batches(page, default_role, seen, deadline, download_timeout_seconds))
         return tuple(files)
 
@@ -580,12 +600,16 @@ class CollaborationDetailAdapter:
         """Download each visible CAP4 attachment through its authenticated control."""
         files: list[DirectAttachment] = []
         for frame in page.frames:
+            if self._capture_timed_out(deadline, "attachments"):
+                break
             try:
                 widgets = frame.locator(".cap4-attach__att")
                 count = widgets.count()
             except PlaywrightError:
                 continue
             for index in range(count):
+                if self._capture_timed_out(deadline, "attachments"):
+                    break
                 widget = widgets.nth(index)
                 try:
                     descriptor = widget.evaluate("""node => ({
@@ -643,6 +667,8 @@ class CollaborationDetailAdapter:
         """Handle newer Cap4 forms whose attachment DOM exposes only batch ZIP links."""
         files: list[DirectAttachment] = []
         for frame in page.frames:
+            if self._capture_timed_out(deadline, "attachments"):
+                break
             try:
                 descriptors = frame.locator("a.cap4-attach-downall[href*='batchDownload/']").evaluate_all(
                     """nodes => nodes.map(node => ({
@@ -663,6 +689,8 @@ class CollaborationDetailAdapter:
                 logger.debug("collector detail: skipping item after error", exc_info=True)
                 continue
             for descriptor in descriptors:
+                if self._capture_timed_out(deadline, "attachments"):
+                    break
                 href = descriptor.get("href") or ""
                 if not href:
                     continue

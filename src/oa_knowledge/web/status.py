@@ -30,6 +30,8 @@ from oa_knowledge.db.models import (
     OAManifestSync,
     OperationEvent,
     OperationJob,
+    PipelineEvent,
+    PipelineTask,
     ReviewEntry,
     Run,
 )
@@ -545,6 +547,7 @@ def dashboard_status(settings: Settings) -> dict[str, Any]:
     finally:
         engine.dispose()
 
+    runtime = _worker_runtime(settings)
     usage = shutil.disk_usage(settings.data_root)
     return {
         "service": "oa-knowledge-web",
@@ -554,7 +557,8 @@ def dashboard_status(settings: Settings) -> dict[str, Any]:
         "oa_auth": {"status": "unknown", "checked_at": None, "read_only": True},
         "counts": {**counts, "archive_statuses": archive_counts},
         "batch": _batch_payload(latest_batch),
-        "worker": _job_payload(active_job) or _worker_runtime(settings),
+        "worker": _job_payload(active_job) or runtime,
+        "worker_runtime": runtime,
         "storage": {
             "total_bytes": usage.total,
             "used_bytes": usage.used,
@@ -575,6 +579,7 @@ def _worker_runtime(settings: Settings) -> dict[str, Any] | None:
             "key": payload["owner"], "type": "daemon", "status": payload["status"],
             "progress_current": 0, "progress_total": None,
             "heartbeat_at": payload["heartbeat_at"],
+            "activity": payload.get("activity"),
         }
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return None
@@ -597,7 +602,11 @@ def maintenance_status(settings: Settings, target_items: int = 500) -> dict[str,
     }
 
 
-def list_reviews(settings: Settings, status: str = "pending") -> list[dict[str, Any]]:
+def list_reviews(
+    settings: Settings,
+    status: str = "pending",
+    kind: str | None = None,
+) -> list[dict[str, Any]]:
     if status not in {"pending", "resolved", "dismissed", "all"}:
         raise ValueError("invalid review status")
     engine = create_db_engine(settings.database_path)
@@ -606,6 +615,8 @@ def list_reviews(settings: Settings, status: str = "pending") -> list[dict[str, 
             query = select(ReviewEntry).order_by(ReviewEntry.created_at.desc(), ReviewEntry.id.desc())
             if status != "all":
                 query = query.where(ReviewEntry.status == status)
+            if kind:
+                query = query.where(ReviewEntry.kind == kind)
             rows = session.scalars(query).all()
             return [{
                 "id": row.id, "kind": row.kind, "item_id": row.item_id,
@@ -630,6 +641,62 @@ def resolve_review(settings: Settings, review_id: int, resolution: str) -> dict[
             row.status = resolution
             session.commit()
             return {"id": row.id, "status": row.status}
+    finally:
+        engine.dispose()
+
+
+def retry_source_review(settings: Settings, review_id: int) -> dict[str, Any]:
+    """Recheck one manually-remediated source without retrying unrelated failures."""
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            review = session.get(ReviewEntry, review_id)
+            if review is None:
+                raise LookupError("review entry not found")
+            if review.kind != "source_markdown_incomplete":
+                raise ValueError("review entry is not a source markdown review")
+            if review.item_id is None:
+                raise ValueError("review entry is not linked to an OA item")
+            item = session.get(OAItem, review.item_id)
+            if item is None:
+                raise LookupError("review OA item not found")
+            task = session.scalar(
+                select(PipelineTask)
+                .where(
+                    PipelineTask.logical_item_key == item.oa_item_key,
+                    PipelineTask.stage == "source_publish",
+                    PipelineTask.status == "failed",
+                    PipelineTask.error_code.in_((
+                        "UNSUPPORTED_SOURCE_FORMAT",
+                        "PARSE_QUALITY_REJECTED",
+                        "UNSAFE_SOURCE_PATH",
+                    )),
+                )
+                .order_by(PipelineTask.priority, PipelineTask.updated_at.desc(), PipelineTask.id.desc())
+                .limit(1)
+            )
+            if task is None:
+                raise LookupError("failed source markdown task not found")
+            task.stage = "attachment_inventory"
+            task.status = "queued"
+            task.attempts = 0
+            task.error_code = None
+            task.last_error = None
+            task.recoverable = True
+            task.next_retry_at = None
+            task.finished_at = None
+            task.lease_owner = None
+            task.lease_expires_at = None
+            review.status = "resolved"
+            session.add(PipelineEvent(
+                task_id=task.id,
+                event_type="manual_review_retry",
+                stage=task.stage,
+                status=task.status,
+                details_json=json.dumps({"review_id": review.id}),
+            ))
+            session.commit()
+            return {"id": review.id, "status": review.status, "task_status": task.status}
     finally:
         engine.dispose()
 

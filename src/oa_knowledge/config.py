@@ -188,8 +188,6 @@ class LlmConfig(StrictModel):
     active_provider: str = "ollama"
     ollama_base_url: str = "http://127.0.0.1:11434/v1"
     ollama_model: str = "qwen3.5:9b"
-    agnes_base_url: str = "https://apihub.agnes-ai.com/v1"
-    agnes_model: str = "agnes-2.0-flash"
     provider_name: str = "newapi"
     base_url: str = "http://127.0.0.1:11434/v1"
     api_key_env: str = "LOCAL_LLM_API_KEY"
@@ -208,27 +206,24 @@ class LlmConfig(StrictModel):
     allow_restricted: bool = False
     require_redaction: bool = True
     max_concurrency: int = 1
+    context_window_fallback: int = 8192
+    context_window_cap: int = 131072
+    context_safety_margin: int = 1024
 
     @model_validator(mode="after")
     def apply_provider_choice(self) -> "LlmConfig":
-        if self.active_provider not in {"ollama", "agnes"}:
-            raise ValueError("llm.active_provider must be ollama or agnes")
-        if self.active_provider == "ollama":
-            self.provider_name = "ollama"
-            self.base_url = self.ollama_base_url
-            self.model = self.ollama_model
-            self.text_model = self.ollama_model
-            self.api_key_env = "OLLAMA_API_KEY"
-            self.provider_mode = "local_only"
-            self.uses_local_gpu = True
-        else:
-            self.provider_name = "agnes"
-            self.base_url = self.agnes_base_url
-            self.model = self.agnes_model
-            self.text_model = self.agnes_model
-            self.api_key_env = "AGNES_API_KEY"
-            self.provider_mode = "approved_remote"
-            self.uses_local_gpu = False
+        if self.active_provider != "ollama":
+            raise ValueError("llm.active_provider must be ollama; OA model processing is local-only")
+        if self.ollama_model != "qwen3.5:9b":
+            raise ValueError("llm.ollama_model must be qwen3.5:9b")
+        self.provider_name = "ollama"
+        self.base_url = self.ollama_base_url
+        self.model = self.ollama_model
+        self.text_model = self.ollama_model
+        self.vision_model = "qwen3-vl:8b"
+        self.api_key_env = "OLLAMA_API_KEY"
+        self.provider_mode = "local_only"
+        self.uses_local_gpu = True
         return self
 
 
@@ -236,6 +231,13 @@ class ProcessingConfig(StrictModel):
     enabled: bool = True
     max_workers: int = 1
     batch_limit: int = 50
+
+
+class CurationConfig(StrictModel):
+    enabled: bool = False
+    batch_limit: int = Field(default=10, ge=1, le=100)
+    confidence_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
+    max_input_tokens: int = Field(default=60_000, ge=1024, le=120_000)
     cpu_weight: int = 50
     io_class: str = "idle"
     pause_on_backfill_degradation: bool = True
@@ -322,6 +324,7 @@ class Settings(StrictModel):
     feishu: FeishuConfig = FeishuConfig()
     llm: LlmConfig = LlmConfig()
     processing: ProcessingConfig = ProcessingConfig()
+    curation: CurationConfig = CurationConfig()
     markdown_export: MarkdownExportConfig = MarkdownExportConfig()
     conversion: ConversionConfig = ConversionConfig()
     online_audit: OnlineAuditConfig = OnlineAuditConfig()
@@ -384,6 +387,13 @@ def load_settings(path: Path | None = None) -> Settings:
         if not isinstance(loaded, dict):
             raise ValueError("configuration root must be a mapping")
         raw = loaded
+    # Older local configuration files may still contain inactive fields from
+    # the removed remote-provider UI. Ignore those names only; selecting the
+    # old provider itself still fails LlmConfig validation.
+    llm_raw = raw.get("llm")
+    if isinstance(llm_raw, dict):
+        llm_raw.pop("agnes_base_url", None)
+        llm_raw.pop("agnes_model", None)
     _reject_secrets(raw)
     env_root = os.getenv("OA_APP__DATA_ROOT")
     if env_root:

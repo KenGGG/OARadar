@@ -11,7 +11,9 @@ ExecStart={{UV_BIN}} run oa worker --poll-seconds 2 --config {{CONFIG_PATH}}
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
-PrivateTmp=true
+# Chrome persistent profiles use /tmp for singleton/IPC state. A private
+# namespace makes OA navigation fail with net::ERR_ACCESS_DENIED.
+PrivateTmp=false
 UMask=0077
 
 [Install]

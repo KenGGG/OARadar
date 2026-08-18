@@ -19,35 +19,30 @@ def test_loopback_provider_is_allowed_in_local_only_mode() -> None:
     assert decision.reason_code == "LOCAL_PROVIDER_ALLOWED"
 
 
-def test_remote_provider_requires_explicit_approved_remote_mode() -> None:
+def test_remote_provider_is_prohibited() -> None:
     config = ProviderConfig(provider_name="newapi-remote", base_url="https://llm.example.invalid/v1", model="synthetic")
     context = ProviderRequestContext(input_hash="a" * 64, content_classification=ContentClassification.INTERNAL, redacted=True)
 
     decision = evaluate_provider_request(config, context)
 
     assert not decision.allowed
-    assert decision.reason_code == "REMOTE_PROVIDER_NOT_APPROVED"
+    assert decision.reason_code == "REMOTE_PROVIDER_PROHIBITED"
 
 
 @pytest.mark.parametrize("classification", [ContentClassification.CONFIDENTIAL, ContentClassification.RESTRICTED])
-def test_remote_provider_rejects_sensitive_content_by_default(classification: ContentClassification) -> None:
-    config = ProviderConfig(
-        provider_name="approved", base_url="https://llm.example.invalid/v1", model="synthetic",
-        provider_mode="approved_remote",
-    )
-    context = ProviderRequestContext(input_hash="b" * 64, content_classification=classification, redacted=True)
-
-    assert evaluate_provider_request(config, context).reason_code == "CONTENT_CLASSIFICATION_DENIED"
+def test_legacy_approved_remote_provider_mode_is_invalid(classification: ContentClassification) -> None:
+    with pytest.raises(ValidationError):
+        ProviderConfig(
+            provider_name="approved", base_url="https://llm.example.invalid/v1", model="synthetic",
+            provider_mode="approved_remote",
+        )
 
 
-def test_remote_provider_requires_redaction() -> None:
-    config = ProviderConfig(
-        provider_name="approved", base_url="https://llm.example.invalid/v1", model="synthetic",
-        provider_mode="approved_remote",
-    )
+def test_remote_provider_never_becomes_allowed_after_redaction() -> None:
+    config = ProviderConfig(provider_name="remote", base_url="https://llm.example.invalid/v1", model="synthetic")
     context = ProviderRequestContext(input_hash="c" * 64, content_classification=ContentClassification.INTERNAL)
 
-    assert evaluate_provider_request(config, context).reason_code == "REDACTION_REQUIRED"
+    assert evaluate_provider_request(config, context).reason_code == "REMOTE_PROVIDER_PROHIBITED"
 
 
 def test_secret_bearing_context_is_always_rejected() -> None:

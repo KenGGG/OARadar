@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -85,6 +88,55 @@ def test_migrate_archive_paths_moves_and_rewrites_db(config_file) -> None:
         assert pending.archive_relpath == "archive/raw/oa/pending/1/5"
         pf = session.scalar(select(ArchivedFile).where(ArchivedFile.oa_item_id == pending_id))
         assert pf.local_relpath == "archive/raw/oa/pending/1/5/b.pdf"
+
+
+def test_migrate_archive_paths_preserves_every_source_byte(config_file) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    _seed(engine, settings.data_root)
+    source = settings.data_root / "raw/done/unknown/已办事项_x"
+    # Historical manifests can contain the old relative prefix. A path migration
+    # must not rewrite that evidence in place; derived manifests are rebuilt later.
+    manifest = source / "manifest.json"
+    manifest.write_text('{"source":"raw/done/unknown/已办事项_x/a.pdf"}', encoding="utf-8")
+    before = {
+        path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source.rglob("*") if path.is_file()
+    }
+
+    with Session(engine) as session:
+        counts = migrate_archive_paths(session, settings, dry_run=False)
+
+    target = settings.data_root / "archive/raw/oa/done/unknown/已办事项_x"
+    after = {
+        path.relative_to(target).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in target.rglob("*") if path.is_file()
+    }
+    assert counts["failed"] == 0
+    assert after == before
+    assert "raw/done/unknown" in (target / "manifest.json").read_text(encoding="utf-8")
+
+
+def test_migrate_archive_paths_rejects_symlinked_archive(config_file) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    _seed(engine, settings.data_root)
+    source = settings.data_root / "raw/done/unknown/已办事项_x"
+    outside = settings.data_root / "outside.txt"
+    outside.write_text("unique evidence", encoding="utf-8")
+    try:
+        (source / "escape-link").symlink_to(outside)
+    except OSError:
+        pytest.skip("filesystem does not support symlinks")
+
+    with Session(engine) as session:
+        counts = migrate_archive_paths(session, settings, dry_run=False)
+
+    assert counts["failed"] == 1
+    assert source.is_dir()
+    assert outside.read_text(encoding="utf-8") == "unique evidence"
 
 
 def test_migrate_archive_paths_is_idempotent(config_file) -> None:

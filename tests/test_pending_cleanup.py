@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -23,7 +25,14 @@ from oa_knowledge.pending_cleanup import (
 )
 
 
-def _build_graph(session: Session, settings, *, delivery_status, key="pend:1"):
+def _build_graph(
+    session: Session,
+    settings,
+    *,
+    delivery_status,
+    key="pend:1",
+    local_relpath="raw/pending/1/tmp.pdf",
+):
     logical = LogicalItem(logical_key=key, title="T", lifecycle_status="pending")
     session.add(logical)
     session.flush()
@@ -47,7 +56,7 @@ def _build_graph(session: Session, settings, *, delivery_status, key="pend:1"):
     af = ArchivedFile(
         oa_item_id=oa.id, attachment_key="att1", file_role="direct_attachment",
         source_container_key="c1", original_name="tmp.pdf",
-        local_relpath="pending/1/tmp.pdf", content_object_id=co.id,
+        local_relpath=local_relpath, content_object_id=co.id,
         download_status="verified", sha256="a" * 64,
     )
     session.add(af)
@@ -80,20 +89,32 @@ def _build_graph(session: Session, settings, *, delivery_status, key="pend:1"):
     return occ, logical, oa, af, snap, dl
 
 
-def _write_temp_file(settings) -> None:
-    path = settings.archive_root / "pending/1/tmp.pdf"
+def _write_temp_file(settings, relpath="raw/pending/1/tmp.pdf") -> Path:
+    path = settings.data_root / relpath
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"secret-pending-attachment")
+    return path
 
 
-def test_successful_delivery_cleans_business_data_and_keeps_ledger(config_file, tmp_path):
+@pytest.mark.parametrize(
+    "local_relpath",
+    (
+        "raw/pending/1/tmp.pdf",
+        "archive/raw/oa/pending/1/tmp.pdf",
+    ),
+)
+def test_successful_delivery_cleans_business_data_and_keeps_ledger(
+    config_file, tmp_path, local_relpath,
+):
     settings = load_settings(config_file)
     settings.data_root.mkdir(parents=True)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
     with Session(engine) as session:
-        occ, logical, oa, af, snap, dl = _build_graph(session, settings, delivery_status="sent")
-        _write_temp_file(settings)
+        occ, logical, oa, af, snap, dl = _build_graph(
+            session, settings, delivery_status="sent", local_relpath=local_relpath,
+        )
+        physical_file = _write_temp_file(settings, local_relpath)
         now = datetime.now(timezone.utc)
 
         result = maybe_cleanup_after_delivery(session, occ, dl, settings, now)
@@ -111,13 +132,13 @@ def test_successful_delivery_cleans_business_data_and_keeps_ledger(config_file, 
 
         # business rows erased
         assert session.get(ItemSnapshot, snap.id) is None
-        assert session.get(SourceAttachment, sa_id(session, snap.id)) is None
+        assert sa_id(session, snap.id) is None
         assert session.get(OAItem, oa.id) is None
         assert session.get(ArchivedFile, af.id) is None
         # delivery (minimal ledger) retained
         assert session.get(NotificationDelivery, dl.id) is not None
         # physical file erased
-        assert not (settings.archive_root / "pending/1/tmp.pdf").exists()
+        assert not physical_file.exists()
 
 
 def sa_id(session, snapshot_id):
@@ -131,7 +152,7 @@ def test_failed_delivery_is_not_cleaned(config_file):
     engine = create_db_engine(settings.database_path)
     with Session(engine) as session:
         occ, logical, oa, af, snap, dl = _build_graph(session, settings, delivery_status="failed")
-        _write_temp_file(settings)
+        physical_file = _write_temp_file(settings)
         now = datetime.now(timezone.utc)
 
         result = maybe_cleanup_after_delivery(session, occ, dl, settings, now)
@@ -141,7 +162,7 @@ def test_failed_delivery_is_not_cleaned(config_file):
         assert occ.cleanup_status in {None, NOT_ELIGIBLE}
         assert occ.title == "机密标题"
         assert session.get(ItemSnapshot, snap.id) is not None
-        assert (settings.archive_root / "pending/1/tmp.pdf").exists()
+        assert physical_file.exists()
 
 
 def test_unknown_outcome_is_not_cleaned_and_not_resent(config_file):
@@ -151,7 +172,7 @@ def test_unknown_outcome_is_not_cleaned_and_not_resent(config_file):
     engine = create_db_engine(settings.database_path)
     with Session(engine) as session:
         occ, logical, oa, af, snap, dl = _build_graph(session, settings, delivery_status="unknown_outcome")
-        _write_temp_file(settings)
+        physical_file = _write_temp_file(settings)
         now = datetime.now(timezone.utc)
 
         eligible, reason = cleanup_eligibility(occ, dl, settings, now)
@@ -162,10 +183,40 @@ def test_unknown_outcome_is_not_cleaned_and_not_resent(config_file):
         session.commit()
         assert result is None
         assert occ.title == "机密标题"
-        assert (settings.archive_root / "pending/1/tmp.pdf").exists()
+        assert physical_file.exists()
 
 
-def test_force_cleanup_respects_config_flag(config_file):
+def test_physical_delete_failure_keeps_database_row_and_marks_cleanup_failed(
+    config_file, monkeypatch,
+):
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        occ, logical, oa, af, snap, dl = _build_graph(
+            session, settings, delivery_status="sent",
+        )
+        physical_file = _write_temp_file(settings)
+        archived_file_id = af.id
+        original_unlink = Path.unlink
+
+        def fail_target_unlink(path: Path, *args, **kwargs):
+            if path == physical_file:
+                raise OSError("synthetic unlink failure")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+
+        with pytest.raises(OSError, match="synthetic unlink failure"):
+            perform_cleanup(session, occ, settings, datetime.now(timezone.utc))
+
+        assert occ.cleanup_status == "cleanup_failed"
+        assert session.get(ArchivedFile, archived_file_id) is not None
+        assert physical_file.exists()
+
+
+def test_force_cleanup_cannot_bypass_unconfirmed_delivery(config_file):
     settings = load_settings(config_file)
     settings.data_root.mkdir(parents=True)
     upgrade_database(settings.database_path)
@@ -175,19 +226,9 @@ def test_force_cleanup_respects_config_flag(config_file):
         _write_temp_file(settings)
         now = datetime.now(timezone.utc)
 
-        # allow_force_cleanup defaults True -> force works
-        perform_cleanup(session, occ, settings, now, force=True)
-        session.commit()
-        assert occ.cleanup_status == CLEANED
+        settings.pending_cleanup.allow_force_cleanup = True
+        with pytest.raises(ValueError, match="delivery_not_sent:failed"):
+            perform_cleanup(session, occ, settings, now, force=True)
 
-        # disabled -> force raises
-        settings.pending_cleanup.allow_force_cleanup = False
-        occ2, *_ = _build_graph(session, settings, delivery_status="failed", key="pend:2")
-        from sqlalchemy.orm import Session as S2
-        with S2(engine) as s2:
-            occ2r = s2.get(ItemOccurrence, occ2.id)
-            try:
-                perform_cleanup(s2, occ2r, settings, now, force=True)
-                assert False, "expected ValueError"
-            except ValueError as exc:
-                assert "force_cleanup_disabled" in str(exc)
+        assert occ.cleanup_status != CLEANED
+        assert session.get(ArchivedFile, af.id) is not None

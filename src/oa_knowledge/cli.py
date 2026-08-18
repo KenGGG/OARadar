@@ -72,6 +72,10 @@ notifications_app = typer.Typer(help="Feishu delivery lifecycle and operational 
 app.add_typer(notifications_app, name="notifications")
 knowledge_app = typer.Typer(help="Done-archive to Markdown knowledge handoff")
 app.add_typer(knowledge_app, name="knowledge")
+curate_app = typer.Typer(help="Local-only OA Package to curated knowledge documents")
+app.add_typer(curate_app, name="curate")
+data_app = typer.Typer(help="本地数据预检、隔离、恢复与清除")
+app.add_typer(data_app, name="data")
 
 
 def settings_option(config: Path | None) -> Settings:
@@ -1945,6 +1949,22 @@ def schedule_nightly(
     typer.echo(json.dumps(result, ensure_ascii=False))
 
 
+@schedule_app.command("enqueue")
+def schedule_enqueue(
+    stage: str = typer.Argument(..., help="hourly 或 nightly"),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """只创建持久调度任务，由唯一 OA Worker 串行使用浏览器登录态。"""
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    from oa_knowledge.web.schedule_views import trigger_schedule_run
+    try:
+        result = trigger_schedule_run(settings, stage, config_path=config)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="stage") from exc
+    typer.echo(json.dumps(result, ensure_ascii=False))
+
+
 @schedule_app.command("status")
 def schedule_status(
     limit: int = typer.Option(10, "--limit", min=1, max=100),
@@ -2072,6 +2092,162 @@ def knowledge_audit_handoff(
         from oa_knowledge.markdown_queue import audit_handoff
         report = audit_handoff(engine, settings)
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    finally:
+        engine.dispose()
+
+
+@curate_app.command("plan")
+def curate_plan(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+    limit: int | None = typer.Option(None, "--limit", min=1, max=100),
+    oa_item_key: str | None = typer.Option(None, "--oa-item-key"),
+) -> None:
+    """Read-only package/rule inventory. Does not call the model or write Curated state."""
+    from oa_knowledge.curation.service import plan_curation
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        typer.echo(json.dumps(plan_curation(settings, engine, limit=limit, oa_item_key=oa_item_key).model_dump(), ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@curate_app.command("run")
+def curate_run(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+    limit: int | None = typer.Option(None, "--limit", min=1, max=100),
+    oa_item_key: str | None = typer.Option(None, "--oa-item-key"),
+) -> None:
+    """Run a bounded local-model curation batch."""
+    from oa_knowledge.curation.service import run_curation
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        result = run_curation(settings, engine, limit=limit, oa_item_key=oa_item_key)
+        typer.echo(json.dumps(result.model_dump(), ensure_ascii=False))
+        if result.failed:
+            raise typer.Exit(1)
+    finally:
+        engine.dispose()
+
+
+@curate_app.command("retry")
+def curate_retry(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+    limit: int = typer.Option(10, "--limit", min=1, max=100),
+) -> None:
+    """Retry a bounded batch; completed signatures remain skipped."""
+    curate_run(config=config, limit=limit, oa_item_key=None)
+
+
+@curate_app.command("validate")
+def curate_validate(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    from oa_knowledge.curation.service import validate_curation
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        result = validate_curation(settings, engine)
+        typer.echo(json.dumps(result, ensure_ascii=False))
+        if not result["ok"]:
+            raise typer.Exit(1)
+    finally:
+        engine.dispose()
+
+
+@curate_app.command("report")
+def curate_report(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    from oa_knowledge.curation.service import curation_report
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        typer.echo(json.dumps(curation_report(engine), ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@data_app.command("status")
+def data_status(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """查看清理运行汇总；不输出候选文件名或 OA 内容。"""
+    from oa_knowledge.web.data_governance_views import data_governance_view
+    settings = settings_option(config)
+    engine = require_engine(settings)
+    engine.dispose()
+    typer.echo(json.dumps(data_governance_view(settings), ensure_ascii=False))
+
+
+@data_app.command("plan")
+def data_plan(
+    categories: str = typer.Option(
+        "browser_cache,runtime_reports,expired_backups,sent_pending_orphans",
+        "--categories",
+    ),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """只读扫描并持久化清理候选；不会移动或删除文件。"""
+    from oa_knowledge.data_governance.service import build_cleanup_plan
+    settings = settings_option(config)
+    engine = require_engine(settings)
+    try:
+        selected = {value.strip() for value in categories.split(",") if value.strip()}
+        result = build_cleanup_plan(settings, engine, categories=selected)
+        typer.echo(json.dumps(asdict(result), ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@data_app.command("quarantine")
+def data_quarantine(
+    run_id: int,
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """按预检清单把文件原子移动到同盘隔离区。"""
+    from oa_knowledge.data_governance.quarantine import quarantine_run
+    settings = settings_option(config)
+    engine = require_engine(settings)
+    try:
+        typer.echo(json.dumps(asdict(quarantine_run(settings, engine, run_id)), ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@data_app.command("restore")
+def data_restore(
+    run_id: int,
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """恢复一个隔离运行；绝不覆盖已重建的目标文件。"""
+    from oa_knowledge.data_governance.quarantine import restore_run
+    settings = settings_option(config)
+    engine = require_engine(settings)
+    try:
+        typer.echo(json.dumps(asdict(restore_run(settings, engine, run_id)), ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@data_app.command("purge")
+def data_purge(
+    run_id: int,
+    confirmation: str = typer.Option(..., "--confirmation"),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """隔离期满后以精确确认串永久清除隔离文件。"""
+    from oa_knowledge.data_governance.quarantine import purge_run
+    settings = settings_option(config)
+    engine = require_engine(settings)
+    try:
+        result = purge_run(settings, engine, run_id, confirmation=confirmation)
+        typer.echo(json.dumps(asdict(result), ensure_ascii=False))
     finally:
         engine.dispose()
 

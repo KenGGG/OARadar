@@ -24,6 +24,10 @@ data_root、systemd 用户目录、环境变量文件**，并据此渲染 6 个 
 - `oaradar-hourly.service` / `.timer` —— 工作时段每小时扫描
 - `oaradar-nightly.service` / `.timer` —— 工作日晚间全量核对
 
+两个定时 one-shot 只向 SQLite 创建持久任务，不直接启动浏览器。真实 OA 只读扫描
+统一由 `oaradar-worker.service` 串行执行，因此在线逐项核验、待办扫描和夜间补齐
+不会争用同一个 Chromium 登录配置目录。
+
 环境变量文件 `~/.config/oaradar/env`（chmod 600）用于注入飞书 webhook/secret
 等敏感值，**不要写进 YAML**。若不存在，安装脚本会创建一个空文件，请手动填写。
 
@@ -39,17 +43,19 @@ data_root、systemd 用户目录、环境变量文件**，并据此渲染 6 个 
 
 ## 安全要求
 
-service 单元包含：`Restart=always`、`RestartSec=5`、`NoNewPrivileges=true`、
-`PrivateTmp=true`、`UMask=0077`。未加入会阻止 Chrome / Playwright / GPU /
-Unix socket / 本地文件访问的过度沙箱。
+service 单元包含：`Restart=always`、`RestartSec=5`、`NoNewPrivileges=true` 和
+`UMask=0077`。Web 与 Markdown Worker 使用 `PrivateTmp=true`；OA Worker 因 Chrome
+持久配置需要共享用户 `/tmp` 中的 singleton/IPC 状态，明确使用
+`PrivateTmp=false`。未加入会阻止 Chrome / Playwright / GPU / Unix socket /
+本地文件访问的过度沙箱。
 
 ## 防重复运行
 
-定时扫描同时依赖三层防护，任一层检测到已有任务都会正常退出、不视为故障：
+定时入口和实际扫描依赖三层防护：
 
 1. systemd 单实例 service；
 2. `flock`（`%t/oaradar-*.lock`）；
-3. Python 侧 `ResourceLease`（浏览器/数据库租约）。
+3. 持久 `OperationJob` 队列与单一 OA Worker（浏览器/数据库租约）。
 
 ## 健康检查
 

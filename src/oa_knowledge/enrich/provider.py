@@ -30,7 +30,7 @@ class ProviderConfig(BaseModel):
     timeout_seconds: int = Field(default=180, ge=1, le=7200)
     max_tokens: int = Field(default=4096, ge=1, le=131072)
     temperature: float = Field(default=0.1, ge=0, le=2)
-    provider_mode: str = Field(default="local_only", pattern="^(local_only|approved_remote)$")
+    provider_mode: str = Field(default="local_only", pattern="^local_only$")
     supports_json_schema: bool = False
     supports_vision: bool = False
     uses_local_gpu: bool = False
@@ -38,6 +38,9 @@ class ProviderConfig(BaseModel):
     allow_restricted: bool = False
     require_redaction: bool = True
     max_concurrency: int = Field(default=1, ge=1, le=32)
+    context_window_fallback: int = Field(default=8192, ge=2048)
+    context_window_cap: int = Field(default=131072, ge=2048)
+    context_safety_margin: int = Field(default=1024, ge=128)
 
     @field_validator("base_url")
     @classmethod
@@ -82,17 +85,9 @@ def evaluate_provider_request(config: ProviderConfig, context: ProviderRequestCo
 
     if normalized_fields & _FORBIDDEN_FIELDS:
         allowed, reason = False, "FORBIDDEN_CONTEXT_FIELD"
-    elif not config.is_loopback and config.provider_mode != "approved_remote":
-        allowed, reason = False, "REMOTE_PROVIDER_NOT_APPROVED"
-    elif not config.is_loopback and (
-        context.content_classification == ContentClassification.CONFIDENTIAL and not config.allow_confidential
-        or context.content_classification == ContentClassification.RESTRICTED and not config.allow_restricted
-    ):
-        allowed, reason = False, "CONTENT_CLASSIFICATION_DENIED"
-    elif not config.is_loopback and config.require_redaction and not context.redacted:
-        allowed, reason = False, "REDACTION_REQUIRED"
     elif not config.is_loopback:
-        reason = "APPROVED_REMOTE_ALLOWED"
+        allowed = False
+        reason = "REMOTE_PROVIDER_PROHIBITED"
 
     return ProviderDecision(
         allowed=allowed,
@@ -131,6 +126,9 @@ class GuardedLlmClient(LlmClient):
             timeout_seconds=config.timeout_seconds,
             max_retries=max_retries,
             provider_mode=config.provider_mode,
+            context_window_fallback=config.context_window_fallback,
+            context_window_cap=config.context_window_cap,
+            context_safety_margin=config.context_safety_margin,
         )
         self._provider_config = config
 

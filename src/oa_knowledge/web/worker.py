@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -16,13 +17,19 @@ from oa_knowledge.config import Settings
 from oa_knowledge.archive import atomic_write_bytes
 from oa_knowledge.constants import BatchStatus, LEASE_TTL
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, ItemSnapshot, NotificationDelivery, OAItem, OAManifestItem, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, SourceAttachment, SummaryVersion
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, ItemSnapshot, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OnlineAuditRun, OperationEvent, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry, SourceAttachment, SummaryVersion
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.ops.audit import audit_database
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.ops.capacity import capacity_report
 from oa_knowledge.web.cli_runner import run_cli
 from oa_knowledge.web.status import _apply_policy_to_pending, execute_archive_job
+
+
+ONLINE_AUDIT_BATCH_SIZE = 25
+ONLINE_AUDIT_BATCH_SECONDS = 60
+ONLINE_AUDIT_YIELD = timedelta(seconds=5)
+PIPELINE_HEARTBEAT_SECONDS = 60
 
 
 def _pump_stream(stream, buffer: list[str]) -> None:
@@ -38,11 +45,12 @@ def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:
     item = session.scalar(select(OAItem.id).where(OAItem.oa_item_key == oa_item_key))
     if item is None:
         return False
-    return session.scalar(select(func.count()).select_from(ArchivedFile).where(
+    count = session.scalar(select(func.count()).select_from(ArchivedFile).where(
         ArchivedFile.oa_item_id == item,
         ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
         ArchivedFile.download_status == "verified",
-    ).exists()) or False
+    )) or 0
+    return count > 0
 
 
 def _run_piped(command: list[str], cwd: Path, poll_callback, poll_interval: float = 5.0):
@@ -88,6 +96,12 @@ class OperationWorker:
     def _retry_progress(total_targets: int, resumed: int, completed_after_resume: int) -> int:
         return min(total_targets, resumed + completed_after_resume)
 
+    @staticmethod
+    def _completed_scan_progress(pending: dict, done: dict) -> tuple[int, int]:
+        """Represent a finished scan as 100%; detailed counts remain separate."""
+        processed = (pending.get("source_total", 0) or 0) + (done.get("new_items", 0) or 0)
+        return processed, processed
+
     def recover_expired(self) -> int:
         now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
@@ -122,11 +136,28 @@ class OperationWorker:
         return "oa" in command and "worker" in command
 
     def run_once(self) -> bool:
+        # This is a cheap no-op while the newest online audit is unfinished. As
+        # soon as it completes, the durable migration job is created before any
+        # historical knowledge task can be claimed.
+        from oa_knowledge.archive_migration_campaign import ensure_verified_archive_migration
+        ensure_verified_archive_migration(self.engine)
         job_id = self._claim_next()
         if job_id is None:
-            task = self.production_queue.claim(self.owner)
+            queue_names = None
+            with Session(self.engine) as session:
+                online_audit_waiting = session.scalar(select(OperationJob.id).where(
+                    OperationJob.job_type == "online_audit",
+                    OperationJob.status.in_(("queued", "running")),
+                ).limit(1)) is not None
+            if online_audit_waiting:
+                # Audit batches deliberately yield for realtime work. Historical
+                # rebuilds wait until verification finishes so a long local-model
+                # call cannot delay the next online comparison batch.
+                queue_names = ("realtime_pending", "realtime_done")
+            task = self.production_queue.claim(self.owner, queue_names=queue_names)
             if task is None:
                 return False
+            self._write_runtime_status("working", self._pipeline_activity(task.stage))
             self._execute_pipeline_task(task)
             return True
         with Session(self.engine) as session:
@@ -135,6 +166,7 @@ class OperationWorker:
                 return False
             job_type = job.job_type
         try:
+            self._write_runtime_status("working", self._job_activity(job_type))
             if job_type == "archive_batch":
                 execute_archive_job(self.settings, job_id, self.config_path)
             elif job_type == "discovery":
@@ -149,15 +181,264 @@ class OperationWorker:
                 self._execute_done_incremental(job_id)
             elif job_type == "online_audit":
                 self._execute_online_audit(job_id)
+            elif job_type == "verified_archive_migration":
+                self._execute_verified_archive_migration(job_id)
             elif job_type == "archive_date_reconcile":
                 self._execute_archive_date_reconcile(job_id)
             elif job_type in ("scheduled_bootstrap", "scheduled_hourly", "scheduled_nightly"):
                 self._execute_scheduled_scan(job_id)
+            elif job_type == "data_governance":
+                self._execute_data_governance(job_id)
             else:
                 self._finish(job_id, "failed", "unsupported_job_type")
         except Exception as exc:
+            if job_type == "online_audit":
+                from oa_knowledge.db.models import OnlineAuditRun
+                from oa_knowledge.online_audit import fail_audit
+                with Session(self.engine) as session:
+                    run_id = session.scalar(select(OnlineAuditRun.id).where(OnlineAuditRun.job_id == job_id))
+                if run_id is not None:
+                    fail_audit(self.settings, run_id, "AUDIT_WORKER_ERROR")
             self._finish(job_id, "failed", f"worker_exception_{type(exc).__name__}")
         return True
+
+    @staticmethod
+    def _job_activity(job_type: str) -> str:
+        return {
+            "online_audit": "正在逐项核验已办",
+            "scheduled_bootstrap": "正在执行初始化扫描",
+            "scheduled_hourly": "正在扫描待办与新增已办",
+            "scheduled_nightly": "正在执行夜间归档检查",
+            "full_manifest": "正在同步 OA 已办清单",
+            "full_manifest_retry": "正在重试已办清单同步",
+            "done_incremental": "正在增量检查已办",
+            "archive_batch": "正在下载并归档已办",
+            "backfill_campaign": "正在补齐历史已办",
+            "verified_archive_migration": "正在迁移已核验历史原件",
+        }.get(job_type, "正在执行本地后台任务")
+
+    @staticmethod
+    def _pipeline_activity(stage: str) -> str:
+        return {
+            "pending_detail": "正在下载待办详情",
+            "pending_parse": "正在生成待办 Source Markdown",
+            "pending_summary": "正在生成待办摘要",
+            "notify_feishu": "正在发送待办飞书提醒",
+            "done_capture_and_archive": "正在下载并归档已办",
+            "attachment_inventory": "正在核对已办附件清单",
+            "parse": "正在生成已办 Source Markdown",
+            "source_publish": "正在发布来源 Markdown",
+            "curation": "正在整理知识目录",
+        }.get(stage, "正在执行 OA 流水线任务")
+
+    def _verify_oa_login(self, browser) -> object:
+        self._write_runtime_status("logging_in", "正在验证 OA 登录")
+        state = browser.login_with_saved_credentials(30)
+        self._write_runtime_status("working", "OA 登录已验证，正在继续当前任务")
+        return state
+
+    def _execute_verified_archive_migration(self, job_id: int) -> None:
+        """Move one restart-safe batch after online evidence has passed."""
+        from oa_knowledge.archive_migration_campaign import (
+            eligible_legacy_done_ids,
+            migration_review_count,
+        )
+        from oa_knowledge.archive_reconciliation import migrate_archive_item_by_id
+
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is None or job.status not in {"queued", "running"}:
+                return
+            params = json.loads(job.parameters_json or "{}")
+            audit_run_id = int(params["audit_run_id"])
+            audit = session.get(OnlineAuditRun, audit_run_id)
+            if audit is None or audit.status != "completed":
+                job.status = "paused"
+                job.last_error_code = "WAITING_FOR_ONLINE_AUDIT"
+                job.lease_owner = None
+                job.lease_expires_at = None
+                self._event(
+                    session, job, "verified_archive_migration_waiting",
+                    "paused", {"reason": "online_audit_reopened"},
+                )
+                session.commit()
+                return
+
+            control = session.get(MarkdownQueueControl, 1)
+            if control is None:
+                control = MarkdownQueueControl(id=1, paused=True)
+                session.add(control)
+                params.setdefault("markdown_was_paused", False)
+            else:
+                params.setdefault("markdown_was_paused", bool(control.paused))
+                control.paused = True
+            job.parameters_json = json.dumps(params, sort_keys=True)
+
+            active_markdown = session.scalar(select(func.count()).select_from(MarkdownTask).where(
+                MarkdownTask.status == "running",
+            )) or 0
+            active_pipeline = session.scalar(select(func.count()).select_from(PipelineTask).where(
+                PipelineTask.status == "running",
+            )) or 0
+            if active_markdown or active_pipeline:
+                job.status = "queued"
+                job.parameters_json = json.dumps(params, sort_keys=True)
+                job.heartbeat_at = datetime.now(timezone.utc)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                session.commit()
+                return
+
+            job.status = "running"
+            job.started_at = job.started_at or datetime.now(timezone.utc)
+            failed_ids = {int(value) for value in params.get("failed_item_ids", [])}
+            item_ids = eligible_legacy_done_ids(
+                session, audit_run_id, exclude_ids=failed_ids, limit=25,
+            )
+            session.commit()
+
+        migrated = 0
+        new_failed_ids: list[int] = []
+        for item_id in item_ids:
+            try:
+                with Session(self.engine) as item_session:
+                    migrate_archive_item_by_id(item_session, self.settings, item_id)
+                migrated += 1
+            except (FileNotFoundError, FileExistsError, OSError, ValueError):
+                new_failed_ids.append(item_id)
+                with Session(self.engine) as review_session:
+                    exists = review_session.scalar(select(ReviewEntry.id).where(
+                        ReviewEntry.kind == "archive_path_migration",
+                        ReviewEntry.item_id == item_id,
+                        ReviewEntry.status == "pending",
+                    ).limit(1))
+                    if exists is None:
+                        review_session.add(ReviewEntry(
+                            kind="archive_path_migration",
+                            item_id=item_id,
+                            details_json=json.dumps({
+                                "reason_code": "ARCHIVE_MIGRATION_REVIEW_REQUIRED",
+                            }),
+                            status="pending",
+                        ))
+                        review_session.commit()
+
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is None:
+                return
+            params = json.loads(job.parameters_json or "{}")
+            failed_ids = {int(value) for value in params.get("failed_item_ids", [])}
+            failed_ids.update(new_failed_ids)
+            params["failed_item_ids"] = sorted(failed_ids)
+            params["processed"] = int(params.get("processed", 0)) + len(item_ids)
+            params["migrated"] = int(params.get("migrated", 0)) + migrated
+            params["failed"] = len(failed_ids)
+            remaining = eligible_legacy_done_ids(
+                session, int(params["audit_run_id"]), exclude_ids=failed_ids, limit=1,
+            )
+            job.progress_current = int(params["processed"])
+            job.parameters_json = json.dumps(params, sort_keys=True)
+            now = datetime.now(timezone.utc)
+            job.heartbeat_at = now
+            if remaining:
+                job.status = "queued"
+                job.lease_owner = None
+                job.lease_expires_at = None
+                session.commit()
+                return
+
+            params["review_required"] = migration_review_count(
+                session, int(params["audit_run_id"]),
+            ) + len(failed_ids)
+            params["historical_released_tasks"] = (
+                self.production_queue.release_verified_historical_tasks(
+                    int(params["audit_run_id"]), session=session,
+                )
+            )
+            params["historical_review_tasks"] = (
+                self.production_queue.finalize_ineligible_historical_tasks(
+                    int(params["audit_run_id"]), session=session,
+                )
+            )
+            job.parameters_json = json.dumps(params, sort_keys=True)
+            control = session.get(MarkdownQueueControl, 1)
+            if control is not None:
+                control.paused = bool(params.get("markdown_was_paused", False))
+            job.status = "completed"
+            job.finished_at = now
+            job.last_error_code = None
+            job.lease_owner = None
+            job.lease_expires_at = None
+            self._event(session, job, "verified_archive_migration_finished", "completed", {
+                "migrated": params["migrated"],
+                "failed": params["failed"],
+                "review_required": params["review_required"],
+                "historical_released_tasks": params["historical_released_tasks"],
+                "historical_review_tasks": params["historical_review_tasks"],
+            })
+            session.commit()
+
+    def _execute_data_governance(self, job_id: int) -> None:
+        """Execute one filesystem-heavy governance action outside HTTP requests."""
+        from oa_knowledge.data_governance.quarantine import purge_run, quarantine_run, restore_run
+        from oa_knowledge.data_governance.service import build_cleanup_plan
+        from oa_knowledge.integrity_reconciliation import classify_integrity_issues, persist_integrity_summary
+
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is None or job.status not in {"queued", "running"}:
+                return
+            parameters = json.loads(job.parameters_json)
+            job.status = "running"
+            job.started_at = job.started_at or datetime.now(timezone.utc)
+            session.commit()
+        action = parameters["action"]
+        if action == "integrity_audit":
+            result = classify_integrity_issues(self.settings, self.engine)
+            summary = {
+                "total": result.total,
+                "issue_counts": result.issue_counts,
+                "reason_counts": result.reason_counts,
+            }
+            persist_integrity_summary(
+                self.engine, result, run_key=f"integrity-reconciliation:{job_id}",
+            )
+        elif action == "plan":
+            result = build_cleanup_plan(
+                self.settings, self.engine, categories=set(parameters["categories"]),
+            )
+            summary = {
+                "action": action, "run_id": result.run_id,
+                "candidate_count": result.candidate_count,
+                "candidate_bytes": result.candidate_bytes,
+            }
+        else:
+            run_id = int(parameters["run_id"])
+            if action == "quarantine":
+                result = quarantine_run(self.settings, self.engine, run_id)
+            elif action == "restore":
+                result = restore_run(self.settings, self.engine, run_id)
+            elif action == "purge":
+                result = purge_run(
+                    self.settings, self.engine, run_id,
+                    confirmation=str(parameters.get("confirmation", "")),
+                )
+            else:
+                raise ValueError("unsupported data-governance action")
+            summary = {
+                "action": action, "run_id": run_id,
+                "succeeded_count": result.succeeded_count,
+                "skipped_count": result.skipped_count,
+                "failed_count": result.failed_count,
+                "processed_bytes": result.processed_bytes,
+            }
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is not None:
+                job.parameters_json = json.dumps(summary, sort_keys=True)
+                session.commit()
+        self._finish(job_id, "completed", None)
 
     def _execute_archive_date_reconcile(self, job_id: int) -> None:
         from oa_knowledge.archive_reconciliation import reconcile_item
@@ -253,11 +534,12 @@ class OperationWorker:
                 "pending_updated": pending.get("updated", 0),
                 "done_new": done.get("new_items", 0),
                 "done_archive_jobs": done.get("download_jobs_enqueued", 0),
-                "markdown_tasks": done.get("markdown_tasks_enqueued", 0),
+                "knowledge_tasks": done.get(
+                    "knowledge_tasks_enqueued", done.get("markdown_tasks_enqueued", 0),
+                ),
                 "feishu_notify_tasks": pending.get("tasks_enqueued", pending.get("created", 0) + pending.get("updated", 0)),
             }
-            progress_total = (counts["pending_scanned"] or 0) + (done.get("source_total", 0) or 0)
-            progress_current = (counts["pending_created"] + counts["pending_updated"]) + counts["done_new"]
+            progress_current, progress_total = self._completed_scan_progress(pending, done)
             self._finish_scheduled(job_id, final_status, error, counts, progress_current, progress_total)
         finally:
             scan_engine.dispose()
@@ -286,11 +568,8 @@ class OperationWorker:
     def _execute_online_audit(self, job_id: int) -> None:
         from oa_knowledge.collector.browser import BrowserSession, LoginState
         from oa_knowledge.collector.detail import CollaborationDetailAdapter
-        from oa_knowledge.cli import verified_attachment_resolver
         from oa_knowledge.db.models import OnlineAuditRun
-        from oa_knowledge.detail_archive import archive_collaboration_detail
-        from oa_knowledge.full_manifest import archive_proxy
-        from oa_knowledge.online_audit import ATTACHMENT_ROLES, AuditObservation, canonical_downloaded_count, execute_audit, fail_audit, unique_capture_attachment_count
+        from oa_knowledge.online_audit import ATTACHMENT_ROLES, AuditObservation, execute_audit, fail_audit, fingerprint_attachments
         with Session(self.engine) as session:
             run = session.scalar(select(OnlineAuditRun).where(OnlineAuditRun.job_id == job_id))
             if run is None:
@@ -301,59 +580,63 @@ class OperationWorker:
                 job.status = "running"; job.started_at = job.started_at or datetime.now(timezone.utc)
                 session.commit()
         with BrowserSession(self.settings, headed=False) as browser:
-            if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+            if self._verify_oa_login(browser) != LoginState.AUTHENTICATED:
                 fail_audit(self.settings, run_id, "OA_AUTH_EXPIRED")
                 self._finish(job_id, "failed", "OA_AUTH_EXPIRED")
                 return
             if browser.page is None:
                 raise RuntimeError("browser page is not available")
-            inventory_adapter = CollaborationDetailAdapter(browser.page, inventory_only=True)
-            download_adapter = CollaborationDetailAdapter(
-                browser.page,
-                attachment_resolver=verified_attachment_resolver(self.engine, self.settings.data_root),
-            )
+            # Strict verification deliberately downloads fresh OA bytes instead
+            # of resolving from the local archive cache. The capture remains in
+            # memory and never overwrites an existing original.
+            verification_adapter = CollaborationDetailAdapter(browser.page)
 
             def inspect(item) -> AuditObservation:
                 if not item.workitem_id_text:
                     raise RuntimeError("OA item identifier unavailable")
-                capture = inventory_adapter.capture_direct(
+                capture = verification_adapter.capture_direct(
                     browser.base_url, item.workitem_id_text,
                     max_depth=self.settings.collector.max_attachment_depth,
                     total_timeout_seconds=self.settings.online_audit.item_timeout_seconds,
                     download_timeout_seconds=self.settings.online_audit.download_timeout_seconds,
                 )
-                recognized = unique_capture_attachment_count(capture)
-                with Session(self.engine) as session:
-                    oa = session.scalar(select(OAItem).where(OAItem.oa_item_key == item.oa_item_key))
-                    verified_rows = session.scalar(select(func.count()).select_from(ArchivedFile).where(
-                        ArchivedFile.oa_item_id == oa.id,
-                        ArchivedFile.file_role.in_(ATTACHMENT_ROLES),
-                        ArchivedFile.download_status == "verified",
-                    )) if oa else 0
-                    unique_hashes = session.scalar(select(func.count(func.distinct(ArchivedFile.sha256))).where(
-                        ArchivedFile.oa_item_id == oa.id,
-                        ArchivedFile.file_role.in_(ATTACHMENT_ROLES), ArchivedFile.download_status == "verified",
-                        ArchivedFile.sha256.is_not(None),
-                    )) if oa else 0
-                    downloaded = canonical_downloaded_count(recognized=recognized, verified_rows=verified_rows or 0, unique_hashes=unique_hashes or 0)
-                if recognized > (downloaded or 0):
-                    full_capture = download_adapter.capture_direct(
-                        browser.base_url, item.workitem_id_text,
-                        max_depth=self.settings.collector.max_attachment_depth,
-                        total_timeout_seconds=self.settings.collector.attachment_total_timeout_seconds,
-                        download_timeout_seconds=self.settings.collector.download_timeout_seconds,
-                    )
-                    with Session(self.engine) as session:
-                        manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == item.oa_item_key))
-                        if manifest is None:
-                            raise LookupError("manifest item disappeared during audit repair")
-                        archive_collaboration_detail(session, archive_proxy(manifest), full_capture, self.settings.data_root)
-                        manifest.archive_relpath = session.scalar(select(OAItem.archive_relpath).where(OAItem.oa_item_key == manifest.oa_item_key))
-                        session.commit()
-                return AuditObservation(recognized_attachments=recognized)
+                if any(
+                    issue.get("kind") == "capture_timeout"
+                    for issue in capture.capture_issues
+                ):
+                    raise TimeoutError("online audit item capture timed out")
+                attachments = list(capture.attachments)
+                for container in capture.related_containers:
+                    attachments.extend(container.attachments)
+                by_key = {}
+                for attachment in attachments:
+                    if attachment.file_role not in ATTACHMENT_ROLES:
+                        continue
+                    digest = hashlib.sha256(attachment.content).hexdigest() if attachment.content is not None else None
+                    by_key.setdefault(attachment.attachment_key, (
+                        attachment.file_role, attachment.attachment_key,
+                        attachment.size_bytes, digest,
+                    ))
+                inventory_hash, content_hash = fingerprint_attachments(list(by_key.values()))
+                depth_limit = any(container.has_unvisited_children for container in capture.related_containers)
+                depth_limit = depth_limit or any(
+                    issue.get("kind") == "depth_limit_reached" for issue in capture.capture_issues
+                )
+                return AuditObservation(
+                    recognized_attachments=len(by_key),
+                    online_inventory_sha256=inventory_hash,
+                    online_content_sha256=content_hash,
+                    depth_limit_reached=depth_limit,
+                    attachment_evidence=tuple(by_key.values()),
+                )
 
             try:
-                execute_audit(self.settings, run_id, inspect_item=inspect)
+                execute_audit(
+                    self.settings, run_id,
+                    inspect_item=inspect,
+                    max_items=ONLINE_AUDIT_BATCH_SIZE,
+                    max_seconds=ONLINE_AUDIT_BATCH_SECONDS,
+                )
             except Exception:
                 fail_audit(self.settings, run_id, "AUDIT_WORKER_ERROR")
                 raise
@@ -373,35 +656,59 @@ class OperationWorker:
         self._finish(job_id, "completed" if result.returncode == 0 else "failed", None if result.returncode == 0 else f"incremental_exit_{result.returncode}")
 
     def _execute_pipeline_task(self, task: PipelineTask) -> None:
+        heartbeat_stop = threading.Event()
+
+        def refresh_lease() -> None:
+            while not heartbeat_stop.wait(PIPELINE_HEARTBEAT_SECONDS):
+                try:
+                    if not self.production_queue.heartbeat(task.id, self.owner):
+                        return
+                except Exception:
+                    # The business task remains authoritative; a transient
+                    # SQLite contention will be retried on the next heartbeat.
+                    continue
+
+        self.production_queue.heartbeat(task.id, self.owner)
+        heartbeat_thread = threading.Thread(target=refresh_lease, daemon=True)
+        heartbeat_thread.start()
         try:
-            if task.stage == "attachment_inventory":
-                self._pipeline_attachment_inventory(task)
-            elif task.stage == "parse":
-                self._pipeline_parse(task)
-            elif task.stage == "detail_sync" and task.queue_name == "realtime_pending":
-                self._pipeline_pending_detail(task)
-            elif task.stage == "pending_summary":
-                self._pipeline_pending_summary(task)
-            elif task.stage == "notify_feishu":
-                self._pipeline_notify_feishu(task)
-            elif task.stage == "oa_resync" and task.queue_name == "realtime_pending":
-                self._pipeline_oa_resync(task)
-            elif task.stage == "done_capture_and_archive" and task.queue_name == "realtime_done":
-                self._pipeline_done_capture_and_archive(task)
-            elif task.stage == "pending_parse":
-                self._pipeline_pending_parse(task)
-            elif task.stage == "ollama_extract":
-                self._pipeline_done_knowledge(task)
-            else:
-                self.production_queue.fail(task.id, self.owner, "PIPELINE_STAGE_NOT_IMPLEMENTED", task.stage, recoverable=False)
-        except Exception as exc:
-            code = {
-                "FileNotFoundError": "ATTACHMENT_DOWNLOAD_FAILED",
-                "RuntimeError": "PIPELINE_RESOURCE_BUSY",
-                "DoneKnowledgeError": "OLLAMA_SCHEMA_INVALID",
-                "PendingSummaryError": "OLLAMA_SCHEMA_INVALID",
-            }.get(type(exc).__name__, "PIPELINE_TASK_FAILED")
-            self.production_queue.fail(task.id, self.owner, code, type(exc).__name__, recoverable=True)
+            try:
+                if task.stage == "attachment_inventory":
+                    self._pipeline_attachment_inventory(task)
+                elif task.stage == "parse":
+                    self._pipeline_parse(task)
+                elif task.stage == "detail_sync" and task.queue_name == "realtime_pending":
+                    self._pipeline_pending_detail(task)
+                elif task.stage == "pending_summary":
+                    self._pipeline_pending_summary(task)
+                elif task.stage == "notify_feishu":
+                    self._pipeline_notify_feishu(task)
+                elif task.stage == "oa_resync" and task.queue_name == "realtime_pending":
+                    self._pipeline_oa_resync(task)
+                elif task.stage == "done_capture_and_archive" and task.queue_name == "realtime_done":
+                    self._pipeline_done_capture_and_archive(task)
+                elif task.stage == "pending_parse":
+                    self._pipeline_pending_parse(task)
+                elif task.stage == "source_publish":
+                    self._pipeline_source_publish(task)
+                elif task.stage == "curation":
+                    self._pipeline_curation(task)
+                elif task.stage == "ollama_extract":
+                    # Compatibility for tasks created before the unified pipeline.
+                    self._pipeline_done_knowledge(task)
+                else:
+                    self.production_queue.fail(task.id, self.owner, "PIPELINE_STAGE_NOT_IMPLEMENTED", task.stage, recoverable=False)
+            except Exception as exc:
+                code = {
+                    "FileNotFoundError": "ATTACHMENT_DOWNLOAD_FAILED",
+                    "RuntimeError": "PIPELINE_RESOURCE_BUSY",
+                    "DoneKnowledgeError": "OLLAMA_SCHEMA_INVALID",
+                    "PendingSummaryError": "OLLAMA_SCHEMA_INVALID",
+                }.get(type(exc).__name__, "PIPELINE_TASK_FAILED")
+                self.production_queue.fail(task.id, self.owner, code, type(exc).__name__, recoverable=True)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
 
     def _pipeline_attachment_inventory(self, task: PipelineTask) -> None:
         from oa_knowledge.pipeline import ParsePipeline
@@ -424,13 +731,9 @@ class OperationWorker:
 
     @staticmethod
     def _historical_source_files(files):
-        source_roles = {
-            "direct_attachment", "official_body", "official_attachment",
-            "associated_document", "opinion_attachment",
-        }
         return [
             file for file in files
-            if file.file_role in source_roles
+            if file.file_role in MARKDOWN_SOURCE_ROLES
         ]
 
     def _pipeline_parse(self, task: PipelineTask) -> None:
@@ -456,7 +759,123 @@ class OperationWorker:
         if failed:
             self.production_queue.fail(task.id, self.owner, "PARSE_FAILED", f"{failed} parse jobs failed", recoverable=True)
             return
-        self.production_queue.advance(task.id, self.owner, "ollama_extract", progress_current=completed, progress_total=len(jobs))
+        self.production_queue.advance(task.id, self.owner, "source_publish", progress_current=completed, progress_total=len(jobs))
+
+    def _pipeline_source_publish(self, task: PipelineTask) -> None:
+        from oa_knowledge.parsers.eligibility import evaluate_eligibility
+        from oa_knowledge.source_markdown.service import publish_active_artifact
+        from oa_knowledge.storage_paths import resolve_data_path
+
+        with Session(self.engine) as session:
+            item = session.scalar(select(OAItem).where(OAItem.oa_item_key == task.logical_item_key))
+            if item is None:
+                self.production_queue.fail(
+                    task.id, self.owner, "ARCHIVED_ITEM_MISSING", "archived item is missing", recoverable=False,
+                )
+                return
+            files = self._historical_source_files(session.scalars(select(ArchivedFile).where(
+                ArchivedFile.oa_item_id == item.id,
+                ArchivedFile.download_status == "verified",
+                ArchivedFile.local_relpath.is_not(None),
+            ).order_by(ArchivedFile.id)).all())
+            review_source = None
+            review_reason = None
+            for source in files:
+                try:
+                    source_path = resolve_data_path(
+                        self.settings.data_root,
+                        source.local_relpath,
+                        allowed_prefixes=("raw/done", "archive/raw/oa/done"),
+                    )
+                except ValueError:
+                    review_source = source
+                    review_reason = "UNSAFE_SOURCE_PATH"
+                    break
+                valid_artifact = session.scalar(select(ParseArtifact.id).where(
+                    ParseArtifact.content_object_id == source.content_object_id,
+                    ParseArtifact.lifecycle_status == "valid",
+                ).limit(1)) if source.content_object_id is not None else None
+                if valid_artifact is not None:
+                    continue
+                skipped = session.scalar(select(ParseJob.id).where(
+                    ParseJob.file_id == source.id,
+                    ParseJob.status == "skipped",
+                ).limit(1)) is not None
+                rejected = session.scalar(
+                    select(ParseArtifact.id)
+                    .join(ParseJob, ParseArtifact.parse_job_id == ParseJob.id)
+                    .where(
+                        ParseJob.file_id == source.id,
+                        ParseArtifact.lifecycle_status == "rejected",
+                    )
+                    .limit(1)
+                ) is not None
+                eligibility = evaluate_eligibility(source_path)
+                if skipped or (
+                    not eligibility.eligible
+                    and eligibility.routing_hint == "review"
+                ):
+                    review_source = source
+                    review_reason = "UNSUPPORTED_SOURCE_FORMAT"
+                    break
+                if rejected:
+                    review_source = source
+                    review_reason = "PARSE_QUALITY_REJECTED"
+                    break
+            if review_source is not None and review_reason is not None:
+                exists = session.scalar(select(ReviewEntry.id).where(
+                    ReviewEntry.kind == "source_markdown_incomplete",
+                    ReviewEntry.file_id == review_source.id,
+                    ReviewEntry.status == "pending",
+                ).limit(1))
+                if exists is None:
+                    session.add(ReviewEntry(
+                        kind="source_markdown_incomplete",
+                        item_id=review_source.oa_item_id,
+                        file_id=review_source.id,
+                        depth=review_source.depth,
+                        details_json=json.dumps({
+                            "reason_code": review_reason,
+                            "stage": "source_publish",
+                        }, ensure_ascii=False),
+                        status="pending",
+                    ))
+                session.commit()
+                self.production_queue.fail(
+                    task.id,
+                    self.owner,
+                    review_reason,
+                    "source requires manual review",
+                    recoverable=False,
+                )
+                return
+            try:
+                for source in files:
+                    publish_active_artifact(session, self.settings, source.id)
+                session.commit()
+            except (FileNotFoundError, ValueError):
+                session.rollback()
+                self.production_queue.advance(
+                    task.id, self.owner, "attachment_inventory",
+                    progress_current=0, progress_total=len(files),
+                )
+                return
+        self.production_queue.advance(
+            task.id, self.owner, "curation", progress_current=len(files), progress_total=len(files),
+        )
+
+    def _pipeline_curation(self, task: PipelineTask) -> None:
+        from oa_knowledge.curation.service import run_curation
+
+        result = run_curation(
+            self.settings, self.engine, limit=1, oa_item_key=task.logical_item_key,
+        )
+        if result.failed:
+            self.production_queue.fail(
+                task.id, self.owner, "CURATION_FAILED", "local curation failed", recoverable=True,
+            )
+            return
+        self.production_queue.complete(task.id, self.owner)
 
     @staticmethod
     def _nonfatal_parse_error(exc: Exception) -> bool:
@@ -493,7 +912,7 @@ class OperationWorker:
             raise RuntimeError("OA browser is busy")
         try:
             with BrowserSession(self.settings, headed=False) as browser:
-                if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+                if self._verify_oa_login(browser) != LoginState.AUTHENTICATED:
                     self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "saved OA session is not authenticated", recoverable=True)
                     return
                 if browser.page is None:
@@ -732,10 +1151,14 @@ class OperationWorker:
         from oa_knowledge.collector.detail import AuthRequiredError, CollaborationDetailAdapter
         from oa_knowledge.detail_archive import archive_collaboration_detail
         from oa_knowledge.full_manifest import archive_proxy
-        from oa_knowledge.markdown_queue import enqueue_verified_for_oa
+        from oa_knowledge.online_audit import (
+            requeue_changed_item_for_latest_audit,
+            requeue_supplemented_item,
+        )
         from oa_knowledge.resources import ResourceCoordinator
 
         oa_item_key = task.logical_item_key
+        payload = json.loads(task.payload_json or "{}")
         with Session(self.engine) as session:
             manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == oa_item_key))
             if manifest is None:
@@ -754,7 +1177,7 @@ class OperationWorker:
             raise RuntimeError("OA browser is busy")
         try:
             with BrowserSession(self.settings, headed=False) as browser:
-                if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+                if self._verify_oa_login(browser) != LoginState.AUTHENTICATED:
                     self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "saved OA session is not authenticated", recoverable=True)
                     return
                 if browser.page is None:
@@ -787,12 +1210,25 @@ class OperationWorker:
                         )
                         manifest.last_error = None
                         manifest.failure_stage = None
+                        audit_run_id = payload.get("online_audit_run_id")
+                        if audit_run_id is not None:
+                            requeue_supplemented_item(
+                                session, int(audit_run_id), oa_item_key,
+                            )
+                        else:
+                            requeue_changed_item_for_latest_audit(
+                                session, oa_item_key,
+                            )
                     else:
                         manifest.processing_status = "download_failed"
                         manifest.retry_count += 1
                         manifest.last_error = proxy.last_error
                         manifest.failure_stage = "attachment"
-                    markdown_enqueued = enqueue_verified_for_oa(session, oa_item_key)
+                    verified_sources = session.scalar(select(func.count()).select_from(ArchivedFile).join(OAItem).where(
+                        OAItem.oa_item_key == oa_item_key,
+                        ArchivedFile.download_status == "verified",
+                        ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+                    )) or 0
                     session.commit()
                 if proxy.archive_status != "archived":
                     self.production_queue.fail(
@@ -801,7 +1237,7 @@ class OperationWorker:
                     return
                 self.production_queue.advance(
                     task.id, self.owner, "attachment_inventory",
-                    progress_current=markdown_enqueued, progress_total=len(attachments) if attachments else 0,
+                    progress_current=verified_sources, progress_total=len(attachments) if attachments else 0,
                 )
         finally:
             coordinator.release(lease, lease_owner)
@@ -981,16 +1417,28 @@ class OperationWorker:
 
     def run_forever(self, poll_seconds: float = 2.0) -> None:
         self.recover_expired()
+        from oa_knowledge.curation.classifier import PROMPT_VERSION
+        from oa_knowledge.curation.rules import RULES_VERSION
+        from oa_knowledge.curation.schemas import SCHEMA_VERSION
+        self.production_queue.enqueue_stale_curation(
+            rules_version=RULES_VERSION,
+            prompt_version=PROMPT_VERSION,
+            schema_version=SCHEMA_VERSION,
+        )
         while True:
-            self._write_runtime_status()
+            # The worker process is persistent, but an OA browser session is
+            # scoped to one operation and closed by BrowserSession.__exit__.
+            # Keep that distinction visible while the scheduler waits.
+            self._write_runtime_status("idle", "当前未登录 OA，等待下次定时任务")
             if not self.run_once():
                 time.sleep(poll_seconds)
 
-    def _write_runtime_status(self) -> None:
+    def _write_runtime_status(self, status: str = "idle", activity: str | None = None) -> None:
         payload = json.dumps({
             "owner": self.owner,
             "pid": os.getpid(),
-            "status": "idle",
+            "status": status,
+            "activity": activity,
             "heartbeat_at": datetime.now(timezone.utc).isoformat(),
         }).encode("utf-8")
         destination = atomic_write_bytes(payload, self.settings.data_root, "runtime/operation-worker.json")
@@ -999,14 +1447,31 @@ class OperationWorker:
     def _claim_next(self) -> int | None:
         now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
+            ready_realtime = session.scalar(select(PipelineTask.id).where(
+                PipelineTask.queue_name.in_(("realtime_pending", "realtime_done")),
+                PipelineTask.status == "queued",
+                or_(PipelineTask.next_retry_at.is_(None), PipelineTask.next_retry_at <= now),
+            ).limit(1)) is not None
             priority = case(
                 (and_(OperationJob.job_type == "full_manifest_retry", OperationJob.parameters_json.like('%"source_status": "download_failed"%')), 0),
                 (OperationJob.job_type == "full_manifest_retry", 1),
                 else_=2,
             )
-            job = session.scalar(select(OperationJob).where(
+            conditions = [
                 OperationJob.status == "queued",
                 or_(OperationJob.lease_expires_at.is_(None), OperationJob.lease_expires_at < now, OperationJob.lease_owner == self.owner),
+                or_(
+                    OperationJob.job_type.notin_(("online_audit", "verified_archive_migration")),
+                    OperationJob.heartbeat_at.is_(None),
+                    OperationJob.heartbeat_at < now - ONLINE_AUDIT_YIELD,
+                ),
+            ]
+            if ready_realtime:
+                conditions.append(OperationJob.job_type.notin_((
+                    "online_audit", "verified_archive_migration", "data_governance",
+                )))
+            job = session.scalar(select(OperationJob).where(
+                *conditions,
             ).order_by(priority, OperationJob.id.desc()).limit(1))
             if job is None:
                 return None

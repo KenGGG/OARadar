@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.coverage
 .ruff_cache/
 *.py[cod]
 *.egg-info/
@@ -34,4 +35,5 @@ config.yaml
 browser-profile/
 runtime/
 logs/
+codebuddy/
 vault/

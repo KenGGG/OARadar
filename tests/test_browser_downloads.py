@@ -119,6 +119,48 @@ def test_inventory_only_lists_attachment_without_downloading() -> None:
     assert [(row.attachment_key, row.download_status, row.content) for row in files] == [("file-1", "discovered", None)]
 
 
+def test_attachment_loop_stops_when_total_capture_deadline_is_reached(monkeypatch) -> None:
+    descriptors = [
+        {"file_url": f"/seeyon/fileDownload.do?id={index}", "key": f"file-{index}",
+         "filename": f"file-{index}.pdf", "role": "direct_attachment"}
+        for index in (1, 2)
+    ]
+    clock = {"value": 0.0}
+
+    class Candidate:
+        def __init__(self, descriptor): self.descriptor = descriptor
+        def get_attribute(self, name): return self.descriptor["file_url"] if name == "_temp" else None
+        def evaluate(self, _script): pass
+    class Locator:
+        def __init__(self, candidates=False): self.candidates = candidates
+        def evaluate_all(self, *_args): return descriptors
+        def count(self): return len(descriptors) if self.candidates else 0
+        def nth(self, index): return Candidate(descriptors[index])
+    class Frame:
+        def locator(self, selector): return Locator(candidates=selector == "a[_temp]")
+    class Page:
+        frames = [Frame()]
+        url = "https://oa.invalid/seeyon/detail"
+        context = type("Context", (), {"request": object()})()
+
+    adapter = CollaborationDetailAdapter(None)  # type: ignore[arg-type]
+
+    def download_one(_page, trigger, _timeout):
+        trigger()
+        clock["value"] = 10.0
+        return b"%PDF synthetic"
+
+    adapter._browser_download_payload = download_one  # type: ignore[method-assign]
+    monkeypatch.setattr("oa_knowledge.collector.detail.monotonic", lambda: clock["value"])
+
+    files = adapter._download_files(
+        Page(), "direct_attachment", deadline=5.0, download_timeout_seconds=30,
+    )
+
+    assert [row.attachment_key for row in files] == ["file-1"]
+    assert adapter._capture_issues == [{"kind": "capture_timeout", "stage": "attachments"}]
+
+
 def test_missing_workflow_tab_is_optional() -> None:
     class Flow:
         def count(self): return 0

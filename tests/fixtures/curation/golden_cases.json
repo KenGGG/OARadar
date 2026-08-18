@@ -1,0 +1,28 @@
+[
+  {
+    "name": "noise_only",
+    "title": "合成传阅事项",
+    "sources": [
+      {"key": "file:1", "title": "传阅单.md", "text": "已阅。流程节点：发起、部门负责人、办结。"}
+    ],
+    "model": {"documents": []},
+    "expected_documents": 0,
+    "expected_reason": "rules_no_documents"
+  },
+  {
+    "name": "two_formal_documents",
+    "title": "合成文件包",
+    "sources": [
+      {"key": "file:1", "title": "示例甲发〔2026〕1号.md", "text": "示例甲集团文件\n示例甲发〔2026〕1号\n关于甲事项的通知"},
+      {"key": "file:2", "title": "示例乙发〔2026〕2号.md", "text": "示例乙集团文件\n示例乙发〔2026〕2号\n关于乙事项的通知"}
+    ],
+    "model": {
+      "documents": [
+        {"document_kind": "formal", "normalized_title": "关于甲事项的通知", "issuer": "示例甲集团", "document_number": "示例甲发〔2026〕1号", "publication_date": "2026-08-01", "topic": "", "customer": "", "project": "", "stage": "", "confidence": 0.95, "sources": [{"source_key": "file:1", "role": "body"}], "evidence_source_keys": ["file:1"]},
+        {"document_kind": "formal", "normalized_title": "关于乙事项的通知", "issuer": "示例乙集团", "document_number": "示例乙发〔2026〕2号", "publication_date": "2026-08-02", "topic": "", "customer": "", "project": "", "stage": "", "confidence": 0.94, "sources": [{"source_key": "file:2", "role": "body"}], "evidence_source_keys": ["file:2"]}
+      ]
+    },
+    "expected_documents": 2,
+    "expected_reason": "ok"
+  }
+]

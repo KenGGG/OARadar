@@ -152,12 +152,6 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
                 details_json=json.dumps(issue, ensure_ascii=False),
             ))
     session.flush()
-    # Newly archived Done items should join the Markdown conversion queue in the
-    # same transaction, so the knowledge base stays current without waiting for a
-    # later full online audit. Enqueueing is idempotent per verified attachment.
-    if item.archive_status == "archived":
-        from oa_knowledge.markdown_queue import enqueue_verified_for_oa
-        enqueue_verified_for_oa(session, item.oa_item_key)
     return manifest
 
 

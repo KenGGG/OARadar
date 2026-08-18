@@ -37,7 +37,7 @@ def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:
     upgrade_database(db)
     upgrade_database(db)
     with sqlite3.connect(db) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0029_oa_gone"
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0033_online_attachment_evidence"
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {
@@ -46,6 +46,8 @@ def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:
         "logical_items", "item_occurrences", "item_snapshots", "summary_jobs", "summary_versions",
         "summary_evidence", "resource_leases", "llm_request_audits",
         "source_attachments", "archive_packages", "archive_members", "oa_item_document_relations",
+        "curated_runs", "curated_decisions", "curated_decision_sources",
+        "cleanup_runs", "cleanup_items",
     } <= tables
 
 

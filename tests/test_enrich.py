@@ -112,13 +112,13 @@ def test_non_ollama_provider_keeps_openai_compatible_protocol() -> None:
     assert client.uses_ollama_native is False
 
 
-def test_llm_client_accepts_explicitly_approved_remote_provider() -> None:
-    client = LlmClient(
-        base_url="https://llm.example.invalid/v1",
-        provider_mode="approved_remote",
-        api_key_env="SYNTHETIC_LLM_API_KEY",
-    )
-    assert client.base_url == "https://llm.example.invalid/v1"
+def test_llm_client_rejects_remote_provider_even_when_marked_approved() -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        LlmClient(
+            base_url="https://llm.example.invalid/v1",
+            provider_mode="approved_remote",
+            api_key_env="SYNTHETIC_LLM_API_KEY",
+        )
 
 
 def test_llm_client_blocks_redirects() -> None:
@@ -126,6 +126,49 @@ def test_llm_client_blocks_redirects() -> None:
     client = LlmClient(base_url="http://127.0.0.1:11434/v1")
     # The client is created successfully; redirect blocking is tested at runtime
     assert client.timeout_seconds == 180
+
+
+def test_llm_client_retries_transient_local_request_errors(monkeypatch) -> None:
+    attempts = 0
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"model": "qwen3.5:9b", "message": {"content": "{}"}}
+
+    class FakeHttpClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def post(self, _path: str, json: dict):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise __import__("httpx").ReadTimeout("synthetic timeout")
+            return FakeResponse()
+
+    monkeypatch.setattr("oa_knowledge.enrich.llm_client.httpx.Client", FakeHttpClient)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    client = LlmClient(
+        base_url="http://127.0.0.1:11434/v1",
+        model="qwen3.5:9b",
+        max_retries=1,
+    )
+    client._profile_discovered = True
+
+    result = client.chat("system", "synthetic", json_schema={"type": "object"})
+
+    assert attempts == 2
+    assert result["error"] is None
+    assert result["content"] == "{}"
 
 
 # --- Extractor tests ---

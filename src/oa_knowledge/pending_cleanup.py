@@ -26,6 +26,7 @@ from oa_knowledge.db.models import (
     NotificationDelivery, OAItem, ParseArtifact, ParseJob, SourceAttachment,
     SummaryEvidence, SummaryJob, SummaryVersion,
 )
+from oa_knowledge.storage_paths import resolve_data_path
 
 # Delivery statuses that mean "do not clean yet" — the payload must stay so the
 # worker can retry or the operator can inspect the outcome.
@@ -65,9 +66,9 @@ def cleanup_eligibility(
 ) -> tuple[bool, str]:
     """Return ``(eligible, reason)`` for cleaning this occurrence's business data.
 
-    Automatic eligibility requires a confirmed successful Feishu delivery and an
-    enabled policy. ``force`` bypasses the success requirement (used by the manual
-    "立即清理" action) but is still gated by ``pending_cleanup.allow_force_cleanup``.
+    Every cleanup path requires a confirmed successful Feishu delivery. ``force``
+    may bypass the automatic-policy switch or retry a previous cleanup failure,
+    but can never bypass delivery confirmation.
     """
     status = occurrence.cleanup_status or NOT_ELIGIBLE
     if status in {CLEANED, CLEANING}:
@@ -75,39 +76,43 @@ def cleanup_eligibility(
     if status == CLEANUP_FAILED and not force:
         return False, "previous_cleanup_failed"
 
-    if force:
-        if not settings.pending_cleanup.allow_force_cleanup:
-            return False, "force_cleanup_disabled"
-        return True, "forced"
-
-    if not settings.pending_cleanup.auto_cleanup_after_success:
-        return False, "auto_cleanup_disabled"
     if delivery is None:
         return False, "no_delivery_record"
     if delivery.status != "sent":
         return False, f"delivery_not_sent:{delivery.status}"
+    if force:
+        if not settings.pending_cleanup.allow_force_cleanup:
+            return False, "force_cleanup_disabled"
+        return True, "delivery_sent_manual"
+    if not settings.pending_cleanup.auto_cleanup_after_success:
+        return False, "auto_cleanup_disabled"
     return True, "delivery_sent"
 
 
 def _delete_archived_file(session: Session, settings: Settings, file: ArchivedFile) -> None:
     """Remove one ArchivedFile row, its physical file, and orphaned content/parse rows.
 
-    Physical deletion is guarded so it can only touch a file under the archive
-    root. A content object is dropped only when no other ArchivedFile still
+    Physical deletion is guarded so it can only touch a pending file under the
+    data root. A content object is dropped only when no other ArchivedFile still
     references it.
     """
     content_object_id = file.content_object_id
     local_relpath = file.local_relpath
+    if local_relpath:
+        target = resolve_data_path(
+            settings.data_root,
+            local_relpath,
+            allowed_prefixes=("raw/pending", "archive/raw/oa/pending"),
+        )
+        if target.exists():
+            if not target.is_file():
+                raise OSError("pending archived path is not a regular file")
+            target.unlink()
+
+    # Do not mutate database relationships until physical deletion succeeds.
     for job in file.parse_jobs:
         session.delete(job)
     session.flush()
-    if local_relpath:
-        target = settings.archive_root / local_relpath
-        try:
-            if target.exists() and target.is_file():
-                target.unlink()
-        except OSError:
-            pass
     session.delete(file)
     if content_object_id is not None:
         remaining = session.scalar(
@@ -172,7 +177,10 @@ def perform_cleanup(
                         af = session.get(ArchivedFile, source.source_file_id)
                         if af is not None:
                             _delete_archived_file(session, settings, af)
-                    session.delete(source)
+                    # ItemSnapshot owns SourceAttachment via ON DELETE CASCADE.
+                    # Deleting both explicitly made SQLite delete the child
+                    # first and SQLAlchemy later warn that its duplicate DELETE
+                    # matched zero rows.
                 for snap in snapshots:
                     session.delete(snap)
 

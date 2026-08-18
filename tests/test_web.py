@@ -15,7 +15,7 @@ from oa_knowledge.batches import BatchPlan, plan_batch
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicyRevision, OAItem, OAManifestItem, OperationEvent, OperationJob, ReviewEntry
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicyRevision, OAItem, OAManifestItem, OperationEvent, OperationJob, PipelineTask, ReviewEntry
 from oa_knowledge.web import create_web_app
 from oa_knowledge.web.status import execute_archive_job, pause_archive_batch, start_archive_job, start_backfill_campaign
 
@@ -41,7 +41,7 @@ def test_status_is_read_only_and_reports_current_schema(config_file: Path) -> No
     response = client.get("/api/status")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["schema"] == "0029_oa_gone"
+    assert payload["schema"] == "0033_online_attachment_evidence"
     assert payload["stage"] == "2B-3"
     assert payload["oa_auth"] == {"status": "unknown", "checked_at": None, "read_only": True}
     assert payload["counts"]["items"] == 0
@@ -68,6 +68,33 @@ def test_lifecycle_endpoints_are_database_backed_and_empty_on_new_database(confi
     assert system.json()["counts"]["snapshots"] == 0
     assert system.json()["worker"] is None
     assert system.json()["markdown"]["recent_exports"] == []
+
+
+def test_knowledge_rebuild_api_enqueues_and_controls_historical_tasks(config_file: Path) -> None:
+    client, data_root = _client(config_file)
+    engine = create_db_engine(data_root / "state/oa.db")
+    with Session(engine) as session:
+        session.add(OAManifestItem(
+            oa_item_key="done:rebuild", title="合成存量事项", list_page=1,
+            processing_status="downloaded",
+        ))
+        session.commit()
+    csrf = client.get("/").cookies["oa_csrf"]
+
+    started = client.post("/api/knowledge/rebuild", headers={"x-csrf-token": csrf})
+    assert started.status_code == 202
+    assert started.json()["created"] == 1
+    assert started.json()["requeued"] == 0
+    with Session(engine) as session:
+        task = session.scalar(select(PipelineTask).where(
+            PipelineTask.logical_item_key == "done:rebuild",
+        ))
+        assert task.stage == "attachment_inventory"
+
+    paused = client.post("/api/knowledge/rebuild/pause", headers={"x-csrf-token": csrf})
+    resumed = client.post("/api/knowledge/rebuild/resume", headers={"x-csrf-token": csrf})
+    assert paused.json()["status"] == "paused"
+    assert resumed.json()["status"] == "running"
 
 
 def test_online_audit_api_starts_pauses_and_resumes(config_file: Path) -> None:
@@ -212,6 +239,7 @@ def test_lifecycle_done_metrics_and_pagination_use_full_dataset(config_file: Pat
 def test_done_incremental_refresh_queues_single_three_page_job(config_file: Path) -> None:
     client, data_root = _client(config_file)
     client.get("/api/status")
+    client.get("/api/reviews")
     csrf = client.cookies.get("oa_csrf")
 
     first = client.post("/api/manifest/refresh-incremental", headers={"x-csrf-token": csrf})
@@ -285,6 +313,79 @@ def test_review_and_maintenance_endpoints(config_file: Path) -> None:
     assert maintenance.status_code == 200
     assert maintenance.json()["audit"]["ok"] is True
     assert "allowed" in maintenance.json()["capacity"]
+
+
+def test_review_endpoint_filters_by_kind(config_file: Path) -> None:
+    client, data_root = _client(config_file)
+    engine = create_db_engine(data_root / "state" / "oa.db")
+    with Session(engine) as session:
+        session.add_all([
+            ReviewEntry(kind="depth_limit_reached", depth=10),
+            ReviewEntry(
+                kind="source_markdown_incomplete",
+                details_json='{"reason_code":"UNSUPPORTED_SOURCE_FORMAT"}',
+            ),
+        ])
+        session.commit()
+
+    response = client.get(
+        "/api/reviews?status=pending&kind=source_markdown_incomplete"
+    )
+
+    assert response.status_code == 200
+    assert [row["kind"] for row in response.json()] == [
+        "source_markdown_incomplete"
+    ]
+
+
+def test_source_review_retry_requeues_knowledge_pipeline(config_file: Path) -> None:
+    client, data_root = _client(config_file)
+    engine = create_db_engine(data_root / "state" / "oa.db")
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="review-retry-item",
+            source_channel="done",
+            title="Synthetic title",
+        )
+        session.add(item)
+        session.flush()
+        review = ReviewEntry(
+            kind="source_markdown_incomplete",
+            item_id=item.id,
+            status="pending",
+        )
+        task = PipelineTask(
+            queue_name="historical_done_backfill",
+            priority=30,
+            logical_item_key=item.oa_item_key,
+            stage="source_publish",
+            status="failed",
+            idempotency_key="review-retry-task",
+            error_code="UNSUPPORTED_SOURCE_FORMAT",
+            recoverable=False,
+        )
+        session.add_all([review, task])
+        session.commit()
+        review_id = review.id
+        task_id = task.id
+
+    client.get("/api/reviews")
+    csrf = client.cookies.get("oa_csrf")
+    response = client.post(
+        f"/api/reviews/{review_id}/retry-source",
+        headers={"x-csrf-token": csrf or ""},
+    )
+
+    assert response.status_code == 202
+    with Session(engine) as session:
+        review = session.get(ReviewEntry, review_id)
+        task = session.get(PipelineTask, task_id)
+        assert review is not None and review.status == "resolved"
+        assert task is not None
+        assert task.status == "queued"
+        assert task.stage == "attachment_inventory"
+        assert task.error_code is None
+        assert task.recoverable is True
 
 
 def test_cross_origin_and_missing_csrf_are_rejected(config_file: Path) -> None:
@@ -544,17 +645,36 @@ def test_static_assets_are_served(config_file: Path) -> None:
     assert resp.status_code in (200, 404)
 
 
-def test_built_console_exposes_autorun_strings(config_file: Path) -> None:
-    """Plan-0806-1 §9 (test five): the built bundle must surface the auto-run console."""
+def _read_built_javascript() -> str:
+    """返回已构建的前端 JS bundle 文本（未构建时跳过）。"""
     import glob
 
     static_dir = Path(__file__).resolve().parents[1] / "src" / "oa_knowledge" / "web" / "static"
     bundle_files = glob.glob(str(static_dir / "assets" / "*.js")) if static_dir.exists() else []
     if not bundle_files:
         pytest.skip("WebUI bundle not built; run `npm ci && npm run build` in webui/")
-    blob = "\n".join(Path(p).read_text(encoding="utf-8", errors="ignore") for p in bundle_files)
+    return "\n".join(Path(p).read_text(encoding="utf-8", errors="ignore") for p in bundle_files)
+
+
+def test_built_console_exposes_autorun_strings(config_file: Path) -> None:
+    """Plan-0806-1 §9 (test five): the built bundle must surface the auto-run console."""
+    blob = _read_built_javascript()
     for required in ("自动运行", "立即扫描", "每小时定时器", "飞书通知"):
         assert required in blob, f"built bundle missing required string: {required}"
+
+
+def test_webui_default_navigation_is_reduced_to_three_business_entries(config_file: Path) -> None:
+    """Plan Task 3: 默认一级导航只有总览 / 已办资料 / 系统设置，旧的待办提醒与数据治理不再是入口。"""
+    client, _ = _client(config_file)
+    html = client.get("/").text
+    assert "root" in html
+    js = _read_built_javascript()
+    assert "总览" in js
+    assert "已办资料" in js
+    assert "系统设置" in js
+    # 只禁止把旧入口作为一级导航对象出现；高级维护内部仍可包含这些文案。
+    assert 'label:"待办提醒"' not in js
+    assert 'label:"数据治理"' not in js
 
 
 def test_security_headers_present_on_all_responses(config_file: Path) -> None:

@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-OARadar is a local-first, read-only OA raw-file archive and faithful Markdown conversion system. It archives OA files without changing them and mirrors every source into Markdown for llm_wiki and Obsidian. OARadar does not build knowledge pages or write the llm_wiki `wiki/` directory.
+OARadar is a local-first, read-only OA archive, faithful Markdown conversion, and curated knowledge system. It preserves immutable source material, then optionally builds disposable curated documents from that material with the local `qwen3.5:9b` model. It never writes the llm_wiki `wiki/` directory.
 
 The repository contains only application code and synthetic fixtures. OA addresses, credentials, records, attachments, browser state, databases, logs, and generated knowledge content stay on the operator's machine.
 
@@ -14,7 +14,7 @@ The repository contains only application code and synthetic fixtures. OA address
 - Browser profiles, cookies, snapshots, downloads, databases, logs, and local configuration are excluded from Git.
 - Container trees are traversed through depth 10. If more children exist, the item is queued as `depth_limit_reached` and is not reported complete.
 - Tests use synthetic or irreversibly redacted fixtures only.
-- Remote model calls remain disabled by default. Review confidentiality and redaction policy before enabling any remote provider.
+- OA-derived model processing is restricted to loopback Ollama with `qwen3.5:9b`; remote model endpoints are rejected.
 
 See [docs/security.md](docs/security.md) for the complete public repository boundary.
 
@@ -53,6 +53,20 @@ uv run oa rebuild-markdown --config config.yaml
 uv run oa markdown-status --config config.yaml
 ```
 
+Plan and run a bounded Curated knowledge batch:
+
+```bash
+uv run oa curate plan --config config.yaml --limit 10
+uv run oa curate run --config config.yaml --limit 10
+uv run oa curate validate --config config.yaml
+uv run oa curate report --config config.yaml
+```
+
+`curate plan` is read-only and does not call the model. Curated output is rebuilt under
+`data/workspace/curated/oa/`; formal files use issuer/year/document-number/title,
+internal files use topic/month, and project files use customer/project/stage. Start with
+a reviewed small sample—there is no implicit full historical backfill.
+
 The default source archive is `data/archive/raw/oa/`. Markdown is written only to `data/workspace/raw/sources/oa/` with the same tree and an appended `.md` suffix (for example, `报告.pdf` becomes `报告.pdf.md`). See [the llm_wiki and Obsidian integration guide](docs/llm-wiki-obsidian-integration.md).
 
 Start the loopback-only Web console:
@@ -76,13 +90,13 @@ Markdown content.
 
 ## Local document processing
 
-The default configuration uses local processing and disables LLM enrichment. A loopback MinerU service can be started with:
+The default configuration uses local processing and disables LLM enrichment. When enabled, text enrichment uses only the installed local `qwen3.5:9b`. A loopback MinerU service can be started with:
 
 ```bash
 docker compose -f mineru/docker-compose.yaml up -d mineru-api
 ```
 
-Before enabling a remote model provider, verify that your organization permits it and keep `allow_confidential`, `allow_restricted`, and redaction controls aligned with your policy.
+The model context window is discovered from Ollama and capped conservatively. Long evidence is chunked and reduced before a final structured decision; canonical bodies are always assembled verbatim from validated Source Markdown.
 
 ## Development
 

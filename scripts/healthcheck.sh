@@ -87,17 +87,16 @@ fi
 
 # --- OA login inferred from last hourly run recency -----------------------
 if command -v python3 >/dev/null 2>&1 && [[ -n "$runs_json" ]]; then
-  age_hours="$(printf '%s' "$runs_json" | python3 -c 'import sys,json,datetime
+  age_hours="$(printf '%s' "$runs_json" | uv run python -c 'import sys,json
+from oa_knowledge.ops.health import utc_age_hours
 try:
     rows=json.load(sys.stdin)
 except Exception:
     rows=[]
-now=datetime.datetime.now(datetime.timezone.utc)
 for r in rows:
     if r.get("stage")=="scheduled_hourly" and r.get("finished_at"):
         try:
-            fin=datetime.datetime.fromisoformat(r["finished_at"].replace("Z","+00:00"))
-            print(round((now-fin).total_seconds()/3600,1)); break
+            print(round(utc_age_hours(r["finished_at"]),1)); break
         except Exception:
             pass' 2>/dev/null || true)"
   if [[ -n "$age_hours" ]]; then
@@ -146,6 +145,45 @@ PY
 )"
 free_gb="$(df -P "$data_root" 2>/dev/null | awk 'NR==2{print int($4/1024/1024)}' || echo 0)"
 if awk "BEGIN{exit !(${free_gb:-0} > 1)}"; then emit OK "disk" "${free_gb}G free on $data_root"; else emit FAIL "disk" "${free_gb}G free on $data_root"; fi
+
+# --- Web 极简状态接口（结构与隐私检查，不硬编码生产计数） ----------------
+port="$(python3 - "$CONFIG" <<'PY'
+import sys, yaml
+try:
+    cfg = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+    print(cfg.get("web", {}).get("port", 2567))
+except Exception:
+    print(2567)
+PY
+)"
+if command -v curl >/dev/null 2>&1; then
+  ss_body="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/api/simple-status" 2>/dev/null || true)"
+  if [[ -z "$ss_body" ]]; then
+    emit WARN "simple-status" "web API not reachable on :$port (skip)"
+  else
+    verdict="$(printf '%s' "$ss_body" | python3 -c 'import sys,json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("invalid-json"); sys.exit(0)
+for k in ("generated_at","overall_status","done","pending","oa_activity","attention"):
+    if k not in d:
+        print("missing-key:"+k); sys.exit(0)
+h = d.get("done",{}).get("headline","")+d.get("pending",{}).get("headline","")
+if not h.strip():
+    print("empty-headline"); sys.exit(0)
+for bad in ("payload_json","structured_json","webhook","secret"):
+    if bad in ss_body:
+        print("leak:"+bad); sys.exit(0)
+print("ok")' 2>/dev/null || echo "check-error")"
+    case "$verdict" in
+      ok) emit OK "simple-status" "keys present, no credential leak" ;;
+      *) emit WARN "simple-status" "issue: $verdict" ;;
+    esac
+  fi
+else
+  emit WARN "simple-status" "curl unavailable (skip)"
+fi
 
 echo "----"
 echo "PASS=$PASS WARN=$WARN FAIL=$FAIL"

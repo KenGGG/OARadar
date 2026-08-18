@@ -236,7 +236,16 @@ def schedule_status(settings, limit: int = 10) -> dict:
             "oa_login": _oa_login_state(recent),
             "nightly": {
                 "last_at": last_nightly["finished_at"] if last_nightly else None,
-                "markdown_tasks_enqueued": nightly_summary.get("done", {}).get("markdown_tasks_enqueued", 0),
+                "source_total": nightly_summary.get("done", {}).get("source_total", 0),
+                "pages_scanned": nightly_summary.get("done", {}).get("pages_scanned", 0),
+                "new_items": nightly_summary.get("done", {}).get("new_items", 0),
+                "changed_items": nightly_summary.get("done", {}).get("changed_items", 0),
+                "baseline_hashes": nightly_summary.get("done", {}).get("baseline_hashes", 0),
+                "retry_items": nightly_summary.get("done", {}).get("retry_items", 0),
+                "knowledge_tasks_enqueued": nightly_summary.get("done", {}).get(
+                    "knowledge_tasks_enqueued",
+                    nightly_summary.get("done", {}).get("markdown_tasks_enqueued", 0),
+                ),
                 "download_jobs_enqueued": nightly_summary.get("done", {}).get("download_jobs_enqueued", 0),
             },
         },

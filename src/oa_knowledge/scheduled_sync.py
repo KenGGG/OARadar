@@ -22,9 +22,8 @@ from oa_knowledge.collector import BrowserSession, DoneAdapter, LoginState
 from oa_knowledge.collector.pending import PENDING_LIST_PATH, PendingAdapter
 from oa_knowledge.db.models import OAManifestItem, PipelineTask, Run
 from oa_knowledge.full_manifest import synchronize_manifest
-from oa_knowledge.markdown_queue import enqueue_missing_markdown_tasks
 from oa_knowledge.pending_sync import PendingSyncResult, sync_pending_discovery
-from oa_knowledge.production_pipeline import QUEUE_PRIORITY
+from oa_knowledge.production_pipeline import QUEUE_PRIORITY, ProductionQueue
 from oa_knowledge.resources import ResourceCoordinator
 
 
@@ -277,6 +276,58 @@ def enqueue_realtime_done(
     return True, task.id
 
 
+def sync_done_versions_and_enqueue(
+    session: Session,
+    items: Sequence,
+    known_hashes: dict[str, str | None],
+) -> dict[str, int]:
+    """Persist a full-list signature baseline and enqueue true deltas.
+
+    Rows that predate discovery hashes get a baseline without an expensive
+    blind redownload.  New rows, changed non-null signatures, and explicit
+    failed/pending rows enter the durable realtime queue.
+    """
+    rows = {
+        row.oa_item_key: row
+        for row in session.scalars(select(OAManifestItem)).all()
+    }
+    new_items = changed_items = baseline_hashes = retry_items = enqueued = 0
+    for item in items:
+        row = rows[item.oa_item_key]
+        signature = _done_signature(item)
+        was_known = item.oa_item_key in known_hashes
+        previous = known_hashes.get(item.oa_item_key)
+        is_new = not was_known
+        is_changed = was_known and previous is not None and previous != signature
+        is_baseline = was_known and previous is None
+        needs_retry = row.processing_status in {"pending_download", "download_failed"}
+
+        new_items += int(is_new)
+        changed_items += int(is_changed)
+        baseline_hashes += int(is_baseline)
+        retry_items += int(needs_retry and not is_new and not is_changed)
+        row.discovery_hash = signature
+        if (
+            row.processing_status != "skipped"
+            and (is_new or is_changed or needs_retry)
+        ):
+            created, _ = enqueue_realtime_done(
+                session,
+                row.oa_item_key,
+                manifest_id=row.id,
+                discovery_hash=signature,
+            )
+            enqueued += int(created)
+    session.flush()
+    return {
+        "new_items": new_items,
+        "changed_items": changed_items,
+        "baseline_hashes": baseline_hashes,
+        "retry_items": retry_items,
+        "download_jobs_enqueued": enqueued,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Self-contained scheduled scans (plan-0806-1 §2.3: shared by CLI and worker)
 # --------------------------------------------------------------------------- #
@@ -352,6 +403,7 @@ def run_nightly_scan(engine, settings, *, headed: bool = False) -> dict:
     if lease_id is None:
         raise RuntimeError("OA browser is busy")
     done_summary: dict = {}
+    known_hashes = _load_known_done_hashes(engine)
     try:
         with BrowserSession(settings, headed=headed) as browser:
             _require_authenticated(browser)
@@ -364,24 +416,19 @@ def run_nightly_scan(engine, settings, *, headed: bool = False) -> dict:
             discovery = done_adapter.discover_all_pages()
             with Session(engine) as session:
                 sync = synchronize_manifest(session, discovery)
+                version_summary = sync_done_versions_and_enqueue(
+                    session, discovery.items, known_hashes,
+                )
                 session.commit()
-                pending = session.scalars(select(OAManifestItem).where(
-                    OAManifestItem.processing_status.in_(("pending_download", "download_failed"))
-                )).all()
-                enqueued = 0
-                for row in pending:
-                    created, _ = enqueue_realtime_done(
-                        session, row.oa_item_key, manifest_id=row.id, discovery_hash=row.discovery_hash,
-                    )
-                    enqueued += int(created)
-                markdown_enqueued = enqueue_missing_markdown_tasks(engine, session=session)
+                unified_enqueued = ProductionQueue(engine).bootstrap_current_state(
+                    session=session,
+                )["historical_done_backfill"]
                 done_summary = {
                     "source_total": discovery.source_total_count,
                     "pages_scanned": discovery.pages_scanned,
-                    "new_items": len(pending),
-                    "download_jobs_enqueued": enqueued,
-                    "markdown_tasks_enqueued": markdown_enqueued,
+                    "knowledge_tasks_enqueued": unified_enqueued,
                     "manifest_sync_id": sync.id,
+                    **version_summary,
                 }
                 run = session.get(Run, run_id)
                 close_scheduled_run(session, run, "completed", done=done_summary)
@@ -401,6 +448,7 @@ def run_bootstrap_scan(engine, settings, *, headed: bool = False) -> dict:
         raise RuntimeError("OA browser is busy")
     pending_summary: dict = {}
     done_summary: dict = {}
+    known_hashes = _load_known_done_hashes(engine)
     try:
         with BrowserSession(settings, headed=headed) as browser:
             _require_authenticated(browser)
@@ -417,8 +465,15 @@ def run_bootstrap_scan(engine, settings, *, headed: bool = False) -> dict:
             discovery = done_adapter.discover_all_pages()
             with Session(engine) as session:
                 sync = synchronize_manifest(session, discovery)
+                version_summary = sync_done_versions_and_enqueue(
+                    session, discovery.items, known_hashes,
+                )
                 session.commit()
-                done_summary = {"source_total": discovery.source_total_count, "manifest_sync_id": sync.id}
+                done_summary = {
+                    "source_total": discovery.source_total_count,
+                    "manifest_sync_id": sync.id,
+                    **version_summary,
+                }
                 run = session.get(Run, run_id)
                 close_scheduled_run(session, run, "completed", pending=pending_summary, done=done_summary)
                 session.commit()

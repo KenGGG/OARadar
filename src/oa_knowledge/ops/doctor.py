@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from oa_knowledge.config import Settings
+from oa_knowledge.enrich.context_budget import discover_ollama_profile
 
 
 def _writable_directory(path: Path) -> bool:
@@ -45,6 +46,19 @@ def run_doctor(settings: Settings) -> list[Check]:
     except Exception:
         mineru_ok = False
     checks.append(Check("mineru", mineru_ok, "enabled and reachable" if settings.mineru.enabled else "disabled", required=False))
+    if settings.llm.enabled or settings.curation.enabled:
+        profile = discover_ollama_profile(
+            settings.llm.base_url, settings.llm.model,
+            fallback_context_window=settings.llm.context_window_fallback,
+            context_window_cap=settings.llm.context_window_cap,
+        )
+        checks.append(Check(
+            "local_qwen",
+            profile.discovered and profile.model == "qwen3.5:9b",
+            f"model={profile.model} context_window={profile.context_window} discovered={profile.discovered}",
+        ))
+    else:
+        checks.append(Check("local_qwen", False, "LLM and curation disabled", required=False))
     db = settings.database_path
     if db.exists():
         try:

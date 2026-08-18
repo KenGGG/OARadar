@@ -31,7 +31,7 @@ def test_markdown_source_dir_cannot_escape_or_target_wiki() -> None:
             })
 
 
-def test_llm_provider_choice_derives_local_gpu_and_remote_modes(tmp_path: Path) -> None:
+def test_llm_provider_choice_is_local_qwen_only(tmp_path: Path) -> None:
     local = Settings(llm={"enabled": True, "active_provider": "ollama"})
     assert local.llm.provider_name == "ollama"
     assert local.llm.base_url == "http://127.0.0.1:11434/v1"
@@ -39,11 +39,24 @@ def test_llm_provider_choice_derives_local_gpu_and_remote_modes(tmp_path: Path) 
     assert local.llm.provider_mode == "local_only"
     assert local.llm.uses_local_gpu is True
 
-    remote = Settings(llm={"enabled": True, "active_provider": "agnes"})
-    assert remote.llm.provider_name == "agnes"
-    assert remote.llm.model == "agnes-2.0-flash"
-    assert remote.llm.provider_mode == "approved_remote"
-    assert remote.llm.uses_local_gpu is False
+    with pytest.raises(ValidationError, match="ollama"):
+        Settings(llm={"enabled": True, "active_provider": "agnes"})
+    with pytest.raises(ValidationError, match="qwen3.5:9b"):
+        Settings(llm={"enabled": True, "ollama_model": "another-model"})
+
+
+def test_load_settings_ignores_obsolete_remote_fields_but_keeps_local_choice(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.yaml"
+    path.write_text(
+        "llm:\n  active_provider: ollama\n  ollama_model: qwen3.5:9b\n"
+        "  agnes_base_url: https://example.invalid/v1\n  agnes_model: old-remote\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(path)
+
+    assert settings.llm.model == "qwen3.5:9b"
+    assert settings.llm.provider_mode == "local_only"
 
 
 def test_archive_depth_is_independent_and_bounded() -> None:

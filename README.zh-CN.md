@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-OARadar 是一个本地优先、只读访问 OA 的原始文件归档与忠实 Markdown 转换系统。它在不修改 OA 文件的前提下完成归档，并将每个来源文件按原目录结构镜像为 Markdown，供 llm_wiki 和 Obsidian 使用。OARadar 不生成知识页面，也不会写入 llm_wiki 的 `wiki/` 目录。
+OARadar 是一个本地优先、只读访问 OA 的归档、忠实 Markdown 转换与 Curated 知识编目系统。它保留不可变来源文件，并可使用本机 `qwen3.5:9b` 从来源 Markdown 构建可删除、可重建的知识文档；不会写入 llm_wiki 的 `wiki/` 目录。
 
 本仓库仅包含应用代码和合成测试夹具。OA 地址、凭据、业务记录、附件、浏览器状态、数据库、日志和生成的知识内容均保留在操作人员本机。
 
@@ -14,7 +14,7 @@ OARadar 是一个本地优先、只读访问 OA 的原始文件归档与忠实 M
 - 浏览器配置文件、Cookie、快照、下载文件、数据库、日志和本地配置均不会进入 Git。
 - 容器树最多遍历 10 层；如仍有子节点，将事项加入 `depth_limit_reached` 队列，且不会错误报告为完成。
 - 测试只使用合成或不可逆脱敏的夹具。
-- 远程模型调用默认关闭。启用任何远程提供商前，请先确认保密与脱敏政策。
+- OA 派生内容只允许发送到回环地址上的 Ollama `qwen3.5:9b`；远程模型端点会被拒绝。
 
 完整的公开仓库边界见 [安全文档](docs/security.md)。
 
@@ -61,7 +61,16 @@ uv run oa markdown-status --config config.yaml
 uv run oa web --config config.yaml
 ```
 
-Web 控制台按业务链路组织，一级导航为「总览 / 待办通知 / 已办归档 / Markdown 输出」，设置单独置于侧栏底部。「总览」聚合三条自动化链路（待办通知、已办归档、Markdown 交付）的运行状态并集中提示需要人工处理的问题；「待办通知」是短期通知处理台，飞书确认发送成功后自动清理业务正文，仅保留最小去重台账；「已办归档」展示原始附件是否完整永久保存并生成 Markdown；「Markdown 输出」列出已成功转换并交付给 llm_wiki 来源目录的文件；「设置 → 运行维护」提供只读在线复查、Markdown 队列、PDF MinerU 重转、归档校准与本机服务控制。详见 [产品方案 plan-0807-1](docs/plan-0807-1.md)。
+Web 控制台默认只回答两条业务链路的结果，一级导航固定为「总览 / 已办资料 / 系统设置」。「总览」用大白话聚合「已办知识库」和「待办飞书提醒」是否完成，并集中提示需要人工处理的问题；「已办资料」只展示每个事项的简化状态（等待下载 / 等待 MD 化 / 等待归类 / 已完成 / 需要处理 / 已按规则排除），不暴露六阶段色条与技术状态；「系统设置」默认只显示扫描频率、模型、飞书配置与五个服务状态，复杂诊断（在线逐项核验、Source Markdown 明细与复核、数据治理、处理中心、运行维护）统一收进「高级维护」，默认折叠、展开才加载。所有 OA 交互严格只读。
+
+判定口径（重要）：
+
+- “已完成”必须同时满足**原件已验证 + 已有有效 Source Markdown + 归类完成 + 全部决策已发布**；仅有原件或仅有 Markdown 不算完成。
+- 待办每小时 05 分检查；夜间全量扫描每日 23:30。
+- 模型“确定性兜底”**不等于**“模型成功”：兜底计数单独展示，不计入 qwen 成功数。
+- 复杂诊断位于「系统设置 → 高级维护」；OA 正文、附件名与凭据不出现在默认页面。
+
+详见 [极简 WebUI 设计规格](docs/superpowers/specs/2026-08-17-webui-simplification-design.md) 与 [实施计划](docs/superpowers/plans/2026-08-17-webui-simplification-implementation.md)。
 
 如需浏览器登录和只读发现，请使用 `uv run oa --help` 中列出的 `oa login`、`oa batch` 或 `oa manifest` 命令。执行任何采集前，请先在本地审查计划批次。
 
@@ -81,7 +90,7 @@ Markdown 内容。
 docker compose -f mineru/docker-compose.yaml up -d mineru-api
 ```
 
-启用远程模型提供商前，请确认组织政策允许相关操作，并确保 `allow_confidential`、`allow_restricted` 和脱敏控制符合你的政策要求。
+启用本地模型后，系统会从 Ollama 探测上下文上限并保守限额；长文按块归纳后再汇总，正式正文始终从已校验的 Source Markdown 原样组装。
 
 ## 开发
 

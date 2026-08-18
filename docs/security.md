@@ -36,7 +36,7 @@ Configuration loading rejects plaintext credential keys such as password, Cookie
 
 ## Models and external services
 
-Local processing is the default and LLM enrichment is disabled in the public example. Before enabling a remote provider, obtain the required authorization and apply the confidentiality and redaction gates. Public repository settings must not permit confidential or restricted content to be sent remotely.
+Local processing is mandatory for OA-derived model input and LLM enrichment is disabled in the public example. The production configuration accepts only loopback Ollama with `qwen3.5:9b`; remote provider modes and endpoints are rejected.
 
 ## Tests and examples
 

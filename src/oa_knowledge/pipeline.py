@@ -121,6 +121,38 @@ class ParsePipeline:
 
             if existing:
                 if existing.status in ("completed",):
+                    artifact = session.scalar(
+                        select(ParseArtifact)
+                        .where(ParseArtifact.parse_job_id == existing.id)
+                        .order_by(ParseArtifact.id.desc())
+                        .limit(1)
+                    )
+                    product = (
+                        self.settings.data_root / "parse" / artifact.output_relpath
+                        if artifact is not None else None
+                    )
+                    product_is_current = bool(
+                        artifact is not None
+                        and product is not None
+                        and product.is_file()
+                        and (
+                            not artifact.product_sha256
+                            or sha256_file(product) == artifact.product_sha256
+                        )
+                    )
+                    if product_is_current:
+                        return existing.id
+                    # A derivative was cleaned, lost, or changed. Reuse the
+                    # durable job identity, but regenerate from the protected
+                    # verified original on its next run.
+                    existing.status = "queued"
+                    existing.error_code = None
+                    existing.output_relpath = None
+                    if artifact is not None:
+                        artifact.lifecycle_status = "superseded"
+                        if content.active_parse_artifact_id == artifact.id:
+                            content.active_parse_artifact_id = None
+                    session.commit()
                     return existing.id
                 # Return existing queued/running job
                 return existing.id
@@ -252,21 +284,41 @@ class ParsePipeline:
             source_sha = file_rec.sha256 or sha256_file(file_path)
             product_sha = sha256_file(result.output_path) if result.output_path.is_file() else None
 
-            artifact = ParseArtifact(
-                parse_job_id=job.id,
-                content_object_id=content.id,
-                engine=result.engine,
-                engine_version=result.engine_version,
-                output_relpath=str(result.output_path.relative_to(output_base)),
-                source_sha256=source_sha,
-                product_sha256=product_sha,
-                config_hash=result.config_hash,
-                page_map_json=json.dumps(pref, ensure_ascii=False),
-                quality_score=result.quality_score,
-                quality_status="low" if result.quality_score < 0.5 else "ok",
-                lifecycle_status="candidate",
-            )
-            session.add(artifact)
+            output_relpath = str(result.output_path.relative_to(output_base))
+            artifact = session.scalar(select(ParseArtifact).where(
+                ParseArtifact.parse_job_id == job.id,
+                ParseArtifact.engine == result.engine,
+                ParseArtifact.engine_version == result.engine_version,
+                ParseArtifact.output_relpath == output_relpath,
+            ))
+            if artifact is None:
+                artifact = ParseArtifact(
+                    parse_job_id=job.id,
+                    content_object_id=content.id,
+                    engine=result.engine,
+                    engine_version=result.engine_version,
+                    output_relpath=output_relpath,
+                    source_sha256=source_sha,
+                    product_sha256=product_sha,
+                    config_hash=result.config_hash,
+                    page_map_json=json.dumps(pref, ensure_ascii=False),
+                    quality_score=result.quality_score,
+                    quality_status="low" if result.quality_score < 0.5 else "ok",
+                    lifecycle_status="candidate",
+                )
+                session.add(artifact)
+            else:
+                # Data governance may remove a rebuildable parse product while
+                # retaining its immutable ledger row. Restore that same product
+                # identity instead of violating the artifact uniqueness key.
+                artifact.content_object_id = content.id
+                artifact.source_sha256 = source_sha
+                artifact.product_sha256 = product_sha
+                artifact.config_hash = result.config_hash
+                artifact.page_map_json = json.dumps(pref, ensure_ascii=False)
+                artifact.quality_score = result.quality_score
+                artifact.quality_status = "low" if result.quality_score < 0.5 else "ok"
+                artifact.lifecycle_status = "candidate"
             session.flush()
 
             current = session.get(ParseArtifact, content.active_parse_artifact_id) if content.active_parse_artifact_id else None

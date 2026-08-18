@@ -430,6 +430,14 @@ class OnlineAuditItem(Base):
     database_attachments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     downloaded_attachments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     markdown_attachments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    online_inventory_sha256: Mapped[str | None] = mapped_column(String(64))
+    local_inventory_sha256: Mapped[str | None] = mapped_column(String(64))
+    online_content_sha256: Mapped[str | None] = mapped_column(String(64))
+    local_content_sha256: Mapped[str | None] = mapped_column(String(64))
+    online_evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    local_evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    comparison_reason: Mapped[str | None] = mapped_column(String(80))
+    depth_limit_reached: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     error_code: Mapped[str | None] = mapped_column(String(80))
     error_detail: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -548,6 +556,72 @@ class OAItemDocumentRelation(Base):
     role: Mapped[str] = mapped_column(String(40), nullable=False)
     is_main_document: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     display_title: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CuratedRun(Base):
+    """A versioned curation attempt for one logical OA package."""
+
+    __tablename__ = "curated_runs"
+    __table_args__ = (UniqueConstraint("logical_item_id", "input_signature", name="uq_curated_run_input"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    logical_item_id: Mapped[int] = mapped_column(ForeignKey("logical_items.id", ondelete="CASCADE"), nullable=False)
+    input_signature: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    rules_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    config_signature: Mapped[str] = mapped_column(String(64), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CuratedDecision(Base):
+    """One of zero-to-many structured documents selected from a package."""
+
+    __tablename__ = "curated_decisions"
+    __table_args__ = (
+        UniqueConstraint("curated_run_id", "ordinal", name="uq_curated_decision_ordinal"),
+        UniqueConstraint("curated_run_id", "decision_hash", name="uq_curated_decision_hash"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    curated_run_id: Mapped[int] = mapped_column(ForeignKey("curated_runs.id", ondelete="CASCADE"), nullable=False)
+    knowledge_document_id: Mapped[int | None] = mapped_column(ForeignKey("knowledge_documents.id", ondelete="SET NULL"))
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    document_kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    canonical_key: Mapped[str | None] = mapped_column(String(160))
+    normalized_title: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    decision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_relpath: Mapped[str | None] = mapped_column(Text)
+    review_reason: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class CuratedDecisionSource(Base):
+    """Validated, ordered membership edge from a decision to package evidence."""
+
+    __tablename__ = "curated_decision_sources"
+    __table_args__ = (
+        UniqueConstraint("curated_decision_id", "source_key", name="uq_curated_decision_source_key"),
+        UniqueConstraint("curated_decision_id", "ordinal", name="uq_curated_decision_source_ordinal"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    curated_decision_id: Mapped[int] = mapped_column(ForeignKey("curated_decisions.id", ondelete="CASCADE"), nullable=False)
+    source_file_id: Mapped[int | None] = mapped_column(ForeignKey("files.id", ondelete="SET NULL"))
+    source_attachment_id: Mapped[int | None] = mapped_column(ForeignKey("source_attachments.id", ondelete="SET NULL"))
+    archive_member_id: Mapped[int | None] = mapped_column(ForeignKey("archive_members.id", ondelete="SET NULL"))
+    parse_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("parse_artifacts.id", ondelete="SET NULL"))
+    source_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(30), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -789,3 +863,67 @@ class ReviewEntry(Base):
     details_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CleanupRun(Base):
+    """一次可审计的数据清理计划及执行汇总。"""
+
+    __tablename__ = "cleanup_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('planning','planned','quarantining','quarantined',"
+            "'restoring','restored','purging','purged','failed')",
+            name="ck_cleanup_run_status",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="planning")
+    rules_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    categories_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    candidate_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    quarantined_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    quarantined_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    restored_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    restored_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    purged_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    purged_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CleanupItem(Base):
+    """不含业务正文的单个清理候选及其隔离状态。"""
+
+    __tablename__ = "cleanup_items"
+    __table_args__ = (
+        UniqueConstraint("cleanup_run_id", "relative_path", name="uq_cleanup_item_run_path"),
+        CheckConstraint(
+            "status IN ('planned','quarantined','restored','purged','skipped','failed')",
+            name="ck_cleanup_item_status",
+        ),
+        CheckConstraint("size_bytes >= 0", name="ck_cleanup_item_size"),
+        CheckConstraint(
+            "relative_path <> '' AND substr(relative_path, 1, 1) <> '/' "
+            "AND relative_path <> '..' AND relative_path NOT LIKE '../%' "
+            "AND relative_path NOT LIKE '%/../%' AND relative_path NOT LIKE '%/..' "
+            "AND relative_path <> '.' AND relative_path NOT LIKE './%' "
+            "AND relative_path NOT LIKE '%/./%' AND relative_path NOT LIKE '%/.'",
+            name="ck_cleanup_item_relative_path",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cleanup_run_id: Mapped[int] = mapped_column(
+        ForeignKey("cleanup_runs.id", ondelete="CASCADE"), nullable=False,
+    )
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    preflight_sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="planned")
+    quarantine_relpath: Mapped[str | None] = mapped_column(Text)
+    reason_code: Mapped[str] = mapped_column(String(80), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
