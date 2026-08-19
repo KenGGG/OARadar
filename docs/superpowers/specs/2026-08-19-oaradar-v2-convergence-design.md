@@ -68,7 +68,7 @@ legacy-business-workflows-23f652a
 
 V2 沿用当前数据库及 Alembic 历史、当前原始归档和 Source Markdown 目录、当前 PipelineTask/PipelineEvent/OperationJob/MarkdownTask/资源租约/Worker，以及当前 systemd hourly、nightly、OA Worker 和 Markdown Worker。
 
-不得新建 V2 数据库、全量迁移器、迁移账本、双数据库切换、新 Pending 模型或新通用任务框架。不得迁移原始归档、重建全部历史状态、重新下载或重新解析已经成功的文件。
+不得新建 V2 数据库、全量迁移器、迁移账本、双数据库切换、新 Pending 模型、新任务表、新协调器或第三套 Queue/Worker 框架。事项级编排继续使用 PipelineTask，文件级解析继续使用 MarkdownTask/ParseJob；OperationJob 仅保留当前核心调度确有需要的既有用途。不得迁移原始归档、重建全部历史状态、重新下载或重新解析已经成功的文件。
 
 ### 4.2 三层原则
 
@@ -132,8 +132,7 @@ Pending 不产生永久归档或 Markdown；Done Archive 不解析、不分类�
 - 不注册日常 Web API；
 - 不在 WebUI 导航或设置页出现；
 - 不再产生新任务或业务写入；
-- 旧代码和旧表保留一个兼容周期；
-- 历史读取仅通过显式只读 oa legacy CLI。
+- 旧代码和旧表原地保留一个兼容周期，但不新增兼容 API、兼容 CLI 或 oa legacy 平台。
 
 存量 queued/running 退役任务在 lease 过期后标记为非恢复失败，错误码为 RETIRED_STAGE，保留历史记录但不再执行。未来类似能力只能作为 Markdown 交付之后的可选消费者，不能成为核心流水线必经 stage。
 
@@ -298,7 +297,7 @@ archive_verify 从本地事实检查：
 
 有附件且全部通过时归档完成；OA 明确无附件时标记 no_attachment。需要遍历超过 10 层、缺失、哈希不符和不安全路径均不得显示完成。Markdown 状态不参与归档判断。
 
-归档成功后创建独立 Markdown Delivery 协调任务并完成 Done Archive 任务，不再将同一个 Done 任务推进到解析或分类。
+归档成功后，在现有 PipelineTask 表中创建 Markdown Delivery 事项任务并完成 Done Archive 任务，不再将同一个 Done 任务推进到解析或分类。该拆分只是现有任务表中的 queue/stage 边界，不新增协调表、协调服务或第三套任务框架。
 
 ~~~text
 markdown:{oa_item_key}:{archive-content-signature}:{markdown-schema-version}
@@ -476,37 +475,19 @@ Markdown 状态：待处理、处理中、已交付、部分交付、交付失�
 
 ## 12. Web API
 
-核心业务接口：
+本节定义业务语义，不要求为每项新建一条路由。实施前必须盘点当前 app.py 与 console_views.py：已有接口能够满足语义时直接复用并收敛响应；只有确无等价接口时才能增加最小路由。
 
-~~~text
-GET  /api/simple-status
+核心业务语义：
 
-GET  /api/pending-notifications
-GET  /api/pending-notifications/{id}
-POST /api/pending-notifications/{id}/retry-summary
-POST /api/pending-notifications/{id}/retry-delivery
-POST /api/pending-notifications/{id}/retry-cleanup
-POST /api/pending-notifications/{id}/sync
+- 总览：读取三条流水线的业务状态和聚合异常；优先复用现有 /api/simple-status。
+- 待办：分页查询、查看详情、重试摘要、重试明确失败的投递、重试清理、同步未清理事项；优先复用现有 pending notifications 接口。
+- 已办：分页查询、查看详情、重试归档、创建 Markdown 重建任务、打开受校验的本地目录；优先复用现有 /api/done-archives 及动作接口。
+- Markdown：按事项分页聚合、查看文档详情、重试失败项、重建索引、打开受校验的 Source Markdown 目录；优先复用现有 /api/markdown-outputs，并扩展其聚合口径。
+- 设置与调度：读取/更新允许的设置，读取 schedule 状态，控制已有自动运行服务；优先复用现有 /api/settings 和 schedule 接口。
 
-GET  /api/done-archives
-GET  /api/done-archives/{id}
-POST /api/done-archives/{id}/retry
-POST /api/done-archives/{id}/rebuild-markdown
-POST /api/done-archives/{id}/open-directory
+路由名称不是 V2 的新平台契约。不得为了使路径“更整齐”而同时保留两套等价接口、建立 API facade 或增加新的协调服务。若必须调整现有路径，前端与测试在同一提交中切换，旧路径直接退役，不做长期双写或转发层。
 
-GET  /api/markdown-outputs
-GET  /api/markdown-outputs/{oa_item_id}
-POST /api/markdown-outputs/{oa_item_id}/retry
-POST /api/markdown-outputs/{oa_item_id}/rebuild-index
-POST /api/markdown-outputs/{oa_item_id}/open-directory
-
-GET  /api/settings
-PUT  /api/settings
-GET  /api/schedule
-POST /api/schedule/control
-~~~
-
-GET 只读；POST/PUT 必须通过 loopback、认证和 CSRF 门禁。列表均服务端分页。长任务返回 202 和任务 ID；不满足前置条件时返回 409；错误始终返回 JSON。API 不返回 OA 正文、附件内容、模型输入输出、飞书正文、凭据、Cookie 或浏览器状态。列表返回相对路径；绝对根仅在设置页显示。
+GET 只读；POST/PUT 必须通过 loopback、认证和 CSRF 门禁。列表均服务端分页。长任务返回 202 和现有任务 ID；不满足前置条件时返回 409；错误始终返回 JSON。API 不返回 OA 正文、附件内容、模型输入输出、飞书正文、凭据、Cookie 或浏览器状态。列表返回相对路径；绝对根仅在设置页显示。
 
 以下路由不再注册，旧地址返回 JSON 404：
 
@@ -543,9 +524,9 @@ GET 只读；POST/PUT 必须通过 loopback、认证和 CSRF 门禁。列表均�
 
 ### Phase 1：断开非核心能力
 
-移除非核心 Worker stage、自动入队、systemd 路径、Web 路由和前端入口；默认 CLI 不展示退役写入命令；增加只读 legacy CLI；停止领取退役任务。
+移除非核心 Worker stage、自动入队、systemd 路径、Web 路由和前端入口；默认 CLI 不展示退役写入命令；停止领取退役任务。旧数据和旧代码原地保留，不新增 legacy 兼容入口。
 
-门禁：连续 24 小时无非核心新写入，核心任务仍正常领取。
+门禁：自动化测试证明非核心路径不会注册、入队或执行，核心任务仍能正常领取。24 小时运行观察不阻塞本阶段完成。
 
 ### Phase 2：修通 Pending Assistant
 
@@ -573,7 +554,7 @@ GET 只读；POST/PUT 必须通过 loopback、认证和 CSRF 门禁。列表均�
 
 ### Phase 6：文档、部署与兼容收尾
 
-更新 README、README.zh-CN、runbook、安全文档、示例配置、systemd 文档和 CLI 帮助。文档必须明确 Pending 短生命周期、Done 原件永久、ParseArtifact 唯一新发布链、Source Markdown 交付边界及退役能力只读兼容。
+更新 README、README.zh-CN、runbook、安全文档、示例配置、systemd 文档和 CLI 帮助。文档必须明确 Pending 短生命周期、Done 原件永久、ParseArtifact 唯一新发布链、Source Markdown 交付边界，以及退役能力停止自动运行、旧数据原地保留且不新增兼容平台。
 
 ## 15. 测试策略
 
@@ -602,17 +583,34 @@ npm run build
 
 前端构建后再次运行静态资源相关后端测试，确保源码与生产 bundle 一致。
 
-### 15.2 真实环境只读验证
+### 15.2 合并前本机只读冒烟
 
-真实数据只在本机使用，验证结果不得进入 Git。部署前备份数据库、配置和 unit，记录脱敏汇总，暂停 timer，部署数据库增量、代码和前端，先启动 Web/Worker，再恢复 timer。
+完成自动化测试后，在实施分支执行一次有界本机冒烟。真实数据只在本机使用，结果不得进入 Git。冒烟前备份数据库、配置和 unit，记录脱敏汇总，暂停 timer，部署数据库增量、代码和前端，启动 Web、OA Worker 和 Markdown Worker。
 
-Pending：首次 baseline 不发送历史通知；仅观察自然产生的新待办或变化；不创建 OA 测试事项、不发送测试飞书。若自然通知发生，只核对计数、时间、一次性投递和清理结果。
+合并前冒烟只验证：
 
-Done：确认历史成功事项不重复下载；观察自然新增 Done；随机抽查 100 个事项的文件存在性、大小、SHA256、路径边界和深度状态。报告不得包含标题、OA 标识、文件名或绝对路径。
+- 服务能够启动并读取现有数据库；
+- Pending baseline 不发送历史通知；
+- 已有成功 Done 不重复下载；
+- 已有成功 Markdown 不重新解析；
+- 一个合成或既有本地事项能够完成 ParseArtifact → Source Markdown → _index.md；
+- 三个业务页面和设置页可读取，退役 Web 路由返回 JSON 404；
+- 停止服务并恢复备份的步骤可执行。
 
-Markdown：确认历史成功不重解析；抽查 100 个事项索引、附件 Markdown、链接、Frontmatter 和 Obsidian 查询；确认 MinerU 不可用不阻塞其他流水线。
+不要求在实施分支等待自然 Pending/Done，也不执行 24 小时或 7 天观察；不创建 OA 测试事项、不发送测试飞书、不修改 OA。
 
-至少连续观察 7 天，并满足：
+### 15.3 main 上的发布稳定观察
+
+自动化测试和合并前本机冒烟通过后即合并回 main。24 小时和 7 天观察均在 main 上执行，是发布稳定门禁，不是 Phase 0–6 的开发完成门禁。
+
+部署 main 后：
+
+- Pending 仅观察自然产生的新待办或变化；若自然通知发生，只核对计数、时间、一次性投递和清理结果；
+- Done 观察自然新增事项，并累计随机抽查 100 个事项的文件存在性、大小、SHA256、路径边界和深度状态；
+- Markdown 累计抽查 100 个事项索引、附件 Markdown、链接、Frontmatter 和 Obsidian 查询；
+- 所有报告不得包含标题、OA 标识、文件名或绝对路径。
+
+main 连续运行 24 小时后完成第一道稳定门禁；连续运行 7 天后完成正式稳定门禁。观察期须满足：
 
 - 无重复飞书；
 - Pending 清理后无业务内容残留；
@@ -622,21 +620,21 @@ Markdown：确认历史成功不重解析；抽查 100 个事项索引、附件 
 - 非核心模块无新写入；
 - 无持续增长的未知积压。
 
-高风险问题出现时停止合并并恢复冻结版本；不得用删除业务数据的方式回滚。
+高风险问题出现时停止发布推进，在 main 上回退到合并前提交或部署冻结版本；不得用删除业务数据的方式回滚。
 
 ## 16. 合并到 main
 
-只有以下条件全部满足后才可合并：
+只有以下条件全部满足后即合并，不等待 24 小时或 7 天观察：
 
 - Phase 0–6 全部门禁通过；
 - 固定验证命令成功；
-- 7 天真实观察通过；
+- 合并前本机只读冒烟通过；
 - git diff main...agent/oaradar-business-workflows 已人工复核；
 - Git 候选集无机密或本地运行数据；
 - README、runbook 与行为一致；
 - 用户明确批准合并。
 
-若 main 仍为 4a0eb40，优先 fast-forward；若已经前进，先审查新增提交再普通 merge，不得盲目 rebase 或覆盖。合并后在 main 再次完整验证。远程 agent 分支只有在 main 稳定且用户再次明确授权后才能删除。
+若 main 仍为 4a0eb40，优先 fast-forward；若已经前进，先审查新增提交再普通 merge，不得盲目 rebase 或覆盖。合并后在 main 再次运行固定验证命令并开始 24 小时/7 天稳定观察。远程 agent 分支只有在 main 通过 7 天稳定门禁且用户再次明确授权后才能删除。
 
 ## 17. 非目标
 
@@ -675,5 +673,5 @@ Markdown：确认历史成功不重解析；抽查 100 个事项索引、附件 
 18. 已清理 Pending 的 API 不泄露已删除业务字段。
 19. 退役 Web 路由返回 JSON 404，退役 stage 不再执行。
 20. Python 测试、前端类型检查、生产构建和公开候选集检查全部通过。
-21. 真实环境只读观察连续 7 天通过。
+21. 自动化测试和本机冒烟通过后已合并 main，且 main 上 24 小时与 7 天发布稳定门禁通过。
 22. 实施、验证和合并过程不修改 OA、不发送测试飞书、不提交任何真实 OA 数据。
