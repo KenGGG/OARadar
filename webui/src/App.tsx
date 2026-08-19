@@ -7,7 +7,6 @@ import type { SimpleDoneItem, SimpleDonePage, SimpleDoneState, SimpleStatusRespo
 import { SimpleOverviewView } from "./views/SimpleOverviewView"
 import { SimpleDoneView } from "./views/SimpleDoneView"
 import { SimpleSettingsView } from "./views/SimpleSettingsView"
-import { AdvancedMaintenance } from "./views/AdvancedMaintenance"
 
 // 一级导航固定为：总览、已办资料、系统设置（spec §2）。
 type View = "overview" | "done" | "settings"
@@ -231,10 +230,9 @@ export function App() {
   const [doneQuery, setDoneQuery] = useState("")
   const [doneFilter, setDoneFilter] = useState<SimpleDoneState | "">("")
   const [settings, setSettings] = useState<SettingsData | null>(null)
-  const [advancedOpen, setAdvancedOpen] = useState(false)
 
   const navigate = useCallback((next: View) => {
-    setView(next); setDoneQuery(""); setDoneFilter(""); setDonePage(1); setAdvancedOpen(false)
+    setView(next); setDoneQuery(""); setDoneFilter(""); setDonePage(1)
     setMobileNav(false)
   }, [])
 
@@ -259,8 +257,6 @@ export function App() {
     const timer = window.setInterval(() => void load(true), 5000)
     return () => window.clearInterval(timer)
   }, [view, load])
-
-  const openAdvanced = useCallback(() => { setAdvancedOpen(true); setView("settings"); setMobileNav(false) }, [])
 
   const topLabel = (id: View) => NAV.find(item => item.id === id)?.label || ""
   const topHint = (id: View) =>
@@ -288,12 +284,8 @@ export function App() {
           page={donePage} setPage={setDonePage}
           query={doneQuery} setQuery={setDoneQuery}
           filter={doneFilter} setFilter={setDoneFilter}
-          onOpenAdvanced={openAdvanced}
         />}
-        {view === "settings" && settings && <>
-          <SimpleSettingsView initial={settings} onJumpAdvanced={() => setAdvancedOpen(true)}/>
-          <AdvancedMaintenance open={advancedOpen} onToggle={setAdvancedOpen}/>
-        </>}
+        {view === "settings" && settings && <SimpleSettingsView initial={settings}/>}
       </>}
     </main>
   </div>

@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { ChevronRight, CircleAlert, FileText, Search, X } from "lucide-react"
+import { ChevronRight, CircleAlert, Search, X } from "lucide-react"
 import type { SimpleDoneItem, SimpleDoneState, SimpleDonePage } from "../types/simple-status"
 import { time } from "../App"
 
@@ -41,10 +41,9 @@ function progressFacts(item: SimpleDoneItem): { original: string; markdown: stri
   return { original, markdown, publish }
 }
 
-function SimpleDoneDrawer({ item, close, onOpenAdvanced }: {
+function SimpleDoneDrawer({ item, close }: {
   item: SimpleDoneItem
   close: () => void
-  onOpenAdvanced: () => void
 }) {
   const facts = progressFacts(item)
   const isAttention = item.simple_status === "attention"
@@ -68,11 +67,6 @@ function SimpleDoneDrawer({ item, close, onOpenAdvanced }: {
         {isAttention && item.attention_reason && (
           <div className="settings-message" role="alert"><CircleAlert size={16}/>{item.attention_reason}</div>
         )}
-        {isAttention && (
-          <div className="drawer-actions">
-            <button onClick={onOpenAdvanced}><FileText size={16}/>打开高级维护</button>
-          </div>
-        )}
         <details className="advanced"><summary>查看技术详情</summary>
           <div className="detail-grid">
             <div className="info"><span>OA 事项 ID</span><strong>{item.item_id || "-"}</strong></div>
@@ -85,7 +79,7 @@ function SimpleDoneDrawer({ item, close, onOpenAdvanced }: {
   </div>
 }
 
-export function SimpleDoneView({ rows, total, metrics, page, setPage, query, setQuery, filter, setFilter, onOpenAdvanced }: {
+export function SimpleDoneView({ rows, total, metrics, page, setPage, query, setQuery, filter, setFilter }: {
   rows: SimpleDoneItem[]
   total: number
   metrics: SimpleDonePage["metrics"]
@@ -95,7 +89,6 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
   setQuery: (v: string) => void
   filter: SimpleDoneState | ""
   setFilter: (v: SimpleDoneState | "") => void
-  onOpenAdvanced: () => void
 }) {
   const pages = Math.max(1, Math.ceil(total / 50))
   const [selected, setSelected] = useState<SimpleDoneItem | null>(null)
@@ -106,7 +99,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       <div className="metric"><span>成功下载</span><strong>{metrics.downloaded_items.toLocaleString()}</strong></div>
       <div className="metric"><span>已验证附件</span><strong>{metrics.verified_attachments.toLocaleString()}</strong></div>
     </div>
-    <div className="section-toolbar"><div><h2>已办资料</h2><p>只回答“已办做好没有”：原件、Markdown、归类发布是否完成。复杂诊断请到系统设置的高级维护。</p></div></div>
+    <div className="section-toolbar"><div><h2>已办资料</h2><p>原件、Markdown 与归类发布的当前完成情况。</p></div></div>
     <div className="filter-row">
       <label className="search"><Search size={17}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索事项标题"/></label>
       <select value={filter} onChange={e => setFilter(e.target.value as SimpleDoneState | "")}>
@@ -138,6 +131,6 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       <span>第 {page}/{pages} 页 · 共 {total.toLocaleString()} 项</span>
       <button disabled={page >= pages} onClick={() => setPage(page + 1)}>下一页</button>
     </div>
-    {selected && <SimpleDoneDrawer item={selected} close={() => setSelected(null)} onOpenAdvanced={onOpenAdvanced}/>}
+    {selected && <SimpleDoneDrawer item={selected} close={() => setSelected(null)}/>}
   </section>
 }

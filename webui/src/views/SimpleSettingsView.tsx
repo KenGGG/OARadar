@@ -1,25 +1,20 @@
 import { useEffect, useState } from "react"
 import {
-  Archive, Bell, BookOpen, BrainCircuit, Save, Server, ShieldCheck,
+  Archive, Bell, BookOpen, BrainCircuit, Save,
 } from "lucide-react"
-import type { SettingsData, ScheduleData, ServiceStatus } from "../App"
+import type { SettingsData } from "../App"
 import {
-  api, postApi, csrf, time, Badge, Field, NumberField, Toggle, SecretState, ServiceCard, SERVICE_TITLES,
+  postApi, Field, NumberField, Toggle, SecretState,
 } from "../App"
 
-export function SimpleSettingsView({ initial, onJumpAdvanced }: {
+export function SimpleSettingsView({ initial }: {
   initial: SettingsData
-  onJumpAdvanced: () => void
 }) {
   const [form, setForm] = useState<SettingsData>(initial)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState("")
-  const [schedule, setSchedule] = useState<ScheduleData | null>(null)
 
   useEffect(() => { setForm(initial) }, [initial])
-  useEffect(() => {
-    void (async () => { try { setSchedule(await api<ScheduleData>("/api/schedule/status")) } catch { /* ignore */ } })()
-  }, [])
 
   const save = async () => {
     setSaving(true); setMessage("")
@@ -48,8 +43,6 @@ export function SimpleSettingsView({ initial, onJumpAdvanced }: {
 
   const toggle = (group: "summary_model" | "feishu" | "data_cleanup" | "markdown", key: string, value: boolean | string | number) =>
     setForm(f => ({ ...f, [group]: { ...(f[group] as Record<string, unknown>), [key]: value } }))
-
-  const services = schedule ? (Object.entries(schedule.services) as [keyof ScheduleData["services"], ServiceStatus][]) : []
 
   return <section className="settings-stack">
     <div className="settings-panel"><h2><Bell size={18}/>待办监控与飞书</h2>
@@ -116,32 +109,6 @@ export function SimpleSettingsView({ initial, onJumpAdvanced }: {
         <div className="info"><span>发布目录可写</span><strong>{initial.llm_wiki.source_dir_writable ? "是" : "否"}</strong></div>
         <div className="info"><span>写入元数据头</span><strong>{initial.llm_wiki.write_frontmatter ? "是" : "否"}</strong></div>
         <div className="info"><span>原子发布</span><strong>{initial.llm_wiki.atomic_publish ? "是" : "否"}</strong></div>
-      </div>
-    </div>
-
-    {/* 默认服务状态摘要（spec §6.3）：五个服务是否运行 + 扫描频率 */}
-    <div className="settings-panel"><h2><Server size={18}/>本地服务</h2>
-      <p className="settings-note">线上核验、Source Markdown 明细、人工复核、数据治理与维护操作均收进下方高级维护。</p>
-      {schedule
-        ? <>
-          <div className="service-grid-5">{services.map(([key, svc]) => <ServiceCard key={key} title={SERVICE_TITLES[key] || key} svc={svc}/>)}</div>
-          <div className="section-toolbar"><div><h3>扫描计划</h3><p>待办每小时 05 分检查；已办夜间全量扫描每日 23:30。</p></div></div>
-          <div className="detail-grid">
-            <div className="info"><span>每小时定时</span><strong>{schedule.hourly_enabled ? "已启用" : "未启用"}</strong></div>
-            <div className="info"><span>最近扫描</span><strong>{time(schedule.last_scan_at)}</strong></div>
-            <div className="info"><span>下次执行</span><strong>{time(schedule.next_run_at)}</strong></div>
-            <div className="info"><span>系统调度可用</span><strong>{schedule.schedule_available ? "是" : "否"}</strong></div>
-          </div>
-          {schedule.summary.nightly.last_at && <div className="detail-grid">
-            <div className="info"><span>最近夜间全量</span><strong>{time(schedule.summary.nightly.last_at)}</strong></div>
-            <div className="info"><span>线上事项</span><strong>{schedule.summary.nightly.source_total.toLocaleString()}</strong></div>
-            <div className="info"><span>新增</span><strong>{schedule.summary.nightly.new_items.toLocaleString()}</strong></div>
-            <div className="info"><span>内容变化</span><strong>{schedule.summary.nightly.changed_items.toLocaleString()}</strong></div>
-          </div>}
-        </>
-        : <div className="empty panel">服务状态加载中…</div>}
-      <div className="toolbar-actions">
-        <button onClick={onJumpAdvanced}><ShieldCheck size={16}/>展开高级维护</button>
       </div>
     </div>
 

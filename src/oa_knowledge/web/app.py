@@ -1,67 +1,22 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from oa_knowledge.config import Settings, load_settings
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.online_audit import audit_view, pause_audit, resume_audit, start_audit
-from oa_knowledge.production_pipeline import ProductionQueue
-from oa_knowledge.web.lifecycle_views import (
-    done_list as lifecycle_done_list,
-)
-from oa_knowledge.web.lifecycle_views import (
-    knowledge_detail as lifecycle_knowledge_detail,
-)
-from oa_knowledge.web.lifecycle_views import (
-    knowledge_list as lifecycle_knowledge_list,
-)
-from oa_knowledge.web.lifecycle_views import (
-    pending_detail as lifecycle_pending_detail,
-)
-from oa_knowledge.web.lifecycle_views import (
-    pending_list as lifecycle_pending_list,
-)
-from oa_knowledge.web.lifecycle_views import (
-    processing_center as lifecycle_processing_center,
-)
-from oa_knowledge.web.lifecycle_views import (
-    system_view as lifecycle_system_view,
-)
-from oa_knowledge.web.provider_settings import (
-    provider_settings_view,
-    update_provider_settings,
-)
-from oa_knowledge.web.schedule_views import (
-    notifications_retry,
-    notifications_status,
-    notifications_test,
-    schedule_control,
-    schedule_job_status,
-    schedule_status,
-    trigger_schedule_run,
-)
-from oa_knowledge.web.data_governance_views import (
-    data_governance_view,
-    enqueue_data_governance_action,
-    enqueue_data_governance_plan,
-    enqueue_integrity_audit,
-)
 from oa_knowledge.web.console_views import (
     build_dashboard,
     cleanup_eligible_pending,
     cleanup_pending,
     done_archives_list,
-    maintenance_action,
     markdown_outputs_list,
     pending_notification_detail,
     pending_notifications_list,
@@ -74,48 +29,11 @@ from oa_knowledge.web.console_views import (
     update_settings,
 )
 from oa_knowledge.web.simple_status import simple_status, _ALLOWED_SIMPLE_STATES
-from oa_knowledge.web.status import (
-    archive_date_status,
-    audit_all_manifest_items,
-    batch_items_preview,
-    cancel_archive_batch,
-    create_discovery_job,
-    create_policies_bulk,
-    create_policy,
-    dashboard_status,
-    delete_policy,
-    freeze_archive_batch,
-    full_manifest_report_path,
-    full_manifest_status,
-    item_detail,
-    job_progress,
-    latest_backfill_campaign,
-    list_batches,
-    list_discovery_jobs,
-    list_events,
-    list_items,
-    list_manifest_items,
-    list_policies,
-    list_reviews,
-    maintenance_status,
-    manifest_item_detail,
-    mark_manifest_manual_review,
-    open_archived_file,
-    pause_archive_batch,
-    preview_policy_hits,
-    recheck_manifest_no_attachment,
-    resolve_review,
-    retry_source_review,
-    resume_archive_batch,
-    retry_batch_items,
-    retry_manifest_failed_items,
-    set_archive_date_job_paused,
-    start_archive_date_job,
-    start_archive_job,
-    start_backfill_campaign,
-    start_done_incremental_job,
-    start_full_manifest_job,
-)
+from oa_knowledge.web.status import dashboard_status
+
+
+class AuthLoginRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=200)
 
 
 class BulkPolicyRequest(BaseModel):
@@ -140,10 +58,6 @@ class BackfillStartRequest(BaseModel):
     time_budget_seconds: int = Field(default=1800, ge=60, le=1800)
 
 
-class AuthLoginRequest(BaseModel):
-    token: str = Field(min_length=1, max_length=200)
-
-
 class DataGovernancePlanRequest(BaseModel):
     categories: list[str] = Field(min_length=1, max_length=6)
 
@@ -153,6 +67,12 @@ class DataGovernanceActionRequest(BaseModel):
 
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+RETIRED_API_PREFIXES = (
+    "/api/audits", "/api/lifecycle", "/api/knowledge", "/api/data-governance",
+    "/api/maintenance", "/api/system/provider-settings", "/api/items", "/api/manifest",
+    "/api/batches", "/api/backfill", "/api/schedule", "/api/notifications", "/api/jobs",
+    "/api/events", "/api/discovery-jobs", "/api/policies", "/api/reviews",
+)
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
@@ -194,6 +114,8 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
         origin = request.headers.get("origin")
         if origin and origin not in _allowed_origins(settings):
             return JSONResponse({"detail": "cross-origin request rejected"}, status_code=403)
+        if request.url.path.startswith(RETIRED_API_PREFIXES):
+            return JSONResponse({"detail": "API route retired from the V2 console"}, status_code=404)
         # Optional bootstrap-token gate: when enabled, every /api/* call (except the
         # two auth endpoints themselves) must carry the session established by
         # POST /api/auth/login. The frontend root and static assets stay open so the

@@ -49,6 +49,25 @@ def test_status_is_read_only_and_reports_current_schema(config_file: Path) -> No
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
 
 
+def test_v2_console_hides_retired_operations_but_keeps_business_routes(config_file: Path) -> None:
+    client, _ = _client(config_file)
+
+    for path in (
+        "/api/audits/online", "/api/lifecycle/processing-center", "/api/knowledge/rebuild",
+        "/api/data-governance", "/api/batches", "/api/backfill/status", "/api/policies",
+        "/api/reviews", "/api/maintenance", "/api/events",
+    ):
+        response = client.get(path)
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("application/json")
+
+    assert client.get("/api/simple-status").status_code == 200
+    assert client.get("/api/pending-notifications").status_code == 200
+    assert client.get("/api/done-archives").status_code == 200
+    assert client.get("/api/markdown-outputs").status_code == 200
+    assert client.get("/api/settings").status_code == 200
+
+
 def test_lifecycle_endpoints_are_database_backed_and_empty_on_new_database(config_file: Path) -> None:
     client, _ = _client(config_file)
 
