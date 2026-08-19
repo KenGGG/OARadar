@@ -656,6 +656,14 @@ class OperationWorker:
         self._finish(job_id, "completed" if result.returncode == 0 else "failed", None if result.returncode == 0 else f"incremental_exit_{result.returncode}")
 
     def _execute_pipeline_task(self, task: PipelineTask) -> None:
+        from oa_knowledge.production_pipeline import CORE_PIPELINE_STAGES
+
+        if task.stage not in CORE_PIPELINE_STAGES:
+            self.production_queue.fail(
+                task.id, self.owner, "RETIRED_STAGE", task.stage, recoverable=False,
+            )
+            return
+
         heartbeat_stop = threading.Event()
 
         def refresh_lease() -> None:

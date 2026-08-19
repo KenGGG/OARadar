@@ -11,7 +11,7 @@ from oa_knowledge.db.models import (
     ArchivedFile, ContentObject, CuratedRun, ItemOccurrence, LogicalItem, OAItem,
     OAManifestItem, OnlineAuditItem, OnlineAuditRun, ParseArtifact, ParseJob, PipelineTask,
 )
-from oa_knowledge.production_pipeline import ProductionQueue
+from oa_knowledge.production_pipeline import CORE_PIPELINE_STAGES, ProductionQueue
 from oa_knowledge.web.lifecycle_views import processing_center
 
 
@@ -35,6 +35,22 @@ def test_realtime_pending_and_done_are_claimed_before_historical(config_file: Pa
     assert [first.queue_name, second.queue_name, third.queue_name] == [
         "realtime_pending", "realtime_done", "historical_done_backfill",
     ]
+
+
+def test_retire_non_core_tasks_marks_existing_curation_task_nonrecoverable(config_file: Path) -> None:
+    queue, _ = _queue(config_file)
+    task_id = queue.enqueue("historical_done_backfill", "done:legacy", "curation", "retire-curation")
+
+    assert "curation" not in CORE_PIPELINE_STAGES
+    assert queue.retire_non_core_tasks() == 1
+    assert queue.claim("worker-a") is None
+
+    with Session(queue.engine) as session:
+        task = session.get(PipelineTask, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        assert task.error_code == "RETIRED_STAGE"
+        assert task.recoverable is False
 
 
 def test_historical_wave_finishes_parse_before_ollama(config_file: Path) -> None:
@@ -406,40 +422,6 @@ def test_start_historical_rebuild_keeps_review_gated_tasks_parked(config_file: P
         assert task.error_code == "ONLINE_AUDIT_REVIEW_REQUIRED"
 
 
-def test_start_historical_rebuild_repairs_legacy_false_completion_while_active(config_file: Path) -> None:
-    queue, _ = _queue(config_file)
-    active_id = queue.enqueue(
-        "historical_done_backfill", "done:active", "parse",
-        "history:done:active:knowledge-v2",
-    )
-    legacy_id = queue.enqueue(
-        "historical_done_backfill", "done:legacy", "ollama_extract",
-        "history:done:legacy:knowledge-v2",
-    )
-    queued_legacy_id = queue.enqueue(
-        "historical_done_backfill", "done:legacy-queued", "ollama_extract",
-        "history:done:legacy-queued:knowledge-v2",
-    )
-    claimed = queue.claim("worker-a")
-    assert claimed is not None and claimed.id == active_id
-    queue.advance(active_id, "worker-a", "parse")
-    with Session(queue.engine) as session:
-        legacy = session.get(PipelineTask, legacy_id)
-        legacy.status = "completed"
-        session.commit()
-
-    result = queue.start_historical_rebuild()
-
-    assert result["repaired_legacy"] == 2
-    with Session(queue.engine) as session:
-        legacy = session.get(PipelineTask, legacy_id)
-        queued_legacy = session.get(PipelineTask, queued_legacy_id)
-        assert legacy.status == "queued"
-        assert legacy.stage == "attachment_inventory"
-        assert queued_legacy.status == "queued"
-        assert queued_legacy.stage == "attachment_inventory"
-
-
 def test_bootstrap_resumes_fully_parsed_done_at_source_publish(config_file: Path) -> None:
     queue, _ = _queue(config_file)
     with Session(queue.engine) as session:
@@ -508,13 +490,13 @@ def test_finish_and_retry_are_durable_and_do_not_block_next_task(config_file: Pa
 
 def test_explicit_retry_resets_failed_production_task(config_file: Path) -> None:
     queue, _ = _queue(config_file)
-    task_id = queue.enqueue("historical_done_backfill", "done:retry", "curation", "retry-me")
+    task_id = queue.enqueue("historical_done_backfill", "done:retry", "parse", "retry-me")
     assert queue.claim("worker-a").id == task_id
     with Session(queue.engine) as session:
         task = session.get(PipelineTask, task_id)
         task.attempts = task.max_attempts
         session.commit()
-    queue.fail(task_id, "worker-a", "CURATION_FAILED", "sanitized", recoverable=True)
+    queue.fail(task_id, "worker-a", "PARSE_FAILED", "sanitized", recoverable=True)
 
     assert queue.retry_failed() == 1
     with Session(queue.engine) as session:

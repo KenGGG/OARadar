@@ -23,6 +23,14 @@ HISTORY_CONTROL_KEY = "__historical_control__"
 HISTORY_WAVE_SIZE = 50
 DEFAULT_TASK_LEASE_SECONDS = int(LEASE_TTL.total_seconds())
 
+# V2 only admits stages belonging to the three production chains.  Old rows
+# remain in the database for diagnosis, but must never be resumed or executed.
+CORE_PIPELINE_STAGES = frozenset({
+    "detail_sync", "pending_parse", "pending_summary", "notify_feishu",
+    "pending_cleanup", "oa_resync", "done_capture_and_archive", "archive_verify",
+    "attachment_inventory", "parse", "source_publish", "classify", "index_publish",
+})
+
 
 class ProductionQueue:
     def __init__(self, engine) -> None:
@@ -44,6 +52,33 @@ class ProductionQueue:
                 session.rollback()
                 return session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == idempotency_key))
             return task.id
+
+    def retire_non_core_tasks(self) -> int:
+        """Park queued legacy stages without deleting their diagnostic history."""
+        now = datetime.now(timezone.utc)
+        with Session(self.engine) as session:
+            rows = session.scalars(select(PipelineTask).where(
+                PipelineTask.status == "queued",
+                ~PipelineTask.stage.in_(CORE_PIPELINE_STAGES),
+            )).all()
+            for row in rows:
+                row.status = "failed"
+                row.recoverable = False
+                row.error_code = "RETIRED_STAGE"
+                row.last_error = "stage retired from OARadar V2 production pipelines"
+                row.next_retry_at = None
+                row.finished_at = now
+                row.lease_owner = None
+                row.lease_expires_at = None
+                session.add(PipelineEvent(
+                    task_id=row.id,
+                    event_type="retired",
+                    stage=row.stage,
+                    status="failed",
+                    details_json=json.dumps({"error_code": "RETIRED_STAGE"}),
+                ))
+            session.commit()
+            return len(rows)
 
     def enqueue_stale_curation(
         self, *, rules_version: str, prompt_version: str, schema_version: str,
@@ -381,6 +416,7 @@ class ProductionQueue:
         *,
         queue_names: tuple[str, ...] | None = None,
     ) -> PipelineTask | None:
+        self.retire_non_core_tasks()
         now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
             conditions = [PipelineTask.status == "queued", PipelineTask.idempotency_key != HISTORY_CONTROL_KEY,

@@ -925,32 +925,6 @@ def test_historical_sources_keep_attachments_and_only_canonical_snapshots() -> N
     assert [file.id for file in selected] == [5, 6, 7, 8, 9]
 
 
-def test_history_without_attachment_evidence_completes_without_llm_failure(config_file: Path, monkeypatch) -> None:
-    from oa_knowledge.done_knowledge import NoAttachmentEvidence
-
-    settings = load_settings(config_file)
-    upgrade_database(settings.database_path)
-    engine = create_db_engine(settings.database_path)
-    queue = ProductionQueue(engine)
-    task_id = queue.enqueue("historical_done_backfill", "done:no-attachments", "ollama_extract", "no-attachments")
-    task = queue.claim("worker-test")
-    worker = OperationWorker(settings, config_path=config_file)
-    worker.owner = "worker-test"
-    monkeypatch.setattr(
-        "oa_knowledge.done_knowledge.generate_done_knowledge",
-        lambda *args, **kwargs: (_ for _ in ()).throw(NoAttachmentEvidence()),
-    )
-    try:
-        worker._pipeline_done_knowledge(task)
-    finally:
-        worker.close()
-
-    with Session(engine) as session:
-        row = session.get(PipelineTask, task_id)
-        assert row.status == "completed"
-        assert row.error_code is None
-
-
 def test_done_parse_advances_to_source_publish_before_curation(config_file: Path) -> None:
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
@@ -1235,29 +1209,6 @@ def test_source_publish_detects_review_blocker_before_writing_any_derivative(
     with Session(engine) as session:
         assert calls == []
         assert session.get(PipelineTask, task_id).status == "failed"
-
-
-def test_curation_stage_completes_after_local_model_success(config_file: Path, monkeypatch) -> None:
-    from types import SimpleNamespace
-
-    settings = load_settings(config_file)
-    upgrade_database(settings.database_path)
-    engine = create_db_engine(settings.database_path)
-    queue = ProductionQueue(engine)
-    task_id = queue.enqueue("historical_done_backfill", "done:curate", "curation", "curation-task")
-    task = queue.claim("worker-test")
-    monkeypatch.setattr(
-        "oa_knowledge.curation.service.run_curation",
-        lambda *_args, **_kwargs: SimpleNamespace(failed=0, completed=1, needs_review=0),
-    )
-    worker = OperationWorker(settings, config_path=config_file); worker.owner = "worker-test"
-    try:
-        worker._pipeline_curation(task)
-    finally:
-        worker.close()
-    with Session(engine) as session:
-        row = session.get(PipelineTask, task_id)
-        assert row.status == "completed"
 
 
 def test_pending_summary_with_notification_requested_advances_to_notify_stage(config_file: Path, monkeypatch) -> None:
