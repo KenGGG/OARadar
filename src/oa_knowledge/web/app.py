@@ -29,6 +29,7 @@ from oa_knowledge.web.console_views import (
     update_settings,
 )
 from oa_knowledge.web.simple_status import simple_status, _ALLOWED_SIMPLE_STATES
+from oa_knowledge.web.schedule_views import schedule_status
 from oa_knowledge.web.status import dashboard_status
 
 
@@ -70,7 +71,7 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 RETIRED_API_PREFIXES = (
     "/api/audits", "/api/lifecycle", "/api/knowledge", "/api/data-governance",
     "/api/maintenance", "/api/system/provider-settings", "/api/items", "/api/manifest",
-    "/api/batches", "/api/backfill", "/api/schedule", "/api/notifications", "/api/jobs",
+    "/api/batches", "/api/backfill", "/api/notifications", "/api/jobs",
     "/api/events", "/api/discovery-jobs", "/api/policies", "/api/reviews",
 )
 SECURITY_HEADERS = {
@@ -115,7 +116,7 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
         if origin and origin not in _allowed_origins(settings):
             return JSONResponse({"detail": "cross-origin request rejected"}, status_code=403)
         if request.url.path.startswith(RETIRED_API_PREFIXES):
-            return JSONResponse({"detail": "API route retired from the V2 console"}, status_code=404)
+            return JSONResponse({"detail": "API route not found"}, status_code=404)
         # Optional bootstrap-token gate: when enabled, every /api/* call (except the
         # two auth endpoints themselves) must carry the session established by
         # POST /api/auth/login. The frontend root and static assets stay open so the
