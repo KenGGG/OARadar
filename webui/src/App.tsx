@@ -253,7 +253,13 @@ export function App() {
         if (doneFilter) params.set("simple_status", doneFilter)
         const result = await api<SimpleDonePage>(`/api/done-archives?${params.toString()}`)
         setDone(result.items); setDoneTotal(result.total); setDoneMetrics(result.metrics)
-      } else if (view === "markdown") setMarkdown((await api<{ items: MarkdownItem[] }>("/api/markdown-outputs?page=1&page_size=100")).items)
+      } else if (view === "markdown") {
+        const result = await api<{ items?: MarkdownItem[] }>("/api/markdown-outputs?page=1&page_size=100")
+        if (!Array.isArray(result.items)) {
+          throw new Error("Markdown 页面需要 V2 Web API；请重启 oaradar-web 服务后重试")
+        }
+        setMarkdown(result.items)
+      }
       else if (view === "settings") setSettings(await api<SettingsData>("/api/settings"))
     } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败") }
     finally { if (!silent) setLoading(false) }
