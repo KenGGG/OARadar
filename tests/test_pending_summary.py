@@ -1,9 +1,14 @@
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
+from oa_knowledge.config import load_settings
+from oa_knowledge.db.engine import create_db_engine
+from oa_knowledge.db.migrate import upgrade_database
+from oa_knowledge.db.models import ItemSnapshot, LogicalItem
 from oa_knowledge.pending_summary import (
     PendingSummary, PendingSummaryError, normalize_pending_content, normalize_pending_response,
-    deterministic_pending_fallback, pending_evidence, summarize_evidence,
+    deterministic_pending_fallback, pending_evidence, summarize_evidence, summarize_pending,
 )
 from oa_knowledge.enrich.context_budget import estimate_tokens
 
@@ -88,3 +93,29 @@ def test_deterministic_fallback_is_marked_and_does_not_invent_facts() -> None:
     assert result.current_stage == "部门阅知"
     assert result.amounts == [] and result.deadlines == [] and result.risks == []
     assert result.confidence == 0
+
+
+def test_llm_disabled_uses_rule_summary_without_client(config_file, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    settings.llm.enabled = False
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="pending:test", title="合成待办")
+        session.add(logical); session.flush()
+        session.add(ItemSnapshot(
+            logical_item_id=logical.id, snapshot_kind="pending_initial", version=1,
+            content_hash="a" * 64,
+            payload_json='{"title":"合成待办","sender":"综合部","current_node":"部门办理"}',
+        ))
+        session.commit()
+        logical_id = logical.id
+
+    monkeypatch.setattr(
+        "oa_knowledge.pending_summary.make_llm_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("model called")),
+    )
+    version = summarize_pending(settings, engine, logical_id)
+
+    assert version.provider_name == "deterministic-fallback"
+    assert version.model_name == "deterministic-fallback"

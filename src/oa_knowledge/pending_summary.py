@@ -231,33 +231,37 @@ def summarize_pending(settings: Settings, engine, logical_item_id: int) -> Summa
         attempt = job.attempts
         max_attempts = job.max_attempts
 
-    coordinator = ResourceCoordinator(engine)
-    owner = f"worker-{os.getpid()}:pending-summary:{job_id}"
-    lease = coordinator.acquire("local_llm", owner, ttl_seconds=settings.llm.timeout_seconds + 60,
-                                uses_local_gpu=settings.llm.uses_local_gpu)
-    if lease is None:
-        raise RuntimeError("GPU resource is busy")
-    try:
-        client = make_llm_client(settings.llm, max_retries=settings.llm.max_retries)
-        profile = discover_ollama_profile(
-            settings.llm.base_url, settings.llm.model,
-            fallback_context_window=settings.llm.context_window_fallback,
-            context_window_cap=settings.llm.context_window_cap,
-        )
-        budget = ContextBudget(
-            context_window=profile.context_window, max_output_tokens=settings.llm.max_tokens,
-            system_tokens=2000, safety_margin=settings.llm.context_safety_margin,
-        )
+    if not settings.llm.enabled:
+        summary = deterministic_pending_fallback(payload)
+        result = {"model": "deterministic-fallback", "provider": "deterministic-fallback", "elapsed_seconds": None, "fallback": True}
+    else:
+        coordinator = ResourceCoordinator(engine)
+        owner = f"worker-{os.getpid()}:pending-summary:{job_id}"
+        lease = coordinator.acquire("local_llm", owner, ttl_seconds=settings.llm.timeout_seconds + 60,
+                                    uses_local_gpu=settings.llm.uses_local_gpu)
+        if lease is None:
+            raise RuntimeError("GPU resource is busy")
         try:
-            summary = summarize_evidence(client, payload, max_input_tokens=budget.max_input_tokens)
-            result = {"model": settings.llm.model, "provider": settings.llm.provider_name, "elapsed_seconds": None, "fallback": False}
-        except PendingSummaryError:
-            if attempt < max_attempts:
-                raise
-            summary = deterministic_pending_fallback(payload)
-            result = {"model": "deterministic-fallback", "provider": "local-fallback", "elapsed_seconds": None, "fallback": True}
-    finally:
-        coordinator.release(lease, owner)
+            client = make_llm_client(settings.llm, max_retries=settings.llm.max_retries)
+            profile = discover_ollama_profile(
+                settings.llm.base_url, settings.llm.model,
+                fallback_context_window=settings.llm.context_window_fallback,
+                context_window_cap=settings.llm.context_window_cap,
+            )
+            budget = ContextBudget(
+                context_window=profile.context_window, max_output_tokens=settings.llm.max_tokens,
+                system_tokens=2000, safety_margin=settings.llm.context_safety_margin,
+            )
+            try:
+                summary = summarize_evidence(client, payload, max_input_tokens=budget.max_input_tokens)
+                result = {"model": settings.llm.model, "provider": settings.llm.provider_name, "elapsed_seconds": None, "fallback": False}
+            except PendingSummaryError:
+                if attempt < max_attempts:
+                    raise
+                summary = deterministic_pending_fallback(payload)
+                result = {"model": "deterministic-fallback", "provider": "deterministic-fallback", "elapsed_seconds": None, "fallback": True}
+        finally:
+            coordinator.release(lease, owner)
 
     with Session(engine) as session:
         job = session.get(SummaryJob, job_id); assert job is not None

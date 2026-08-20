@@ -459,7 +459,7 @@ def run_bootstrap_scan(engine, settings, *, headed: bool = False) -> dict:
                 run_id = run.id
             adapter = PendingAdapter(browser.page, f"{browser.base_url}{PENDING_LIST_PATH}")
             with Session(engine) as session:
-                _, pending_summary = run_pending_scan(session, adapter, notification_mode="baseline")
+                _, pending_summary = run_pending_scan(session, adapter, notification_mode="disabled")
                 session.commit()
             done_adapter = DoneAdapter(browser.page, f"{browser.base_url}{settings.browser.done_list_path}")
             discovery = done_adapter.discover_all_pages()
