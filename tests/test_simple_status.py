@@ -18,8 +18,8 @@ from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import (
-    ArchivedFile, CuratedDecision, CuratedRun, ItemOccurrence, ItemSnapshot,
-    LogicalItem, MarkdownExport, OAItem, OAManifestItem, OnlineAuditItem, OnlineAuditRun, SummaryVersion,
+    ArchivedFile, ItemOccurrence, ItemSnapshot, LogicalItem, MarkdownExport,
+    OAItem, OAManifestItem, SummaryVersion,
 )
 from oa_knowledge.web import create_web_app
 
@@ -38,16 +38,12 @@ def _seed(config_file: Path):
 
 
 def _add_completed_item(session: Session, key: str, *, depth_limited: bool = False) -> None:
-    """已下载 + 有效 Markdown + 全部发布的 CuratedRun（spec §4.1 已完成）。"""
+    """已归档 + Source Markdown + V2 事项索引（spec §9.4 已完成）。"""
     oa_item = OAItem(oa_item_key=key, source_channel="done", title=f"{key} 标题", pipeline_status="downloaded")
     session.add(oa_item)
     session.flush()
-    logical = LogicalItem(logical_key=key, title=f"{key} 标题", lifecycle_status="done_confirmed")
-    session.add(logical)
-    session.flush()
-    oa_item.logical_item_id = logical.id
     manifest = OAManifestItem(
-        oa_item_key=key, title=f"{key} 标题", processing_status="downloaded", list_page=1,
+        oa_item_key=key, title=f"{key} 标题", processing_status=("depth_limit_reached" if depth_limited else "downloaded"), list_page=1,
         completed_at=datetime.now(timezone.utc), last_synced_at=datetime.now(timezone.utc),
     )
     session.add(manifest)
@@ -64,26 +60,12 @@ def _add_completed_item(session: Session, key: str, *, depth_limited: bool = Fal
         parse_config_hash="cfg", schema_version=1, status="success",
         generated_at=datetime.now(timezone.utc),
     ))
-    curated = CuratedRun(
-        logical_item_id=logical.id, input_signature="sig", status="completed",
-        rules_version="v1", prompt_version="v1", schema_version="v1",
-        model_name="qwen3.5:9b", config_signature="cs",
-    )
-    session.add(curated)
-    session.flush()
-    session.add(CuratedDecision(
-        curated_run_id=curated.id, ordinal=0, status="published",
-        document_kind="report", normalized_title=f"{key} 标题",
-        decision_hash="h1", confidence=0.9,
+    session.add(MarkdownExport(
+        oa_item_id=oa_item.id, document_kind="item_index", source_sha256="1" * 64,
+        source_relpath=f"archive/raw/oa/done/{key}", markdown_relpath=f"{key}/_index.md",
+        parse_engine="item_index", parse_engine_version="v1", parse_config_hash="v1",
+        schema_version=1, status="success", generated_at=datetime.now(timezone.utc),
     ))
-    if depth_limited:
-        audit_run = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
-        session.add(audit_run)
-        session.flush()
-        session.add(OnlineAuditItem(
-            run_id=audit_run.id, oa_item_key=key, title=f"{key} 标题", status="pending",
-            depth_limit_reached=True,
-        ))
     session.commit()
 
 
@@ -184,19 +166,34 @@ def test_simple_status_does_not_count_markdown_as_final_publication(config_file:
     assert done["status"] != "completed"
 
 
-def test_simple_status_counts_only_all_published_curated_runs_as_complete(config_file: Path) -> None:
+def test_simple_status_completes_done_item_from_item_index_without_curation(config_file: Path) -> None:
+    client = _client(config_file)
+    engine = _seed(config_file)
+    with Session(engine) as session:
+        _add_markdown_only_item(session, "oa:index-complete")
+        item = session.scalar(select(OAItem).where(OAItem.oa_item_key == "oa:index-complete"))
+        session.add(MarkdownExport(
+            oa_item_id=item.id, document_kind="item_index", source_sha256="2" * 64,
+            source_relpath="archive/raw/oa/done/synthetic", markdown_relpath="source/done/synthetic/_index.md",
+            parse_engine="item_index", parse_engine_version="v1", parse_config_hash="v1",
+            schema_version=1, status="success", generated_at=datetime.now(timezone.utc),
+        ))
+        session.commit()
+
+    done = client.get("/api/simple-status").json()["done"]
+    assert done["published_items"] == 1
+    assert done["status"] == "completed"
+
+
+def test_simple_status_keeps_items_without_an_index_in_markdown_queue(config_file: Path) -> None:
     client = _client(config_file)
     engine = _seed(config_file)
     with Session(engine) as session:
         _add_completed_item(session, "oa:complete")
-        # 一个归类未完成（部分决策未发布）的事项不应计入已完成。
+        # Source Markdown 存在但事项索引未发布，不能计入 V2 交付完成。
         oa_item = OAItem(oa_item_key="oa:partial", source_channel="done", title="partial", pipeline_status="downloaded")
         session.add(oa_item)
         session.flush()
-        logical = LogicalItem(logical_key="oa:partial", title="partial", lifecycle_status="done_confirmed")
-        session.add(logical)
-        session.flush()
-        oa_item.logical_item_id = logical.id
         session.add(OAManifestItem(
             oa_item_key="oa:partial", title="partial", processing_status="downloaded", list_page=1,
             completed_at=datetime.now(timezone.utc), last_synced_at=datetime.now(timezone.utc),
@@ -211,28 +208,12 @@ def test_simple_status_counts_only_all_published_curated_runs_as_complete(config
             parse_config_hash="cfg", schema_version=1, status="success",
             generated_at=datetime.now(timezone.utc),
         ))
-        curated = CuratedRun(
-            logical_item_id=logical.id, input_signature="s2", status="completed",
-            rules_version="v1", prompt_version="v1", schema_version="v1",
-            model_name="qwen3.5:9b", config_signature="cs",
-        )
-        session.add(curated)
-        session.flush()
-        session.add(CuratedDecision(
-            curated_run_id=curated.id, ordinal=0, status="published",
-            document_kind="report", normalized_title="partial", decision_hash="h2", confidence=0.9,
-        ))
-        session.add(CuratedDecision(
-            curated_run_id=curated.id, ordinal=1, status="pending",
-            document_kind="report", normalized_title="partial-2", decision_hash="h3", confidence=0.9,
-        ))
         session.commit()
 
     done = client.get("/api/simple-status").json()["done"]
     assert done["published_items"] == 1
     assert done["oa_total"] == 2
-    # 部分决策未发布的事项不应计入已完成；已完成事项必须正确计入。
-    assert done["failed_items"] + done["review_items"] >= 1
+    assert done["queued_items"] >= 1
 
 
 def test_simple_status_distinguishes_qwen_success_fallback_and_failure(config_file: Path) -> None:

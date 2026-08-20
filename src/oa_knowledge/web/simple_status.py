@@ -14,14 +14,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings, validate_feishu_runtime_config
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
-    ArchivedFile, CuratedDecision, CuratedRun, ItemOccurrence, LogicalItem,
-    MarkdownExport, OAItem, OAManifestItem, OnlineAuditItem, SummaryJob, SummaryVersion,
+    ArchivedFile, ItemOccurrence, MarkdownExport, OAItem, OAManifestItem,
+    SummaryJob, SummaryVersion,
 )
 from oa_knowledge.web.schedule_views import schedule_status
 from oa_knowledge.web.status import dashboard_status
@@ -30,7 +30,6 @@ from oa_knowledge.web.status import dashboard_status
 _SIMPLE_DONE_LABELS: dict[str, str] = {
     "waiting_download": "等待下载",
     "waiting_markdown": "等待 MD 化",
-    "waiting_classification": "等待归类",
     "completed": "已完成",
     "attention": "需要处理",
     "excluded": "已按规则排除",
@@ -59,9 +58,8 @@ _DONE_SCAN_FREQUENCY_TEXT = "每小时 05 分检查"
 def _classify_done_item(
     *,
     processing_status: str,
-    has_success_markdown: bool,
-    curation: dict[str, Any] | None,
-    depth_limited: bool,
+    has_success_item_index: bool,
+    markdown_failed: bool,
 ) -> tuple[str, str | None]:
     """按 spec §4.1 优先级计算单个已办事项的主状态。
 
@@ -70,7 +68,7 @@ def _classify_done_item(
     """
     if processing_status == "skipped":
         return "excluded", None
-    if depth_limited:
+    if processing_status == "depth_limit_reached":
         # depth_limit_reached 永远属于“需要处理”，不得显示为已完成（spec §4.1）。
         return "attention", "容器层级超过上限，需人工确认"
     verified = processing_status in {"downloaded", "no_attachment"}
@@ -79,54 +77,11 @@ def _classify_done_item(
             return "attention", "原件下载失败"
         return "waiting_download", None
     # 原件已验证。
-    if not has_success_markdown:
+    if markdown_failed:
+        return "attention", "Markdown 交付失败"
+    if not has_success_item_index:
         return "waiting_markdown", None
-    # 已有有效 Source Markdown。
-    if curation is None:
-        return "waiting_classification", None
-    if curation["status"] == "completed":
-        if curation["decision_count"] > 0 and curation["all_published"]:
-            return "completed", None
-        return "attention", "部分决策尚未发布"
-    if curation["status"] == "needs_review":
-        return "attention", "归类待人工复核"
-    if curation["status"] == "failed":
-        return "attention", "归类失败"
-    # queued / running 及其他：仍在归类队列中。
-    return "waiting_classification", None
-
-
-def _resolve_curation(session: Session, logical_item_id: int | None) -> dict[str, Any] | None:
-    """取某个 logical item 最新一次 CuratedRun 的归类结论（spec §4.1）。"""
-    if logical_item_id is None:
-        return None
-    curated = session.scalar(
-        select(CuratedRun)
-        .where(CuratedRun.logical_item_id == logical_item_id)
-        .order_by(CuratedRun.id.desc())
-        .limit(1)
-    )
-    if curated is None:
-        return None
-    decisions = list(session.scalars(
-        select(CuratedDecision).where(CuratedDecision.curated_run_id == curated.id)
-    ))
-    n = len(decisions)
-    published = sum(1 for d in decisions if d.status == "published")
-    return {
-        "status": curated.status,
-        "decision_count": n,
-        "all_published": n > 0 and n == published,
-    }
-
-
-def _is_depth_limited(session: Session, oa_item_key: str) -> bool:
-    count = session.scalar(
-        select(func.count())
-        .select_from(OnlineAuditItem)
-        .where(OnlineAuditItem.oa_item_key == oa_item_key, OnlineAuditItem.depth_limit_reached == True)  # noqa: E712
-    )
-    return bool(count)
+    return "completed", None
 
 
 def _done_simple_status_map(session: Session) -> dict[int, tuple[str, str, str | None]]:
@@ -142,71 +97,23 @@ def _done_simple_status_map(session: Session) -> dict[int, tuple[str, str, str |
         )
     ).all()
 
-    markdown_ready_ids = set(session.scalars(
-        select(func.distinct(OAManifestItem.id))
-        .select_from(OAManifestItem)
-        .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key)
-        .join(ArchivedFile, ArchivedFile.oa_item_id == OAItem.id)
-        .join(MarkdownExport, MarkdownExport.source_file_id == ArchivedFile.id)
-        .where(MarkdownExport.status == "success")
+    indexed_keys = set(session.scalars(
+        select(OAItem.oa_item_key)
+        .join(MarkdownExport, MarkdownExport.oa_item_id == OAItem.id)
+        .where(MarkdownExport.document_kind == "item_index", MarkdownExport.status == "success")
     ).all())
-
-    logical_rows = session.execute(
-        select(OAItem.oa_item_key, OAItem.logical_item_id)
-        .where(OAItem.logical_item_id.is_not(None))
-    ).all()
-    logical_by_key = {key: lid for key, lid in logical_rows}
-
-    latest = (
-        select(CuratedRun.logical_item_id.label("logical_item_id"), func.max(CuratedRun.id).label("max_id"))
-        .group_by(CuratedRun.logical_item_id)
-    ).subquery("latest")
-    curated = (
-        select(
-            CuratedRun.logical_item_id.label("logical_item_id"),
-            CuratedRun.status.label("status"),
-            CuratedRun.id.label("run_id"),
-        )
-        .join(latest, (CuratedRun.logical_item_id == latest.c.logical_item_id) & (CuratedRun.id == latest.c.max_id))
-    ).subquery("curated")
-    dec = (
-        select(
-            CuratedDecision.curated_run_id.label("curated_run_id"),
-            func.count().label("n"),
-            func.sum(case((CuratedDecision.status == "published", 1), else_=0)).label("p"),
-        )
-        .group_by(CuratedDecision.curated_run_id)
-    ).subquery("dec")
-    curation_rows = session.execute(
-        select(curated.c.logical_item_id, curated.c.status, dec.c.n, dec.c.p)
-        .outerjoin(dec, dec.c.curated_run_id == curated.c.run_id)
-    ).all()
-    curation_by_logical = {
-        lid: {
-            "status": st,
-            "decision_count": int(n or 0),
-            "all_published": int(n or 0) > 0 and int(n or 0) == int(p or 0),
-        }
-        for lid, st, n, p in curation_rows
-    }
-
-    depth_rows = session.scalars(
-        select(func.distinct(OnlineAuditItem.oa_item_key))
-        .where(OnlineAuditItem.depth_limit_reached == True)  # noqa: E712
-    ).all()
-    depth_limited_keys = set(depth_rows)
+    failed_keys = set(session.scalars(
+        select(OAItem.oa_item_key)
+        .join(MarkdownExport, MarkdownExport.oa_item_id == OAItem.id)
+        .where(MarkdownExport.document_kind == "item_index", MarkdownExport.status == "failed")
+    ).all())
 
     result: dict[int, tuple[str, str, str | None]] = {}
     for mid, processing_status, key in manifests:
-        has_md = mid in markdown_ready_ids
-        lid = logical_by_key.get(key)
-        curation = curation_by_logical.get(lid) if lid is not None else None
-        depth = key in depth_limited_keys
         state, reason = _classify_done_item(
             processing_status=processing_status,
-            has_success_markdown=has_md,
-            curation=curation,
-            depth_limited=depth,
+            has_success_item_index=key in indexed_keys,
+            markdown_failed=key in failed_keys,
         )
         result[mid] = (state, _SIMPLE_DONE_LABELS[state], reason)
     return result
@@ -231,19 +138,13 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
         state, _label, reason = status_map[mid]
         state_counts[state] += 1
         if state == "attention":
-            if reason == "归类待人工复核":
-                review_items += 1
-            else:
-                failed_items += 1
+            failed_items += 1
 
     oa_total = len(manifests)
     published_items = state_counts["completed"]
     markdown_ready_items = _markdown_ready_count(session)
-    queued_items = state_counts["waiting_markdown"] + state_counts["waiting_classification"]
-    running_items = sum(
-        1 for mid in status_map
-        if status_map[mid][0] == "waiting_classification"
-    )
+    queued_items = state_counts["waiting_markdown"]
+    running_items = 0
 
     attention_count = failed_items + review_items
 
@@ -256,7 +157,7 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
     else:
         headline = (
             f"已办知识库尚未完成：已同步 {oa_total} 项，{archive_complete} 项原件完整，"
-            f"{published_items} 项完成最终归类，{queued_items} 项仍在排队。"
+            f"{published_items} 项已完成 Markdown 交付，{queued_items} 项仍在排队。"
         )
         if attention_count > 0:
             headline += f"其中 {attention_count} 项需要处理。"
@@ -281,9 +182,8 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
 
 def _markdown_ready_count(session: Session) -> int:
     return session.scalar(
-        select(func.count(func.distinct(OAManifestItem.id)))
-        .select_from(OAManifestItem)
-        .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key)
+        select(func.count(func.distinct(OAItem.id)))
+        .select_from(OAItem)
         .join(ArchivedFile, ArchivedFile.oa_item_id == OAItem.id)
         .join(MarkdownExport, MarkdownExport.source_file_id == ArchivedFile.id)
         .where(MarkdownExport.status == "success")

@@ -256,7 +256,7 @@ def test_done_archives_exposes_six_durable_pipeline_stages(config_file: Path) ->
         "download": "done",
         "verification": "done",
         "markdown": "running",
-        "curation": "pending",
+        "classification": "pending",
         "publication": "pending",
     }
 
@@ -325,3 +325,30 @@ def test_markdown_outputs_resolves_source_item(config_file: Path) -> None:
     assert resp.status_code == 200
     docs = resp.json()["documents"]
     assert any(d["source_oa_item"] == "来源事项X" and d["source_file"] == "报告.pdf" for d in docs)
+
+
+def test_markdown_outputs_exposes_v2_item_aggregation(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="oa:item-output", source_channel="done", title="事项级输出",
+            archive_relpath="archive/raw/oa/done/synthetic/item-output", source_type="internal",
+            internal_category="经营管理", classification_version="v1",
+        )
+        session.add(item); session.flush()
+        session.add(MarkdownExport(
+            oa_item_id=item.id, document_kind="item_index", source_sha256="a" * 64,
+            source_relpath=item.archive_relpath, markdown_relpath="source/done/synthetic/item-output/_index.md",
+            parse_engine="item_index", parse_engine_version="v1", parse_config_hash="v1",
+            schema_version=1, status="success", generated_at=datetime.now(timezone.utc),
+        ))
+        session.commit()
+
+    payload = _client(config_file).get("/api/markdown-outputs").json()
+    row = next(row for row in payload["items"] if row["title"] == "事项级输出")
+    assert row["source_type"] == "internal"
+    assert row["internal_category"] == "经营管理"
+    assert row["delivery_status"] == "已交付"
+    assert row["index_relpath"].endswith("/_index.md")

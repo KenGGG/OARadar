@@ -16,10 +16,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import (
-    ArchivedFile, CuratedDecision, CuratedRun, LogicalItem, MarkdownExport, OAItem,
-    OAManifestItem, OnlineAuditItem, OnlineAuditRun,
-)
+from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem
 from oa_knowledge.web import create_web_app
 from oa_knowledge.web.console_views import _simple_done_state, _markdown_status_for_item
 
@@ -33,21 +30,11 @@ def _client(config_file: Path) -> TestClient:
 
 def _seed_fact(session: Session, key: str, facts: dict) -> OAManifestItem:
     processing_status = facts["manifest"]
-    depth_limited = processing_status == "depth_limit_reached"
-    if depth_limited:
-        processing_status = "downloaded"
-
     oa_item: OAItem | None = None
-    logical: LogicalItem | None = None
-    if facts.get("markdown") == "success" or facts.get("curation") is not None:
+    if facts.get("markdown") == "success" or facts.get("index") is not None:
         oa_item = OAItem(oa_item_key=key, source_channel="done", title=f"{key} 标题", pipeline_status=processing_status)
         session.add(oa_item)
         session.flush()
-        if facts.get("curation") is not None:
-            logical = LogicalItem(logical_key=key, title=f"{key} 标题", lifecycle_status="done_confirmed")
-            session.add(logical)
-            session.flush()
-            oa_item.logical_item_id = logical.id
 
     manifest = OAManifestItem(
         oa_item_key=key, title=f"{key} 标题", processing_status=processing_status,
@@ -71,28 +58,12 @@ def _seed_fact(session: Session, key: str, facts: dict) -> OAManifestItem:
             generated_at=datetime.now(timezone.utc),
         ))
 
-    if facts.get("curation") is not None and logical is not None:
-        curated = CuratedRun(
-            logical_item_id=logical.id, input_signature="sig", status=facts["curation"],
-            rules_version="v1", prompt_version="v1", schema_version="v1",
-            model_name="qwen3.5:9b", config_signature="cs",
-        )
-        session.add(curated)
-        session.flush()
-        for ordinal, decision_status in enumerate(facts.get("decisions", [])):
-            session.add(CuratedDecision(
-                curated_run_id=curated.id, ordinal=ordinal, status=decision_status,
-                document_kind="report", normalized_title=f"{key} 标题",
-                decision_hash=f"h{ordinal}", confidence=0.9,
-            ))
-
-    if depth_limited:
-        audit_run = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
-        session.add(audit_run)
-        session.flush()
-        session.add(OnlineAuditItem(
-            run_id=audit_run.id, oa_item_key=key, title=f"{key} 标题", status="pending",
-            depth_limit_reached=True,
+    if facts.get("index") is not None and oa_item is not None:
+        session.add(MarkdownExport(
+            oa_item_id=oa_item.id, document_kind="item_index", source_sha256="1" * 64,
+            source_relpath=f"archive/raw/oa/done/{key}", markdown_relpath=f"{key}/_index.md",
+            parse_engine="item_index", parse_engine_version="v1", parse_config_hash="v1",
+            schema_version=1, status=facts["index"], generated_at=datetime.now(timezone.utc),
         ))
 
     session.commit()
@@ -102,9 +73,9 @@ def _seed_fact(session: Session, key: str, facts: dict) -> OAManifestItem:
 @pytest.mark.parametrize(("facts", "expected"), [
     ({"manifest": "discovered"}, "waiting_download"),
     ({"manifest": "downloaded", "markdown": "pending"}, "waiting_markdown"),
-    ({"manifest": "downloaded", "markdown": "success", "curation": "queued"}, "waiting_classification"),
-    ({"manifest": "downloaded", "markdown": "success", "curation": "completed", "decisions": ["published"]}, "completed"),
-    ({"manifest": "downloaded", "markdown": "success", "curation": "needs_review"}, "attention"),
+    ({"manifest": "downloaded", "markdown": "success"}, "waiting_markdown"),
+    ({"manifest": "downloaded", "markdown": "success", "index": "success"}, "completed"),
+    ({"manifest": "downloaded", "markdown": "success", "index": "failed"}, "attention"),
     ({"manifest": "skipped"}, "excluded"),
     ({"manifest": "depth_limit_reached"}, "attention"),
 ])
@@ -130,7 +101,7 @@ def test_done_archives_exposes_simple_status_fields(config_file: Path) -> None:
     with Session(engine) as session:
         _seed_fact(session, "oa:done-1", {
             "manifest": "downloaded", "markdown": "success",
-            "curation": "completed", "decisions": ["published"],
+            "index": "success",
         })
 
     payload = client.get("/api/done-archives?page=1&page_size=50").json()
@@ -153,7 +124,7 @@ def test_done_archives_filters_by_simple_status_server_side(config_file: Path) -
         for i in range(60):
             _seed_fact(session, f"oa:cp-{i}", {
                 "manifest": "downloaded", "markdown": "success",
-                "curation": "completed", "decisions": ["published"],
+                "index": "success",
             })
 
     done = client.get("/api/done-archives?page=1&page_size=50&simple_status=waiting_download").json()

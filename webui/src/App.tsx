@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useState } from "react"
 import {
-  BookOpen, CircleAlert, LayoutDashboard, Menu, RefreshCw, Settings as SettingsIcon, ShieldCheck, X,
+  Bell, BookOpen, CircleAlert, FileText, LayoutDashboard, Menu, RefreshCw, Settings as SettingsIcon, ShieldCheck, X,
 } from "lucide-react"
 import { Progress } from "./components/ui/progress"
 import type { SimpleDoneItem, SimpleDonePage, SimpleDoneState, SimpleStatusResponse } from "./types/simple-status"
 import { SimpleOverviewView } from "./views/SimpleOverviewView"
 import { SimpleDoneView } from "./views/SimpleDoneView"
 import { SimpleSettingsView } from "./views/SimpleSettingsView"
+import { PendingView, type PendingRow } from "./views/PendingView"
+import { MarkdownView, type MarkdownItem } from "./views/MarkdownView"
 
 // 一级导航固定为：总览、已办资料、系统设置（spec §2）。
-type View = "overview" | "done" | "settings"
+type View = "overview" | "pending" | "done" | "markdown" | "settings"
 
 // ---- 共享类型（供高级维护与设置视图复用，不删除既有能力） ----
 
@@ -136,7 +138,9 @@ type ArchiveMigration = {
 
 const NAV = [
   { id: "overview" as View, label: "总览", icon: LayoutDashboard },
+  { id: "pending" as View, label: "待办通知", icon: Bell },
   { id: "done" as View, label: "已办资料", icon: BookOpen },
+  { id: "markdown" as View, label: "Markdown 输出", icon: FileText },
   { id: "settings" as View, label: "系统设置", icon: SettingsIcon },
 ]
 
@@ -230,6 +234,8 @@ export function App() {
   const [doneQuery, setDoneQuery] = useState("")
   const [doneFilter, setDoneFilter] = useState<SimpleDoneState | "">("")
   const [settings, setSettings] = useState<SettingsData | null>(null)
+  const [pending, setPending] = useState<PendingRow[]>([])
+  const [markdown, setMarkdown] = useState<MarkdownItem[]>([])
 
   const navigate = useCallback((next: View) => {
     setView(next); setDoneQuery(""); setDoneFilter(""); setDonePage(1)
@@ -240,28 +246,32 @@ export function App() {
     if (!silent) { setLoading(true); setError("") }
     try {
       if (view === "overview") setSimpleStatus(await api<SimpleStatusResponse>("/api/simple-status"))
+      else if (view === "pending") setPending((await api<{ items: PendingRow[] }>("/api/pending-notifications")).items)
       else if (view === "done") {
         const params = new URLSearchParams({ page: String(donePage), page_size: "50" })
         if (doneQuery) params.set("query", doneQuery)
         if (doneFilter) params.set("simple_status", doneFilter)
         const result = await api<SimpleDonePage>(`/api/done-archives?${params.toString()}`)
         setDone(result.items); setDoneTotal(result.total); setDoneMetrics(result.metrics)
-      } else if (view === "settings") setSettings(await api<SettingsData>("/api/settings"))
+      } else if (view === "markdown") setMarkdown((await api<{ items: MarkdownItem[] }>("/api/markdown-outputs?page=1&page_size=100")).items)
+      else if (view === "settings") setSettings(await api<SettingsData>("/api/settings"))
     } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败") }
     finally { if (!silent) setLoading(false) }
   }, [view, donePage, doneQuery, doneFilter])
 
   useEffect(() => { void load() }, [load])
   useEffect(() => {
-    if (view !== "overview" && view !== "done") return
+    if (view !== "overview" && view !== "pending" && view !== "done" && view !== "markdown") return
     const timer = window.setInterval(() => void load(true), 5000)
     return () => window.clearInterval(timer)
   }, [view, load])
 
   const topLabel = (id: View) => NAV.find(item => item.id === id)?.label || ""
   const topHint = (id: View) =>
-    id === "overview" ? "两条自动化业务链路是否正常，以及当前需要人工处理的事项"
-    : id === "done" ? "已办资料：原件、Markdown、归类发布是否完成"
+    id === "overview" ? "三条自动化业务链路是否正常，以及当前需要人工处理的事项"
+    : id === "pending" ? "待办摘要、飞书投递与清理"
+    : id === "done" ? "已办资料：原件归档与 Markdown 交付状态"
+    : id === "markdown" ? "Source Markdown、分类和事项索引"
     : "扫描、模型、飞书与本地服务设置"
 
   return <div className="app-shell">
@@ -279,12 +289,14 @@ export function App() {
       {error && <div className="error-banner"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}
       {loading ? <div className="loading"><RefreshCw className="spin"/><span>正在读取本地状态</span></div> : <>
         {view === "overview" && simpleStatus && <SimpleOverviewView data={simpleStatus} onJump={navigate}/>}
+        {view === "pending" && <PendingView rows={pending} refresh={() => void load()}/>}
         {view === "done" && <SimpleDoneView
           rows={done} total={doneTotal} metrics={doneMetrics}
           page={donePage} setPage={setDonePage}
           query={doneQuery} setQuery={setDoneQuery}
           filter={doneFilter} setFilter={setDoneFilter}
         />}
+        {view === "markdown" && <MarkdownView rows={markdown}/>}
         {view === "settings" && settings && <SimpleSettingsView initial={settings}/>}
       </>}
     </main>

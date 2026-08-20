@@ -19,8 +19,8 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings, load_settings, validate_feishu_runtime_config
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
-    ArchivedFile, ContentObject, CuratedDecision, CuratedRun, ItemOccurrence, KnowledgeDocument, LogicalItem,
-    MarkdownExport, NotificationDelivery, OAItem, OAManifestItem, OnlineAuditItem, ParseArtifact,
+    ArchivedFile, ContentObject, ItemOccurrence, KnowledgeDocument, LogicalItem,
+    MarkdownExport, NotificationDelivery, OAItem, OAManifestItem, ParseArtifact,
     PipelineTask, SourceAttachment, SummaryVersion,
 )
 from oa_knowledge.notifications.feishu_service import retry_pending_summary_delivery
@@ -660,39 +660,16 @@ def _simple_done_state(
 ) -> dict[str, str | None]:
     """为单个已办事项计算简化状态（spec §4.1）。"""
     processing_status = manifest.processing_status if manifest is not None else "discovered"
-    has_success_markdown = bool(markdown) and markdown.get("status") == "success"
-    logical_item_id = archived.logical_item_id if archived is not None else None
-    curation = _resolve_curation(session, logical_item_id)
-    depth_limited = (
-        session.scalar(
-            select(func.count()).select_from(OnlineAuditItem)
-            .where(OnlineAuditItem.oa_item_key == manifest.oa_item_key, OnlineAuditItem.depth_limit_reached == True)  # noqa: E712
-        ) or 0
-    ) > 0 if manifest is not None else False
+    index = session.scalar(select(MarkdownExport).where(
+        MarkdownExport.oa_item_id == (archived.id if archived is not None else None),
+        MarkdownExport.document_kind == "item_index",
+    ).order_by(MarkdownExport.id.desc()).limit(1))
     state, reason = _classify_done_item(
         processing_status=processing_status,
-        has_success_markdown=has_success_markdown,
-        curation=curation,
-        depth_limited=depth_limited,
+        has_success_item_index=bool(index and index.status == "success"),
+        markdown_failed=bool(index and index.status == "failed"),
     )
     return {"state": state, "label": _SIMPLE_DONE_LABELS[state], "reason": reason}
-
-
-def _resolve_curation(session: Session, logical_item_id: int | None) -> dict | None:
-    if logical_item_id is None:
-        return None
-    curated = session.scalar(
-        select(CuratedRun).where(CuratedRun.logical_item_id == logical_item_id)
-        .order_by(CuratedRun.id.desc()).limit(1)
-    )
-    if curated is None:
-        return None
-    decisions = list(session.scalars(
-        select(CuratedDecision).where(CuratedDecision.curated_run_id == curated.id)
-    ))
-    n = len(decisions)
-    published = sum(1 for d in decisions if d.status == "published")
-    return {"status": curated.status, "decision_count": n, "all_published": n > 0 and n == published}
 
 
 def _enrich_done_item(
@@ -714,10 +691,12 @@ def _enrich_done_item(
 
 _DONE_STAGE_ORDER = {
     "done_capture_and_archive": 0,
-    "attachment_inventory": 1,
-    "parse": 2,
-    "source_publish": 3,
-    "curation": 4,
+    "archive_verify": 1,
+    "attachment_inventory": 2,
+    "parse": 3,
+    "source_publish": 4,
+    "classify": 5,
+    "index_publish": 6,
 }
 
 
@@ -766,9 +745,9 @@ def _done_pipeline_stages(
         else _task_stage_state(task, 1)
     )
     task_index = _DONE_STAGE_ORDER.get(task.stage, -1) if task else -1
-    if task and task_index > 3:
+    if task and task_index > 4:
         markdown_state = "done"
-    elif task and task_index in {2, 3}:
+    elif task and task_index in {3, 4}:
         markdown_state = _task_stage_state(task, task_index)
     elif markdown["status"] == "success":
         markdown_state = "done"
@@ -777,31 +756,14 @@ def _done_pipeline_stages(
     else:
         markdown_state = "pending"
 
-    curation = _task_stage_state(task, 4)
-    publication = "done" if task and task.stage == "curation" and task.status == "completed" else "pending"
-    if archived is not None and archived.logical_item_id is not None:
-        curated = session.scalar(select(CuratedRun).where(
-            CuratedRun.logical_item_id == archived.logical_item_id,
-        ).order_by(CuratedRun.id.desc()).limit(1))
-        if curated is not None:
-            if curated.status == "running":
-                curation, publication = "running", "pending"
-            elif curated.status == "failed":
-                curation, publication = "failed", "pending"
-            elif curated.status == "needs_review":
-                curation, publication = "review", "review"
-            elif curated.status == "completed":
-                curation = "done"
-                decisions = list(session.scalars(select(CuratedDecision).where(
-                    CuratedDecision.curated_run_id == curated.id,
-                )))
-                publication = "done" if all(row.status == "published" for row in decisions) else "failed"
+    classification = _task_stage_state(task, 5)
+    publication = _task_stage_state(task, 6)
     return {
         "discovery": "done" if manifest is not None else "pending",
         "download": download,
         "verification": verification,
         "markdown": markdown_state,
-        "curation": curation,
+        "classification": classification,
         "publication": publication,
     }
 
@@ -875,7 +837,59 @@ def markdown_outputs_list(
                     "llm_wiki_path": str(settings.markdown_root / export.markdown_relpath),
                     "delivery_status": "exported" if export.status == "success" else export.status,
                 })
-            return {"documents": docs, "total": total, "page": page, "page_size": page_size}
+            # V2 consumes Markdown by Done item, while retaining the legacy
+            # attachment ledger payload above for existing clients during the
+            # compatibility window.  No paths are made absolute or user supplied.
+            item_total = session.scalar(select(func.count()).select_from(OAItem).where(
+                OAItem.source_channel == "done",
+            )) or 0
+            items = []
+            archived_items = session.scalars(select(OAItem).where(
+                OAItem.source_channel == "done",
+            ).order_by(OAItem.completed_at.desc(), OAItem.id.desc()).offset(
+                (page - 1) * page_size
+            ).limit(page_size)).all()
+            for item in archived_items:
+                item_exports = session.scalars(select(MarkdownExport).where(
+                    MarkdownExport.oa_item_id == item.id,
+                ).order_by(MarkdownExport.id)).all()
+                # Older attachment exports did not have oa_item_id.  Read them
+                # as facts without manufacturing a new association.
+                if not item_exports:
+                    item_exports = session.scalars(select(MarkdownExport).join(
+                        ArchivedFile, ArchivedFile.id == MarkdownExport.source_file_id,
+                    ).where(ArchivedFile.oa_item_id == item.id)).all()
+                index = next((row for row in item_exports if row.document_kind == "item_index"), None)
+                attachments = [row for row in item_exports if row.document_kind != "item_index"]
+                if index and index.status == "success":
+                    delivery_status = "已交付"
+                elif any(row.status == "failed" for row in attachments) or (index and index.status == "failed"):
+                    delivery_status = "交付失败"
+                elif any(row.status == "success" for row in attachments):
+                    delivery_status = "部分交付"
+                else:
+                    delivery_status = "待处理"
+                items.append({
+                    "id": item.id,
+                    "title": item.title,
+                    "source_type": item.source_type or "unknown",
+                    "internal_category": item.internal_category,
+                    "external_issuer": item.external_issuer,
+                    "markdown_count": sum(row.status == "success" for row in attachments),
+                    "delivery_status": delivery_status,
+                    "index_relpath": index.markdown_relpath if index else None,
+                    "source_relpath": item.archive_relpath,
+                    "updated_at": (index.generated_at.isoformat() if index and index.generated_at else None),
+                    "documents": [
+                        {"id": row.id, "relpath": row.markdown_relpath, "status": row.status,
+                         "source_file_id": row.source_file_id, "error_code": row.last_error_code}
+                        for row in attachments
+                    ],
+                })
+            return {
+                "documents": docs, "total": total, "page": page, "page_size": page_size,
+                "items": items, "item_total": item_total,
+            }
     finally:
         engine.dispose()
 
