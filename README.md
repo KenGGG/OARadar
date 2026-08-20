@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-OARadar is a local-first, read-only OA archive, faithful Markdown conversion, and curated knowledge system. It preserves immutable source material, then optionally builds disposable curated documents from that material with the local `qwen3.5:9b` model. It never writes the llm_wiki `wiki/` directory.
+OARadar is a local-first, read-only OA workbench with three stable automations: Pending notifications, permanent Done archives, and Source Markdown delivery. It never writes the llm_wiki `wiki/` directory.
 
 The repository contains only application code and synthetic fixtures. OA addresses, credentials, records, attachments, browser state, databases, logs, and generated knowledge content stay on the operator's machine.
 
@@ -53,20 +53,6 @@ uv run oa rebuild-markdown --config config.yaml
 uv run oa markdown-status --config config.yaml
 ```
 
-Plan and run a bounded Curated knowledge batch:
-
-```bash
-uv run oa curate plan --config config.yaml --limit 10
-uv run oa curate run --config config.yaml --limit 10
-uv run oa curate validate --config config.yaml
-uv run oa curate report --config config.yaml
-```
-
-`curate plan` is read-only and does not call the model. Curated output is rebuilt under
-`data/workspace/curated/oa/`; formal files use issuer/year/document-number/title,
-internal files use topic/month, and project files use customer/project/stage. Start with
-a reviewed small sample—there is no implicit full historical backfill.
-
 The default source archive is `data/archive/raw/oa/`. Markdown is written only to `data/workspace/raw/sources/oa/` with the same tree and an appended `.md` suffix (for example, `报告.pdf` becomes `报告.pdf.md`). See [the llm_wiki and Obsidian integration guide](docs/llm-wiki-obsidian-integration.md).
 
 Start the loopback-only Web console:
@@ -75,7 +61,7 @@ Start the loopback-only Web console:
 uv run oa web --config config.yaml
 ```
 
-The Web console is organized around the product's business chains. The primary navigation is Overview / Pending Notifications / Done Archives / Markdown Output, with Settings at the bottom of the sidebar. "Overview" aggregates the three automation chains (pending notification, done archive, Markdown delivery) and surfaces only the issues needing human attention. "Pending Notifications" is a short-lived notification console: once Feishu confirms a successful send, the business payload is erased and only a minimal de-duplication ledger is kept. "Done Archives" shows whether original attachments are fully, permanently saved and turned into Markdown. "Markdown Output" lists files successfully converted and handed off to the llm_wiki source directory. "Settings → Maintenance" provides the read-only online review, Markdown queue, PDF MinerU re-conversion, archive-date calibration, and local service controls. See [plan-0807-1](docs/plan-0807-1.md).
+The primary navigation is Overview / Pending Notifications / Done Archives / Markdown Output / Settings. Pending data is short-lived: after confirmed Feishu delivery, its business payload is cleaned and only de-duplication facts remain. Done Archive proves original files locally; Markdown Delivery then independently creates ParseArtifact-backed Source Markdown and one `_index.md` per item. Curated, governance, audit, review, policy, and backfill features are retained only as historical code/data compatibility and do not run in the V2 production chain.
 
 For browser login and read-only discovery, use the relevant `oa login`, `oa batch`, or `oa manifest` commands shown by `uv run oa --help`. Review the planned batch locally before any collection run.
 
@@ -96,7 +82,7 @@ The default configuration uses local processing and disables LLM enrichment. Whe
 docker compose -f mineru/docker-compose.yaml up -d mineru-api
 ```
 
-The model context window is discovered from Ollama and capped conservatively. Long evidence is chunked and reduced before a final structured decision; canonical bodies are always assembled verbatim from validated Source Markdown.
+Pending summaries can use local Ollama when enabled and otherwise use a deterministic rule fallback. New attachment Markdown is published only from an active, valid ParseArtifact; it is never reparsed from the original during publishing.
 
 ## Development
 

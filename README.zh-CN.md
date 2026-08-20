@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-OARadar 是一个本地优先、只读访问 OA 的归档、忠实 Markdown 转换与 Curated 知识编目系统。它保留不可变来源文件，并可使用本机 `qwen3.5:9b` 从来源 Markdown 构建可删除、可重建的知识文档；不会写入 llm_wiki 的 `wiki/` 目录。
+OARadar 是本地优先、只读访问 OA 的个人工作台，稳定运行三条自动化：待办通知、已办永久归档与 Source Markdown 交付；不会写入 llm_wiki 的 `wiki/` 目录。
 
 本仓库仅包含应用代码和合成测试夹具。OA 地址、凭据、业务记录、附件、浏览器状态、数据库、日志和生成的知识内容均保留在操作人员本机。
 
@@ -61,11 +61,11 @@ uv run oa markdown-status --config config.yaml
 uv run oa web --config config.yaml
 ```
 
-Web 控制台默认只回答两条业务链路的结果，一级导航固定为「总览 / 已办资料 / 系统设置」。「总览」用大白话聚合「已办知识库」和「待办飞书提醒」是否完成，并集中提示需要人工处理的问题；「已办资料」只展示每个事项的简化状态（等待下载 / 等待 MD 化 / 等待归类 / 已完成 / 需要处理 / 已按规则排除），不暴露六阶段色条与技术状态；「系统设置」默认只显示扫描频率、模型、飞书配置与五个服务状态，复杂诊断（在线逐项核验、Source Markdown 明细与复核、数据治理、处理中心、运行维护）统一收进「高级维护」，默认折叠、展开才加载。所有 OA 交互严格只读。
+Web 控制台一级导航固定为「总览 / 待办通知 / 已办资料 / Markdown 输出 / 系统设置」。待办是短生命周期数据：飞书确认成功后清理业务内容，只保留去重事实；已办归档只证明原件完整；Markdown 交付独立从有效 ParseArtifact 发布 Source Markdown，并为每个事项生成一个 `_index.md`。Curated、治理、审计、Review、Policy 和 Backfill 仅保留历史代码/数据兼容，不再进入 V2 生产链。所有 OA 交互严格只读。
 
 判定口径（重要）：
 
-- “已完成”必须同时满足**原件已验证 + 已有有效 Source Markdown + 归类完成 + 全部决策已发布**；仅有原件或仅有 Markdown 不算完成。
+- “已完成”必须同时满足**原件已验证 + 事项 `_index.md` 已交付**；分类只更新 Frontmatter，不移动归档或 Markdown 路径。
 - 待办每小时 05 分检查；夜间全量扫描每日 23:30。
 - 模型“确定性兜底”**不等于**“模型成功”：兜底计数单独展示，不计入 qwen 成功数。
 - 复杂诊断位于「系统设置 → 高级维护」；OA 正文、附件名与凭据不出现在默认页面。
@@ -90,7 +90,7 @@ Markdown 内容。
 docker compose -f mineru/docker-compose.yaml up -d mineru-api
 ```
 
-启用本地模型后，系统会从 Ollama 探测上下文上限并保守限额；长文按块归纳后再汇总，正式正文始终从已校验的 Source Markdown 原样组装。
+待办摘要在启用本地模型时使用 Ollama，关闭或失败时使用确定性规则兜底。新附件 Markdown 只允许从 active ParseArtifact 发布，发布时不会重新解析原件。
 
 ## 开发
 
