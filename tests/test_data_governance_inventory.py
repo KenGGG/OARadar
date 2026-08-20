@@ -118,16 +118,20 @@ def test_expired_backups_keep_newest_two_and_one_weekly_baseline(tmp_path: Path)
     settings = Settings(app={"data_root": data_root})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    now = datetime.now(timezone.utc)
-    same_week: list[Path] = []
+    # Thursday fixes the ISO-week boundary: the third backup is Monday in the
+    # current week and the fourth is Sunday in the previous week.
+    now = datetime(2026, 8, 20, 12, 0, 0, tzinfo=timezone.utc)
     for index, days_old in enumerate((1, 2, 3, 4), start=1):
         path = _write(data_root, f"state/backups/oa-{index}.db")
         timestamp = (now - timedelta(days=days_old)).timestamp()
         os.utime(path, (timestamp, timestamp))
-        same_week.append(path)
     weekly = _write(data_root, "state/backups/weekly-baseline.db")
-    timestamp = (now - timedelta(days=10)).timestamp()
+    # This baseline belongs to an older ISO week than the Sunday backup above.
+    timestamp = (now - timedelta(days=14)).timestamp()
     os.utime(weekly, (timestamp, timestamp))
+    expired = _write(data_root, "state/backups/expired.db")
+    timestamp = (now - timedelta(days=15)).timestamp()
+    os.utime(expired, (timestamp, timestamp))
 
     summary = build_cleanup_plan(settings, engine, categories={"expired_backups"})
 
@@ -136,7 +140,7 @@ def test_expired_backups_keep_newest_two_and_one_weekly_baseline(tmp_path: Path)
             select(CleanupItem).where(CleanupItem.cleanup_run_id == summary.run_id)
         ).all()
     planned = {row.relative_path for row in rows}
-    # The newest two are always retained; the newest remaining file in the
-    # current ISO week is retained as its weekly baseline.
-    assert planned == {same_week[3].relative_to(data_root).as_posix()}
+    # The newest two and the newest remaining file from each ISO week are
+    # retained; only the older file in the two-weeks-ago bucket is eligible.
+    assert planned == {expired.relative_to(data_root).as_posix()}
     assert weekly.relative_to(data_root).as_posix() not in planned

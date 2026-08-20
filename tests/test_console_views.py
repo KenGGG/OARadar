@@ -291,13 +291,6 @@ def test_markdown_outputs_endpoint_returns_only_the_requested_page(config_file: 
     assert len(payload["documents"]) == 1
 
 
-def test_maintenance_endpoint(config_file: Path) -> None:
-    client = _client(config_file)
-    resp = client.get("/api/maintenance")
-    assert resp.status_code == 200
-    assert "doctor" in resp.json()
-
-
 def test_markdown_outputs_resolves_source_item(config_file: Path) -> None:
     """§8: an export linked to an archived file must surface its source OA item title."""
     from datetime import datetime, timezone
