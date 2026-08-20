@@ -1236,6 +1236,10 @@ class OperationWorker:
                         )
                         manifest.last_error = None
                         manifest.failure_stage = None
+                    elif proxy.archive_status == "depth_limit_reached":
+                        manifest.processing_status = "depth_limit_reached"
+                        manifest.last_error = "attachment container depth limit reached"
+                        manifest.failure_stage = "archive_verify"
                     else:
                         manifest.processing_status = "download_failed"
                         manifest.retry_count += 1
@@ -1248,8 +1252,10 @@ class OperationWorker:
                     )) or 0
                     session.commit()
                 if proxy.archive_status != "archived":
+                    code = "DEPTH_LIMIT_REACHED" if proxy.archive_status == "depth_limit_reached" else "ARCHIVE_FAILED"
                     self.production_queue.fail(
-                        task.id, self.owner, "ARCHIVE_FAILED", proxy.last_error or "archive failed", recoverable=True
+                        task.id, self.owner, code, proxy.last_error or "archive failed",
+                        recoverable=code != "DEPTH_LIMIT_REACHED",
                     )
                     return
                 self.production_queue.advance(

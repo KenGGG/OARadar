@@ -86,3 +86,17 @@ def test_done_archive_with_only_evidence_is_explicitly_no_attachment(config_file
         result = verify_done_archive(session, settings, item.oa_item_key)
 
     assert result.status == "no_attachment"
+
+
+def test_depth_limit_is_never_verified_as_a_complete_archive(config_file) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = _verified_item(session, settings)
+        manifest = session.query(OAManifestItem).filter_by(oa_item_key=item.oa_item_key).one()
+        manifest.processing_status = "depth_limit_reached"
+        result = verify_done_archive(session, settings, item.oa_item_key)
+
+    assert result.status == "failed"
+    assert result.reason == "DEPTH_LIMIT_REACHED"
