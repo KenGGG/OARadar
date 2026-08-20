@@ -25,8 +25,8 @@ data_root、systemd 用户目录、环境变量文件**，并据此渲染 6 个 
 - `oaradar-nightly.service` / `.timer` —— 工作日晚间全量核对
 
 两个定时 one-shot 只向 SQLite 创建持久任务，不直接启动浏览器。真实 OA 只读扫描
-统一由 `oaradar-worker.service` 串行执行，因此在线逐项核验、待办扫描和夜间补齐
-不会争用同一个 Chromium 登录配置目录。
+统一由 `oaradar-worker.service` 串行执行：Pending 扫描与 Done Archive 共用同一个
+Chromium 登录配置目录，不会并发争用。
 
 环境变量文件 `~/.config/oaradar/env`（chmod 600）用于注入飞书 webhook/secret
 等敏感值，**不要写进 YAML**。若不存在，安装脚本会创建一个空文件，请手动填写。

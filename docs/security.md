@@ -30,6 +30,8 @@ Container traversal is limited to depth 10. When an item has additional children
 
 OA identifiers are stored as text. Archive paths are stored relative to `data_root` so a database cannot expose machine-specific absolute paths.
 
+Pending material is a short-lived notification payload, not a knowledge asset: after a confirmed Feishu delivery, the body, temporary attachments, snapshots, and summaries are removed while minimal delivery/de-duplication facts remain. Done originals are immutable local evidence. Markdown Delivery reads only verified local files and publishes Source Markdown from active `ParseArtifact` records; it never accesses OA or writes an independent Obsidian Vault.
+
 ## Credentials
 
 Configuration loading rejects plaintext credential keys such as password, Cookie, Authorization, Token, and Secret. Use environment-variable names or a local browser credential mechanism. Do not pass credentials on the command line or write them to logs.

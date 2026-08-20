@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,13 @@ def test_schedule_help_returns_zero() -> None:
 def test_notifications_help_returns_zero() -> None:
     result = _run(["notifications", "--help"], None)
     assert result.returncode == 0
+
+
+def test_default_help_hides_retired_write_command_groups() -> None:
+    result = _run(["--help"], None)
+    assert result.returncode == 0
+    for name in ("backfill", "curate", "data", "knowledge", "wiki"):
+        assert not re.search(rf"│ {re.escape(name)}\\s+", result.stdout)
 
 
 def test_knowledge_help_returns_zero() -> None:

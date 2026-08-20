@@ -49,10 +49,6 @@ conversion:
   workers: 1
   force_rebuild: false
 
-online_audit:
-  item_timeout_seconds: 120
-  download_timeout_seconds: 30
-
 # Pending (待办) notification data retention. Pending items are short-lived
 # notification records, not permanent knowledge assets. After Feishu confirms a
 # successful delivery the business payload is erased and only the minimal
@@ -127,9 +123,3 @@ llm:
   context_window_fallback: 8192
   context_window_cap: 131072
   context_safety_margin: 1024
-
-curation:
-  enabled: false
-  batch_limit: 10
-  confidence_threshold: 0.75
-  max_input_tokens: 60000

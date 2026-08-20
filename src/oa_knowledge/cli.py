@@ -51,7 +51,7 @@ from oa_knowledge.reconcile import reconcile_done_occurrence
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.markdown_export.service import convert_archive, markdown_status as get_markdown_status
 
-app = typer.Typer(help="OA Knowledge Hub stage 0+1 foundation")
+app = typer.Typer(help="OARadar V2 local read-only OA workspace")
 db_app = typer.Typer(help="Database migration commands")
 batch_app = typer.Typer(help="Immutable historical collection batch planning")
 backfill_app = typer.Typer(help="Stage 2A-7 gated historical backfill")
@@ -61,7 +61,7 @@ pending_app = typer.Typer(help="Read-only Pending-list discovery")
 archive_app = typer.Typer(help="Local archive path reconciliation and migration")
 app.add_typer(db_app, name="db")
 app.add_typer(batch_app, name="batch")
-app.add_typer(backfill_app, name="backfill")
+app.add_typer(backfill_app, name="backfill", hidden=True)
 app.add_typer(parse_app, name="parse")
 app.add_typer(manifest_app, name="manifest")
 app.add_typer(pending_app, name="pending")
@@ -71,11 +71,11 @@ app.add_typer(schedule_app, name="schedule")
 notifications_app = typer.Typer(help="Feishu delivery lifecycle and operational controls")
 app.add_typer(notifications_app, name="notifications")
 knowledge_app = typer.Typer(help="Done-archive to Markdown knowledge handoff")
-app.add_typer(knowledge_app, name="knowledge")
+app.add_typer(knowledge_app, name="knowledge", hidden=True)
 curate_app = typer.Typer(help="Local-only OA Package to curated knowledge documents")
-app.add_typer(curate_app, name="curate")
+app.add_typer(curate_app, name="curate", hidden=True)
 data_app = typer.Typer(help="本地数据预检、隔离、恢复与清除")
-app.add_typer(data_app, name="data")
+app.add_typer(data_app, name="data", hidden=True)
 
 
 def settings_option(config: Path | None) -> Settings:
@@ -1789,7 +1789,7 @@ def parse_digest(
 
 
 wiki_app = typer.Typer(help="Stage 6 LLM Wiki ingestion and lint")
-app.add_typer(wiki_app, name="wiki")
+app.add_typer(wiki_app, name="wiki", hidden=True)
 
 
 @wiki_app.command("trial-publish")

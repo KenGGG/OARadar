@@ -35,3 +35,22 @@ def test_retired_v2_routes_return_json_404(client: TestClient, path: str) -> Non
     assert response.status_code == 404
     assert response.headers["content-type"].startswith("application/json")
     assert response.json()["detail"] == "API route not found"
+
+
+def test_retired_v2_routes_are_not_registered(client: TestClient) -> None:
+    retired_prefixes = (
+        "/api/audits",
+        "/api/governance",
+        "/api/reviews",
+        "/api/policies",
+        "/api/batches",
+        "/api/backfill",
+        "/api/lifecycle/knowledge",
+        "/api/lifecycle/processing",
+        "/api/maintenance",
+    )
+    registered_paths = [getattr(route, "path", "") for route in client.app.routes]
+
+    assert not [
+        path for path in registered_paths if path.startswith(retired_prefixes)
+    ]

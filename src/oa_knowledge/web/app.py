@@ -868,6 +868,16 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     def get_maintenance(target_items: int = Query(500, ge=1, le=100000)) -> dict:
         return maintenance_status(settings, target_items)
 
+    # Keep the historical handler implementations in this module for one
+    # compatibility cycle, but remove their decorators from the application
+    # router.  The middleware above owns the retired-address JSON 404 contract;
+    # keeping these routes registered would leave a second Web product surface.
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not getattr(route, "path", "").startswith(RETIRED_API_PREFIXES)
+    ]
+
     static_dir = Path(__file__).with_name("static")
     assets_dir = static_dir / "assets"
     if assets_dir.is_dir():
