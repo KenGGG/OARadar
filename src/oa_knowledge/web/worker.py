@@ -697,6 +697,8 @@ class OperationWorker:
                     self._pipeline_oa_resync(task)
                 elif task.stage == "done_capture_and_archive" and task.queue_name == "realtime_done":
                     self._pipeline_done_capture_and_archive(task)
+                elif task.stage == "archive_verify" and task.queue_name == "realtime_done":
+                    self._pipeline_archive_verify(task)
                 elif task.stage == "pending_parse":
                     self._pipeline_pending_parse(task)
                 elif task.stage == "source_publish":
@@ -1180,14 +1182,9 @@ class OperationWorker:
         from oa_knowledge.collector.detail import AuthRequiredError, CollaborationDetailAdapter
         from oa_knowledge.detail_archive import archive_collaboration_detail
         from oa_knowledge.full_manifest import archive_proxy
-        from oa_knowledge.online_audit import (
-            requeue_changed_item_for_latest_audit,
-            requeue_supplemented_item,
-        )
         from oa_knowledge.resources import ResourceCoordinator
 
         oa_item_key = task.logical_item_key
-        payload = json.loads(task.payload_json or "{}")
         with Session(self.engine) as session:
             manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == oa_item_key))
             if manifest is None:
@@ -1239,15 +1236,6 @@ class OperationWorker:
                         )
                         manifest.last_error = None
                         manifest.failure_stage = None
-                        audit_run_id = payload.get("online_audit_run_id")
-                        if audit_run_id is not None:
-                            requeue_supplemented_item(
-                                session, int(audit_run_id), oa_item_key,
-                            )
-                        else:
-                            requeue_changed_item_for_latest_audit(
-                                session, oa_item_key,
-                            )
                     else:
                         manifest.processing_status = "download_failed"
                         manifest.retry_count += 1
@@ -1265,11 +1253,43 @@ class OperationWorker:
                     )
                     return
                 self.production_queue.advance(
-                    task.id, self.owner, "attachment_inventory",
+                    task.id, self.owner, "archive_verify",
                     progress_current=verified_sources, progress_total=len(attachments) if attachments else 0,
                 )
         finally:
             coordinator.release(lease, lease_owner)
+
+    def _pipeline_archive_verify(self, task: PipelineTask) -> None:
+        from oa_knowledge.done_archive import verify_done_archive
+
+        with Session(self.engine) as session:
+            result = verify_done_archive(session, self.settings, task.logical_item_key)
+            manifest = session.scalar(select(OAManifestItem).where(
+                OAManifestItem.oa_item_key == task.logical_item_key,
+            ))
+            if result.status == "failed":
+                if manifest is not None:
+                    manifest.processing_status = "download_failed"
+                    manifest.failure_stage = "archive_verify"
+                    manifest.last_error = result.reason
+                    session.commit()
+                self.production_queue.fail(
+                    task.id, self.owner, result.reason or "ARCHIVE_VERIFY_FAILED",
+                    "local archive verification failed", recoverable=False,
+                )
+                return
+            if manifest is not None:
+                manifest.processing_status = "downloaded" if result.status == "verified" else "no_attachment"
+                manifest.failure_stage = None
+                manifest.last_error = None
+                session.commit()
+
+        markdown_key = f"markdown:{task.logical_item_key}:{result.content_signature}:v1"
+        self.production_queue.enqueue(
+            "markdown_delivery", task.logical_item_key, "attachment_inventory", markdown_key,
+            payload={"archive_content_signature": result.content_signature},
+        )
+        self.production_queue.complete(task.id, self.owner)
 
     def _pipeline_done_knowledge(self, task: PipelineTask) -> None:
         from oa_knowledge.done_knowledge import NoAttachmentEvidence, generate_done_knowledge

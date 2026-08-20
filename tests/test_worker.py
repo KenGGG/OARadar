@@ -1448,8 +1448,8 @@ def test_pending_cleanup_failure_is_requeued_without_resending(config_file: Path
 
 
 def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Path, monkeypatch) -> None:
-    # A newly discovered Done item is archived and enters the unified parse
-    # flow. The old MarkdownTask path must not reparse the original attachment.
+    # Done capture records only local evidence. Verification creates a separate
+    # Markdown Delivery task; the archive task never enters parsing itself.
     from types import SimpleNamespace
 
     from oa_knowledge.collector import LoginState
@@ -1465,27 +1465,12 @@ def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Pa
             oa_item_key="done:abc", workitem_id_text="abc", title="已办事项",
             list_page=0, processing_status="pending_download",
         ))
-        audit_job = OperationJob(
-            job_key="audit-supplement-callback", job_type="online_audit",
-            status="completed", idempotency_key="audit-supplement-callback",
-        )
-        session.add(audit_job); session.flush()
-        audit = OnlineAuditRun(
-            job_id=audit_job.id, status="completed", total_items=1,
-            completed_items=1, mismatch_items=1,
-        )
-        session.add(audit); session.flush()
-        session.add(OnlineAuditItem(
-            run_id=audit.id, oa_item_key="done:abc", title="已办事项",
-            status="missing_download", comparison_reason="inventory_changed",
-        ))
-        audit_id = audit.id
         session.commit()
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
         "realtime_done", "done:abc", "done_capture_and_archive",
         "realtime-done:done:abc:na:archive-v2",
-        payload={"online_audit_run_id": audit_id},
+        payload={},
     )
 
     # Fake a DownloadedAttachment whose content passes integrity (stub inspect_file).
@@ -1518,8 +1503,13 @@ def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Pa
         def __exit__(self, *a):
             return False
 
-    monkeypatch.setattr("oa_knowledge.detail_archive.inspect_file",
-                        lambda *a, **k: SimpleNamespace(status="verified", valid=True, size_bytes=10, sha256="a" * 64))
+    monkeypatch.setattr(
+        "oa_knowledge.detail_archive.inspect_file",
+        lambda path, *_args, **_kwargs: SimpleNamespace(
+            status="verified", valid=True, size_bytes=path.stat().st_size,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        ),
+    )
     monkeypatch.setattr("oa_knowledge.collector.detail.CollaborationDetailAdapter", _FakeAdapter)
     monkeypatch.setattr("oa_knowledge.cli.verified_attachment_resolver", lambda *a, **k: object())
     monkeypatch.setattr("oa_knowledge.collector.browser.BrowserSession", lambda *a, **k: _FakeBrowserCtx())
@@ -1543,15 +1533,25 @@ def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Pa
         assert session.scalar(select(MarkdownTask).where(MarkdownTask.source_file_id.is_not(None))) is None
         row = session.get(PipelineTask, task_id)
         assert row.status == "queued"
-        assert row.stage == "attachment_inventory"
-        refreshed_audit = session.get(OnlineAuditRun, audit_id)
-        refreshed_item = session.scalar(select(OnlineAuditItem).where(
-            OnlineAuditItem.run_id == audit_id,
-            OnlineAuditItem.oa_item_key == "done:abc",
+        assert row.stage == "archive_verify"
+
+    verify_task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_archive_verify(verify_task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        assert session.get(PipelineTask, task_id).status == "completed"
+        markdown_task = session.scalar(select(PipelineTask).where(
+            PipelineTask.queue_name == "markdown_delivery",
+            PipelineTask.logical_item_key == "done:abc",
         ))
-        assert refreshed_audit.status == "queued"
-        assert refreshed_audit.completed_items == 0
-        assert refreshed_item.status == "pending"
+        assert markdown_task is not None
+        assert markdown_task.stage == "attachment_inventory"
+        assert markdown_task.idempotency_key.startswith("markdown:done:abc:")
 
 
 def test_pipeline_done_capture_and_archive_fails_when_manifest_missing(config_file: Path, monkeypatch) -> None:

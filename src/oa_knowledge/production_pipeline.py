@@ -18,7 +18,12 @@ from oa_knowledge.db.models import (
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
 
-QUEUE_PRIORITY = {"realtime_pending": 0, "realtime_done": 10, "historical_done_backfill": 100}
+QUEUE_PRIORITY = {
+    "realtime_pending": 0,
+    "realtime_done": 10,
+    "markdown_delivery": 50,
+    "historical_done_backfill": 100,
+}
 HISTORY_CONTROL_KEY = "__historical_control__"
 HISTORY_WAVE_SIZE = 50
 DEFAULT_TASK_LEASE_SECONDS = int(LEASE_TTL.total_seconds())
