@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func as sa_func
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func as sa_func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -341,9 +341,16 @@ class MarkdownExport(Base):
         UniqueConstraint("source_file_id", "schema_version", name="uq_markdown_export_source_schema"),
         UniqueConstraint("markdown_relpath", name="uq_markdown_export_relpath"),
         CheckConstraint("markdown_relpath NOT LIKE '/%' AND markdown_relpath <> '..' AND markdown_relpath NOT LIKE '../%' AND markdown_relpath NOT LIKE '%/../%' AND markdown_relpath NOT LIKE '%/..'", name="ck_markdown_export_relative"),
+        CheckConstraint("document_kind IN ('attachment', 'item_index')", name="ck_markdown_export_document_kind"),
+        Index(
+            "uq_markdown_export_item_index_schema", "oa_item_id", "schema_version",
+            unique=True, sqlite_where=text("document_kind = 'item_index'"),
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     source_file_id: Mapped[int | None] = mapped_column(ForeignKey("files.id", ondelete="SET NULL"))
+    oa_item_id: Mapped[int | None] = mapped_column(ForeignKey("oa_items.id", ondelete="SET NULL"))
+    document_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="attachment")
     content_object_id: Mapped[int | None] = mapped_column(ForeignKey("content_objects.id", ondelete="SET NULL"))
     parse_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("parse_artifacts.id", ondelete="SET NULL"))
     source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)

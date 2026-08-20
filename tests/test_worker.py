@@ -958,7 +958,7 @@ def test_done_parse_advances_to_source_publish_before_curation(config_file: Path
         assert row.stage == "source_publish"
 
 
-def test_source_publish_advances_to_curation_and_missing_artifact_stops(config_file: Path, monkeypatch) -> None:
+def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_file: Path, monkeypatch) -> None:
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
@@ -971,7 +971,24 @@ def test_source_publish_advances_to_curation_and_missing_artifact_stops(config_f
             file_role="direct_attachment", source_container_key="root", depth=1,
             local_relpath="archive/raw/oa/done/source.pdf", download_status="verified",
         )
-        session.add(source); session.commit(); source_id = source.id
+        session.add(source); session.flush()
+        content = ContentObject(sha256="a" * 64, size_bytes=1)
+        session.add(content); session.flush()
+        source.content_object_id = content.id
+        job = ParseJob(
+            file_id=source.id, engine="synthetic", engine_version="1",
+            config_hash="c" * 64, status="completed",
+        )
+        session.add(job); session.flush()
+        artifact = ParseArtifact(
+            parse_job_id=job.id, content_object_id=content.id, engine="synthetic",
+            engine_version="1", output_relpath="synthetic/source.md",
+            source_sha256=content.sha256, product_sha256="b" * 64,
+            config_hash="c" * 64, lifecycle_status="valid",
+        )
+        session.add(artifact); session.flush()
+        content.active_parse_artifact_id = artifact.id
+        session.commit(); source_id = source.id
     task_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-task")
     task = queue.claim("worker-test")
     called: list[int] = []
@@ -987,7 +1004,7 @@ def test_source_publish_advances_to_curation_and_missing_artifact_stops(config_f
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
         assert called == [source_id]
-        assert row.stage == "curation" and row.status == "queued"
+        assert row.stage == "classify" and row.status == "queued"
 
     missing_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-missing")
     missing = queue.claim("worker-test")
@@ -1007,7 +1024,7 @@ def test_source_publish_advances_to_curation_and_missing_artifact_stops(config_f
         assert row.error_code is None
 
 
-def test_source_publish_parks_unsupported_source_for_review_instead_of_looping(
+def test_source_publish_records_unsupported_source_in_item_index_without_review(
     config_file: Path,
 ) -> None:
     settings = load_settings(config_file)
@@ -1045,16 +1062,12 @@ def test_source_publish_parks_unsupported_source_for_review_instead_of_looping(
 
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
-        review = session.query(ReviewEntry).filter_by(
-            kind="source_markdown_incomplete", status="pending",
-        ).one()
-        assert row.status == "failed"
-        assert row.error_code == "UNSUPPORTED_SOURCE_FORMAT"
-        assert review.file_id is not None
-        assert "source.wps" not in review.details_json
+        assert row.status == "queued"
+        assert row.stage == "classify"
+        assert session.query(ReviewEntry).filter_by(kind="source_markdown_incomplete").count() == 0
 
 
-def test_source_publish_parks_parser_skipped_source_for_review(config_file: Path) -> None:
+def test_source_publish_records_parser_skipped_source_without_review(config_file: Path) -> None:
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
@@ -1093,14 +1106,14 @@ def test_source_publish_parks_parser_skipped_source_for_review(config_file: Path
 
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
-        assert row.status == "failed"
-        assert row.error_code == "UNSUPPORTED_SOURCE_FORMAT"
+        assert row.status == "queued"
+        assert row.stage == "classify"
         assert session.query(ReviewEntry).filter_by(
             kind="source_markdown_incomplete", file_id=source_id,
-        ).count() == 1
+        ).count() == 0
 
 
-def test_source_publish_parks_rejected_quality_artifact_for_review(config_file: Path) -> None:
+def test_source_publish_fails_rejected_quality_artifact_without_review(config_file: Path) -> None:
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
@@ -1156,10 +1169,10 @@ def test_source_publish_parks_rejected_quality_artifact_for_review(config_file: 
         assert row.error_code == "PARSE_QUALITY_REJECTED"
         assert session.query(ReviewEntry).filter_by(
             kind="source_markdown_incomplete", file_id=source_id,
-        ).count() == 1
+        ).count() == 0
 
 
-def test_source_publish_detects_review_blocker_before_writing_any_derivative(
+def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publication(
     config_file: Path, monkeypatch,
 ) -> None:
     settings = load_settings(config_file)
@@ -1183,15 +1196,31 @@ def test_source_publish_detects_review_blocker_before_writing_any_derivative(
             file_role="official_attachment", source_container_key="root", depth=1,
             local_relpath="archive/raw/oa/done/synthetic/second.wps", download_status="verified",
         )
-        session.add_all([first, second])
+        session.add_all([first, second]); session.flush()
+        content = ContentObject(sha256=hashlib.sha256(b"synthetic eligible source").hexdigest(), size_bytes=25)
+        session.add(content); session.flush()
+        first.content_object_id = content.id
+        job = ParseJob(
+            file_id=first.id, engine="synthetic", engine_version="1",
+            config_hash="c" * 64, status="completed",
+        )
+        session.add(job); session.flush()
+        artifact = ParseArtifact(
+            parse_job_id=job.id, content_object_id=content.id, engine="synthetic",
+            engine_version="1", output_relpath="synthetic/first.md",
+            source_sha256=content.sha256, product_sha256="d" * 64,
+            config_hash="c" * 64, lifecycle_status="valid",
+        )
+        session.add(artifact); session.flush()
+        content.active_parse_artifact_id = artifact.id
         session.commit()
+        first_id = first.id
         second_id = second.id
     calls: list[int] = []
 
     def publish(_session, _settings, file_id: int):
         calls.append(file_id)
-        if file_id == second_id:
-            raise FileNotFoundError("valid parse artifact unavailable")
+        assert file_id != second_id
 
     monkeypatch.setattr("oa_knowledge.source_markdown.service.publish_active_artifact", publish)
     queue = ProductionQueue(engine)
@@ -1207,8 +1236,11 @@ def test_source_publish_detects_review_blocker_before_writing_any_derivative(
         worker.close()
 
     with Session(engine) as session:
-        assert calls == []
-        assert session.get(PipelineTask, task_id).status == "failed"
+        assert calls == [first_id]
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "queued"
+        assert row.stage == "classify"
+        assert session.query(ReviewEntry).filter_by(kind="source_markdown_incomplete").count() == 0
 
 
 def test_pending_summary_with_notification_requested_advances_to_notify_stage(config_file: Path, monkeypatch) -> None:

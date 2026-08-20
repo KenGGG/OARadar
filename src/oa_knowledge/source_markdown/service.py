@@ -121,6 +121,8 @@ def publish_active_artifact(
         session.add(record)
     record.attempts = (record.attempts or 0) + 1
     record.source_file_id = source.id
+    record.oa_item_id = source.oa_item_id
+    record.document_kind = "attachment"
     record.content_object_id = source.content_object_id
     record.parse_artifact_id = artifact.id
     record.source_relpath = source.local_relpath

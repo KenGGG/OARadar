@@ -34,7 +34,7 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     assert oct((data_root / "state" / "oa.db").stat().st_mode & 0o777) == "0o600"
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0033_online_attachment_evidence"
+    assert json.loads(status.output)["schema"] == "0035_markdown_item_indexes"
 
 
 def test_schedule_enqueue_creates_worker_job_without_opening_browser(config_file: Path) -> None:

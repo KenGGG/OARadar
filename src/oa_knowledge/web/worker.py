@@ -703,6 +703,10 @@ class OperationWorker:
                     self._pipeline_pending_parse(task)
                 elif task.stage == "source_publish":
                     self._pipeline_source_publish(task)
+                elif task.stage == "classify":
+                    self._pipeline_classify(task)
+                elif task.stage == "index_publish":
+                    self._pipeline_index_publish(task)
                 elif task.stage == "curation":
                     self._pipeline_curation(task)
                 elif task.stage == "ollama_extract":
@@ -737,7 +741,7 @@ class OperationWorker:
             pipeline = ParsePipeline(self.settings, self.engine)
             enqueued = sum(pipeline.enqueue(file.id, session=session) is not None for file in files)
         if not files:
-            self.production_queue.complete(task.id, self.owner)
+            self.production_queue.advance(task.id, self.owner, "classify")
             return
         self.production_queue.advance(task.id, self.owner, "parse", progress_current=0, progress_total=enqueued)
 
@@ -790,8 +794,8 @@ class OperationWorker:
                 ArchivedFile.download_status == "verified",
                 ArchivedFile.local_relpath.is_not(None),
             ).order_by(ArchivedFile.id)).all())
-            review_source = None
-            review_reason = None
+            publishable_files = []
+            retry_required = False
             for source in files:
                 try:
                     source_path = resolve_data_path(
@@ -800,14 +804,16 @@ class OperationWorker:
                         allowed_prefixes=("raw/done", "archive/raw/oa/done"),
                     )
                 except ValueError:
-                    review_source = source
-                    review_reason = "UNSAFE_SOURCE_PATH"
-                    break
+                    self.production_queue.fail(
+                        task.id, self.owner, "UNSAFE_SOURCE_PATH", "source path is unsafe", recoverable=False,
+                    )
+                    return
                 valid_artifact = session.scalar(select(ParseArtifact.id).where(
                     ParseArtifact.content_object_id == source.content_object_id,
                     ParseArtifact.lifecycle_status == "valid",
                 ).limit(1)) if source.content_object_id is not None else None
                 if valid_artifact is not None:
+                    publishable_files.append(source)
                     continue
                 skipped = session.scalar(select(ParseJob.id).where(
                     ParseJob.file_id == source.id,
@@ -827,42 +833,24 @@ class OperationWorker:
                     not eligibility.eligible
                     and eligibility.routing_hint == "review"
                 ):
-                    review_source = source
-                    review_reason = "UNSUPPORTED_SOURCE_FORMAT"
-                    break
+                    # Unsupported is a terminal per-file conversion outcome;
+                    # it is rendered in the item index, not sent to Review.
+                    continue
                 if rejected:
-                    review_source = source
-                    review_reason = "PARSE_QUALITY_REJECTED"
-                    break
-            if review_source is not None and review_reason is not None:
-                exists = session.scalar(select(ReviewEntry.id).where(
-                    ReviewEntry.kind == "source_markdown_incomplete",
-                    ReviewEntry.file_id == review_source.id,
-                    ReviewEntry.status == "pending",
-                ).limit(1))
-                if exists is None:
-                    session.add(ReviewEntry(
-                        kind="source_markdown_incomplete",
-                        item_id=review_source.oa_item_id,
-                        file_id=review_source.id,
-                        depth=review_source.depth,
-                        details_json=json.dumps({
-                            "reason_code": review_reason,
-                            "stage": "source_publish",
-                        }, ensure_ascii=False),
-                        status="pending",
-                    ))
-                session.commit()
-                self.production_queue.fail(
-                    task.id,
-                    self.owner,
-                    review_reason,
-                    "source requires manual review",
-                    recoverable=False,
+                    self.production_queue.fail(
+                        task.id, self.owner, "PARSE_QUALITY_REJECTED", "parse artifact rejected",
+                        recoverable=False,
+                    )
+                    return
+                retry_required = True
+            if retry_required:
+                self.production_queue.advance(
+                    task.id, self.owner, "attachment_inventory",
+                    progress_current=0, progress_total=len(files),
                 )
                 return
             try:
-                for source in files:
+                for source in publishable_files:
                     publish_active_artifact(session, self.settings, source.id)
                 session.commit()
             except (FileNotFoundError, ValueError):
@@ -873,8 +861,24 @@ class OperationWorker:
                 )
                 return
         self.production_queue.advance(
-            task.id, self.owner, "curation", progress_current=len(files), progress_total=len(files),
+            task.id, self.owner, "classify", progress_current=len(files), progress_total=len(files),
         )
+
+    def _pipeline_classify(self, task: PipelineTask) -> None:
+        from oa_knowledge.markdown_delivery import classify_done_item
+
+        with Session(self.engine) as session:
+            classify_done_item(session, task.logical_item_key)
+            session.commit()
+        self.production_queue.advance(task.id, self.owner, "index_publish")
+
+    def _pipeline_index_publish(self, task: PipelineTask) -> None:
+        from oa_knowledge.markdown_delivery import publish_item_index
+
+        with Session(self.engine) as session:
+            publish_item_index(session, self.settings, task.logical_item_key)
+            session.commit()
+        self.production_queue.complete(task.id, self.owner)
 
     def _pipeline_curation(self, task: PipelineTask) -> None:
         from oa_knowledge.curation.service import run_curation
