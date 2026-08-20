@@ -232,3 +232,19 @@ def test_force_cleanup_cannot_bypass_unconfirmed_delivery(config_file):
 
         assert occ.cleanup_status != CLEANED
         assert session.get(ArchivedFile, af.id) is not None
+
+
+def test_cleanup_retry_after_physical_failure_keeps_delivery_guard(config_file):
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        occ, *_ = _build_graph(session, settings, delivery_status="sent")
+        occ.cleanup_status = "cleanup_failed"
+
+        result = perform_cleanup(
+            session, occ, settings, datetime.now(timezone.utc), retry_failed=True,
+        )
+
+        assert result["cleanup_status"] == CLEANED

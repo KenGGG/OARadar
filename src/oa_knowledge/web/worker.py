@@ -691,6 +691,8 @@ class OperationWorker:
                     self._pipeline_pending_summary(task)
                 elif task.stage == "notify_feishu":
                     self._pipeline_notify_feishu(task)
+                elif task.stage == "pending_cleanup" and task.queue_name == "realtime_pending":
+                    self._pipeline_pending_cleanup(task)
                 elif task.stage == "oa_resync" and task.queue_name == "realtime_pending":
                     self._pipeline_oa_resync(task)
                 elif task.stage == "done_capture_and_archive" and task.queue_name == "realtime_done":
@@ -1046,7 +1048,7 @@ class OperationWorker:
             ))
             if existing is not None and existing.status == "sent":
                 session.expunge(existing)
-                self.production_queue.complete(task.id, self.owner)
+                self.production_queue.advance(task.id, self.owner, "pending_cleanup")
                 return
             delivery = existing or NotificationDelivery(
                 logical_item_id=logical_item_id,
@@ -1088,35 +1090,54 @@ class OperationWorker:
             apply_delivery_result(delivery, result, now)
             session.commit()
 
-            # Pending data is short-lived: once Feishu confirms a successful
-            # delivery, erase the business payload and keep only the minimal
-            # de-duplication ledger (plan-0807-1 §6). Failed / unknown / retrying
-            # deliveries are never cleaned here.
-            if result.status == "sent":
-                from oa_knowledge.pending_cleanup import maybe_cleanup_after_delivery
-                cleaned_occurrence = None
-                if logical_item_id is not None:
-                    cleaned_occurrence = session.scalar(select(ItemOccurrence).where(
-                        ItemOccurrence.logical_item_id == logical_item_id,
-                        ItemOccurrence.channel == "pending",
-                    ).order_by(ItemOccurrence.id.desc()).limit(1))
-                if cleaned_occurrence is not None:
-                    try:
-                        maybe_cleanup_after_delivery(session, cleaned_occurrence, delivery, self.settings, now)
-                        session.commit()
-                    except Exception:  # noqa: BLE001 - ledger stays; operator retries cleanup
-                        session.rollback()
-
-        # A successful send completes the task. A retryable transport error is
-        # re-queued (with backoff) by the queue; anything else is parked for
-        # manual retry so we never blindly re-push an uncertain delivery (§3.2).
+        # A successful send advances to the independent cleanup stage. A
+        # retryable transport error is re-queued (with backoff) by the queue;
+        # anything else is parked for manual retry so we never blindly re-push
+        # an uncertain delivery (§3.2).
         if result.status == "sent":
-            self.production_queue.complete(task.id, self.owner)
+            self.production_queue.advance(task.id, self.owner, "pending_cleanup")
         else:
             self.production_queue.fail(
                 task.id, self.owner, "FEISHU_SEND_FAILED",
                 result.safe_error or "feishu delivery failed", recoverable=result.retryable,
             )
+
+    def _pipeline_pending_cleanup(self, task: PipelineTask) -> None:
+        from oa_knowledge.pending_cleanup import CLEANED, perform_cleanup
+
+        payload = json.loads(task.payload_json or "{}")
+        occurrence_id = payload.get("occurrence_id")
+        with Session(self.engine) as session:
+            occurrence = session.get(ItemOccurrence, occurrence_id) if occurrence_id is not None else session.scalar(
+                select(ItemOccurrence).where(
+                    ItemOccurrence.logical_item_id == int(task.logical_item_key),
+                    ItemOccurrence.channel == "pending",
+                ).order_by(ItemOccurrence.id.desc()).limit(1)
+            )
+            if occurrence is None:
+                self.production_queue.fail(task.id, self.owner, "PENDING_OCCURRENCE_MISSING", "pending occurrence missing", recoverable=False)
+                return
+            if occurrence.cleanup_status == CLEANED:
+                self.production_queue.complete(task.id, self.owner)
+                return
+            try:
+                perform_cleanup(
+                    session, occurrence, self.settings, datetime.now(timezone.utc),
+                    retry_failed=True,
+                )
+                session.commit()
+            except ValueError as exc:
+                session.rollback()
+                self.production_queue.fail(task.id, self.owner, "PENDING_CLEANUP_NOT_READY", str(exc), recoverable=True)
+                return
+            except Exception as exc:  # cleanup stores its failure status for retry
+                # ``perform_cleanup`` records ``cleanup_failed`` before it
+                # raises. Persist that ledger state; rolling back here would
+                # turn a retry into an opaque repeated failure.
+                session.commit()
+                self.production_queue.fail(task.id, self.owner, "PENDING_CLEANUP_FAILED", type(exc).__name__, recoverable=True)
+                return
+        self.production_queue.complete(task.id, self.owner)
 
     def _pipeline_oa_resync(self, task: PipelineTask) -> None:
         """Re-sync a single cleaned Pending item's display columns from OA.

@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ContentObject, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ContentObject, ItemOccurrence, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
 from oa_knowledge.online_audit import start_audit
 from oa_knowledge.web.worker import OperationWorker, _has_verified_attachment
 from oa_knowledge.production_pipeline import ProductionQueue
@@ -1353,12 +1353,98 @@ def test_notify_feishu_delivers_and_records_delivery(config_file: Path, monkeypa
     assert len(sent) == 1
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
-        assert row.status == "completed"
+        assert row.status == "queued"
+        assert row.stage == "pending_cleanup"
         delivery = session.scalar(select(NotificationDelivery).where(
             NotificationDelivery.idempotency_key == f"feishu:pending:{logical_id}:abc123"))
         assert delivery is not None
         assert delivery.status == "sent"
         assert delivery.sent_at is not None
+
+
+def test_sent_pending_delivery_advances_to_cleanup_without_resend(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    settings.feishu.enabled = True
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    logical_id, occurrence_id = _seed_pending_summary(engine, monkeypatch)
+    with Session(engine) as session:
+        session.add(NotificationDelivery(
+            logical_item_id=logical_id,
+            channel="feishu",
+            notification_type="pending_summary",
+            idempotency_key=f"feishu:pending:{logical_id}:abc123",
+            status="sent",
+        ))
+        session.commit()
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", str(logical_id), "notify_feishu", "sent-then-cleanup",
+        payload={"occurrence_id": occurrence_id, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr(
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_pending_summary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not resend")),
+    )
+    try:
+        worker._pipeline_notify_feishu(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "queued"
+        assert row.stage == "pending_cleanup"
+
+
+def test_pending_cleanup_failure_is_requeued_without_resending(config_file: Path, monkeypatch) -> None:
+    """Cleanup retries retain the sent delivery and never re-enter Feishu."""
+    settings = load_settings(config_file)
+    settings.feishu.enabled = True
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    logical_id, occurrence_id = _seed_pending_summary(engine, monkeypatch)
+    with Session(engine) as session:
+        session.add(NotificationDelivery(
+            logical_item_id=logical_id,
+            channel="feishu",
+            notification_type="pending_summary",
+            idempotency_key=f"feishu:pending:{logical_id}:abc123",
+            status="sent",
+        ))
+        session.commit()
+
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", str(logical_id), "pending_cleanup", "cleanup-retry-only",
+        payload={"occurrence_id": occurrence_id, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+
+    def fail_cleanup(session, occurrence, *_args, **_kwargs):
+        occurrence.cleanup_status = "cleanup_failed"
+        occurrence.cleanup_error_code = "OSError"
+        session.flush()
+        raise OSError("synthetic cleanup failure")
+
+    monkeypatch.setattr("oa_knowledge.pending_cleanup.perform_cleanup", fail_cleanup)
+    try:
+        worker._pipeline_pending_cleanup(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        occurrence = session.get(ItemOccurrence, occurrence_id)
+        assert row.status == "queued"
+        assert row.stage == "pending_cleanup"
+        assert row.error_code == "PENDING_CLEANUP_FAILED"
+        assert occurrence.cleanup_status == "cleanup_failed"
 
 
 def test_pipeline_done_capture_and_archive_archives_and_enqueues(config_file: Path, monkeypatch) -> None:

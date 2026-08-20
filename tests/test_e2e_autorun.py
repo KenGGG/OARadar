@@ -97,7 +97,10 @@ def test_e2e_new_pending_notifies_exactly_once(config_file: Path) -> None:
             assert worker.run_once() is True
             # notify_feishu -> sends to Feishu
             assert worker.run_once() is True
-            # A third pass should find no further work.
+            # pending_cleanup runs separately, so a successful send can never
+            # be repeated while transient cleanup work is retried.
+            assert worker.run_once() is True
+            # All three Pending stages are now complete.
             assert worker.run_once() is False
         finally:
             worker.close()

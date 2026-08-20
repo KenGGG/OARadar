@@ -189,6 +189,9 @@ def test_normal_discovery_notifies_new_items(tmp_path) -> None:
         session.commit()
         payload = _payload(session, "pending:affair-1")
         assert payload["notify"] is True
+        task = session.scalar(select(PipelineTask).where(PipelineTask.stage == "detail_sync"))
+        occurrence = session.get(ItemOccurrence, task.logical_item_id)
+        assert task.idempotency_key == f"pending:{occurrence.occurrence_key}:{occurrence.discovery_hash}:v2"
 
 
 def test_disabled_mode_syncs_state_but_enqueues_no_tasks(tmp_path) -> None:

@@ -113,7 +113,7 @@ def sync_pending_discovery(
             continue
         if enqueue_pipeline:
             notify = notification_mode == "normal"
-        task_key = f"pending:{occurrence.occurrence_key}:{discovery_hash}:detail-v1"
+        task_key = f"pending:{occurrence.occurrence_key}:{discovery_hash}:v2"
         if session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == task_key)) is None:
             session.add(PipelineTask(
                 queue_name="realtime_pending", priority=0, logical_item_key=str(occurrence.logical_item_id),
@@ -277,4 +277,3 @@ def resync_pending_item_from_oa(
         sync_pending_discovery(session, [matched], authoritative=False, notification_mode="disabled")
         session.commit()
         return True
-

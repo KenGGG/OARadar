@@ -63,6 +63,7 @@ def cleanup_eligibility(
     now: datetime,
     *,
     force: bool = False,
+    retry_failed: bool = False,
 ) -> tuple[bool, str]:
     """Return ``(eligible, reason)`` for cleaning this occurrence's business data.
 
@@ -73,7 +74,7 @@ def cleanup_eligibility(
     status = occurrence.cleanup_status or NOT_ELIGIBLE
     if status in {CLEANED, CLEANING}:
         return False, "already_cleaned" if status == CLEANED else "already_cleaning"
-    if status == CLEANUP_FAILED and not force:
+    if status == CLEANUP_FAILED and not (force or retry_failed):
         return False, "previous_cleanup_failed"
 
     if delivery is None:
@@ -144,14 +145,18 @@ def perform_cleanup(
     now: datetime,
     *,
     force: bool = False,
+    retry_failed: bool = False,
 ) -> dict[str, Any]:
     """Delete the business payload for ``occurrence`` and retain the minimal ledger.
 
-    Returns a summary dict. Raises nothing for ordinary data problems — failures
-    are recorded on the occurrence as ``cleanup_failed`` so the operator can retry.
+    Returns a summary dict. Ordinary eligibility failures raise ``ValueError``;
+    physical cleanup failures are recorded as ``cleanup_failed`` before raising
+    so the dedicated cleanup stage can retry without re-sending Feishu.
     """
     delivery = delivery_for_occurrence(session, occurrence)
-    eligible, reason = cleanup_eligibility(occurrence, delivery, settings, now, force=force)
+    eligible, reason = cleanup_eligibility(
+        occurrence, delivery, settings, now, force=force, retry_failed=retry_failed,
+    )
     if not eligible:
         raise ValueError(f"cleanup not eligible: {reason}")
 
