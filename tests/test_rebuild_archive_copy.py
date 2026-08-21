@@ -45,7 +45,7 @@ def session(settings: Settings):
 def run_id(session: Session) -> int:
     run = PipelineRun(run_key="synthetic-rebuild-copy", pipeline_type="data_rebuild")
     session.add(run)
-    session.flush()
+    session.commit()
     return run.id
 
 
@@ -76,7 +76,7 @@ def inventory_row(session: Session, settings: Settings) -> InventoryRow:
         download_status="verified",
     )
     session.add(file)
-    session.flush()
+    session.commit()
     return build_inventory(session, settings)[0]
 
 
@@ -101,7 +101,7 @@ def test_copy_is_idempotent(
 
     assert first.status == second.status == "success"
     assert second.id == first.id
-    assert session.scalars(select(RebuildOutput)).all() == [first]
+    assert [output.id for output in session.scalars(select(RebuildOutput))] == [first.id]
 
 
 @pytest.mark.parametrize("damage", ("deleted", "tampered"))
@@ -153,14 +153,14 @@ def test_atomic_no_clobber_race_preserves_a_concurrent_different_target(
     assert not list(target.parent.glob(".rebuild-copy-*.tmp"))
 
 
-def test_final_ledger_persistence_failure_compensates_its_own_publication(
+def test_final_ledger_persistence_failure_retains_pending_final_for_retry(
     monkeypatch: pytest.MonkeyPatch,
     session: Session,
     settings: Settings,
     run_id: int,
     inventory_row: InventoryRow,
 ) -> None:
-    """A failed success commit removes only the inode this call linked into place."""
+    """A failed success commit leaves a verified pending final for later recovery."""
     target = resolve_rebuild_path(settings, inventory_row.destination_relpath)
     real_set_status = archive_copy._set_status
 
@@ -174,13 +174,40 @@ def test_final_ledger_persistence_failure_compensates_its_own_publication(
     with pytest.raises(RuntimeError, match="persistence"):
         copy_inventory_row(session, settings, inventory_row, run_id=run_id)
 
-    assert not target.exists()
+    assert target.read_bytes() == b"synthetic original evidence"
     session.rollback()
     engine = create_db_engine(settings.database_path)
     with Session(engine) as verifier:
         persisted = verifier.scalar(select(RebuildOutput))
     assert persisted is not None
     assert persisted.status == "pending"
+
+    monkeypatch.setattr(archive_copy, "_set_status", real_set_status)
+    recovered = copy_inventory_row(session, settings, inventory_row, run_id=run_id)
+    assert recovered.id == persisted.id
+    assert recovered.status == "success"
+
+
+def test_copy_does_not_commit_unrelated_caller_session_work(
+    session: Session, settings: Settings, run_id: int, inventory_row: InventoryRow
+) -> None:
+    """The isolated ledger transaction leaves caller-owned changes rollbackable."""
+    unrelated = OAItem(
+        oa_item_key="uncommitted-synthetic-caller-item",
+        source_channel="done",
+        title="Uncommitted synthetic item",
+    )
+    session.add(unrelated)
+
+    output = copy_inventory_row(session, settings, inventory_row, run_id=run_id)
+
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as verifier:
+        assert verifier.get(RebuildOutput, output.id) is not None
+        assert verifier.scalar(select(OAItem).where(
+            OAItem.oa_item_key == "uncommitted-synthetic-caller-item"
+        )) is None
+    session.rollback()
 
 
 def test_persistence_failure_before_publish_leaves_no_final_target(

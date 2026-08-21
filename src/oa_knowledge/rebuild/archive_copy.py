@@ -104,29 +104,17 @@ def _record_failure(session: Session, row: InventoryRow, *, run_id: int, error_c
     )
 
 
-def _unlink_if_owned(target: Path, published_inode: tuple[int, int]) -> None:
-    """Compensate only a final name still pointing at our published inode."""
-    try:
-        stat_result = target.stat()
-    except OSError:
-        return
-    if (stat_result.st_dev, stat_result.st_ino) == published_inode:
-        target.unlink(missing_ok=True)
-        _fsync_directory(target.parent)
-
-
-def _publish_no_clobber(temporary: Path, target: Path) -> tuple[bool, tuple[int, int] | None]:
+def _publish_no_clobber(temporary: Path, target: Path) -> bool:
     """Atomically create the final name from target-local temporary bytes."""
-    stat_result = temporary.stat()
     try:
         os.link(temporary, target)
     except FileExistsError:
-        return False, None
+        return False
     _fsync_directory(target.parent)
-    return True, (stat_result.st_dev, stat_result.st_ino)
+    return True
 
 
-def copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, *, run_id: int) -> RebuildOutput:
+def _copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, *, run_id: int) -> RebuildOutput:
     """Durably ledger and atomically publish one verified ready original.
 
     The function owns commits for its ledger transition, so a caller rollback
@@ -160,14 +148,13 @@ def copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, 
         return _set_status(session, output, status="failed", error_code="TARGET_CONFLICT")
 
     temporary: Path | None = None
-    published_inode: tuple[int, int] | None = None
     try:
         temporary = _copy_to_temporary(source, target.parent)
         if not _file_matches(temporary, size_bytes=row.size_bytes, sha256=row.sha256):
             return _set_status(session, output, status="failed", error_code="COPY_VERIFICATION_FAILED")
         if not _file_matches(source, size_bytes=row.size_bytes, sha256=row.sha256):
             return _set_status(session, output, status="failed", error_code="SOURCE_CHANGED")
-        published, published_inode = _publish_no_clobber(temporary, target)
+        published = _publish_no_clobber(temporary, target)
         if not published:
             if _file_matches(target, size_bytes=row.size_bytes, sha256=row.sha256):
                 return _set_status(session, output, status="success", error_code=None)
@@ -175,15 +162,21 @@ def copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, 
         temporary.unlink()
         temporary = None
         if not _file_matches(target, size_bytes=row.size_bytes, sha256=row.sha256):
-            _unlink_if_owned(target, published_inode)
             return _set_status(session, output, status="failed", error_code="COPY_VERIFICATION_FAILED")
-        try:
-            return _set_status(session, output, status="success", error_code=None)
-        except Exception:
-            _unlink_if_owned(target, published_inode)
-            raise
+        return _set_status(session, output, status="success", error_code=None)
     except OSError:
         return _set_status(session, output, status="failed", error_code="COPY_FAILED")
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, *, run_id: int) -> RebuildOutput:
+    """Copy using a dedicated ledger session without committing caller work.
+
+    Referenced run, item, and file rows must already be committed. A final
+    persistence failure leaves its precommitted ledger entry pending and the
+    verified final intact; a later call revalidates and finalizes it.
+    """
+    with Session(bind=session.get_bind(), expire_on_commit=False) as ledger_session:
+        return _copy_inventory_row(ledger_session, settings, row, run_id=run_id)
