@@ -96,6 +96,28 @@ def _tree_sha256(directory: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _parse_manifest(directory: Path, *, source_file_id: int, source_sha256: str) -> tuple[str, str] | None:
+    """Return a manifest-backed engine identity, never inferred from a path."""
+    try:
+        value = json.loads((directory / ".oaradar-parse.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    engine = value.get("engine")
+    engine_version = value.get("engine_version")
+    if (
+        not isinstance(engine, str)
+        or not engine
+        or not isinstance(engine_version, str)
+        or not engine_version
+        or value.get("source_file_id") != source_file_id
+        or value.get("source_sha256") != source_sha256
+    ):
+        return None
+    return engine, engine_version
+
+
 def _fsync_tree(directory: Path) -> None:
     for path in _validated_regular_files(directory):
         try:
@@ -309,8 +331,11 @@ def parse_rebuilt_source(
         for output in existing:
             target = resolve_rebuild_path(settings, output.target_relpath)
             product_sha = _tree_sha256(target)
-            if product_sha is not None and product_sha == output.sha256:
-                engine = Path(output.target_relpath).name
+            manifest = _parse_manifest(
+                target, source_file_id=source.id, source_sha256=source_sha,
+            )
+            if product_sha is not None and product_sha == output.sha256 and manifest is not None:
+                engine, _engine_version = manifest
                 return _result(source_file_id, "success", engine, relpath=output.target_relpath,
                                source_sha256=source_sha, product_sha256=product_sha, error_code=None)
 
@@ -333,7 +358,11 @@ def parse_rebuilt_source(
             if product_sha is None:
                 raise ValueError("parser produced no regular files")
             _fsync_tree(staging)
-            relpath = f"{base_relpath}/{parsed.engine}"
+            # A manifest-less legacy directory can occupy the old engine-only
+            # name.  Content-addressing the new product keeps promotion
+            # no-clobber; only after success do we remove the same-source
+            # legacy result through the ledger reconciliation below.
+            relpath = f"{base_relpath}/{parsed.engine}-{product_sha[:16]}"
             target = resolve_rebuild_path(settings, relpath)
             target.parent.mkdir(parents=True, exist_ok=True)
 

@@ -17,7 +17,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, OAItem, PipelineRun, RebuildOutput
 from oa_knowledge.parsers.router import ParseResult
-from oa_knowledge.rebuild.parser import parse_rebuilt_source
+from oa_knowledge.rebuild.parser import _tree_sha256, parse_rebuilt_source
 from oa_knowledge.rebuild.paths import resolve_rebuild_path
 
 
@@ -176,6 +176,50 @@ def test_parser_reuses_verified_current_run_product(
     assert second.output_relpath == first.output_relpath
     assert calls == 1
     assert len(list(session.scalars(select(RebuildOutput).where(RebuildOutput.kind == "parse")))) == 1
+
+
+def test_parser_rebuilds_legacy_success_without_parse_manifest(
+    monkeypatch: pytest.MonkeyPatch, session: Session, settings: Settings, run_id: int,
+) -> None:
+    """A hash-valid pre-manifest product is replaced by a manifest-backed product."""
+    original = _rebuilt_original(session, settings, run_id, name="source.txt", copied=b"copied bytes")
+    legacy_relpath = f"parse/{run_id}/{original.source_file_id}/{original.sha256}/stub"
+    legacy_target = resolve_rebuild_path(settings, legacy_relpath)
+    legacy_product = legacy_target / "stub-v1" / "source.md"
+    legacy_product.parent.mkdir(parents=True)
+    legacy_product.write_text("# copied bytes\n", encoding="utf-8")
+    (legacy_product.parent / "asset.txt").write_text("synthetic asset\n", encoding="utf-8")
+    legacy = RebuildOutput(
+        run_id=run_id, oa_item_id=original.oa_item_id, source_file_id=original.source_file_id,
+        kind="parse", target_relpath=legacy_relpath, sha256=_tree_sha256(legacy_target),
+        status="success", error_code=None,
+    )
+    session.add(legacy)
+    session.commit()
+    legacy_id = legacy.id
+    calls = 0
+
+    def parse_again(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _stub_parser(*args, **kwargs)
+
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", parse_again)
+
+    result = parse_rebuilt_source(session, settings, run_id, original.source_file_id)
+
+    assert result.status == "success"
+    assert calls == 1
+    assert result.output_relpath is not None
+    assert result.output_relpath != legacy_relpath
+    target = resolve_rebuild_path(settings, result.output_relpath)
+    assert json.loads((target / ".oaradar-parse.json").read_text(encoding="utf-8")) == {
+        "engine": "stub", "engine_version": "1",
+        "source_file_id": original.source_file_id, "source_sha256": original.sha256,
+    }
+    session.expire_all()
+    assert session.get(RebuildOutput, legacy_id) is None
+    assert not legacy_target.exists()
 
 
 def test_invalid_rebuilt_original_never_falls_back_to_live_file(
