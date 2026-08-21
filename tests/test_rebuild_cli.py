@@ -26,6 +26,8 @@ from oa_knowledge.db.models import (
     PipelineTask,
     RebuildOutput,
 )
+from oa_knowledge.rebuild import cutover
+from oa_knowledge.rebuild.cutover import CutoverPlan, generate_authorization_token
 
 
 def _add_ready_evidence(config_file: Path) -> None:
@@ -186,11 +188,68 @@ def test_successful_archive_output_includes_safe_run_id(config_file) -> None:
     assert payload["copied"] == 1
 
 
+def test_cutover_command_defaults_to_zero_mutation_dry_run(config_file: Path) -> None:
+    """Planning must not rename either directory or invoke service control."""
+    settings = load_settings(config_file)
+    settings.data_root.mkdir()
+    rebuilt = config_file.parent / "data_rebuilt"
+    rebuilt.mkdir()
+
+    result = CliRunner().invoke(app, [
+        "rebuild", "cutover", "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is True
+    assert payload["ready"] is False
+    assert payload["unit_count"] == 5
+    assert settings.data_root.exists() and rebuilt.exists()
+    assert not list(config_file.parent.glob("data_legacy_*"))
+
+
+def test_cutover_execute_requires_a_fresh_path_bound_token(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live = tmp_path / "data"
+    rebuilt = tmp_path / "data_rebuilt"
+    legacy = tmp_path / "data_legacy_20260822T120000Z"
+    live.mkdir(); rebuilt.mkdir()
+    plan = CutoverPlan(
+        live_root=live, rebuilt_root=rebuilt, legacy_root=legacy,
+        units=cutover.KNOWN_USER_UNITS,
+        validation_ok=True, database_backup_ok=True, external_backup_ok=True, git_clean=True,
+        units_discovered=True, same_filesystem=True, legacy_available=True,
+    )
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_AUTHORIZATION_KEY", "x" * 32)
+    token = generate_authorization_token(plan, now=datetime.now(UTC))
+    monkeypatch.setattr(cli, "build_cutover_plan", lambda _settings, _now: plan)
+    called: list[bool] = []
+    monkeypatch.setattr(
+        cli, "execute_cutover",
+        lambda _plan, *, authorized: called.append(authorized) or {"status": "cutover_complete", "rollback": "not_required"},
+    )
+
+    denied = CliRunner().invoke(app, [
+        "rebuild", "cutover", "--execute", "--config", str(config_file),
+    ])
+    accepted = CliRunner().invoke(app, [
+        "rebuild", "cutover", "--execute", "--authorization-token", token,
+        "--config", str(config_file),
+    ])
+
+    assert denied.exit_code == 1
+    assert json.loads(denied.stdout) == {"error_code": "CUTOVER_AUTHORIZATION_REQUIRED"}
+    assert accepted.exit_code == 0
+    assert json.loads(accepted.stdout)["status"] == "cutover_complete"
+    assert called == [True]
+
+
 def test_rebuild_help_registers_all_local_commands() -> None:
     result = CliRunner().invoke(app, ["rebuild", "--help"])
 
     assert result.exit_code == 0
-    assert all(command in result.stdout for command in ("inventory", "archive", "status"))
+    assert all(command in result.stdout for command in ("inventory", "archive", "status", "cutover"))
 
 
 @pytest.mark.parametrize("command", ("inventory", "status", "archive"))

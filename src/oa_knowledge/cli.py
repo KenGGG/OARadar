@@ -61,6 +61,14 @@ from oa_knowledge.rebuild.campaign import (
 )
 from oa_knowledge.rebuild.inventory import build_inventory, inventory_summary, write_private_inventory
 from oa_knowledge.rebuild.paths import resolve_rebuild_path, resolve_rebuild_root
+from oa_knowledge.rebuild.cutover import (
+    CutoverAuthorizationError,
+    CutoverError,
+    build_cutover_plan,
+    execute_cutover,
+    generate_authorization_token,
+    verify_authorization_token,
+)
 
 app = typer.Typer(help="OARadar V2 local read-only OA workspace")
 db_app = typer.Typer(help="Database migration commands")
@@ -213,6 +221,47 @@ def rebuild_status(
     finally:
         if "engine" in locals():
             engine.dispose()
+
+
+@rebuild_app.command("cutover")
+def rebuild_cutover(
+    execute: bool = typer.Option(False, "--execute"),
+    authorization_token: str | None = typer.Option(None, "--authorization-token"),
+    config: Path | None = typer.Option(None, "--config", dir_okay=False),  # noqa: B008
+) -> None:
+    """Inspect a bounded cutover by default; execute only with a fresh token."""
+    try:
+        settings = settings_option(config)
+        plan = build_cutover_plan(settings, datetime.now(timezone.utc))
+        if not execute:
+            token: str | None = None
+            if plan.ready:
+                try:
+                    token = generate_authorization_token(plan, now=datetime.now(timezone.utc))
+                except CutoverAuthorizationError:
+                    # A dry run remains safe and useful even before the local
+                    # operator installs the execution-only HMAC key.
+                    token = None
+            typer.echo(json.dumps({
+                "authorization_token": token,
+                "dry_run": True,
+                "preflight_errors": plan.preflight_errors,
+                "ready": plan.ready,
+                "unit_count": len(plan.units),
+            }, ensure_ascii=False))
+            return
+        if not authorization_token:
+            _rebuild_error("CUTOVER_AUTHORIZATION_REQUIRED")
+        verify_authorization_token(
+            plan, authorization_token, now=datetime.now(timezone.utc),
+        )
+        typer.echo(json.dumps(execute_cutover(plan, authorized=True), ensure_ascii=False))
+    except typer.Exit:
+        raise
+    except CutoverError as exc:
+        _rebuild_error(exc.error_code)
+    except Exception:  # noqa: BLE001 - cutover output must remain redacted.
+        _rebuild_error("CUTOVER_FAILED")
 
 
 def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:
