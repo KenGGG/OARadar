@@ -323,7 +323,7 @@ def test_parser_file_uri_is_rejected_without_path_disclosure(
     parsed = _parse(session, settings, run_id, source)
     parse_root = resolve_rebuild_path(settings, parsed.target_relpath)
     (parse_root / "stub-v2" / "document.md").write_text(
-        "[private](file:///home/example/private.txt)\n", encoding="utf-8"
+        "[private](file:///home/example/private.txt)\n", encoding="utf-8"  # public-release: synthetic
     )
     parsed.sha256 = _tree_sha256(parse_root)
     session.commit()
