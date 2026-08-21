@@ -1,14 +1,17 @@
 """V2 Markdown Delivery classification and item-index tests."""
 
 import sqlite3
+from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import MarkdownExport, OAItem
+from oa_knowledge.db.models import MarkdownExport, OAItem, RebuildClassificationEvent
 from oa_knowledge.markdown_delivery import classify_done_item, publish_item_index
+from oa_knowledge.rebuild.classification import confirm_classification
 
 
 def _item(session, *, title: str, sender: str | None, document_number: str | None = None) -> OAItem:
@@ -50,6 +53,61 @@ def test_external_classification_uses_sender_as_normalized_issuer(tmp_path) -> N
         assert item.internal_category is None
         assert item.external_issuer == "示例省国资委"
         assert item.classification_version == "v1"
+
+
+def test_legacy_classifier_does_not_mutate_confirmed_classification_or_audit(tmp_path) -> None:
+    settings = Settings(app={"data_root": tmp_path / "data"})
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = _item(
+            session, title="关于开展专项检查的通知", sender="示例省国资委",
+            document_number="示例国资〔2026〕1号",
+        )
+        item.source_type = "internal"
+        item.internal_category = "风险管理"
+        item.classification_state = "suggested"
+        item.classification_confidence = 0.95
+        item.classification_source = "rule"
+        confirmed_at = datetime(2026, 8, 21, tzinfo=timezone.utc)
+        confirm_classification(
+            session, item.id, source_type="internal", internal_category="风险管理",
+            external_issuer=None, confirmed_at=confirmed_at, actor="synthetic_reviewer",
+        )
+        session.commit()
+        event_before = session.scalar(select(RebuildClassificationEvent).where(
+            RebuildClassificationEvent.oa_item_id == item.id,
+        ))
+        assert event_before is not None
+        classification_before = (
+            item.source_type, item.internal_category, item.external_issuer,
+            item.classification_version,
+            item.classification_state, item.classification_confidence,
+            item.classification_confirmed_at, item.classification_source,
+        )
+        audit_before = (
+            event_before.id, event_before.previous_classification_json,
+            event_before.current_classification_json, event_before.actor, event_before.created_at,
+        )
+
+        classify_done_item(session, item.oa_item_key)
+        session.commit()
+
+        events_after = session.scalars(select(RebuildClassificationEvent).where(
+            RebuildClassificationEvent.oa_item_id == item.id,
+        )).all()
+        assert (
+            item.source_type, item.internal_category, item.external_issuer,
+            item.classification_version,
+            item.classification_state, item.classification_confidence,
+            item.classification_confirmed_at, item.classification_source,
+        ) == classification_before
+        assert len(events_after) == 1
+        assert (
+            events_after[0].id, events_after[0].previous_classification_json,
+            events_after[0].current_classification_json, events_after[0].actor,
+            events_after[0].created_at,
+        ) == audit_before
 
 
 def test_item_index_ledger_migration_enforces_document_kind_and_unique_item_schema(tmp_path) -> None:

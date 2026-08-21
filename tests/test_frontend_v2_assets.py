@@ -41,3 +41,33 @@ def test_rebuild_page_limits_internal_categories_and_traps_dialog_focus() -> Non
     assert "getFocusableElements" in source
     assert 'event.key !== "Tab"' in source
     assert "focusable[focusable.length - 1].focus()" in source
+
+
+def test_rebuild_unknown_source_is_unselected_in_confirmation_form() -> None:
+    root = Path(__file__).parents[1]
+    source = (root / "webui/src/views/RebuildClassificationView.tsx").read_text(encoding="utf-8")
+    types = (root / "webui/src/types/rebuild.ts").read_text(encoding="utf-8")
+
+    assert '"internal" | "external" | "unknown" | null' in types
+    assert "sourceTypeForForm" in source
+    assert '<option value="">请选择事项类别</option>' in source
+    assert 'useState<"internal" | "external" | "">("")' in source
+    assert 'sourceType === "external" ? <label><span>外部机构</span>' in source
+
+
+def test_rebuild_dialog_restores_focus_and_inerts_background() -> None:
+    source = Path("webui/src/views/RebuildClassificationView.tsx").read_text(encoding="utf-8")
+
+    assert "createPortal" in source
+    assert "previouslyFocused" in source
+    assert "appShell.inert = true" in source
+    assert "previouslyFocused?.focus()" in source
+
+
+def test_rebuild_item_metadata_shows_document_and_missing_date_status() -> None:
+    source = Path("webui/src/views/RebuildClassificationView.tsx").read_text(encoding="utf-8")
+
+    assert "日期待补充" in source
+    assert "has_document_number" in source
+    assert "需生成正文" in source
+    assert "无需生成正文" in source

@@ -14,39 +14,46 @@ def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     existing_columns = {column["name"] for column in inspector.get_columns("oa_items")}
-    existing_constraints = {constraint["name"] for constraint in inspector.get_check_constraints("oa_items")}
     existing_indexes = {index["name"] for index in inspector.get_indexes("oa_items")}
-    with op.batch_alter_table("oa_items", recreate="always") as batch:
-        additions = (
-            ("document_date", sa.Date(), True, None),
-            (
-                "classification_state",
-                sa.String(20),
-                False,
-                sa.text("'needs_review'"),
-            ),
-            ("classification_confidence", sa.Float(), True, None),
-            ("classification_confirmed_at", sa.DateTime(timezone=True), True, None),
-            ("classification_source", sa.String(20), True, None),
-        )
-        for name, type_, nullable, server_default in additions:
-            if name not in existing_columns:
-                batch.add_column(sa.Column(name, type_, nullable=nullable, server_default=server_default))
-        if "ck_oa_items_classification_state" not in existing_constraints:
-            batch.create_check_constraint(
-                "ck_oa_items_classification_state",
+
+    # SQLite supports ADD COLUMN with a column-level CHECK constraint.  Adding
+    # these fields in place is essential: recreating this referenced parent
+    # table while foreign_keys=ON fires CASCADE and SET NULL actions in every
+    # dependent table when the old parent is dropped.
+    additions = (
+        sa.Column("document_date", sa.Date(), nullable=True),
+        sa.Column(
+            "classification_state",
+            sa.String(20),
+            sa.CheckConstraint(
                 "classification_state IN ('suggested', 'needs_review', 'confirmed')",
-            )
-        if "ck_oa_items_classification_source" not in existing_constraints:
-            batch.create_check_constraint(
-                "ck_oa_items_classification_source",
+                name="ck_oa_items_classification_state",
+            ),
+            nullable=False,
+            server_default=sa.text("'needs_review'"),
+        ),
+        sa.Column("classification_confidence", sa.Float(), nullable=True),
+        sa.Column("classification_confirmed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "classification_source",
+            sa.String(20),
+            sa.CheckConstraint(
                 "classification_source IS NULL OR classification_source IN ('rule', 'manual')",
-            )
-        if "ix_oa_items_source_channel_classification_state_source_type" not in existing_indexes:
-            batch.create_index(
-                "ix_oa_items_source_channel_classification_state_source_type",
-                ["source_channel", "classification_state", "source_type"],
-            )
+                name="ck_oa_items_classification_source",
+            ),
+            nullable=True,
+        ),
+    )
+    for column in additions:
+        if column.name not in existing_columns:
+            op.add_column("oa_items", column)
+
+    if "ix_oa_items_source_channel_classification_state_source_type" not in existing_indexes:
+        op.create_index(
+            "ix_oa_items_source_channel_classification_state_source_type",
+            "oa_items",
+            ["source_channel", "classification_state", "source_type"],
+        )
 
     if "rebuild_classification_events" not in inspector.get_table_names():
         op.create_table(
@@ -62,12 +69,12 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("rebuild_classification_events")
-    with op.batch_alter_table("oa_items", recreate="always") as batch:
-        batch.drop_index("ix_oa_items_source_channel_classification_state_source_type")
-        batch.drop_constraint("ck_oa_items_classification_source", type_="check")
-        batch.drop_constraint("ck_oa_items_classification_state", type_="check")
-        batch.drop_column("classification_source")
-        batch.drop_column("classification_confirmed_at")
-        batch.drop_column("classification_confidence")
-        batch.drop_column("classification_state")
-        batch.drop_column("document_date")
+    op.drop_index("ix_oa_items_source_channel_classification_state_source_type", table_name="oa_items")
+    for column_name in (
+        "classification_source",
+        "classification_confirmed_at",
+        "classification_confidence",
+        "classification_state",
+        "document_date",
+    ):
+        op.drop_column("oa_items", column_name)

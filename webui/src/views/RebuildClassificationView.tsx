@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react"
+import { createPortal } from "react-dom"
 import { CircleAlert, RefreshCw, X } from "lucide-react"
 import { api, postApi, time } from "../App"
 import type { ClassificationGroup, RebuildClassificationItem, RebuildClassificationPage, RebuildClassificationSummary } from "../types/rebuild"
@@ -13,6 +14,7 @@ const INTERNAL_CATEGORIES = [
   "财务资金", "人力行政", "信息化", "其他内部",
 ] as const
 type InternalCategory = typeof INTERNAL_CATEGORIES[number]
+type FormSourceType = "internal" | "external" | ""
 
 function isInternalCategory(value: string): value is InternalCategory {
   return INTERNAL_CATEGORIES.includes(value as InternalCategory)
@@ -22,11 +24,16 @@ function groupLabel(group: ClassificationGroup) {
   return GROUPS.find(item => item.id === group)?.label || ""
 }
 
+function sourceTypeForForm(value: RebuildClassificationItem["source_type"]): FormSourceType {
+  return value === "internal" || value === "external" ? value : ""
+}
+
 function metadataFor(item: RebuildClassificationItem) {
   return [
     item.document_number && `文号：${item.document_number}`,
     item.sender && `来源：${item.sender}`,
-    item.item_date && `日期：${time(item.item_date)}`,
+    item.item_date ? `日期：${time(item.item_date)}` : "日期待补充",
+    item.has_document_number ? "主文档：需生成正文" : "主文档：无需生成正文",
     `附件：${item.attachment_count} 个`,
   ].filter(Boolean).join(" · ") || "暂无可展示的元数据"
 }
@@ -34,7 +41,19 @@ function metadataFor(item: RebuildClassificationItem) {
 function Dialog({ children, close, titleId }: { children: React.ReactNode; close: () => void; titleId: string }) {
   const closeRef = useRef<HTMLButtonElement>(null)
   const dialogRef = useRef<HTMLElement>(null)
-  useEffect(() => { closeRef.current?.focus() }, [])
+  const previouslyFocused = useRef(
+    document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  ).current
+  useEffect(() => {
+    const appShell = document.querySelector<HTMLElement>(".app-shell")
+    const wasInert = appShell?.inert || false
+    if (appShell) appShell.inert = true
+    closeRef.current?.focus()
+    return () => {
+      if (appShell) appShell.inert = wasInert
+      previouslyFocused?.focus()
+    }
+  }, [previouslyFocused])
   const getFocusableElements = () => Array.from(
     dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex='-1'])") || [],
   ).filter(element => element.tabIndex >= 0)
@@ -50,13 +69,13 @@ function Dialog({ children, close, titleId }: { children: React.ReactNode; close
       event.preventDefault(); focusable[0].focus()
     }
   }
-  return <div className="classification-dialog-layer" role="presentation" onKeyDown={onKeyDown}>
+  return createPortal(<div className="classification-dialog-layer" role="presentation" onKeyDown={onKeyDown}>
     <button className="classification-dialog-scrim" aria-label="关闭确认窗口" onClick={close}/>
     <section ref={dialogRef} className="classification-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId}>
       <button ref={closeRef} className="icon-button classification-dialog-close" aria-label="关闭" onClick={close}><X size={18}/></button>
       {children}
     </section>
-  </div>
+  </div>, document.body)
 }
 
 export function RebuildClassificationView({ refreshKey }: { refreshKey: number }) {
@@ -66,7 +85,7 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
   const [summary, setSummary] = useState<RebuildClassificationSummary | null>(null)
   const [selected, setSelected] = useState<RebuildClassificationItem | null>(null)
   const [bulkGroup, setBulkGroup] = useState<"internal" | "external" | null>(null)
-  const [sourceType, setSourceType] = useState<"internal" | "external">("internal")
+  const [sourceType, setSourceType] = useState<"internal" | "external" | "">("")
   const [internalCategory, setInternalCategory] = useState<InternalCategory | "">("")
   const [externalIssuer, setExternalIssuer] = useState("")
   const [loading, setLoading] = useState(true)
@@ -90,15 +109,17 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
   const openConfirmation = (item: RebuildClassificationItem) => {
     const suggestedCategory = item.internal_category || ""
     setSelected(item)
-    setSourceType(item.source_type || "internal")
+    setSourceType(sourceTypeForForm(item.source_type))
     setInternalCategory(isInternalCategory(suggestedCategory) ? suggestedCategory : "")
     setExternalIssuer(item.external_issuer || "")
   }
-  const valid = sourceType === "internal" ? isInternalCategory(internalCategory) : externalIssuer.trim().length > 0
+  const valid = sourceType === "internal"
+    ? isInternalCategory(internalCategory)
+    : sourceType === "external" && externalIssuer.trim().length > 0
   const pages = Math.max(1, Math.ceil((data?.total || 0) / 50))
 
   const confirmOne = async () => {
-    if (!selected || !valid) return
+    if (!selected || !valid || !sourceType) return
     setBusy(true); setError("")
     try {
       await postApi(`/api/rebuild/classifications/${selected.id}/confirm`, {
@@ -106,7 +127,7 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
         internal_category: sourceType === "internal" && isInternalCategory(internalCategory) ? internalCategory : null,
         external_issuer: sourceType === "external" ? externalIssuer.trim() : null,
       })
-      setSelected(null); await load()
+      await load(); setBusy(false); setSelected(null)
     } catch (reason) { setError(reason instanceof Error ? reason.message : "确认失败") }
     finally { setBusy(false) }
   }
@@ -115,7 +136,7 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
     setBusy(true); setError("")
     try {
       await postApi("/api/rebuild/classifications/bulk-confirm", { source_type: bulkGroup })
-      setBulkGroup(null); await load()
+      await load(); setBusy(false); setBulkGroup(null)
     } catch (reason) { setError(reason instanceof Error ? reason.message : "批量确认失败") }
     finally { setBusy(false) }
   }
@@ -153,8 +174,8 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
     {selected && <Dialog close={() => !busy && setSelected(null)} titleId="classification-confirm-title">
       <header><div><small>确认分类</small><h3 id="classification-confirm-title">{selected.title || "未命名事项"}</h3></div></header>
       <p className="classification-dialog-meta">{metadataFor(selected)}</p>
-      <div className="classification-form"><label><span>事项类别</span><select value={sourceType} onChange={event => setSourceType(event.target.value as "internal" | "external")} disabled={busy}><option value="internal">内部事项</option><option value="external">外部事项</option></select></label>
-        {sourceType === "internal" ? <label><span>内部分类</span><select value={internalCategory} onChange={event => setInternalCategory(event.target.value as InternalCategory | "")} disabled={busy}><option value="">请选择内部分类</option>{INTERNAL_CATEGORIES.map(category => <option key={category} value={category}>{category}</option>)}</select></label> : <label><span>外部机构</span><input value={externalIssuer} onChange={event => setExternalIssuer(event.target.value)} placeholder="填写外部发文机构" disabled={busy}/></label>}
+      <div className="classification-form"><label><span>事项类别</span><select value={sourceType} onChange={event => setSourceType(event.target.value as FormSourceType)} disabled={busy}><option value="">请选择事项类别</option><option value="internal">内部事项</option><option value="external">外部事项</option></select></label>
+        {sourceType === "internal" ? <label><span>内部分类</span><select value={internalCategory} onChange={event => setInternalCategory(event.target.value as InternalCategory | "")} disabled={busy}><option value="">请选择内部分类</option>{INTERNAL_CATEGORIES.map(category => <option key={category} value={category}>{category}</option>)}</select></label> : sourceType === "external" ? <label><span>外部机构</span><input value={externalIssuer} onChange={event => setExternalIssuer(event.target.value)} placeholder="填写外部发文机构" disabled={busy}/></label> : null}
       </div>
       <footer><button className="secondary-button" disabled={busy} onClick={() => setSelected(null)}>取消</button><button className="primary-button" disabled={busy || !valid} onClick={() => void confirmOne()}>{busy ? "正在确认…" : "确认分类"}</button></footer>
     </Dialog>}

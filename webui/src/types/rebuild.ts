@@ -6,7 +6,7 @@ export type RebuildClassificationItem = {
   document_number: string | null
   sender: string | null
   item_date: string | null
-  source_type: "internal" | "external" | null
+  source_type: "internal" | "external" | "unknown" | null
   internal_category: string | null
   external_issuer: string | null
   classification_state: "suggested" | "confirmed" | "needs_review"

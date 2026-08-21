@@ -129,8 +129,11 @@ def confirm_rebuild_classification(
                 session, item_id, source_type=source_type, internal_category=internal_category,
                 external_issuer=external_issuer, confirmed_at=datetime.now(UTC),
             )
+            attachment_count = session.scalar(select(func.count(ArchivedFile.id)).where(
+                ArchivedFile.oa_item_id == item_id,
+            )) or 0
             session.commit()
-            return _item_payload(confirmed, 0)
+            return _item_payload(confirmed, attachment_count)
     finally:
         engine.dispose()
 
@@ -141,6 +144,10 @@ def bulk_confirm_rebuild_classifications(settings: Settings, *, source_type: str
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
+            # Acquire SQLite's single writer slot before reading candidates.
+            # Concurrent bulk requests then serialize: the second request sees
+            # the first request's committed confirmations and emits no audits.
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             needs_review_unchanged = session.scalar(select(func.count()).select_from(OAItem).where(
                 OAItem.source_channel == "done", OAItem.classification_state == "needs_review",
             )) or 0

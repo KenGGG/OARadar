@@ -49,6 +49,8 @@ def classify_done_item(session: Session, oa_item_key: str) -> OAItem:
     ))
     if item is None:
         raise LookupError("done item not found")
+    if item.classification_state == "confirmed":
+        return item
 
     title = item.title or ""
     issuer = _normalized_issuer(item.sender)

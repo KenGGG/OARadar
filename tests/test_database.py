@@ -90,6 +90,34 @@ def existing_0035_database(tmp_path: Path) -> Path:
             "VALUES (?, ?, ?, ?, ?, ?)",
             ("synthetic-0035-item", "done", "Synthetic item", "discovered", "2026-08-21T00:00:00+00:00", "2026-08-21T00:00:00+00:00"),
         )
+        item_id = connection.execute(
+            "SELECT id FROM oa_items WHERE oa_item_key = 'synthetic-0035-item'"
+        ).fetchone()[0]
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            """
+            INSERT INTO files (
+                id, oa_item_id, original_name, attachment_key, file_role,
+                source_container_key, depth, download_status, download_attempts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (3501, item_id, "synthetic-cascade.pdf", "synthetic-cascade", "direct_attachment",
+             "synthetic-container", 1, "verified", 0),
+        )
+        connection.execute(
+            """
+            INSERT INTO markdown_exports (
+                id, source_file_id, oa_item_id, document_kind, source_sha256,
+                source_relpath, markdown_relpath, parse_engine, parse_engine_version,
+                parse_config_hash, schema_version, status, attempts, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (3502, 3501, item_id, "attachment", "a" * 64,
+             "archive/synthetic-cascade.pdf", "markdown/synthetic-cascade.pdf.md",
+             "synthetic", "1", "b" * 64, "synthetic-v1", "success", 0,
+             "2026-08-21T00:00:00+00:00"),
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     return database_path
 
 
@@ -125,6 +153,13 @@ def test_0036_adds_rebuild_classification_gate(existing_0035_database: Path) -> 
         foreign_key[2] == "logical_items" and foreign_key[3] == "logical_item_id" and foreign_key[6] == "SET NULL"
         for foreign_key in historical_foreign_keys
     )
+    with sqlite3.connect(existing_0035_database) as connection:
+        assert connection.execute(
+            "SELECT id, oa_item_id, original_name FROM files WHERE id = 3501"
+        ).fetchone() == (3501, 1, "synthetic-cascade.pdf")
+        assert connection.execute(
+            "SELECT id, source_file_id, oa_item_id, markdown_relpath FROM markdown_exports WHERE id = 3502"
+        ).fetchone() == (3502, 3501, 1, "markdown/synthetic-cascade.pdf.md")
 
     upgrade(existing_0035_database)
     columns = table_columns(existing_0035_database, "oa_items")
@@ -143,9 +178,29 @@ def test_0036_adds_rebuild_classification_gate(existing_0035_database: Path) -> 
         table_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'oa_items'"
         ).fetchone()[0]
+        cascade_child = connection.execute(
+            "SELECT id, oa_item_id, original_name FROM files WHERE id = 3501"
+        ).fetchone()
+        set_null_child = connection.execute(
+            "SELECT id, source_file_id, oa_item_id, markdown_relpath FROM markdown_exports WHERE id = 3502"
+        ).fetchone()
+        foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
     assert "ix_oa_items_source_channel_classification_state_source_type" in indexes
     assert "ck_oa_items_classification_state" in table_sql
     assert "ck_oa_items_classification_source" in table_sql
+    assert cascade_child == (3501, 1, "synthetic-cascade.pdf")
+    assert set_null_child == (3502, 3501, 1, "markdown/synthetic-cascade.pdf.md")
+    assert foreign_key_violations == []
+
+    with sqlite3.connect(existing_0035_database) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE oa_items SET classification_state = 'invalid' WHERE oa_item_key = 'synthetic-0035-item'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE oa_items SET classification_source = 'invalid' WHERE oa_item_key = 'synthetic-0035-item'"
+            )
 
 
 def test_oa_item_classification_gate_and_event_audit_model(tmp_path: Path) -> None:
@@ -214,6 +269,19 @@ def test_orm_metadata_restricts_classification_source_to_rule_or_manual(tmp_path
             source_channel="done",
             title="Synthetic",
             classification_source="generated",
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_orm_metadata_restricts_classification_state_to_gate_values(tmp_path: Path) -> None:
+    db = tmp_path / "orm-classification-state.db"
+    engine = create_db_engine(db)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OAItem(
+            oa_item_key="orm-invalid-state", source_channel="done", title="Synthetic",
+            classification_state="invalid",
         ))
         with pytest.raises(IntegrityError):
             session.commit()

@@ -18,6 +18,10 @@ class OAItem(Base):
     __tablename__ = "oa_items"
     __table_args__ = (
         CheckConstraint(
+            "classification_state IN ('suggested', 'needs_review', 'confirmed')",
+            name="ck_oa_items_classification_state",
+        ),
+        CheckConstraint(
             "classification_source IS NULL OR classification_source IN ('rule', 'manual')",
             name="ck_oa_items_classification_source",
         ),

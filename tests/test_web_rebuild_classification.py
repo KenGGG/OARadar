@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -105,6 +105,7 @@ def test_confirm_requires_valid_transition_and_shape(client: TestClient, seeded_
     assert invalid_shape.status_code == 422
     assert confirmed.status_code == 200
     assert confirmed.json()["classification_state"] == "confirmed"
+    assert confirmed.json()["attachment_count"] == 1
     assert invalid_transition.status_code == 409
 
 
@@ -127,6 +128,121 @@ def test_bulk_confirm_does_not_confirm_needs_review(client: TestClient, seeded_i
     assert response.status_code == 200
     assert response.json()["confirmed"] == 1
     assert response.json()["needs_review_unchanged"] > 0
+
+
+def test_bulk_confirm_only_changes_eligible_done_rows_once(client: TestClient) -> None:
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            rows = [
+                OAItem(
+                    oa_item_key="done:eligible", source_channel="done", title="Synthetic eligible",
+                    source_type="internal", internal_category="风险管理", classification_state="suggested",
+                    classification_confidence=0.95, classification_source="rule",
+                ),
+                OAItem(
+                    oa_item_key="pending:eligible-shape", source_channel="pending", title="Synthetic pending",
+                    source_type="internal", internal_category="风险管理", classification_state="suggested",
+                    classification_confidence=0.95, classification_source="rule",
+                ),
+                OAItem(
+                    oa_item_key="done:low-confidence", source_channel="done", title="Synthetic low confidence",
+                    source_type="internal", internal_category="风险管理", classification_state="suggested",
+                    classification_confidence=0.89, classification_source="rule",
+                ),
+                OAItem(
+                    oa_item_key="done:wrong-source", source_channel="done", title="Synthetic external",
+                    source_type="external", external_issuer="Synthetic institution", classification_state="suggested",
+                    classification_confidence=0.95, classification_source="rule",
+                ),
+                OAItem(
+                    oa_item_key="done:already-confirmed", source_channel="done", title="Synthetic confirmed",
+                    source_type="internal", internal_category="风险管理", classification_state="confirmed",
+                    classification_confidence=1.0, classification_source="manual",
+                    classification_confirmed_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+                ),
+            ]
+            session.add_all(rows)
+            session.commit()
+            ids = {row.oa_item_key: row.id for row in rows}
+    finally:
+        engine.dispose()
+
+    headers = _csrf_headers(client)
+    first = client.post(
+        "/api/rebuild/classifications/bulk-confirm", json={"source_type": "internal"}, headers=headers,
+    )
+    second = client.post(
+        "/api/rebuild/classifications/bulk-confirm", json={"source_type": "internal"}, headers=headers,
+    )
+
+    assert first.json()["confirmed"] == 1
+    assert second.json()["confirmed"] == 0
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            states = {
+                item.oa_item_key: item.classification_state
+                for item in session.scalars(select(OAItem).where(OAItem.id.in_(ids.values())))
+            }
+            events = session.scalars(select(RebuildClassificationEvent).where(
+                RebuildClassificationEvent.oa_item_id.in_(ids.values()),
+            )).all()
+    finally:
+        engine.dispose()
+    assert states == {
+        "done:eligible": "confirmed",
+        "pending:eligible-shape": "suggested",
+        "done:low-confidence": "suggested",
+        "done:wrong-source": "suggested",
+        "done:already-confirmed": "confirmed",
+    }
+    assert [event.oa_item_id for event in events] == [ids["done:eligible"]]
+
+
+def test_concurrent_bulk_confirm_is_idempotent_with_one_audit_per_item(client: TestClient) -> None:
+    item_count = 40
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            rows = [
+                OAItem(
+                    oa_item_key=f"done:bulk-concurrent-{index}", source_channel="done",
+                    title=f"Synthetic concurrent {index}", source_type="internal",
+                    internal_category="风险管理", classification_state="suggested",
+                    classification_confidence=0.95, classification_source="rule",
+                )
+                for index in range(item_count)
+            ]
+            session.add_all(rows)
+            session.commit()
+            item_ids = [row.id for row in rows]
+    finally:
+        engine.dispose()
+
+    start = threading.Barrier(2)
+
+    def confirm_bulk() -> int:
+        start.wait(timeout=5)
+        return rebuild_views.bulk_confirm_rebuild_classifications(
+            client.app.state.settings, source_type="internal",
+        )["confirmed"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        counts = list(executor.map(lambda _: confirm_bulk(), range(2)))
+
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            events = session.scalars(select(RebuildClassificationEvent).where(
+                RebuildClassificationEvent.oa_item_id.in_(item_ids),
+            )).all()
+    finally:
+        engine.dispose()
+
+    assert sorted(counts) == [0, item_count]
+    assert len(events) == item_count
+    assert {event.oa_item_id for event in events} == set(item_ids)
 
 
 def test_suggest_is_explicit_and_summary_is_metadata_only(client: TestClient) -> None:
