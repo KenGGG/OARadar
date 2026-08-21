@@ -37,9 +37,26 @@ class OAItem(Base):
     internal_category: Mapped[str | None] = mapped_column(String(80))
     external_issuer: Mapped[str | None] = mapped_column(Text)
     classification_version: Mapped[str | None] = mapped_column(String(20))
+    document_date: Mapped[date | None] = mapped_column(Date)
+    classification_state: Mapped[str] = mapped_column(String(20), nullable=False, default="needs_review")
+    classification_confidence: Mapped[float | None] = mapped_column(Float)
+    classification_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    classification_source: Mapped[str | None] = mapped_column(String(20))
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     files: Mapped[list[ArchivedFile]] = relationship(back_populates="item", cascade="all, delete-orphan")
+
+
+class RebuildClassificationEvent(Base):
+    """Local before/after audit record for a rebuild classification change."""
+
+    __tablename__ = "rebuild_classification_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    oa_item_id: Mapped[int] = mapped_column(ForeignKey("oa_items.id", ondelete="CASCADE"), nullable=False)
+    previous_classification_json: Mapped[str] = mapped_column(Text, nullable=False)
+    current_classification_json: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(String(40), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class OAManifestItem(Base):

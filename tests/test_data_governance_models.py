@@ -26,7 +26,7 @@ def test_data_governance_migration_is_current_and_idempotent(tmp_path: Path) -> 
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert version == "0035_markdown_item_indexes"
+    assert version == "0036_rebuild_classification_gate"
     assert {"cleanup_runs", "cleanup_items"} <= tables
 
 

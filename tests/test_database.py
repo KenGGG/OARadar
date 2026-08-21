@@ -2,6 +2,8 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -24,6 +26,7 @@ from oa_knowledge.db.models import (
     OAItemDocumentRelation,
     ParseArtifact,
     ResourceLease,
+    RebuildClassificationEvent,
     SourceReference,
     SourceAttachment,
     SummaryEvidence,
@@ -32,12 +35,111 @@ from oa_knowledge.db.models import (
 )
 
 
+def _migration_config(database_path: Path) -> Config:
+    root = Path(__file__).resolve().parents[1]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "src" / "oa_knowledge" / "db" / "migrations"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    return config
+
+
+@pytest.fixture
+def existing_0035_database(tmp_path: Path) -> Path:
+    database_path = tmp_path / "oa.db"
+    config = _migration_config(database_path)
+    command.upgrade(config, "0035_markdown_item_indexes")
+    with sqlite3.connect(database_path) as connection:
+        # Migration 0001 creates the current SQLAlchemy metadata, so remove
+        # fields that did not exist at revision 0035 before exercising 0036.
+        for column in (
+            "classification_source",
+            "classification_confirmed_at",
+            "classification_confidence",
+            "classification_state",
+            "document_date",
+        ):
+            connection.execute(f"ALTER TABLE oa_items DROP COLUMN {column}")
+        connection.execute("DROP TABLE rebuild_classification_events")
+        connection.execute(
+            "INSERT INTO oa_items (oa_item_key, source_channel, title, pipeline_status, first_seen_at, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("synthetic-0035-item", "done", "Synthetic item", "discovered", "2026-08-21T00:00:00+00:00", "2026-08-21T00:00:00+00:00"),
+        )
+    return database_path
+
+
+def upgrade(database_path: Path) -> None:
+    command.upgrade(_migration_config(database_path), "head")
+
+
+def table_columns(database_path: Path, table_name: str) -> set[str]:
+    with sqlite3.connect(database_path) as connection:
+        return {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})")}
+
+
+def fetch_item(database_path: Path) -> sqlite3.Row:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute("SELECT * FROM oa_items WHERE oa_item_key = 'synthetic-0035-item'").fetchone()
+
+
+def test_0036_adds_rebuild_classification_gate(existing_0035_database: Path) -> None:
+    upgrade(existing_0035_database)
+    columns = table_columns(existing_0035_database, "oa_items")
+    assert {
+        "document_date", "classification_state", "classification_confidence",
+        "classification_confirmed_at", "classification_source",
+    } <= columns
+    row = fetch_item(existing_0035_database)
+    assert row["classification_state"] == "needs_review"
+
+    assert table_columns(existing_0035_database, "rebuild_classification_events") == {
+        "id", "oa_item_id", "previous_classification_json", "current_classification_json", "actor", "created_at",
+    }
+    with sqlite3.connect(existing_0035_database) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(oa_items)")}
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'oa_items'"
+        ).fetchone()[0]
+    assert "ix_oa_items_source_channel_classification_state_source_type" in indexes
+    assert "ck_oa_items_classification_state" in table_sql
+
+
+def test_oa_item_classification_gate_and_event_audit_model(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="classification-synthetic", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        assert item.classification_state == "needs_review"
+        assert item.document_date is None
+        assert item.classification_confidence is None
+        assert item.classification_confirmed_at is None
+        assert item.classification_source is None
+
+        event = RebuildClassificationEvent(
+            oa_item_id=item.id,
+            previous_classification_json='{"classification_state":"suggested"}',
+            current_classification_json='{"classification_state":"confirmed"}',
+            actor="local_web",
+        )
+        session.add(event)
+        session.commit()
+
+        persisted_event = session.scalar(select(RebuildClassificationEvent))
+        assert persisted_event is not None
+        assert persisted_event.oa_item_id == item.id
+        assert persisted_event.current_classification_json == '{"classification_state":"confirmed"}'
+
+
 def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:
     db = tmp_path / "state" / "oa.db"
     upgrade_database(db)
     upgrade_database(db)
     with sqlite3.connect(db) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0035_markdown_item_indexes"
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0036_rebuild_classification_gate"
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {
@@ -48,6 +150,7 @@ def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:
         "source_attachments", "archive_packages", "archive_members", "oa_item_document_relations",
         "curated_runs", "curated_decisions", "curated_decision_sources",
         "cleanup_runs", "cleanup_items",
+        "rebuild_classification_events",
     } <= tables
 
 
