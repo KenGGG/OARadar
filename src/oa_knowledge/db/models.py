@@ -16,6 +16,12 @@ class Base(DeclarativeBase):
 
 class OAItem(Base):
     __tablename__ = "oa_items"
+    __table_args__ = (
+        CheckConstraint(
+            "classification_source IS NULL OR classification_source IN ('rule', 'manual')",
+            name="ck_oa_items_classification_source",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     oa_item_key: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     logical_item_id: Mapped[int | None] = mapped_column(ForeignKey("logical_items.id", ondelete="SET NULL"))

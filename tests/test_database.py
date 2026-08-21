@@ -15,6 +15,7 @@ from oa_knowledge.db.models import (
     ArchiveMember,
     ArchivePackage,
     BatchItem,
+    Base,
     CollectionBatch,
     ContentObject,
     KnowledgeDocument,
@@ -51,14 +52,17 @@ def existing_0035_database(tmp_path: Path) -> Path:
     with sqlite3.connect(database_path) as connection:
         # Migration 0001 creates the current SQLAlchemy metadata, so remove
         # fields that did not exist at revision 0035 before exercising 0036.
-        for column in (
-            "classification_source",
-            "classification_confirmed_at",
-            "classification_confidence",
-            "classification_state",
-            "document_date",
-        ):
-            connection.execute(f"ALTER TABLE oa_items DROP COLUMN {column}")
+        historical_columns = (
+            "id", "oa_item_key", "logical_item_id", "workitem_id_text", "source_channel", "process_id_text",
+            "title", "sender", "department", "document_number", "initiated_at", "received_at", "completed_at",
+            "oa_status", "pipeline_status", "archive_relpath", "content_sha256", "source_type",
+            "internal_category", "external_issuer", "classification_version", "first_seen_at", "last_seen_at",
+        )
+        connection.execute(
+            f"CREATE TABLE oa_items_0035 AS SELECT {', '.join(historical_columns)} FROM oa_items"
+        )
+        connection.execute("DROP TABLE oa_items")
+        connection.execute("ALTER TABLE oa_items_0035 RENAME TO oa_items")
         connection.execute("DROP TABLE rebuild_classification_events")
         connection.execute(
             "INSERT INTO oa_items (oa_item_key, source_channel, title, pipeline_status, first_seen_at, last_seen_at) "
@@ -148,6 +152,27 @@ def test_oa_item_classification_source_accepts_only_rule_or_manual(tmp_path: Pat
 
         session.add(OAItem(
             oa_item_key="classification-invalid-source",
+            source_channel="done",
+            title="Synthetic",
+            classification_source="generated",
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_orm_metadata_restricts_classification_source_to_rule_or_manual(tmp_path: Path) -> None:
+    db = tmp_path / "orm-metadata.db"
+    engine = create_db_engine(db)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add_all([
+            OAItem(oa_item_key="orm-rule", source_channel="done", title="Synthetic", classification_source="rule"),
+            OAItem(oa_item_key="orm-manual", source_channel="done", title="Synthetic", classification_source="manual"),
+        ])
+        session.commit()
+
+        session.add(OAItem(
+            oa_item_key="orm-invalid-source",
             source_channel="done",
             title="Synthetic",
             classification_source="generated",
