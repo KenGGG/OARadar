@@ -27,8 +27,10 @@ from oa_knowledge.db.models import (
     PipelineTask,
     RebuildOutput,
 )
+from oa_knowledge.parsers.router import ParseResult
 from oa_knowledge.rebuild import cutover
 from oa_knowledge.rebuild.cutover import CutoverPlan, generate_authorization_token
+from oa_knowledge.rebuild.paths import resolve_rebuild_root
 
 
 def _add_ready_evidence(config_file: Path) -> None:
@@ -62,6 +64,53 @@ def _add_ready_evidence(config_file: Path) -> None:
         ))
         session.commit()
     engine.dispose()
+
+
+def _add_build_ready_evidence(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    content = b"synthetic build-ready evidence"
+    relpath = "archive/raw/oa/done/synthetic/build.txt"
+    source = settings.data_root / relpath
+    source.parent.mkdir(parents=True)
+    source.write_bytes(content)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:synthetic-build",
+            source_channel="done",
+            title="Synthetic build item",
+            document_date=datetime(2026, 8, 20, tzinfo=UTC).date(),
+            classification_state="confirmed",
+            source_type="internal",
+            internal_category="风险管理",
+        )
+        session.add(item)
+        session.flush()
+        session.add(ArchivedFile(
+            oa_item_id=item.id,
+            original_name="build.txt",
+            attachment_key="synthetic-build",
+            file_role="direct_attachment",
+            source_container_key="root",
+            local_relpath=relpath,
+            size_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            download_status="verified",
+        ))
+        session.commit()
+    engine.dispose()
+
+
+def _synthetic_parse(
+    source: Path, _settings, *, output_dir: Path | None = None,
+) -> ParseResult:
+    """Produce a parser product locally without OA, services, or network access."""
+    assert output_dir is not None
+    product = output_dir / "result.md"
+    text = f"# synthetic\n\n{source.read_text(encoding='utf-8')}\n"
+    product.write_text(text, encoding="utf-8")
+    return ParseResult(product, "synthetic-local", "1", 1.0, len(text))
 
 
 def test_archive_command_defaults_to_meaningful_zero_mutation_dry_run(config_file) -> None:
@@ -189,6 +238,141 @@ def test_successful_archive_output_includes_safe_run_id(config_file) -> None:
     assert payload["copied"] == 1
 
 
+def test_build_command_defaults_to_a_zero_mutation_dry_run(config_file: Path) -> None:
+    _add_build_ready_evidence(config_file)
+    archive = CliRunner().invoke(app, [
+        "rebuild", "archive", "--execute", "--config", str(config_file),
+    ])
+    assert archive.exit_code == 0
+    run_id = json.loads(archive.stdout)["run_id"]
+    settings = load_settings(config_file)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        before = {
+            "runs": session.scalar(select(func.count()).select_from(PipelineRun)),
+            "tasks": session.scalar(select(func.count()).select_from(PipelineTask)),
+            "outputs": session.scalar(select(func.count()).select_from(RebuildOutput)),
+        }
+    engine.dispose()
+
+    result = CliRunner().invoke(app, [
+        "rebuild", "build", "--run-id", str(run_id), "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "acceptance_evidence_required": True,
+        "blockers": {"date_missing": 0, "needs_review": 0},
+        "candidate_items": 1,
+        "database_copy_ready": False,
+        "dry_run": True,
+        "run_id": run_id,
+    }
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        after = {
+            "runs": session.scalar(select(func.count()).select_from(PipelineRun)),
+            "tasks": session.scalar(select(func.count()).select_from(PipelineTask)),
+            "outputs": session.scalar(select(func.count()).select_from(RebuildOutput)),
+        }
+    engine.dispose()
+    assert after == before
+    assert not (resolve_rebuild_root(settings) / settings.storage.sqlite_path).exists()
+
+
+def test_build_execute_requires_an_explicit_private_acceptance_attestation(
+    config_file: Path,
+) -> None:
+    _add_build_ready_evidence(config_file)
+    archive = CliRunner().invoke(app, [
+        "rebuild", "archive", "--execute", "--config", str(config_file),
+    ])
+    assert archive.exit_code == 0
+    run_id = json.loads(archive.stdout)["run_id"]
+
+    result = CliRunner().invoke(app, [
+        "rebuild", "build", "--execute", "--run-id", str(run_id),
+        "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "error_code": "BUILD_ACCEPTANCE_EVIDENCE_REQUIRED",
+    }
+
+
+def test_build_execute_rejects_a_group_readable_acceptance_attestation(
+    config_file: Path, tmp_path: Path,
+) -> None:
+    _add_build_ready_evidence(config_file)
+    archive = CliRunner().invoke(app, [
+        "rebuild", "archive", "--execute", "--config", str(config_file),
+    ])
+    assert archive.exit_code == 0
+    run_id = json.loads(archive.stdout)["run_id"]
+    attestation = tmp_path / "unsafe-acceptance.json"
+    attestation.write_text("{}", encoding="utf-8")
+    attestation.chmod(0o640)
+
+    result = CliRunner().invoke(app, [
+        "rebuild", "build", "--execute", "--run-id", str(run_id),
+        "--acceptance-evidence", str(attestation), "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "error_code": "BUILD_ACCEPTANCE_EVIDENCE_INVALID",
+    }
+
+
+def test_build_execute_runs_rebuild_validation_and_prepares_database_copy(
+    config_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _add_build_ready_evidence(config_file)
+    archive = CliRunner().invoke(app, [
+        "rebuild", "archive", "--execute", "--config", str(config_file),
+    ])
+    assert archive.exit_code == 0
+    run_id = json.loads(archive.stdout)["run_id"]
+    attestation = tmp_path / "aggregate-acceptance.json"
+    attestation.write_text(json.dumps({
+        "automated_tests_passed": True,
+        "build_passed": True,
+        "external_sample_count": 100,
+        "frontend_check_passed": True,
+        "internal_sample_count": 100,
+        "synthetic_smoke_passed": True,
+        "webui_filter_contract": True,
+    }), encoding="utf-8")
+    attestation.chmod(0o600)
+    monkeypatch.setenv(
+        "OA_REBUILD_ACCEPTANCE_EVIDENCE_HMAC_KEY",
+        "synthetic-build-signing-key-material-at-least-32-bytes",
+    )
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", _synthetic_parse)
+
+    result = CliRunner().invoke(app, [
+        "rebuild", "build", "--execute", "--run-id", str(run_id),
+        "--acceptance-evidence", str(attestation), "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "database_copy_ready": True,
+        "dry_run": False,
+        "enqueued": 1,
+        "processed": 3,
+        "run_id": run_id,
+        "updated_files": 1,
+        "validation_checks": 15,
+    }
+    settings = load_settings(config_file)
+    copied_database = resolve_rebuild_root(settings) / settings.storage.sqlite_path
+    assert copied_database.is_file()
+    assert all(check.ok for check in cli.validate_database_copy(copied_database))
+
+
 def test_cutover_command_defaults_to_zero_mutation_dry_run(config_file: Path) -> None:
     """Planning must not rename either directory or invoke service control."""
     settings = load_settings(config_file)
@@ -278,10 +462,13 @@ def test_rebuild_help_registers_all_local_commands() -> None:
     result = CliRunner().invoke(app, ["rebuild", "--help"])
 
     assert result.exit_code == 0
-    assert all(command in result.stdout for command in ("inventory", "archive", "status", "cutover"))
+    assert all(
+        f"│ {command:<10}" in result.stdout
+        for command in ("inventory", "archive", "build", "status", "cutover")
+    )
 
 
-@pytest.mark.parametrize("command", ("inventory", "status", "archive"))
+@pytest.mark.parametrize("command", ("inventory", "status", "archive", "build"))
 def test_rebuild_commands_never_print_path_bearing_internal_errors(
     monkeypatch: pytest.MonkeyPatch, command: str, config_file
 ) -> None:
@@ -292,10 +479,12 @@ def test_rebuild_commands_never_print_path_bearing_internal_errors(
     arguments = ["rebuild", command, "--config", str(config_file)]
     if command == "archive":
         arguments.append("--execute")
+    elif command == "build":
+        arguments.extend(("--run-id", "1"))
     result = CliRunner().invoke(app, arguments)
 
     assert result.exit_code == 1
-    assert json.loads(result.stdout)["error_code"].startswith("REBUILD_")
+    assert json.loads(result.stdout)["error_code"].startswith(("REBUILD_", "BUILD_"))
     assert "sensitive" not in result.stdout
     assert "private/path" not in result.stdout
 

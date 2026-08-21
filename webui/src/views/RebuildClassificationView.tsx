@@ -160,9 +160,9 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
     <section className="classification-bulk" aria-labelledby="rebuild-progress-title">
       <div><strong id="rebuild-progress-title">Markdown 重建进度</strong><span>排队 {execution?.queued || 0} · 执行中 {execution?.running || 0} · 已完成 {execution?.completed || 0} · 失败 {execution?.failed || 0}</span></div>
       <div className="classification-bulk-actions">
-        <button className="toolbar-button" disabled title="需完成 Phase 4 CAS 修复后才能执行">开始重建</button>
-        <button className="toolbar-button" disabled title="需完成 Phase 4 CAS 修复后才能执行">暂停</button>
-        <button className="toolbar-button" disabled title="需完成 Phase 4 CAS 修复后才能执行">继续</button>
+        <button className="toolbar-button" disabled title="仅允许通过受限本机命令执行">开始重建</button>
+        <button className="toolbar-button" disabled title="仅允许通过受限本机命令执行">暂停</button>
+        <button className="toolbar-button" disabled title="仅允许通过受限本机命令执行">继续</button>
       </div>
     </section>
     <section className="classification-bulk" aria-labelledby="rebuild-validation-title">

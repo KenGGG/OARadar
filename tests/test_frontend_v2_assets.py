@@ -79,3 +79,10 @@ def test_rebuild_page_shows_the_redacted_acceptance_summary() -> None:
     assert 'api<RebuildValidationReport>("/api/rebuild/validation")' in source
     assert "重建验收" in source
     assert "validation.checks.filter" in source
+
+
+def test_rebuild_page_does_not_claim_phase4_is_still_waiting_for_a_cas_fix() -> None:
+    source = Path("webui/src/views/RebuildClassificationView.tsx").read_text(encoding="utf-8")
+
+    assert "Phase 4 CAS" not in source
+    assert "受限本机命令" in source

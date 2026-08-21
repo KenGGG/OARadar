@@ -187,6 +187,13 @@ def test_rebuild_from_synthetic_live_data_to_valid_new_root(
         assert applied["files"] == 3
         assert all(check.ok for check in validate_database_copy(copied_database))
 
+        live_identity = settings.data_root / "runtime" / "synthetic-tree-identity"
+        rebuilt_identity = settings.rebuild.target_root / "runtime" / "synthetic-tree-identity"
+        live_identity.parent.mkdir(parents=True, exist_ok=True)
+        rebuilt_identity.parent.mkdir(parents=True, exist_ok=True)
+        live_identity.write_text("pre-cutover-live", encoding="utf-8")
+        rebuilt_identity.write_text("pre-cutover-rebuilt", encoding="utf-8")
+
         plan = CutoverPlan(
             live_root=settings.data_root,
             rebuilt_root=settings.rebuild.target_root,
@@ -210,5 +217,7 @@ def test_rebuild_from_synthetic_live_data_to_valid_new_root(
         assert settings.data_root.is_dir()
         assert settings.rebuild.target_root.is_dir()
         assert not plan.legacy_root.exists()
+        assert live_identity.read_text(encoding="utf-8") == "pre-cutover-live"
+        assert rebuilt_identity.read_text(encoding="utf-8") == "pre-cutover-rebuilt"
     finally:
         engine.dispose()

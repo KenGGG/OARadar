@@ -226,6 +226,18 @@ class OperationWorker:
             raise RuntimeError("worker did not become idle")
         return completed
 
+    def run_rebuild_until_idle(self, *, limit: int = 1000) -> int:
+        """Drive only local rebuild tasks, never unrelated production queues."""
+        completed = 0
+        while completed < limit:
+            task = self._claim_rebuild_task()
+            if task is None:
+                return completed
+            self._write_runtime_status("working", self._pipeline_activity(task.stage))
+            self._execute_rebuild_task(task)
+            completed += 1
+        raise RuntimeError("rebuild worker did not become idle")
+
     @staticmethod
     def _job_activity(job_type: str) -> str:
         return {

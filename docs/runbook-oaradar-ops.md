@@ -146,7 +146,39 @@ uv run oa rebuild archive --config <config.yaml>
 uv run oa rebuild archive --execute --config <config.yaml>
 ```
 
-后续解析与 Markdown 重建继续使用同一 `data_rebuild` 运行和既有 `PipelineTask`/lease；不得新增任务表或协调框架。中断后从同一运行继续，已校验成功的原件和产物不得重复覆盖。构建过程中不得启动切换。
+保存命令返回的脱敏 `run_id`。复制完成后，先用同一运行做零写入构建预检：
+
+```bash
+uv run oa rebuild build --run-id <run_id> --config <config.yaml>
+```
+
+默认输出只包含候选数量、分类/日期阻塞数量及是否需要验收证据；不会排队、解析、写 Markdown 或创建数据库副本。`needs_review` 和 `date_missing` 任一非零时，返回 WebUI 完成人工确认，不得执行构建。
+
+显式执行前，操作者必须在仓库和 `data/` 之外创建一个仅含聚合门禁结果的 JSON 文件，并将权限设为 `0600`。文件不得包含 OA 标题、文号、附件名、正文、标识符或本机路径：
+
+```json
+{
+  "automated_tests_passed": true,
+  "build_passed": true,
+  "external_sample_count": 100,
+  "frontend_check_passed": true,
+  "internal_sample_count": 100,
+  "synthetic_smoke_passed": true,
+  "webui_filter_contract": true
+}
+```
+
+按 `rebuild.acceptance_evidence_key_env` 配置的环境变量提供至少 32 字节的本机 HMAC 密钥；密钥本身不得写入配置、命令行、报告或 Git。确认本次构建授权后再执行：
+
+```bash
+uv run oa rebuild build \
+  --execute \
+  --run-id <run_id> \
+  --acceptance-evidence <private-aggregate-json> \
+  --config <config.yaml>
+```
+
+该受限本机命令继续使用同一 `data_rebuild` 运行和既有 `PipelineTask`/lease，只领取重建队列，依次完成解析、Markdown 与 `_index.md`，写入签名验收证据，执行 15 项验收，然后用 SQLite backup API 建立并应用 `data_rebuilt/state/oa.db`。任一环节失败均返回稳定错误代码，且不得启动切换。重复执行同一 `run_id` 时，已校验成功的原件和产物不得重复覆盖；中断后仍从既有任务/lease 恢复。不得新增任务表或协调框架，也不得通过 WebUI 执行这些构建动作。
 
 ### 8.5 切换前验收
 

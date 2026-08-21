@@ -30,7 +30,7 @@ from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.archive.naming import validate_relative_path
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, OAItem, OAManifestItem, OAManifestSync, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, Run
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, OAItem, OAManifestItem, OAManifestSync, OperationEvent, OperationJob, ParseJob, PipelineRun, PipelineTask, RebuildOutput, ReviewEntry, Run
 from oa_knowledge.collector.done import DoneDiscovery
 from oa_knowledge.collector.pending import PENDING_LIST_PATH, PendingAdapter
 from oa_knowledge.collector.pending_detail import extract_pending_detail_identifiers
@@ -56,11 +56,22 @@ from oa_knowledge.rebuild.campaign import (
     enqueue_archive_copy,
     execute_archive_copy,
     inventory_blocker_counts,
+    enqueue_markdown_rebuild,
     rebuild_status_summary,
     resume_rebuild_run,
 )
 from oa_knowledge.rebuild.inventory import build_inventory, inventory_summary, write_private_inventory
-from oa_knowledge.rebuild.paths import resolve_rebuild_path, resolve_rebuild_root
+from oa_knowledge.rebuild.paths import effective_item_date, resolve_rebuild_path, resolve_rebuild_root
+from oa_knowledge.rebuild.state_copy import (
+    apply_rebuilt_ledger,
+    backup_live_database,
+    validate_database_copy,
+)
+from oa_knowledge.rebuild.validation import (
+    validate_rebuild,
+    validation_passed,
+    write_acceptance_evidence,
+)
 from oa_knowledge.rebuild.cutover import (
     CutoverAuthorizationError,
     CutoverError,
@@ -118,6 +129,77 @@ def require_engine(settings: Settings):
 def _rebuild_error(error_code: str) -> None:
     typer.echo(json.dumps({"error_code": error_code}, ensure_ascii=False))
     raise typer.Exit(1)
+
+
+_BUILD_ATTESTATION_KEYS = frozenset({
+    "automated_tests_passed",
+    "build_passed",
+    "external_sample_count",
+    "frontend_check_passed",
+    "internal_sample_count",
+    "synthetic_smoke_passed",
+    "webui_filter_contract",
+})
+
+
+def _load_build_attestation(path: Path) -> dict[str, object]:
+    """Read one private, aggregate-only operator attestation."""
+    if not path.is_file() or path.is_symlink() or path.stat().st_mode & 0o077:
+        raise ValueError("BUILD_ACCEPTANCE_EVIDENCE_INVALID")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("BUILD_ACCEPTANCE_EVIDENCE_INVALID") from exc
+    if not isinstance(payload, dict) or set(payload) != _BUILD_ATTESTATION_KEYS:
+        raise ValueError("BUILD_ACCEPTANCE_EVIDENCE_INVALID")
+    boolean_keys = _BUILD_ATTESTATION_KEYS - {
+        "external_sample_count", "internal_sample_count",
+    }
+    if any(not isinstance(payload.get(key), bool) for key in boolean_keys):
+        raise ValueError("BUILD_ACCEPTANCE_EVIDENCE_INVALID")
+    if any(
+        not isinstance(payload.get(key), int)
+        or isinstance(payload.get(key), bool)
+        or int(payload[key]) < 0
+        for key in ("external_sample_count", "internal_sample_count")
+    ):
+        raise ValueError("BUILD_ACCEPTANCE_EVIDENCE_INVALID")
+    return payload
+
+
+def _rebuild_build_plan(session: Session, run_id: int) -> dict[str, object]:
+    """Return the count-only, zero-mutation build admission plan."""
+    run = session.get(PipelineRun, run_id)
+    if run is None or run.pipeline_type != "data_rebuild":
+        raise ValueError("REBUILD_RUN_NOT_FOUND")
+    item_ids = list(session.scalars(
+        select(RebuildOutput.oa_item_id)
+        .where(
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.kind == "original",
+            RebuildOutput.status == "success",
+        )
+        .distinct()
+        .order_by(RebuildOutput.oa_item_id)
+    ))
+    items = list(session.scalars(select(OAItem).where(OAItem.id.in_(item_ids)))) if item_ids else []
+    needs_review = sum(item.classification_state != "confirmed" for item in items)
+    date_missing = 0
+    for item in items:
+        if item.classification_state != "confirmed":
+            continue
+        try:
+            effective_item_date(item)
+        except ValueError:
+            date_missing += 1
+    return {
+        "acceptance_evidence_required": True,
+        "blockers": {"date_missing": date_missing, "needs_review": needs_review},
+        "candidate_items": len(items),
+        "database_copy_ready": False,
+        "dry_run": True,
+        "run_id": run_id,
+    }
 
 
 @rebuild_app.command("inventory")
@@ -218,6 +300,97 @@ def rebuild_status(
         raise
     except Exception:  # noqa: BLE001 - never expose local paths or OA details on CLI stdout.
         _rebuild_error("REBUILD_STATUS_FAILED")
+    finally:
+        if "engine" in locals():
+            engine.dispose()
+
+
+@rebuild_app.command("build")
+def rebuild_build(
+    execute: bool = typer.Option(False, "--execute"),
+    run_id: int = typer.Option(..., "--run-id", min=1),
+    acceptance_evidence: Path | None = typer.Option(
+        None, "--acceptance-evidence", dir_okay=False,
+    ),
+    config: Path | None = typer.Option(None, "--config", dir_okay=False),  # noqa: B008
+) -> None:
+    """Build Markdown locally; dry-run unless execution and evidence are explicit."""
+    try:
+        settings = settings_option(config)
+        if not settings.database_path.exists():
+            _rebuild_error("DATABASE_NOT_INITIALIZED")
+        resolve_rebuild_root(settings)
+        engine = create_db_engine(settings.database_path, read_only=not execute)
+        with Session(engine) as session:
+            plan = _rebuild_build_plan(session, run_id)
+        if not execute:
+            typer.echo(json.dumps(plan, ensure_ascii=False))
+            return
+        if acceptance_evidence is None:
+            _rebuild_error("BUILD_ACCEPTANCE_EVIDENCE_REQUIRED")
+        attestation = _load_build_attestation(acceptance_evidence)
+        if any(plan["blockers"].values()):
+            _rebuild_error("BUILD_CLASSIFICATION_INCOMPLETE")
+        signing_value = os.environ.get(settings.rebuild.acceptance_evidence_key_env, "")
+        if len(signing_value.encode("utf-8")) < 32:
+            _rebuild_error("BUILD_ACCEPTANCE_SIGNING_KEY_UNAVAILABLE")
+
+        with Session(engine) as session:
+            item_ids = list(session.scalars(
+                select(RebuildOutput.oa_item_id)
+                .where(
+                    RebuildOutput.run_id == run_id,
+                    RebuildOutput.kind == "original",
+                    RebuildOutput.status == "success",
+                )
+                .distinct()
+                .order_by(RebuildOutput.oa_item_id)
+            ))
+            enqueued = enqueue_markdown_rebuild(session, run_id, item_ids)
+
+        from oa_knowledge.web.worker import OperationWorker
+
+        worker = OperationWorker(settings, config_path=config)
+        try:
+            processed = worker.run_rebuild_until_idle()
+        finally:
+            worker.close()
+
+        with Session(engine) as session:
+            write_acceptance_evidence(
+                session,
+                settings,
+                run_id,
+                **attestation,
+            )
+            checks = validate_rebuild(session, settings, run_id)
+        if not validation_passed(checks):
+            _rebuild_error("BUILD_VALIDATION_FAILED")
+
+        engine.dispose()
+        del engine
+        copied_database = resolve_rebuild_root(settings) / settings.storage.sqlite_path
+        backup_live_database(settings.database_path, copied_database)
+        applied = apply_rebuilt_ledger(copied_database, run_id)
+        database_checks = validate_database_copy(copied_database)
+        if not all(check.ok for check in database_checks):
+            _rebuild_error("BUILD_DATABASE_COPY_FAILED")
+        typer.echo(json.dumps({
+            "database_copy_ready": True,
+            "dry_run": False,
+            "enqueued": enqueued,
+            "processed": processed,
+            "run_id": run_id,
+            "validation_checks": len(checks),
+            "updated_files": applied["files"],
+        }, ensure_ascii=False))
+    except typer.Exit:
+        raise
+    except ValueError as exc:
+        code = str(exc)
+        _rebuild_error(code if code.startswith(("BUILD_", "REBUILD_")) else "BUILD_FAILED")
+    except Exception:  # noqa: BLE001 - build output must remain count-only and redacted.
+        _rebuild_error("BUILD_FAILED")
     finally:
         if "engine" in locals():
             engine.dispose()

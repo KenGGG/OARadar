@@ -338,6 +338,25 @@ def test_rebuild_validation_endpoint_is_empty_when_no_run_exists(client: TestCli
     }
 
 
+def test_rebuild_validation_endpoint_opens_the_live_database_read_only(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GET-only acceptance report must not open a write-capable connection."""
+    real_create_engine = rebuild_views.create_db_engine
+    observed_modes: list[bool] = []
+
+    def capture_mode(path: Path, *, read_only: bool = False):
+        observed_modes.append(read_only)
+        return real_create_engine(path, read_only=read_only)
+
+    monkeypatch.setattr(rebuild_views, "create_db_engine", capture_mode)
+
+    response = client.get("/api/rebuild/validation")
+
+    assert response.status_code == 200
+    assert observed_modes == [True]
+
+
 def test_concurrent_confirmation_allows_one_transition_and_one_audit_event(
     client: TestClient, seeded_items: dict[str, int], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

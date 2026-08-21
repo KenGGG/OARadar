@@ -192,7 +192,7 @@ def rebuild_validation_summary(settings: Settings) -> dict[str, object]:
     failed aggregate check instead of leaking exception text through the Web
     console.
     """
-    engine = create_db_engine(settings.database_path)
+    engine = create_db_engine(settings.database_path, read_only=True)
     try:
         with Session(engine) as session:
             run = session.scalar(
