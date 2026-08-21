@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 # Keys whose presence in YAML means a plaintext credential is being stored inline.
 # Credentials must come from environment variables instead (see AGENTS.md). Exact
 # lower-cased match avoids substring false-positives (e.g. "bypass").
@@ -306,6 +305,7 @@ class RebuildConfig(StrictModel):
     external_issuer_aliases: dict[str, str] = Field(default_factory=dict)
     target_root: Path = Path("../data_rebuilt")
     item_title_max_chars: int = Field(default=96, ge=1)
+    acceptance_evidence_key_env: str = "OA_REBUILD_ACCEPTANCE_EVIDENCE_HMAC_KEY"
 
     @field_validator("external_issuer_aliases")
     @classmethod
@@ -318,6 +318,15 @@ class RebuildConfig(StrictModel):
                 raise ValueError("rebuild.external_issuer_aliases names must be non-empty")
             normalized[alias_name] = issuer_name
         return normalized
+
+    @field_validator("acceptance_evidence_key_env")
+    @classmethod
+    def valid_acceptance_evidence_key_env(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*", value) is None:
+            raise ValueError(
+                "rebuild.acceptance_evidence_key_env must name an environment variable"
+            )
+        return value
 
 
 class WebConfig(StrictModel):

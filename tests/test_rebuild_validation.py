@@ -6,7 +6,7 @@ import hashlib
 import json
 import posixpath
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -28,7 +28,12 @@ from oa_knowledge.rebuild.paths import (
     markdown_item_relpath,
     resolve_rebuild_path,
 )
-from oa_knowledge.rebuild.validation import validate_rebuild, validation_passed
+from oa_knowledge.rebuild.validation import (
+    _run_artifact_fingerprint,
+    validate_rebuild,
+    validation_passed,
+    write_acceptance_evidence,
+)
 
 
 @dataclass
@@ -42,16 +47,21 @@ class RebuildFixture:
 
 
 @pytest.fixture
-def rebuild_fixture(tmp_path: Path) -> RebuildFixture:
+def rebuild_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RebuildFixture:
+    key_env = "SYNTHETIC_REBUILD_EVIDENCE_HMAC_KEY"
+    monkeypatch.setenv(key_env, "synthetic-test-key-material-32-bytes-minimum")
     settings = Settings(
         app={"data_root": tmp_path / "live-data"},
-        rebuild={"target_root": tmp_path / "clean-rebuild"},
+        rebuild={
+            "target_root": tmp_path / "clean-rebuild",
+            "acceptance_evidence_key_env": key_env,
+        },
     )
     settings.data_root.mkdir(parents=True)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
     session = Session(engine)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     run = PipelineRun(
         run_key="synthetic-validation-run",
         pipeline_type="data_rebuild",
@@ -123,54 +133,10 @@ def _frontmatter(item: OAItem) -> str:
     )
 
 
-def _evidence_fingerprint(session: Session, settings: Settings, run_id: int) -> str:
-    """Independently derive the redacted evidence binding used by this fixture."""
-    records: list[dict[str, object]] = []
-    rows = session.scalars(select(RebuildOutput).where(
-        RebuildOutput.run_id == run_id,
-        RebuildOutput.status == "success",
-    )).all()
-    for output in rows:
-        target = resolve_rebuild_path(settings, output.target_relpath)
-        if output.kind == "parse":
-            artifact_sha256 = _tree_sha256(target)
-        elif output.kind in {"body_markdown", "attachment_markdown"}:
-            assets = target.parent / "assets" / str(output.source_file_id)
-            artifact_sha256 = _publication_sha(target, assets if assets.is_dir() else None)
-        else:
-            artifact_sha256 = _digest(target.read_bytes())
-        records.append({
-            "artifact_sha256": artifact_sha256,
-            "kind": output.kind,
-            "ledger_sha256": output.sha256,
-            "oa_item_id": output.oa_item_id,
-            "source_file_id": output.source_file_id,
-            "target_relpath": output.target_relpath,
-        })
-    payload = {
-        "run_id": run_id,
-        "schema_version": 1,
-        "outputs": sorted(
-            records,
-            key=lambda row: (
-                str(row["kind"]), int(row["oa_item_id"]),
-                -1 if row["source_file_id"] is None else int(row["source_file_id"]),
-                str(row["target_relpath"]),
-            ),
-        ),
-    }
-    return _digest(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
-
-
 def _write_acceptance_evidence(
     session: Session, settings: Settings, ledger_run_id: int, **changes: object,
 ) -> None:
-    payload = {
-        "schema_version": 1,
-        "run_id": ledger_run_id,
-        "fingerprint": _evidence_fingerprint(session, settings, ledger_run_id),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "producer": "oaradar.rebuild.acceptance.v1",
+    checks = {
         "webui_filter_contract": True,
         "internal_sample_count": 100,
         "external_sample_count": 100,
@@ -178,10 +144,16 @@ def _write_acceptance_evidence(
         "frontend_check_passed": True,
         "build_passed": True,
         "synthetic_smoke_passed": True,
-    } | changes
-    target = settings.rebuild.target_root / "state" / "acceptance-evidence.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload), encoding="utf-8")
+    }
+    generated_at = changes.pop("generated_at", None)
+    checks.update(changes)
+    write_acceptance_evidence(
+        session,
+        settings,
+        ledger_run_id,
+        generated_at=generated_at,
+        **checks,
+    )
 
 
 def _seed_publications(session: Session, settings: Settings, run_id: int, item: OAItem, source: ArchivedFile, *, body: bool) -> None:
@@ -225,7 +197,7 @@ def test_nonterminal_or_failed_current_run_cannot_pass_artifact_gates(
     assert run is not None
     run.status = status
     run.failed_tasks = 1 if status == "failed" else 0
-    run.finished_at = datetime.now(timezone.utc) if status == "failed" else None
+    run.finished_at = datetime.now(UTC) if status == "failed" else None
     rebuild_fixture.session.commit()
 
     checks = validate_rebuild(
@@ -279,48 +251,157 @@ def test_non_success_current_original_output_or_source_fails_validation(
     assert not _check(checks, "ORIGINAL_HASHES_MATCH").ok
 
 
+def test_additional_pending_current_run_output_cannot_pass_validation(
+    rebuild_fixture: RebuildFixture,
+) -> None:
+    source = rebuild_fixture.files["attachment"]
+    rebuild_fixture.session.add(RebuildOutput(
+        run_id=rebuild_fixture.run_id,
+        oa_item_id=source.oa_item_id,
+        source_file_id=source.id,
+        kind="parse",
+        target_relpath=f"parse/{rebuild_fixture.run_id}/{source.id}/pending-extra",
+        sha256=None,
+        status="pending",
+        error_code=None,
+    ))
+    rebuild_fixture.session.commit()
+
+    checks = validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    )
+
+    assert not validation_passed(checks)
+
+
+def test_failed_output_outside_explicit_terminal_categories_cannot_pass_validation(
+    rebuild_fixture: RebuildFixture,
+) -> None:
+    relpath = (
+        markdown_item_relpath(rebuild_fixture.unnumbered) / "failed-extra-index.md"
+    ).as_posix()
+    rebuild_fixture.session.add(RebuildOutput(
+        run_id=rebuild_fixture.run_id,
+        oa_item_id=rebuild_fixture.unnumbered.id,
+        source_file_id=None,
+        kind="item_index",
+        target_relpath=relpath,
+        sha256=None,
+        status="failed",
+        error_code="TARGET_CONFLICT",
+    ))
+    rebuild_fixture.session.commit()
+
+    checks = validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    )
+
+    assert not validation_passed(checks)
+
+
+def test_evidence_fingerprint_binds_non_success_output_identity_status_and_error(
+    rebuild_fixture: RebuildFixture,
+) -> None:
+    before = _run_artifact_fingerprint(
+        rebuild_fixture.settings, rebuild_fixture.run_id,
+        list(rebuild_fixture.session.scalars(select(RebuildOutput).where(
+            RebuildOutput.run_id == rebuild_fixture.run_id,
+        ))),
+    )
+    source = rebuild_fixture.files["attachment"]
+    output = RebuildOutput(
+        run_id=rebuild_fixture.run_id,
+        oa_item_id=source.oa_item_id,
+        source_file_id=source.id,
+        kind="parse",
+        target_relpath=f"parse/{rebuild_fixture.run_id}/{source.id}/pending-fingerprint",
+        sha256=None,
+        status="pending",
+        error_code=None,
+    )
+    rebuild_fixture.session.add(output)
+    rebuild_fixture.session.flush()
+    pending = _run_artifact_fingerprint(
+        rebuild_fixture.settings, rebuild_fixture.run_id,
+        list(rebuild_fixture.session.scalars(select(RebuildOutput).where(
+            RebuildOutput.run_id == rebuild_fixture.run_id,
+        ))),
+    )
+    output.status = "failed"
+    output.error_code = "PARSER_TIMEOUT"
+    rebuild_fixture.session.flush()
+    failed = _run_artifact_fingerprint(
+        rebuild_fixture.settings, rebuild_fixture.run_id,
+        list(rebuild_fixture.session.scalars(select(RebuildOutput).where(
+            RebuildOutput.run_id == rebuild_fixture.run_id,
+        ))),
+    )
+
+    assert before != pending
+    assert pending != failed
+
+
 @pytest.mark.parametrize("damage", (
     "missing", "wrong_schema", "wrong_run", "stale", "before_finished", "wrong_producer",
-    "wrong_fingerprint",
+    "wrong_fingerprint", "missing_signature", "bad_signature", "tampered_check",
 ))
-def test_run_specific_acceptance_evidence_rejects_missing_stale_or_fabricated_payloads(
+def test_signed_acceptance_evidence_rejects_missing_stale_or_tampered_envelopes(
     rebuild_fixture: RebuildFixture, damage: str,
 ) -> None:
     target = rebuild_fixture.settings.rebuild.target_root / "state" / "acceptance-evidence.json"
     if damage == "missing":
         target.unlink()
-    elif damage == "wrong_schema":
-        _write_acceptance_evidence(
-            rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
-            schema_version=999,
-        )
-    elif damage == "wrong_run":
-        _write_acceptance_evidence(
-            rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
-            run_id=rebuild_fixture.run_id + 1,
-        )
     elif damage == "stale":
         _write_acceptance_evidence(
             rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
-            generated_at=(datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),
+            generated_at=datetime.now(UTC) - timedelta(hours=25),
         )
     elif damage == "before_finished":
         run = rebuild_fixture.session.get(PipelineRun, rebuild_fixture.run_id)
         assert run is not None and run.finished_at is not None
+        finished_at = run.finished_at.replace(tzinfo=UTC)
         _write_acceptance_evidence(
             rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
-            generated_at=(run.finished_at - timedelta(seconds=1)).isoformat(),
-        )
-    elif damage == "wrong_producer":
-        _write_acceptance_evidence(
-            rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
-            producer="other-process",
+            generated_at=finished_at - timedelta(seconds=1),
         )
     else:
-        _write_acceptance_evidence(
-            rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
-            fingerprint="0" * 64,
-        )
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        if damage == "wrong_schema":
+            payload["schema_version"] = 999
+        elif damage == "wrong_run":
+            payload["run_id"] = rebuild_fixture.run_id + 1
+        elif damage == "wrong_producer":
+            payload["producer"] = "other-process"
+        elif damage == "wrong_fingerprint":
+            payload["fingerprint"] = "0" * 64
+        elif damage == "missing_signature":
+            payload.pop("signature")
+        elif damage == "bad_signature":
+            payload["signature"] = "0" * 64
+        else:
+            payload["checks"]["build_passed"] = False
+        target.write_text(json.dumps(payload), encoding="utf-8")
+
+    checks = validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    )
+
+    assert not _check(checks, "WEBUI_FILTER_CONTRACT").ok
+    assert not _check(checks, "SAMPLE_EVIDENCE_COMPLETE").ok
+    assert not _check(checks, "AUTOMATED_GATES_CONFIRMED").ok
+
+
+@pytest.mark.parametrize("key_state", ("missing", "wrong"))
+def test_acceptance_evidence_signature_is_bound_to_configured_local_key(
+    rebuild_fixture: RebuildFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    key_state: str,
+) -> None:
+    key_env = rebuild_fixture.settings.rebuild.acceptance_evidence_key_env
+    if key_state == "missing":
+        monkeypatch.delenv(key_env)
+    else:
+        monkeypatch.setenv(key_env, "different-synthetic-test-key-material-32-bytes")
 
     checks = validate_rebuild(
         rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
@@ -397,6 +478,47 @@ def test_supported_attachment_retryable_failure_is_accepted_when_indexed(
     ), "SUPPORTED_ATTACHMENTS_ACCOUNTED").ok
 
 
+def test_supported_parse_failure_is_accounted_when_indexed_without_attachment_output(
+    rebuild_fixture: RebuildFixture,
+) -> None:
+    source = rebuild_fixture.files["attachment"]
+    parse = next(rebuild_fixture.session.scalars(select(RebuildOutput).where(
+        RebuildOutput.run_id == rebuild_fixture.run_id,
+        RebuildOutput.source_file_id == source.id,
+        RebuildOutput.kind == "parse",
+    )))
+    attachment = next(rebuild_fixture.session.scalars(select(RebuildOutput).where(
+        RebuildOutput.run_id == rebuild_fixture.run_id,
+        RebuildOutput.source_file_id == source.id,
+        RebuildOutput.kind == "attachment_markdown",
+    )))
+    resolve_rebuild_path(rebuild_fixture.settings, attachment.target_relpath).unlink()
+    rebuild_fixture.session.delete(attachment)
+    parse.status = "failed"
+    parse.error_code = "PARSER_TIMEOUT"
+    parse.sha256 = None
+    index = next(rebuild_fixture.session.scalars(select(RebuildOutput).where(
+        RebuildOutput.run_id == rebuild_fixture.run_id,
+        RebuildOutput.oa_item_id == rebuild_fixture.unnumbered.id,
+        RebuildOutput.kind == "item_index",
+    )))
+    target = resolve_rebuild_path(rebuild_fixture.settings, index.target_relpath)
+    target.write_text(
+        _frontmatter(rebuild_fixture.unnumbered)
+        + f"- {source.original_name}：转换失败，等待重试\n",
+        encoding="utf-8",
+    )
+    index.sha256 = _digest(target.read_bytes())
+    rebuild_fixture.session.commit()
+
+    checks = validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    )
+
+    assert _check(checks, "ORIGINALS_COMPLETE").ok
+    assert _check(checks, "SUPPORTED_ATTACHMENTS_ACCOUNTED").ok
+
+
 def test_links_to_parse_are_not_permitted(rebuild_fixture: RebuildFixture) -> None:
     index = next(rebuild_fixture.session.scalars(select(RebuildOutput).where(
         RebuildOutput.run_id == rebuild_fixture.run_id, RebuildOutput.kind == "item_index",
@@ -451,8 +573,13 @@ def _damage(fixture: RebuildFixture, kind: str) -> None:
     elif kind == "supported_retry_indexed":
         attachment = next(row for row in rows if row.kind == "attachment_markdown")
         attachment.status, attachment.error_code = "failed", "RETRYABLE_CONVERSION_FAILED"
+        source = fixture.files["attachment"]
         index = next(row for row in rows if row.kind == "item_index" and row.oa_item_id == fixture.unnumbered.id)
         target = resolve_rebuild_path(settings, index.target_relpath)
-        target.write_text(_frontmatter(fixture.unnumbered) + "转换失败，等待重试\n", encoding="utf-8")
+        target.write_text(
+            _frontmatter(fixture.unnumbered)
+            + f"- {source.original_name}：转换失败，等待重试\n",
+            encoding="utf-8",
+        )
         index.sha256 = _digest(target.read_bytes())
     session.commit()

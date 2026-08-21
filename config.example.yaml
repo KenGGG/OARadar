@@ -69,6 +69,8 @@ rebuild:
   # A protected sibling of the live app.data_root; never point this at data/.
   target_root: ../data_rebuilt
   item_title_max_chars: 96
+  # Store the HMAC key itself only in this environment variable (32+ bytes).
+  acceptance_evidence_key_env: OA_REBUILD_ACCEPTANCE_EVIDENCE_HMAC_KEY
 
 archive:
   max_recursive_depth: 2
