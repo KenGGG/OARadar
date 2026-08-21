@@ -280,6 +280,18 @@ def _attachment_states(
             target_relpath=target,
         )
         if output is None:
+            failed = session.scalar(
+                select(RebuildOutput.id).where(
+                    RebuildOutput.run_id == run_id,
+                    RebuildOutput.oa_item_id == item.id,
+                    RebuildOutput.source_file_id == source.id,
+                    RebuildOutput.kind == "attachment_markdown",
+                    RebuildOutput.status == "failed",
+                ).limit(1)
+            )
+            if failed is not None:
+                states.append(_AttachmentState(source, "retryable"))
+                continue
             raise _error("ATTACHMENT_MARKDOWN_UNAVAILABLE")
         states.append(_AttachmentState(source, "success", output))
     return states
@@ -316,14 +328,14 @@ def _body_output(
         page is not None,
     )
     if selected.kind == "none":
-        raise _error("BODY_SOURCE_UNAVAILABLE")
+        return None
     source_id = (
         selected.source_file_id
         if selected.kind == "attachment"
         else page.source_file_id
     )
     if source_id is None:
-        raise _error("BODY_SOURCE_UNAVAILABLE")
+        return None
     target = (markdown_item_relpath(item) / filename).as_posix()
     output = _exact_markdown(
         session,
@@ -334,8 +346,6 @@ def _body_output(
         kind="body_markdown",
         target_relpath=target,
     )
-    if output is None:
-        raise _error("BODY_MARKDOWN_UNAVAILABLE")
     return output
 
 
@@ -350,17 +360,20 @@ def _render(
     lines = _item_lines(item)
     lines.extend(("", "## 正文", ""))
     if body is None:
-        lines.append("- 无文号事项不生成正文。")
+        lines.append("- 无可用正文证据。")
     else:
         lines.append(
             f"- [正文]({_relative_link(body.target_relpath, item_relpath=item_relpath)})"
         )
     lines.extend(("", "## 原始附件", ""))
-    for evidence in sorted(originals.values(), key=lambda value: value.source.id):
-        lines.append(
-            f"- [{_link_label(evidence.source.original_name)}]"
-            f"({_relative_link(evidence.output.target_relpath, item_relpath=item_relpath)})"
-        )
+    if originals:
+        for evidence in sorted(originals.values(), key=lambda value: value.source.id):
+            lines.append(
+                f"- [{_link_label(evidence.source.original_name)}]"
+                f"({_relative_link(evidence.output.target_relpath, item_relpath=item_relpath)})"
+            )
+    else:
+        lines.append("- 无可用本地重建原件。")
     lines.extend(("", "## 附件 Markdown", ""))
     successful = [state for state in attachments if state.state == "success"]
     if successful:
@@ -399,13 +412,21 @@ def _build_content(
     body = _body_output(
         session, settings, run_id=run_id, item=item, originals=originals
     )
+    page = load_verified_page_body_evidence(session, settings, item.id, run_id=run_id)
+    selected = select_body_source(
+        item,
+        [evidence.source for evidence in originals.values()],
+        page is not None,
+    )
     attachments = _attachment_states(
         session,
         settings,
         run_id=run_id,
         item=item,
         originals=originals,
-        selected_body_id=body.source_file_id if body is not None else None,
+        selected_body_id=(
+            selected.source_file_id if selected.kind == "attachment" else None
+        ),
     )
     return (item_relpath / "_index.md").as_posix(), _render(
         item,

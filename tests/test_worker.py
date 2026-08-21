@@ -122,6 +122,364 @@ def test_rebuild_worker_advances_confirmed_synthetic_item_to_index(
         )) is not None
 
 
+def test_rebuild_worker_publishes_page_body_without_markdown_attachment(
+    config_file: Path, monkeypatch,
+) -> None:
+    """Dropping page-body fallback would strand a numbered, body-only item."""
+    settings = load_settings(config_file)
+    settings.rebuild.target_root = settings.data_root.parent / "data_rebuilt"
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:page-body-only", source_channel="done", title="合成正文事项",
+            document_number="示例〔2026〕1号", document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        session.add(item); session.flush()
+        page = ArchivedFile(
+            oa_item_id=item.id, attachment_key="page-body-only", original_name="body.html",
+            file_role="body_snapshot", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="b" * 64,
+        )
+        session.add(page); session.flush()
+        run = PipelineRun(run_key="synthetic-page-body-only", pipeline_type="data_rebuild")
+        session.add(run); session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, source_file_id=page.id, kind="original",
+            target_relpath="archive/synthetic/body.html", sha256=page.sha256,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 2
+        run_id, item_id = run.id, item.id
+
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.markdown.publish_rebuilt_body",
+        lambda *_args, **_kwargs: SimpleNamespace(status="success"),
+    )
+
+    def publish_index(session, _settings, rebuild_run_id, rebuild_item_id):
+        output = RebuildOutput(
+            run_id=rebuild_run_id, oa_item_id=rebuild_item_id, source_file_id=None,
+            kind="item_index", target_relpath="markdown/page-body-only/_index.md", sha256="c" * 64,
+            status="success", error_code=None,
+        )
+        session.add(output); session.commit()
+        return output
+
+    monkeypatch.setattr("oa_knowledge.rebuild.index.publish_rebuilt_index", publish_index)
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_until_idle() == 2
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_publish",
+            PipelineTask.status == "completed",
+        )) is not None
+        assert session.scalar(select(RebuildOutput).where(
+            RebuildOutput.run_id == run_id, RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.kind == "item_index", RebuildOutput.status == "success",
+        )) is not None
+
+
+def test_rebuild_worker_indexes_confirmed_item_without_sources(
+    config_file: Path, monkeypatch,
+) -> None:
+    """Removing empty-evidence indexing would hide confirmed metadata-only items."""
+    settings = load_settings(config_file)
+    settings.rebuild.target_root = settings.data_root.parent / "data_rebuilt"
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:no-rebuild-source", source_channel="done", title="合成无附件事项",
+            document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        run = PipelineRun(run_key="synthetic-no-rebuild-source", pipeline_type="data_rebuild")
+        session.add_all((item, run)); session.flush(); session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        run_id, item_id = run.id, item.id
+
+    def publish_index(session, _settings, rebuild_run_id, rebuild_item_id):
+        output = RebuildOutput(
+            run_id=rebuild_run_id, oa_item_id=rebuild_item_id, source_file_id=None,
+            kind="item_index", target_relpath="markdown/no-source/_index.md", sha256="d" * 64,
+            status="success", error_code=None,
+        )
+        session.add(output); session.commit()
+        return output
+
+    monkeypatch.setattr("oa_knowledge.rebuild.index.publish_rebuilt_index", publish_index)
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_until_idle() == 1
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_index",
+            PipelineTask.status == "completed",
+        )) is not None
+        assert session.scalar(select(RebuildOutput).where(
+            RebuildOutput.run_id == run_id, RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.kind == "item_index", RebuildOutput.status == "success",
+        )) is not None
+
+
+def test_rebuild_parse_failure_still_publishes_other_completed_evidence(
+    config_file: Path, monkeypatch,
+) -> None:
+    """Returning after one file's parse failure must not strand successful siblings."""
+    settings = load_settings(config_file)
+    settings.rebuild.target_root = settings.data_root.parent / "data_rebuilt"
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:parse-sibling", source_channel="done", title="合成解析同级事项",
+            document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        session.add(item); session.flush()
+        first = ArchivedFile(
+            oa_item_id=item.id, attachment_key="parse-first", original_name="first.txt",
+            file_role="direct_attachment", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="e" * 64,
+        )
+        second = ArchivedFile(
+            oa_item_id=item.id, attachment_key="parse-second", original_name="second.txt",
+            file_role="direct_attachment", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="f" * 64,
+        )
+        session.add_all((first, second)); session.flush()
+        run = PipelineRun(run_key="synthetic-parse-sibling", pipeline_type="data_rebuild")
+        session.add(run); session.flush()
+        for source in (first, second):
+            session.add(RebuildOutput(
+                run_id=run.id, oa_item_id=item.id, source_file_id=source.id, kind="original",
+                target_relpath=f"archive/synthetic/{source.original_name}", sha256=source.sha256,
+                status="success", error_code=None,
+            ))
+        session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 2
+        run_id, item_id, first_id, second_id = run.id, item.id, first.id, second.id
+
+    def parse(session, _settings, rebuild_run_id, source_file_id):
+        if source_file_id == first_id:
+            return SimpleNamespace(status="failed", error_code="SYNTHETIC_PARSE_FAILED")
+        session.add(RebuildOutput(
+            run_id=rebuild_run_id, oa_item_id=item_id, source_file_id=source_file_id, kind="parse",
+            target_relpath="parsed/synthetic-second", sha256="1" * 64,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        return SimpleNamespace(status="success", error_code=None)
+
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_rebuilt_source", parse)
+    published: list[int] = []
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.markdown.publish_rebuilt_attachment",
+        lambda _session, _settings, _run_id, source_file_id: published.append(source_file_id),
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.index.publish_rebuilt_index",
+        lambda _session, _settings, _run_id, _item_id: SimpleNamespace(status="success"),
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_until_idle() == 4
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        assert published == [second_id]
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_parse",
+            PipelineTask.status == "failed",
+        )) is not None
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_index",
+            PipelineTask.status == "completed",
+        )) is not None
+
+
+def test_rebuild_publish_failure_still_schedules_index(
+    config_file: Path, monkeypatch,
+) -> None:
+    """A terminal publication failure must not prevent a retryable item index."""
+    settings = load_settings(config_file)
+    settings.rebuild.target_root = settings.data_root.parent / "data_rebuilt"
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:publish-failure", source_channel="done", title="合成发布失败事项",
+            document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, attachment_key="publish-failure", original_name="source.txt",
+            file_role="direct_attachment", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="2" * 64,
+        )
+        session.add(source); session.flush()
+        run = PipelineRun(run_key="synthetic-publish-failure", pipeline_type="data_rebuild")
+        session.add(run); session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, source_file_id=source.id, kind="original",
+            target_relpath="archive/synthetic/publish.txt", sha256=source.sha256,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        run_id, item_id, source_id = run.id, item.id, source.id
+
+    def parse(session, _settings, rebuild_run_id, source_file_id):
+        session.add(RebuildOutput(
+            run_id=rebuild_run_id, oa_item_id=item_id, source_file_id=source_file_id, kind="parse",
+            target_relpath="parsed/synthetic-publish", sha256="3" * 64,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        return SimpleNamespace(status="success", error_code=None)
+
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_rebuilt_source", parse)
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.markdown.publish_rebuilt_attachment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("SYNTHETIC_PUBLISH_FAILED")),
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.index.publish_rebuilt_index",
+        lambda _session, _settings, _run_id, _item_id: SimpleNamespace(status="success"),
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_until_idle() == 3
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_publish",
+            PipelineTask.status == "failed",
+        )) is not None
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_index",
+            PipelineTask.status == "completed",
+        )) is not None
+
+
+def test_rebuild_worker_recovers_expired_rebuild_lease(config_file: Path, monkeypatch) -> None:
+    """Removing local lease recovery would leave a crashed rebuild parse unclaimable."""
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:expired-rebuild", source_channel="done", title="合成过期租约事项",
+            document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, attachment_key="expired-rebuild", original_name="source.txt",
+            file_role="direct_attachment", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="4" * 64,
+        )
+        session.add(source); session.flush()
+        run = PipelineRun(run_key="synthetic-expired-rebuild", pipeline_type="data_rebuild")
+        session.add(run); session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, source_file_id=source.id, kind="original",
+            target_relpath="archive/synthetic/expired.txt", sha256=source.sha256,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+        assert task is not None
+        task.status, task.lease_owner = "running", "crashed-rebuild-worker"
+        task.lease_expires_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        session.commit()
+        task_id = task.id
+
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.parser.parse_rebuilt_source",
+        lambda *_args, **_kwargs: SimpleNamespace(status="failed", error_code="SYNTHETIC_PARSE_FAILED"),
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_once() is True
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        task = session.get(PipelineTask, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        assert task.attempts == 1
+        assert session.scalar(select(func.count()).select_from(PipelineTask).where(
+            PipelineTask.id == task_id,
+        )) == 1
+
+
+def test_rebuild_index_requeues_when_evidence_fingerprint_changes(
+    config_file: Path, monkeypatch,
+) -> None:
+    """An index claimed for stale evidence must not publish under its old key."""
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:stale-index", source_channel="done", title="合成索引变更事项",
+            document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        run = PipelineRun(run_key="synthetic-stale-index", pipeline_type="data_rebuild")
+        session.add_all((item, run)); session.flush(); session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        original_task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+        assert original_task is not None
+        page = ArchivedFile(
+            oa_item_id=item.id, attachment_key="stale-index-page", original_name="body.html",
+            file_role="body_snapshot", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="5" * 64,
+        )
+        session.add(page); session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, source_file_id=page.id, kind="original",
+            target_relpath="archive/synthetic/stale-body.html", sha256=page.sha256,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        old_task_id, run_id, item_id = original_task.id, run.id, item.id
+
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.index.publish_rebuilt_index",
+        lambda _session, _settings, _run_id, _item_id: SimpleNamespace(status="success"),
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_until_idle() == 2
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        old = session.get(PipelineTask, old_task_id)
+        assert old is not None
+        assert old.status == "failed"
+        assert old.error_code == "REBUILD_INDEX_STALE_INPUT"
+        replacement = session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_index",
+            PipelineTask.id != old_task_id,
+        ))
+        assert replacement is not None
+        assert replacement.status == "completed"
+
+
 def test_oa_login_writes_a_live_logging_in_status_before_browser_access(config_file: Path) -> None:
     settings = load_settings(config_file)
     settings.data_root.mkdir(parents=True, exist_ok=True)

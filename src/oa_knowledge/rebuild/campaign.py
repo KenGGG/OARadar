@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from collections.abc import Sequence
@@ -27,6 +28,7 @@ from oa_knowledge.rebuild.archive_copy import (
     copy_inventory_row,
     reconcile_successful_output,
 )
+from oa_knowledge.rebuild.body_source import body_markdown_filename
 from oa_knowledge.rebuild.inventory import InventoryRow
 from oa_knowledge.rebuild.paths import effective_item_date
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
@@ -215,6 +217,94 @@ def _eligible_markdown_rebuild_item(item: OAItem) -> bool:
     return True
 
 
+def _markdown_task_key(run_id: int, stage: str, target_id: int, source_sha256: str) -> str:
+    return f"rebuild:{run_id}:{stage}:{target_id}:{source_sha256}"
+
+
+def _enqueue_markdown_task(
+    session: Session,
+    *,
+    run_id: int,
+    item_id: int,
+    stage: str,
+    target_id: int,
+    source_sha256: str,
+    payload: dict[str, object],
+) -> bool:
+    """Create one local rebuild task, preserving idempotent retry semantics."""
+    key = _markdown_task_key(run_id, stage, target_id, source_sha256)
+    task = session.scalar(select(PipelineTask).where(PipelineTask.idempotency_key == key))
+    if task is None:
+        task = PipelineTask(
+            run_id=run_id,
+            queue_name=QUEUE_NAME,
+            priority=100,
+            logical_item_key=f"rebuild-item:{item_id}",
+            stage=stage,
+            status="queued",
+            idempotency_key=key,
+            payload_json=json.dumps(payload, sort_keys=True),
+        )
+        session.add(task)
+        session.flush()
+        _add_event(session, task, "enqueued", "queued")
+        return True
+    if task.status == "failed" and task.recoverable:
+        task.status = "queued"
+        task.error_code = task.last_error = None
+        task.finished_at = None
+        _add_event(session, task, "requeued", "queued")
+        return True
+    return False
+
+
+def _current_original_fingerprint(session: Session, *, run_id: int, item_id: int) -> str:
+    """Fingerprint only current-run copied originals bound to current source hashes."""
+    pairs = session.execute(
+        select(ArchivedFile.id, ArchivedFile.sha256)
+        .join(RebuildOutput, RebuildOutput.source_file_id == ArchivedFile.id)
+        .where(
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.kind == "original",
+            RebuildOutput.status == "success",
+            ArchivedFile.oa_item_id == item_id,
+            ArchivedFile.download_status == "verified",
+            ArchivedFile.sha256.is_not(None),
+            RebuildOutput.sha256 == ArchivedFile.sha256,
+        )
+        .order_by(ArchivedFile.id, RebuildOutput.id.desc())
+    ).all()
+    values: dict[int, str] = {}
+    for source_id, source_sha in pairs:
+        values.setdefault(source_id, source_sha)
+    evidence = "\0".join(f"{source_id}:{source_sha}" for source_id, source_sha in values.items())
+    return hashlib.sha256(evidence.encode()).hexdigest()
+
+
+def _current_page_body_source(
+    session: Session, *, run_id: int, item_id: int,
+) -> ArchivedFile | None:
+    """Return only a verified body snapshot with a matching copied-original row."""
+    return session.scalar(
+        select(ArchivedFile)
+        .join(RebuildOutput, RebuildOutput.source_file_id == ArchivedFile.id)
+        .where(
+            ArchivedFile.oa_item_id == item_id,
+            ArchivedFile.file_role == "body_snapshot",
+            ArchivedFile.download_status == "verified",
+            ArchivedFile.sha256.is_not(None),
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.kind == "original",
+            RebuildOutput.status == "success",
+            RebuildOutput.sha256 == ArchivedFile.sha256,
+        )
+        .order_by(RebuildOutput.id.desc())
+        .limit(1)
+    )
+
+
 def enqueue_markdown_rebuild(
     session: Session, run_id: int, item_ids: Sequence[int],
 ) -> int:
@@ -251,35 +341,57 @@ def enqueue_markdown_rebuild(
                 continue
             source_sha = source.sha256
             assert source_sha is not None
-            key = f"rebuild:{run_id}:{REBUILD_PARSE_STAGE}:{source.id}:{source_sha}"
-            task = session.scalar(select(PipelineTask).where(
-                PipelineTask.idempotency_key == key,
-            ))
-            if task is None:
-                task = PipelineTask(
-                    run_id=run_id,
-                    queue_name=QUEUE_NAME,
-                    priority=100,
-                    logical_item_key=f"rebuild-item:{item.id}",
-                    stage=REBUILD_PARSE_STAGE,
-                    status="queued",
-                    idempotency_key=key,
-                    payload_json=json.dumps({
-                        "item_id": item.id,
-                        "source_file_id": source.id,
-                        "source_sha256": source_sha,
-                    }, sort_keys=True),
-                )
-                session.add(task)
-                session.flush()
-                _add_event(session, task, "enqueued", "queued")
+            if _enqueue_markdown_task(
+                session,
+                run_id=run_id,
+                item_id=item.id,
+                stage=REBUILD_PARSE_STAGE,
+                target_id=source.id,
+                source_sha256=source_sha,
+                payload={
+                    "item_id": item.id,
+                    "source_file_id": source.id,
+                    "source_sha256": source_sha,
+                },
+            ):
                 added += 1
-            elif task.status == "failed" and task.recoverable:
-                task.status = "queued"
-                task.error_code = task.last_error = None
-                task.finished_at = None
-                _add_event(session, task, "requeued", "queued")
-                added += 1
+        if files:
+            continue
+        page = _current_page_body_source(session, run_id=run_id, item_id=item.id)
+        if (
+            page is not None
+            and page.sha256
+            and body_markdown_filename(item) is not None
+            and _enqueue_markdown_task(
+                session,
+                run_id=run_id,
+                item_id=item.id,
+                stage=REBUILD_PUBLISH_STAGE,
+                target_id=item.id,
+                source_sha256=page.sha256,
+                payload={
+                    "item_id": item.id,
+                    "kind": "body",
+                    "source_file_id": page.id,
+                    "source_sha256": page.sha256,
+                },
+            )
+        ):
+            added += 1
+        # A confirmed item with no Markdown-convertible source still has a
+        # useful metadata/original-evidence index.  Page body publication (if
+        # present) is inserted first so this index cannot run ahead of it.
+        fingerprint = _current_original_fingerprint(session, run_id=run_id, item_id=item.id)
+        if _enqueue_markdown_task(
+            session,
+            run_id=run_id,
+            item_id=item.id,
+            stage=REBUILD_INDEX_STAGE,
+            target_id=item.id,
+            source_sha256=fingerprint,
+            payload={"item_id": item.id, "source_sha256": fingerprint},
+        ):
+            added += 1
     if added:
         run.status = "running"
         run.finished_at = None

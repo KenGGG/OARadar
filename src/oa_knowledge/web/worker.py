@@ -30,6 +30,7 @@ from oa_knowledge.rebuild.campaign import (
     REBUILD_INDEX_STAGE,
     REBUILD_PARSE_STAGE,
     REBUILD_PUBLISH_STAGE,
+    _current_original_fingerprint,
     _finish_run,
 )
 from oa_knowledge.rebuild.paths import effective_item_date
@@ -261,6 +262,36 @@ class OperationWorker:
         """Claim only a running local rebuild run; paused runs admit no new work."""
         now = datetime.now(timezone.utc)
         with Session(self.engine, expire_on_commit=False) as session:
+            expired = list(session.scalars(select(PipelineTask).join(
+                PipelineRun, PipelineRun.id == PipelineTask.run_id,
+            ).where(
+                PipelineTask.queue_name == REBUILD_QUEUE_NAME,
+                PipelineTask.stage.in_(MARKDOWN_REBUILD_STAGES),
+                PipelineTask.status == "running",
+                PipelineRun.pipeline_type == "data_rebuild",
+                PipelineRun.status == "running",
+            )))
+            for running in expired:
+                expiry = running.lease_expires_at
+                if expiry is not None and expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry is not None and expiry > now:
+                    continue
+                recovered = session.execute(update(PipelineTask).where(
+                    PipelineTask.id == running.id,
+                    PipelineTask.status == "running",
+                    PipelineTask.lease_owner == running.lease_owner,
+                    PipelineTask.lease_expires_at == running.lease_expires_at,
+                ).values(
+                    status="queued", error_code=None, last_error=None,
+                    finished_at=None, lease_owner=None, lease_expires_at=None,
+                )).rowcount
+                if recovered == 1:
+                    session.add(PipelineEvent(
+                        task_id=running.id, event_type="recovered", stage=running.stage,
+                        status="queued", details_json=json.dumps({"reason": "expired_lease"}),
+                    ))
+            session.commit()
             task = session.scalar(select(PipelineTask).join(
                 PipelineRun, PipelineRun.id == PipelineTask.run_id,
             ).where(
@@ -373,7 +404,13 @@ class OperationWorker:
         return True
 
     def _schedule_rebuild_publish(
-        self, session: Session, *, run_id: int, item_id: int, current_task_id: int | None = None,
+        self,
+        session: Session,
+        *,
+        run_id: int,
+        item_id: int,
+        current_task_id: int | None = None,
+        successful_source_id: int | None = None,
     ) -> None:
         """Admit publish only after all copied-source parse tasks are terminal."""
         item = self._rebuild_item_admitted(session, item_id)
@@ -403,6 +440,17 @@ class OperationWorker:
             session, run_id=run_id, item_id=item_id, source_file_id=source.id,
             source_sha256=source.sha256 or "",
         )]
+        parsed = [source for source in current if (
+            source.id == successful_source_id
+            or session.scalar(select(RebuildOutput.id).where(
+                RebuildOutput.run_id == run_id,
+                RebuildOutput.oa_item_id == item_id,
+                RebuildOutput.source_file_id == source.id,
+                RebuildOutput.kind == "parse",
+                RebuildOutput.status == "success",
+                RebuildOutput.sha256.is_not(None),
+            ).limit(1)) is not None
+        )]
         page_output = session.scalar(select(RebuildOutput).join(ArchivedFile).where(
             RebuildOutput.run_id == run_id,
             RebuildOutput.oa_item_id == item_id,
@@ -411,32 +459,37 @@ class OperationWorker:
             ArchivedFile.id == RebuildOutput.source_file_id,
             ArchivedFile.file_role == "body_snapshot",
         ).order_by(RebuildOutput.id.desc()).limit(1))
-        body = select_body_source(item, current, page_output is not None)
+        body = select_body_source(item, parsed, page_output is not None)
+        added = False
         if body.kind == "attachment" and body.source_file_id is not None:
             source = session.get(ArchivedFile, body.source_file_id)
             if source is not None and source.sha256:
-                self._enqueue_rebuild_task(
+                added = self._enqueue_rebuild_task(
                     session, run_id=run_id, item_id=item_id, stage=REBUILD_PUBLISH_STAGE,
                     target_id=item_id, source_sha256=source.sha256,
                     payload={"item_id": item_id, "kind": "body", "source_file_id": source.id,
                              "source_sha256": source.sha256},
                 )
         elif body.kind == "page_body" and page_output is not None and page_output.sha256:
-            self._enqueue_rebuild_task(
+            added = self._enqueue_rebuild_task(
                 session, run_id=run_id, item_id=item_id, stage=REBUILD_PUBLISH_STAGE,
                 target_id=item_id, source_sha256=page_output.sha256,
                 payload={"item_id": item_id, "kind": "body", "source_file_id": page_output.source_file_id,
                          "source_sha256": page_output.sha256},
             )
         body_file_id = body.source_file_id if body.kind == "attachment" else None
-        for source in current:
+        for source in parsed:
             if source.id == body_file_id or not source.sha256:
                 continue
-            self._enqueue_rebuild_task(
+            added = self._enqueue_rebuild_task(
                 session, run_id=run_id, item_id=item_id, stage=REBUILD_PUBLISH_STAGE,
                 target_id=source.id, source_sha256=source.sha256,
                 payload={"item_id": item_id, "kind": "attachment", "source_file_id": source.id,
                          "source_sha256": source.sha256},
+            ) or added
+        if not added:
+            self._schedule_rebuild_index(
+                session, run_id=run_id, item_id=item_id, current_task_id=current_task_id,
             )
         session.commit()
 
@@ -457,16 +510,9 @@ class OperationWorker:
             for task in tasks
         ):
             return
-        fingerprints = sorted(
-            str(value) for value in session.scalars(select(RebuildOutput.sha256).where(
-                RebuildOutput.run_id == run_id, RebuildOutput.oa_item_id == item_id,
-                RebuildOutput.kind == "original", RebuildOutput.status == "success",
-                RebuildOutput.sha256.is_not(None),
-            ))
+        source_sha = _current_original_fingerprint(
+            session, run_id=run_id, item_id=item_id,
         )
-        if not fingerprints:
-            return
-        source_sha = hashlib.sha256("\0".join(fingerprints).encode()).hexdigest()
         self._enqueue_rebuild_task(
             session, run_id=run_id, item_id=item_id, stage=REBUILD_INDEX_STAGE,
             target_id=item_id, source_sha256=source_sha,
@@ -486,13 +532,32 @@ class OperationWorker:
             if self._rebuild_item_admitted(session, item_id) is None:
                 self._finish_rebuild_task(task, error_code="REBUILD_ITEM_NOT_ADMITTED")
                 return
-            if task.stage != REBUILD_INDEX_STAGE:
+            if task.stage == REBUILD_INDEX_STAGE:
+                source_sha = payload.get("source_sha256")
+                current = _current_original_fingerprint(
+                    session, run_id=task.run_id, item_id=item_id,
+                )
+                if not isinstance(source_sha, str) or source_sha != current:
+                    self._schedule_rebuild_index(
+                        session, run_id=task.run_id, item_id=item_id,
+                    )
+                    self._finish_rebuild_task(task, error_code="REBUILD_INDEX_STALE_INPUT")
+                    return
+            else:
                 source_id = payload.get("source_file_id")
                 source_sha = payload.get("source_sha256")
                 if not isinstance(source_id, int) or not isinstance(source_sha, str) or not self._rebuild_source_is_current(
                     session, run_id=task.run_id, item_id=item_id, source_file_id=source_id,
                     source_sha256=source_sha,
                 ):
+                    if task.stage == REBUILD_PARSE_STAGE:
+                        self._schedule_rebuild_publish(
+                            session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                        )
+                    elif task.stage == REBUILD_PUBLISH_STAGE:
+                        self._schedule_rebuild_index(
+                            session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                        )
                     self._finish_rebuild_task(task, error_code="REBUILT_ORIGINAL_UNAVAILABLE")
                     return
         try:
@@ -503,11 +568,19 @@ class OperationWorker:
                         parser_session, self.settings, task.run_id, int(payload["source_file_id"]),
                     )
                 if result.status not in {"success", "unsupported"}:
+                    with Session(self.engine) as session:
+                        self._schedule_rebuild_publish(
+                            session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                        )
                     self._finish_rebuild_task(task, error_code=result.error_code or "REBUILD_PARSE_FAILED")
                     return
                 with Session(self.engine) as session:
                     self._schedule_rebuild_publish(
                         session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                        successful_source_id=(
+                            int(payload["source_file_id"])
+                            if result.status == "success" else None
+                        ),
                     )
             elif task.stage == REBUILD_PUBLISH_STAGE:
                 if payload.get("kind") == "body":
@@ -532,6 +605,15 @@ class OperationWorker:
                 self._finish_rebuild_task(task, error_code="REBUILD_STAGE_INVALID")
                 return
         except Exception as exc:  # Rebuild producers expose code-only failures; never persist details.
+            with Session(self.engine) as session:
+                if task.stage == REBUILD_PARSE_STAGE:
+                    self._schedule_rebuild_publish(
+                        session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                    )
+                elif task.stage == REBUILD_PUBLISH_STAGE:
+                    self._schedule_rebuild_index(
+                        session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                    )
             self._finish_rebuild_task(task, error_code=self._rebuild_error_code(exc))
             return
         self._finish_rebuild_task(task)

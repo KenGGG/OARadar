@@ -208,13 +208,13 @@ def test_index_is_unique_per_run_and_item(
     assert second.id == first.id
 
 
-def test_index_rejects_missing_numbered_body(
+def test_index_marks_missing_numbered_body_as_no_content(
     session: Session,
     settings: Settings,
     run_id: int,
     rebuilt_item: OAItem,
 ) -> None:
-    """A numbered item cannot claim completion until its one required body exists."""
+    """A missing body must be explicit local no-content, not an item failure."""
     body = next(
         output
         for output in session.query(RebuildOutput).all()
@@ -222,8 +222,11 @@ def test_index_rejects_missing_numbered_body(
     )
     resolve_rebuild_path(settings, body.target_relpath).unlink()
 
-    with pytest.raises(RebuildIndexError, match="BODY_MARKDOWN_UNAVAILABLE"):
-        publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
+    output = publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
+    text = resolve_rebuild_path(settings, output.target_relpath).read_text(encoding="utf-8")
+
+    assert output.status == "success"
+    assert "- 无可用正文证据。" in text
 
 
 def test_index_url_encodes_original_and_markdown_link_destinations(
@@ -410,6 +413,54 @@ def test_index_lists_terminal_unsupported_and_retryable_attachment_failure(
 
     assert "预算表.xlsx：暂不支持转换" in text
     assert "待重试.docx：转换失败，等待重试" in text
+
+
+def test_index_lists_retryable_terminal_attachment_publication_failure(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    rebuilt_item: OAItem,
+) -> None:
+    """A failed per-file publisher must not suppress the completed item index."""
+    markdown = next(
+        output for output in session.query(RebuildOutput).all()
+        if output.kind == "attachment_markdown"
+    )
+    markdown.status = "failed"
+    markdown.error_code = "SYNTHETIC_PUBLICATION_FAILED"
+    session.commit()
+
+    output = publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
+    text = resolve_rebuild_path(settings, output.target_relpath).read_text(encoding="utf-8")
+
+    assert output.status == "success"
+    assert "预算表.xlsx：转换失败，等待重试" in text
+
+
+def test_confirmed_metadata_only_item_publishes_an_explicit_empty_index(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+) -> None:
+    """Removing no-source support would make confirmed local metadata undiscoverable."""
+    item = OAItem(
+        oa_item_key="done:synthetic-metadata-only",
+        source_channel="done",
+        title="合成元数据事项",
+        document_date=date(2026, 8, 20),
+        classification_state="confirmed",
+        source_type="internal",
+        internal_category="风险管理",
+    )
+    session.add(item)
+    session.commit()
+
+    output = publish_rebuilt_index(session, settings, run_id, item.id)
+    text = resolve_rebuild_path(settings, output.target_relpath).read_text(encoding="utf-8")
+
+    assert output.status == "success"
+    assert "- 无可用正文证据。" in text
+    assert "- 无可用本地重建原件。" in text
 
 
 def test_index_rejects_another_runs_global_target(
