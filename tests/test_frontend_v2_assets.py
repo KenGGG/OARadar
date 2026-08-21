@@ -18,3 +18,11 @@ def test_markdown_view_reports_an_outdated_web_api() -> None:
 
     assert "Array.isArray(result.items)" in source
     assert "Markdown 页面需要 V2 Web API" in source
+
+
+def test_rebuild_page_exposes_three_review_groups() -> None:
+    source = Path("webui/src/views/RebuildClassificationView.tsx").read_text()
+
+    assert all(label in source for label in ("内部事项", "外部事项", "待确认事项"))
+    assert "确认全部明确的内部事项" in source
+    assert "确认全部明确的外部事项" in source

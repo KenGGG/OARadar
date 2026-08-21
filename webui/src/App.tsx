@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react"
 import {
-  Bell, BookOpen, CircleAlert, FileText, LayoutDashboard, Menu, RefreshCw, Settings as SettingsIcon, ShieldCheck, X,
+  Bell, BookOpen, CircleAlert, FileText, LayoutDashboard, ListChecks, Menu, RefreshCw, Settings as SettingsIcon, ShieldCheck, X,
 } from "lucide-react"
 import { Progress } from "./components/ui/progress"
 import type { SimpleDoneItem, SimpleDonePage, SimpleDoneState, SimpleStatusResponse } from "./types/simple-status"
@@ -9,9 +9,10 @@ import { SimpleDoneView } from "./views/SimpleDoneView"
 import { SimpleSettingsView } from "./views/SimpleSettingsView"
 import { PendingView, type PendingRow } from "./views/PendingView"
 import { MarkdownView, type MarkdownItem } from "./views/MarkdownView"
+import { RebuildClassificationView } from "./views/RebuildClassificationView"
 
 // 一级导航固定为：总览、已办资料、系统设置（spec §2）。
-type View = "overview" | "pending" | "done" | "markdown" | "settings"
+type View = "overview" | "pending" | "done" | "markdown" | "settings" | "rebuild"
 
 // ---- 共享类型（供高级维护与设置视图复用，不删除既有能力） ----
 
@@ -141,6 +142,7 @@ const NAV = [
   { id: "pending" as View, label: "待办通知", icon: Bell },
   { id: "done" as View, label: "已办资料", icon: BookOpen },
   { id: "markdown" as View, label: "Markdown 输出", icon: FileText },
+  { id: "rebuild" as View, label: "资料重建", icon: ListChecks },
   { id: "settings" as View, label: "系统设置", icon: SettingsIcon },
 ]
 
@@ -236,6 +238,7 @@ export function App() {
   const [settings, setSettings] = useState<SettingsData | null>(null)
   const [pending, setPending] = useState<PendingRow[]>([])
   const [markdown, setMarkdown] = useState<MarkdownItem[]>([])
+  const [rebuildRefreshKey, setRebuildRefreshKey] = useState(0)
 
   const navigate = useCallback((next: View) => {
     setView(next); setDoneQuery(""); setDoneFilter(""); setDonePage(1)
@@ -278,6 +281,7 @@ export function App() {
     : id === "pending" ? "待办摘要、飞书投递与清理"
     : id === "done" ? "已办资料：原件归档与 Markdown 交付状态"
     : id === "markdown" ? "Source Markdown、分类和事项索引"
+    : id === "rebuild" ? "复核资料重建的内部、外部与待确认分类"
     : "扫描、模型、飞书与本地服务设置"
 
   return <div className="app-shell">
@@ -290,7 +294,7 @@ export function App() {
       <header className="topbar">
         <button className="icon-button menu-button" title="打开导航" onClick={() => setMobileNav(!mobileNav)}><Menu size={19}/></button>
         <div><h1>{topLabel(view)}</h1><p>{topHint(view)}</p></div>
-        <button className="icon-button refresh" title="刷新当前页面" onClick={() => void load()} disabled={loading}><RefreshCw size={18} className={loading ? "spin" : ""}/></button>
+        <button className="icon-button refresh" title="刷新当前页面" onClick={() => view === "rebuild" ? setRebuildRefreshKey(value => value + 1) : void load()} disabled={loading}><RefreshCw size={18} className={loading ? "spin" : ""}/></button>
       </header>
       {error && <div className="error-banner"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}
       {loading ? <div className="loading"><RefreshCw className="spin"/><span>正在读取本地状态</span></div> : <>
@@ -303,6 +307,7 @@ export function App() {
           filter={doneFilter} setFilter={setDoneFilter}
         />}
         {view === "markdown" && <MarkdownView rows={markdown}/>}
+        {view === "rebuild" && <RebuildClassificationView refreshKey={rebuildRefreshKey}/>}
         {view === "settings" && settings && <SimpleSettingsView initial={settings}/>}
       </>}
     </main>
