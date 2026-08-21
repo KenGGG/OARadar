@@ -125,6 +125,31 @@ def test_unsupported_is_explicit(session: Session, settings: Settings, run_id: i
     assert output.sha256 is None
 
 
+def test_unsupported_converges_legacy_success_ledger_row(
+    session: Session, settings: Settings, run_id: int,
+) -> None:
+    """A legacy success row without an artifact becomes terminal unsupported."""
+    original = _rebuilt_original(session, settings, run_id, name="source.exe", copied=b"synthetic")
+    relpath = f"parse/{run_id}/{original.source_file_id}/{original.sha256}/unsupported"
+    legacy = RebuildOutput(
+        run_id=run_id, oa_item_id=original.oa_item_id, source_file_id=original.source_file_id,
+        kind="parse", target_relpath=relpath, sha256="legacy-product-sha",
+        status="success", error_code=None,
+    )
+    session.add(legacy)
+    session.commit()
+
+    result = parse_rebuilt_source(session, settings, run_id, original.source_file_id)
+
+    assert result.status == "unsupported"
+    session.expire_all()
+    persisted = session.get(RebuildOutput, legacy.id)
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.error_code == "UNSUPPORTED_FORMAT"
+    assert persisted.sha256 is None
+
+
 def test_parser_reuses_verified_current_run_product(
     monkeypatch: pytest.MonkeyPatch, session: Session, settings: Settings, run_id: int,
 ) -> None:

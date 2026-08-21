@@ -283,9 +283,17 @@ def parse_rebuilt_source(
             existing = ledger.scalar(select(RebuildOutput).where(
                 RebuildOutput.run_id == run_id, RebuildOutput.target_relpath == relpath,
             ))
-            if existing is None or existing.status != "success":
+            if existing is None or (
+                existing.kind == "parse"
+                and existing.source_file_id == source.id
+                and existing.oa_item_id == source.oa_item_id
+            ):
                 _record_output(ledger, run_id=run_id, source=source, relpath=relpath,
                                sha256=None, status="failed", error_code="UNSUPPORTED_FORMAT")
+            else:
+                return _result(source_file_id, "failed", "none", relpath=None,
+                               source_sha256=source_sha, product_sha256=None,
+                               error_code="TARGET_CONFLICT")
             _remove_prior_successes(ledger, settings, run_id=run_id,
                                     source_file_id=source_file_id, keep_relpath=relpath)
             return _result(source_file_id, "unsupported", "none", relpath=None,
