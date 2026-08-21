@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import tempfile
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from oa_knowledge.archive.integrity import sha256_text
 
 logger = logging.getLogger(__name__)
+
+
+def is_supported_file(file_path: Path, settings) -> bool:
+    """Return whether this router is configured to parse the file's suffix.
+
+    Callers which need an explicit terminal ``unsupported`` result should use
+    this admission check instead of asking an engine to guess at arbitrary
+    bytes.  ``parse_file`` remains permissive for legacy callers.
+    """
+    return Path(file_path).suffix.lower() in {
+        suffix.lower() for suffix in settings.parser.supported_extensions
+    }
 
 
 @dataclass(frozen=True)
@@ -172,7 +183,7 @@ def parse_file(
         - Other -> MarkItDown
     """
     from oa_knowledge.parsers.markitdown_parser import parse_with_markitdown
-    from oa_knowledge.parsers.mineru_parser import parse_with_mineru, mineru_available
+    from oa_knowledge.parsers.mineru_parser import mineru_available, parse_with_mineru
 
     file_path = Path(file_path)
     if not file_path.is_file():
