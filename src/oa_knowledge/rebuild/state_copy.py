@@ -12,7 +12,8 @@ from alembic.script import ScriptDirectory
 
 from oa_knowledge.rebuild.validation import ValidationCheck
 
-_COPY_APPLICATION_ID = 0x4F415243  # "OARC" — an internally prepared rebuild copy.
+_PREPARED_COPY_APPLICATION_ID = 0x4F415243  # "OARC" — ready for one ledger application.
+_APPLIED_COPY_APPLICATION_ID = 0x4F415250  # "OARP" — applied and ready for cutover promotion.
 
 
 def _sqlite_sidecars(database_path: Path) -> tuple[Path, Path]:
@@ -90,7 +91,11 @@ def validate_database_copy(database_path: Path) -> list[ValidationCheck]:
             row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
             revision = row[0] if row is not None else None
             active_paths = _active_path_count(connection)
-            prepared_copy = connection.execute("PRAGMA application_id").fetchone()[0] == _COPY_APPLICATION_ID
+            application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+            prepared_copy = application_id in {
+                _PREPARED_COPY_APPLICATION_ID,
+                _APPLIED_COPY_APPLICATION_ID,
+            }
     except (OSError, sqlite3.DatabaseError):
         pass
     return [
@@ -130,16 +135,41 @@ def _map_export_rows(
             changed.add(export_id)
 
 
+def _supersede_legacy_parse_artifacts(connection: sqlite3.Connection, source_file_id: int) -> int:
+    artifact_ids = [
+        row[0]
+        for row in connection.execute(
+            "SELECT parse_artifacts.id FROM parse_artifacts "
+            "JOIN parse_jobs ON parse_jobs.id = parse_artifacts.parse_job_id "
+            "WHERE parse_jobs.file_id = ? AND parse_artifacts.lifecycle_status = 'valid'",
+            (source_file_id,),
+        )
+    ]
+    if not artifact_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in artifact_ids)
+    connection.execute(
+        f"UPDATE parse_artifacts SET lifecycle_status = 'superseded' WHERE id IN ({placeholders})",
+        artifact_ids,
+    )
+    connection.execute(
+        f"UPDATE content_objects SET active_parse_artifact_id = NULL "
+        f"WHERE active_parse_artifact_id IN ({placeholders})",
+        artifact_ids,
+    )
+    return len(artifact_ids)
+
+
 def apply_rebuilt_ledger(database_path: Path, run_id: int) -> dict[str, int]:
     """Apply one run's successful rebuilt paths to a copied runtime database only."""
     database_path = _reject_symlink_path(database_path)
     if not database_path.is_file() or database_path.is_symlink():
         raise ValueError("database copy must be a regular file")
-    files_changed = 0
+    files_changed = parse_artifacts_changed = 0
     exports_changed: set[int] = set()
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
-        if connection.execute("PRAGMA application_id").fetchone()[0] != _COPY_APPLICATION_ID:
+        if connection.execute("PRAGMA application_id").fetchone()[0] != _PREPARED_COPY_APPLICATION_ID:
             raise ValueError("database path is not a prepared database copy")
         run = connection.execute(
             "SELECT 1 FROM pipeline_runs WHERE id = ? AND pipeline_type = 'data_rebuild'", (run_id,)
@@ -165,6 +195,10 @@ def apply_rebuilt_ledger(database_path: Path, run_id: int) -> dict[str, int]:
                     if current[0] != target:
                         connection.execute("UPDATE files SET local_relpath = ? WHERE id = ?", (target, source_file_id))
                         files_changed += 1
+                    # The rebuild tree contains parser product directories, not
+                    # the legacy regular artifact files. Once an original is
+                    # remapped, no valid legacy artifact for it may remain active.
+                    parse_artifacts_changed += _supersede_legacy_parse_artifacts(connection, source_file_id)
                     _map_export_rows(
                         connection,
                         "SELECT id, source_relpath FROM markdown_exports WHERE source_file_id = ?",
@@ -173,9 +207,13 @@ def apply_rebuilt_ledger(database_path: Path, run_id: int) -> dict[str, int]:
                 elif kind == "parse":
                     # A rebuild parse ledger target is a product directory. Legacy
                     # parse rows instead name one regular product file beneath
-                    # ``data_root/parse``. Keep those historical rows stable; the
-                    # normal parse pipeline detects the retired missing product and
-                    # safely queues a new current artifact from the remapped source.
+                    # ``data_root/parse``. Do not manufacture a directory path in
+                    # those file fields: supersede retired legacy products instead.
+                    # The successful original branch has already superseded those
+                    # legacy records; the normal parse pipeline will queue a new
+                    # artifact from the remapped original when it is next invoked.
+                    if source_file_id is None:
+                        raise RuntimeError("successful parse is missing its source file")
                     continue
                 elif kind in {"body_markdown", "attachment_markdown"}:
                     if source_file_id is None:
@@ -202,6 +240,7 @@ def apply_rebuilt_ledger(database_path: Path, run_id: int) -> dict[str, int]:
                     )
             if _active_path_count(connection):
                 raise RuntimeError("retired filesystem paths remain in active runtime rows")
+            connection.execute(f"PRAGMA application_id = {_APPLIED_COPY_APPLICATION_ID}")
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -209,7 +248,7 @@ def apply_rebuilt_ledger(database_path: Path, run_id: int) -> dict[str, int]:
     return {
         "files": files_changed,
         "markdown_exports": len(exports_changed),
-        "parse_artifacts": 0,
+        "parse_artifacts": parse_artifacts_changed,
     }
 
 
@@ -237,7 +276,7 @@ def backup_live_database(source: Path, target: Path) -> None:
             journal_mode = target_connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
             if journal_mode.lower() != "delete":
                 raise RuntimeError("database copy could not be made self-contained")
-            target_connection.execute(f"PRAGMA application_id = {_COPY_APPLICATION_ID}")
+            target_connection.execute(f"PRAGMA application_id = {_PREPARED_COPY_APPLICATION_ID}")
             target_connection.commit()
         if any(sidecar.exists() for sidecar in _sqlite_sidecars(temporary)):
             raise RuntimeError("database copy retained SQLite sidecars")

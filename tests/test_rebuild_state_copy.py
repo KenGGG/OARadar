@@ -13,6 +13,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import (
     ArchivedFile,
+    ContentObject,
     MarkdownExport,
     Notification,
     OAItem,
@@ -28,6 +29,7 @@ from oa_knowledge.rebuild.state_copy import (
     backup_live_database,
     validate_database_copy,
 )
+from oa_knowledge.source_markdown.service import publish_active_artifact
 
 
 def _integrity_check(path: Path) -> str:
@@ -43,16 +45,19 @@ def _seed_rebuild_copy(path: Path) -> int:
             item = OAItem(
                 oa_item_key="synthetic-copy-item", source_channel="done", title="Synthetic copy",
             )
+            content = ContentObject(sha256="a" * 64, size_bytes=16)
             source = ArchivedFile(
                 oa_item_id=1, original_name="source.bin", local_relpath="retired/source.bin",
                 attachment_key="synthetic-source", file_role="direct_attachment",
                 source_container_key="synthetic-container", download_status="verified",
+                sha256="a" * 64,
             )
             run = PipelineRun(run_key="synthetic-copy-run", pipeline_type="data_rebuild", status="completed")
             other_run = PipelineRun(run_key="synthetic-other-run", pipeline_type="data_rebuild", status="completed")
-            session.add_all([item, run, other_run])
+            session.add_all([item, content, run, other_run])
             session.flush()
             source.oa_item_id = item.id
+            source.content_object_id = content.id
             session.add(source)
             session.flush()
             parse_job = ParseJob(
@@ -61,11 +66,14 @@ def _seed_rebuild_copy(path: Path) -> int:
             )
             session.add(parse_job)
             session.flush()
-            session.add(ParseArtifact(
+            artifact = ParseArtifact(
                 parse_job_id=parse_job.id, engine="synthetic", engine_version="1",
                 output_relpath="retired/parse/source", source_sha256="a" * 64,
-                config_hash="j" * 64, lifecycle_status="valid",
-            ))
+                config_hash="j" * 64, lifecycle_status="valid", content_object_id=content.id,
+            )
+            session.add(artifact)
+            session.flush()
+            content.active_parse_artifact_id = artifact.id
             session.add_all([
                 MarkdownExport(
                     source_file_id=source.id, oa_item_id=item.id, document_kind="attachment",
@@ -143,7 +151,7 @@ def test_apply_ledger_updates_only_the_copy_and_preserves_notification_dedupe(tm
 
     result = apply_rebuilt_ledger(copied, run_id)
 
-    assert result == {"files": 1, "markdown_exports": 2, "parse_artifacts": 0}
+    assert result == {"files": 1, "markdown_exports": 2, "parse_artifacts": 1}
     with sqlite3.connect(source) as connection:
         assert connection.execute("SELECT local_relpath FROM files").fetchone()[0] == "retired/source.bin"
         assert connection.execute("SELECT idempotency_key, attempts FROM notifications").fetchone() == ("synthetic-dedupe", 2)
@@ -161,8 +169,8 @@ def test_apply_ledger_updates_only_the_copy_and_preserves_notification_dedupe(tm
     assert all(check.ok for check in validate_database_copy(copied))
 
 
-def test_apply_keeps_legacy_parse_products_stable_until_the_pipeline_rebuilds_them(tmp_path: Path) -> None:
-    """Writing the rebuild parse directory into a legacy artifact file field breaks its consumers."""
+def test_apply_supersedes_retired_active_artifact_before_source_markdown_consumes_it(tmp_path: Path) -> None:
+    """Leaving a valid artifact selected after its retired product is unavailable breaks source Markdown."""
     source = tmp_path / "live.db"
     data_root = tmp_path / "rebuilt"
     copied = data_root / "state" / "oa.db"
@@ -183,21 +191,59 @@ def test_apply_keeps_legacy_parse_products_stable_until_the_pipeline_rebuilds_th
 
     result = apply_rebuilt_ledger(copied, run_id)
 
-    assert result["parse_artifacts"] == 0
+    assert result["parse_artifacts"] == 1
     with sqlite3.connect(copied) as connection:
         source_id = connection.execute("SELECT id FROM files").fetchone()[0]
         assert connection.execute("SELECT output_relpath FROM parse_artifacts").fetchone()[0] == "retired/parse/source"
         assert connection.execute("SELECT output_relpath FROM parse_jobs").fetchone()[0] == "retired/parse/source"
+        assert connection.execute("SELECT lifecycle_status FROM parse_artifacts").fetchone()[0] == "superseded"
+        assert connection.execute("SELECT active_parse_artifact_id FROM content_objects").fetchone()[0] is None
 
     settings = Settings(app={"data_root": data_root})
     engine = create_db_engine(copied)
     try:
+        with Session(engine) as session, pytest.raises(FileNotFoundError, match="valid parse artifact unavailable"):
+            publish_active_artifact(session, settings, source_id)
         assert ParsePipeline(settings, engine).enqueue(source_id) is not None
         with Session(engine) as session:
             assert session.get(ParseJob, 1).status == "queued"
             assert session.get(ParseArtifact, 1).lifecycle_status == "superseded"
     finally:
         engine.dispose()
+
+
+def test_apply_supersedes_retired_artifacts_when_the_current_run_parse_failed(tmp_path: Path) -> None:
+    """A failed rebuild parse must not leave its source selecting a retired valid legacy product."""
+    source = tmp_path / "live.db"
+    copied = tmp_path / "copy.db"
+    run_id = _seed_rebuild_copy(source)
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "UPDATE rebuild_outputs SET status = 'failed', error_code = 'SYNTHETIC_FAILURE' "
+            "WHERE run_id = ? AND kind = 'parse'",
+            (run_id,),
+        )
+    backup_live_database(source, copied)
+
+    result = apply_rebuilt_ledger(copied, run_id)
+
+    assert result["parse_artifacts"] == 1
+    with sqlite3.connect(copied) as connection:
+        assert connection.execute("SELECT lifecycle_status FROM parse_artifacts").fetchone()[0] == "superseded"
+        assert connection.execute("SELECT active_parse_artifact_id FROM content_objects").fetchone()[0] is None
+
+
+def test_apply_rejects_a_copy_after_its_successful_one_shot_application(tmp_path: Path) -> None:
+    """Keeping the prepared marker after apply would permit a post-cutover live DB mutation."""
+    source = tmp_path / "live.db"
+    copied = tmp_path / "copy.db"
+    run_id = _seed_rebuild_copy(source)
+    backup_live_database(source, copied)
+
+    apply_rebuilt_ledger(copied, run_id)
+
+    with pytest.raises(ValueError, match="prepared database copy"):
+        apply_rebuilt_ledger(copied, run_id)
 
 
 def test_apply_ledger_rejects_unmapped_retired_active_path(tmp_path: Path) -> None:
