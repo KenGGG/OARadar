@@ -125,10 +125,83 @@ def test_archive_item_folder_truncates_title_before_stable_key(item: OAItem) -> 
     assert "甲" * 97 not in folder
 
 
+def test_item_path_builders_accept_a_configured_title_limit(item: OAItem) -> None:
+    item.title = "甲" * 100
+    item.source_type = "internal"
+    item.internal_category = "风险管理"
+    item.classification_state = "confirmed"
+
+    settings = Settings(rebuild={"item_title_max_chars": 8})
+    archive_folder = archive_item_relpath(
+        item, item_title_max_chars=settings.rebuild.item_title_max_chars,
+    ).parts[-1]
+    markdown_folder = markdown_item_relpath(
+        item, item_title_max_chars=settings.rebuild.item_title_max_chars,
+    ).parts[-1]
+
+    assert "甲" * 8 in archive_folder
+    assert "甲" * 9 not in archive_folder
+    assert markdown_folder == archive_folder
+
+
+def test_archive_file_paths_do_not_collide_after_name_sanitization(item: OAItem) -> None:
+    first = ArchivedFile(
+        original_name="合成?.pdf", attachment_key="first", file_role="attachment", source_container_key="container",
+    )
+    second = ArchivedFile(
+        original_name="合成*.pdf", attachment_key="second", file_role="attachment", source_container_key="container",
+    )
+
+    first_path = archive_file_relpath(item, first)
+    second_path = archive_file_relpath(item, second)
+
+    assert first_path != second_path
+    assert first_path.name.startswith("合成.pdf--")
+    assert second_path.name.startswith("合成.pdf--")
+
+
+def test_archive_file_paths_do_not_collide_for_exact_duplicate_names(item: OAItem) -> None:
+    first = ArchivedFile(
+        original_name="合成.pdf", attachment_key="first", file_role="attachment", source_container_key="container",
+    )
+    second = ArchivedFile(
+        original_name="合成.pdf", attachment_key="second", file_role="attachment", source_container_key="container",
+    )
+
+    first_path = archive_file_relpath(item, first)
+    second_path = archive_file_relpath(item, second)
+
+    assert first_path != second_path
+    assert archive_file_relpath(item, first) == first_path
+
+
 def test_resolve_rebuild_root_is_a_sibling_of_live_data(tmp_path: Path) -> None:
     settings = Settings(app={"data_root": tmp_path / "data"})
 
     assert resolve_rebuild_root(settings) == (tmp_path / "data_rebuilt").resolve()
+
+
+def test_resolve_rebuild_root_is_anchored_to_live_data_when_cwd_changes(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(app={"data_root": tmp_path / "data"})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    assert resolve_rebuild_root(settings) == (tmp_path / "data_rebuilt").resolve()
+
+
+def test_resolve_rebuild_root_rejects_actual_repository_root_when_cwd_changes(tmp_path: Path, monkeypatch) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    settings = Settings(
+        app={"data_root": tmp_path / "data"},
+        rebuild={"target_root": repository_root},
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    with pytest.raises(ValueError, match="repository root"):
+        resolve_rebuild_root(settings)
 
 
 @pytest.mark.parametrize("target_root", [".", "data", "data/child"])

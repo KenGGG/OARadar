@@ -13,6 +13,9 @@ from oa_knowledge.rebuild.classification import INTERNAL_CATEGORIES
 
 _FORBIDDEN_COMPONENT_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]')
 _CONTROL_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+_REPOSITORY_ROOT = next(
+    parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file()
+)
 
 
 def _is_relative_to(path: Path, other: Path) -> bool:
@@ -28,10 +31,9 @@ def resolve_rebuild_root(settings: Settings) -> Path:
     configured = settings.rebuild.target_root.expanduser()
     target = configured.resolve() if configured.is_absolute() else (settings.data_root / configured).resolve()
     live_root = settings.data_root.resolve()
-    repository_root = Path.cwd().resolve()
     home = Path.home().resolve()
 
-    if target == Path("/") or target == home or target == repository_root:
+    if target == Path("/") or target == home or target == _REPOSITORY_ROOT:
         raise ValueError("rebuild target must not be the filesystem root, home directory, or repository root")
     if _is_relative_to(target, live_root) or _is_relative_to(live_root, target):
         raise ValueError("rebuild target must resolve outside the live data root")
@@ -57,9 +59,9 @@ def effective_item_date(item: OAItem) -> date:
     raise ValueError("item has no effective date")
 
 
-def _item_folder(item: OAItem) -> str:
+def _item_folder(item: OAItem, *, item_title_max_chars: int = 96) -> str:
     item_date = effective_item_date(item)
-    title = safe_component(item.title)
+    title = safe_component(item.title, max_chars=item_title_max_chars)
     parts = [item_date.strftime("%Y%m%d")]
     if item.document_number is not None:
         parts.append(safe_component(item.document_number))
@@ -68,18 +70,27 @@ def _item_folder(item: OAItem) -> str:
     return "-".join(parts) + f"--{short_key}"
 
 
-def archive_item_relpath(item: OAItem) -> PurePosixPath:
+def archive_item_relpath(item: OAItem, *, item_title_max_chars: int = 96) -> PurePosixPath:
     """Return the classification-independent archive directory for an OA item."""
     item_date = effective_item_date(item)
-    return PurePosixPath("archive", "oa", "done", item_date.strftime("%Y"), item_date.strftime("%m"), _item_folder(item))
+    return PurePosixPath(
+        "archive", "oa", "done", item_date.strftime("%Y"), item_date.strftime("%m"),
+        _item_folder(item, item_title_max_chars=item_title_max_chars),
+    )
 
 
-def archive_file_relpath(item: OAItem, source: ArchivedFile) -> PurePosixPath:
+def archive_file_relpath(
+    item: OAItem, source: ArchivedFile, *, item_title_max_chars: int = 96,
+) -> PurePosixPath:
     """Return the archive evidence path without consulting classification fields."""
-    return archive_item_relpath(item) / safe_component(source.original_name)
+    identity = f"{source.attachment_key}\0{source.file_role}\0{source.source_container_key}"
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    return archive_item_relpath(item, item_title_max_chars=item_title_max_chars) / (
+        f"{safe_component(source.original_name)}--{suffix}"
+    )
 
 
-def markdown_item_relpath(item: OAItem) -> PurePosixPath:
+def markdown_item_relpath(item: OAItem, *, item_title_max_chars: int = 96) -> PurePosixPath:
     """Return a Markdown folder only for an explicitly confirmed classification."""
     if item.classification_state != "confirmed":
         raise ValueError("Markdown paths require confirmed classification")
@@ -95,7 +106,8 @@ def markdown_item_relpath(item: OAItem) -> PurePosixPath:
     else:
         raise ValueError("confirmed Markdown path requires internal or external classification")
     return PurePosixPath(
-        "markdown", *classification_parts, f"{item_date:%Y}年", f"{item_date:%m}月", _item_folder(item),
+        "markdown", *classification_parts, f"{item_date:%Y}年", f"{item_date:%m}月",
+        _item_folder(item, item_title_max_chars=item_title_max_chars),
     )
 
 
