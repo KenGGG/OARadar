@@ -23,13 +23,14 @@ from oa_knowledge.db.models import (
     PipelineTask,
     RebuildOutput,
 )
-from oa_knowledge.rebuild import campaign
+from oa_knowledge.rebuild import archive_copy, campaign
 from oa_knowledge.rebuild.campaign import (
     create_rebuild_run,
     enqueue_archive_copy,
     execute_archive_copy,
 )
 from oa_knowledge.rebuild.inventory import build_inventory
+from oa_knowledge.rebuild.paths import resolve_rebuild_path
 
 
 def _execute_in_session(engine, settings, run_id: int, inventory_row) -> None:
@@ -433,4 +434,83 @@ def test_ownership_loss_fences_cooperative_copy_without_terminal_write(
     assert enqueue_archive_copy(session, run.id, [inventory_row]) == 0
     assert [event.event_type for event in events].count("claimed") == 1
     assert [event.event_type for event in events].count("completed") == 0
+    assert [event.event_type for event in events].count("failed") == 0
+
+
+def test_ownership_loss_after_verification_fences_publish_and_later_owner_resumes(
+    session, settings, inventory_row, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claimant fenced at the publish boundary leaves retryable local state."""
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    engine = session.get_bind()
+    health = campaign._LeaseHealth()
+    original_start = campaign._start_lease_heartbeat
+    original_file_matches = archive_copy._file_matches
+    match_calls = 0
+
+    def controlled_heartbeat(*args, **kwargs):
+        stop = threading.Event()
+        thread = threading.Thread(target=stop.wait, daemon=True)
+        thread.start()
+        return stop, thread, health
+
+    def lose_ownership_after_final_verification(*args, **kwargs):
+        nonlocal match_calls
+        matches = original_file_matches(*args, **kwargs)
+        match_calls += 1
+        if match_calls == 3:
+            with Session(engine) as thief_session:
+                thief = thief_session.scalar(select(PipelineTask).where(
+                    PipelineTask.run_id == run.id,
+                    PipelineTask.stage == "archive_copy",
+                ))
+                assert thief is not None
+                thief.lease_owner = "later-owner"
+                thief.lease_expires_at = datetime.now(UTC) + timedelta(seconds=1)
+                thief_session.commit()
+            health.lost.set()
+        return matches
+
+    monkeypatch.setattr(campaign, "_start_lease_heartbeat", controlled_heartbeat)
+    monkeypatch.setattr(archive_copy, "_file_matches", lose_ownership_after_final_verification)
+
+    first_result = execute_archive_copy(session, settings, run.id, [inventory_row])
+
+    session.expire_all()
+    task = session.scalar(select(PipelineTask).where(
+        PipelineTask.run_id == run.id,
+        PipelineTask.stage == "archive_copy",
+    ))
+    output = session.scalar(select(RebuildOutput).where(RebuildOutput.run_id == run.id))
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
+    target = resolve_rebuild_path(settings, inventory_row.destination_relpath)
+    assert first_result == {"copied": 0, "failed": 0}
+    assert match_calls == 3
+    assert not target.exists()
+    assert output.status == "failed"
+    assert output.error_code == "LEASE_LOST"
+    assert task.status == "running"
+    assert task.lease_owner == "later-owner"
+    assert task.recoverable is True
+    assert [event.event_type for event in events if event.event_type in {"completed", "failed"}] == []
+
+    monkeypatch.setattr(campaign, "_start_lease_heartbeat", original_start)
+    monkeypatch.setattr(archive_copy, "_file_matches", original_file_matches)
+    task.lease_expires_at = datetime(2020, 1, 1, tzinfo=UTC)
+    session.commit()
+
+    assert enqueue_archive_copy(session, run.id, [inventory_row]) == 1
+    second_result = execute_archive_copy(session, settings, run.id, [inventory_row])
+
+    session.refresh(task)
+    session.refresh(output)
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
+    assert second_result == {"copied": 1, "failed": 0}
+    assert target.read_bytes() == b"synthetic campaign original"
+    assert output.status == "success"
+    assert output.error_code is None
+    assert task.status == "completed"
+    assert [event.event_type for event in events].count("claimed") == 2
+    assert [event.event_type for event in events].count("completed") == 1
     assert [event.event_type for event in events].count("failed") == 0

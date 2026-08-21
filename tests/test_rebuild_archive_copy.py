@@ -116,6 +116,34 @@ def test_copy_fences_itself_when_lease_health_is_lost(
     assert not resolve_rebuild_path(settings, inventory_row.destination_relpath).exists()
 
 
+def test_empty_copy_rechecks_lease_health_before_publication(
+    session: Session, settings: Settings, run_id: int, inventory_row: InventoryRow
+) -> None:
+    """An empty source still observes cancellation after its zero-chunk copy."""
+    source = settings.data_root / inventory_row.source_relpath
+    source.write_bytes(b"")
+    empty_row = InventoryRow(
+        **{
+            **inventory_row.__dict__,
+            "size_bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        }
+    )
+    health_checks = iter((True, True, False))
+
+    output = copy_inventory_row(
+        session,
+        settings,
+        empty_row,
+        run_id=run_id,
+        should_continue=lambda: next(health_checks),
+    )
+
+    assert output.status == "failed"
+    assert output.error_code == "LEASE_LOST"
+    assert not resolve_rebuild_path(settings, empty_row.destination_relpath).exists()
+
+
 @pytest.mark.parametrize("damage", ("deleted", "tampered"))
 def test_success_ledger_row_is_reverified_before_reuse(
     session: Session,

@@ -24,6 +24,11 @@ class _CopyCancelled(Exception):
     """Stop an in-progress copy once its synchronous claimant is fenced."""
 
 
+def _raise_if_cancelled(should_continue: Callable[[], bool] | None) -> None:
+    if should_continue is not None and not should_continue():
+        raise _CopyCancelled
+
+
 def _file_matches(path: Path, *, size_bytes: int, sha256: str) -> bool:
     try:
         if not path.is_file() or path.stat().st_size != size_bytes:
@@ -59,8 +64,7 @@ def _copy_to_temporary(
         with source.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
             descriptor = -1
             for chunk in iter(lambda: reader.read(1024 * 1024), b""):
-                if should_continue is not None and not should_continue():
-                    raise _CopyCancelled
+                _raise_if_cancelled(should_continue)
                 writer.write(chunk)
             writer.flush()
             os.fsync(writer.fileno())
@@ -140,7 +144,10 @@ def _copy_inventory_row(
         source = resolve_data_path(settings.data_root, row.source_relpath, allowed_prefixes=DONE_ARCHIVE_PREFIXES)
     except ValueError:
         return _record_failure(session, row, run_id=run_id, error_code="SOURCE_UNSAFE")
-    if not _file_matches(source, size_bytes=row.size_bytes, sha256=row.sha256):
+    source_matches = _file_matches(source, size_bytes=row.size_bytes, sha256=row.sha256)
+    if should_continue is not None and not should_continue():
+        return _record_failure(session, row, run_id=run_id, error_code="LEASE_LOST")
+    if not source_matches:
         error = "SOURCE_MISSING" if not source.exists() else "SOURCE_SIZE_MISMATCH"
         if source.exists() and source.is_file() and source.stat().st_size == row.size_bytes:
             error = "SOURCE_HASH_MISMATCH"
@@ -164,9 +171,16 @@ def _copy_inventory_row(
     temporary: Path | None = None
     try:
         temporary = _copy_to_temporary(source, target.parent, should_continue=should_continue)
-        if not _file_matches(temporary, size_bytes=row.size_bytes, sha256=row.sha256):
+        _raise_if_cancelled(should_continue)
+        temporary_matches = _file_matches(
+            temporary, size_bytes=row.size_bytes, sha256=row.sha256,
+        )
+        _raise_if_cancelled(should_continue)
+        if not temporary_matches:
             return _set_status(session, output, status="failed", error_code="COPY_VERIFICATION_FAILED")
-        if not _file_matches(source, size_bytes=row.size_bytes, sha256=row.sha256):
+        source_matches = _file_matches(source, size_bytes=row.size_bytes, sha256=row.sha256)
+        _raise_if_cancelled(should_continue)
+        if not source_matches:
             return _set_status(session, output, status="failed", error_code="SOURCE_CHANGED")
         published = _publish_no_clobber(temporary, target)
         if not published:
