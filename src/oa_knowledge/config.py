@@ -304,6 +304,8 @@ class RebuildConfig(StrictModel):
     """Configured, local institution aliases allowed in deterministic suggestions."""
 
     external_issuer_aliases: dict[str, str] = Field(default_factory=dict)
+    target_root: Path = Path("../data_rebuilt")
+    item_title_max_chars: int = Field(default=96, ge=1)
 
     @field_validator("external_issuer_aliases")
     @classmethod

@@ -66,6 +66,9 @@ pending_cleanup:
 # reviewable suggestions; no suggestion is automatically confirmed.
 rebuild:
   external_issuer_aliases: {}
+  # A protected sibling of the live app.data_root; never point this at data/.
+  target_root: ../data_rebuilt
+  item_title_max_chars: 96
 
 archive:
   max_recursive_depth: 2

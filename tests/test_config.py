@@ -22,6 +22,13 @@ def test_defaults_are_local_and_depth_ten() -> None:
     assert settings.markdown_root == settings.data_root / "workspace/raw/sources/oa"
     assert settings.markdown_root != settings.workspace_root / "wiki"
     assert settings.rebuild.external_issuer_aliases == {}
+    assert settings.rebuild.target_root == Path("../data_rebuilt")
+    assert settings.rebuild.item_title_max_chars == 96
+
+
+def test_rebuild_title_limit_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        RebuildConfig(item_title_max_chars=0)
 
 
 def test_rebuild_aliases_require_nonempty_trimmed_names() -> None:
