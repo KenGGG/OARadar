@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -14,8 +15,6 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import ArchivedFile, OAItem, RebuildOutput
-from oa_knowledge.rebuild.archive_copy import reconcile_successful_output
-from oa_knowledge.rebuild.inventory import InventoryRow
 from oa_knowledge.rebuild.paths import (
     COMPONENT_MAX_BYTES,
     resolve_rebuild_path,
@@ -108,12 +107,18 @@ def body_markdown_filename(item: OAItem) -> str | None:
     """Return the bounded main-body filename for a numbered item, or no filename."""
     if not _has_document_number(item):
         return None
-    suffix_bytes = len(_BODY_SUFFIX.encode("utf-8"))
-    number = safe_component(item.document_number or "", max_chars=COMPONENT_MAX_BYTES)
-    number = _truncate_utf8(number, COMPONENT_MAX_BYTES - suffix_bytes)
-    if not number:
+    try:
+        number = safe_component(item.document_number or "", max_chars=COMPONENT_MAX_BYTES)
+        title = safe_component(item.title or "", max_chars=COMPONENT_MAX_BYTES)
+    except ValueError:
         return None
-    return f"{number}{_BODY_SUFFIX}"
+    content_budget = COMPONENT_MAX_BYTES - len(_BODY_SUFFIX.encode("utf-8")) - 1
+    title_reserve = min(len(title.encode("utf-8")), content_budget // 2)
+    number = _truncate_utf8(number, content_budget - title_reserve)
+    title = _truncate_utf8(title, content_budget - len(number.encode("utf-8")))
+    if not number or not title:
+        return None
+    return f"{number}-{title}{_BODY_SUFFIX}"
 
 
 class _BodyTextParser(HTMLParser):
@@ -164,7 +169,7 @@ def load_verified_page_body(
     session: Session, settings: Settings, item_id: int, *, run_id: int,
 ) -> str | None:
     """Read sanitized page text solely from one verified copied body snapshot."""
-    row = session.execute(
+    rows = session.execute(
         select(ArchivedFile, RebuildOutput)
         .join(RebuildOutput, RebuildOutput.source_file_id == ArchivedFile.id)
         .where(
@@ -179,28 +184,20 @@ def load_verified_page_body(
             RebuildOutput.status == "success",
             RebuildOutput.sha256 == ArchivedFile.sha256,
         )
-        .order_by(ArchivedFile.id, RebuildOutput.id)
-    ).first()
-    if row is None:
-        return None
-    snapshot, output = row
-    if snapshot.size_bytes is None or snapshot.sha256 is None:
-        return None
-    row = InventoryRow(
-        item_id=item_id,
-        file_id=snapshot.id,
-        source_relpath="",
-        destination_relpath=output.target_relpath,
-        size_bytes=snapshot.size_bytes,
-        sha256=snapshot.sha256,
-        file_role=snapshot.file_role,
-        status="ready",
-    )
-    if reconcile_successful_output(session, settings, row, run_id=run_id) is None:
-        return None
-    try:
-        target = resolve_rebuild_path(settings, output.target_relpath)
-        content = target.read_text(encoding="utf-8", errors="replace")
-    except (OSError, ValueError):
-        return None
-    return _sanitize_html_to_text(content)
+        .order_by(RebuildOutput.id.desc())
+    ).all()
+    for snapshot, output in rows:
+        if snapshot.size_bytes is None or snapshot.sha256 is None:
+            continue
+        try:
+            target = resolve_rebuild_path(settings, output.target_relpath)
+            content = target.read_bytes()
+        except (OSError, ValueError):
+            continue
+        if (
+            len(content) != snapshot.size_bytes
+            or hashlib.sha256(content).hexdigest() != snapshot.sha256
+        ):
+            continue
+        return _sanitize_html_to_text(content.decode("utf-8", errors="replace"))
+    return None

@@ -132,15 +132,34 @@ def test_page_body_is_fallback_when_no_attachment_matches(item: OAItem) -> None:
     assert result.reason == "verified_page_body"
 
 
-def test_body_markdown_filename_preserves_suffix_within_component_budget(item: OAItem) -> None:
-    """Long document numbers must not displace the required Markdown suffix."""
-    item.document_number = "合成文号" * 100
+def test_body_markdown_filename_has_number_title_and_body_suffix(item: OAItem) -> None:
+    """Omitting any semantic filename component would obscure the item identity."""
+
+    assert body_markdown_filename(item) == "示例〔2026〕12号-合成标题-正文.md"
+
+
+def test_body_markdown_filename_bounds_long_multibyte_number_and_title(item: OAItem) -> None:
+    """Long multibyte metadata must retain both semantic components and the suffix."""
+    item.document_number = "甲" * 100
+    item.title = "乙" * 100
 
     filename = body_markdown_filename(item)
 
     assert filename is not None
+    number, title, suffix = filename.rsplit("-", maxsplit=2)
+    assert number and title
+    assert set(number) == {"甲"}
+    assert set(title) == {"乙"}
+    assert suffix == "正文.md"
     assert filename.endswith("-正文.md")
     assert len(filename.encode("utf-8")) <= 240
+
+
+def test_body_markdown_filename_rejects_entirely_unsafe_document_number(item: OAItem) -> None:
+    """An unsafe number must have the same defined no-filename outcome as no number."""
+    item.document_number = '<>:/\\|?*\x00'
+
+    assert body_markdown_filename(item) is None
 
 
 def test_page_body_loader_reads_only_verified_rebuilt_original(
@@ -210,6 +229,41 @@ def test_page_body_loader_rejects_unverified_or_tampered_snapshot(
     snapshot.download_status = "verified"
     target.write_bytes(b"tampered")
     assert load_verified_page_body(session, settings, item.id, run_id=first_run.id) is None
-    assert output.status == "failed"
-    assert output.error_code == "TARGET_CONFLICT"
+    assert output.status == "success"
+    assert output.error_code is None
     assert load_verified_page_body(session, settings, item.id, run_id=second_run.id) is None
+
+
+def test_page_body_loader_skips_stale_old_output_without_mutating_ledger(
+    session: Session, settings: Settings, item: OAItem,
+) -> None:
+    """An old stale copy must not hide a newer valid copy or rewrite either ledger row."""
+    content = b"<p>new synthetic body</p>"
+    snapshot = _file(item, name="body.html", role="body_snapshot")
+    snapshot.size_bytes = len(content)
+    snapshot.sha256 = hashlib.sha256(content).hexdigest()
+    session.add(snapshot)
+    run = PipelineRun(run_key="synthetic-body-newest", pipeline_type="data_rebuild")
+    session.add(run)
+    session.flush()
+    old_relpath = "archive/oa/done/synthetic/old-body.html"
+    new_relpath = "archive/oa/done/synthetic/new-body.html"
+    old_target = resolve_rebuild_path(settings, old_relpath)
+    new_target = resolve_rebuild_path(settings, new_relpath)
+    old_target.parent.mkdir(parents=True)
+    old_target.write_bytes(b"stale")
+    new_target.write_bytes(content)
+    old_output = RebuildOutput(
+        run_id=run.id, oa_item_id=item.id, source_file_id=snapshot.id, kind="original",
+        target_relpath=old_relpath, sha256=snapshot.sha256, status="success", error_code=None,
+    )
+    new_output = RebuildOutput(
+        run_id=run.id, oa_item_id=item.id, source_file_id=snapshot.id, kind="original",
+        target_relpath=new_relpath, sha256=snapshot.sha256, status="success", error_code=None,
+    )
+    session.add_all((old_output, new_output))
+    session.commit()
+
+    assert load_verified_page_body(session, settings, item.id, run_id=run.id) == "new synthetic body"
+    assert (old_output.status, old_output.error_code) == ("success", None)
+    assert (new_output.status, new_output.error_code) == ("success", None)
