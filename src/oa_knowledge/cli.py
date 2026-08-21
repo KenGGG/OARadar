@@ -50,7 +50,12 @@ from oa_knowledge.scheduled_sync import (
 from oa_knowledge.reconcile import reconcile_done_occurrence
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.markdown_export.service import convert_archive, markdown_status as get_markdown_status
-from oa_knowledge.rebuild.campaign import create_rebuild_run, enqueue_archive_copy, execute_archive_copy
+from oa_knowledge.rebuild.campaign import (
+    create_rebuild_run,
+    enqueue_archive_copy,
+    execute_archive_copy,
+    resume_rebuild_run,
+)
 from oa_knowledge.rebuild.inventory import build_inventory, inventory_summary, write_private_inventory
 from oa_knowledge.rebuild.paths import resolve_rebuild_path
 
@@ -106,45 +111,51 @@ def _rebuild_error(error_code: str) -> None:
 
 @rebuild_app.command("inventory")
 def rebuild_inventory(
-    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),  # noqa: B008
+    config: Path | None = typer.Option(None, "--config", dir_okay=False),  # noqa: B008
 ) -> None:
     """Build the local inventory and save details only in protected private state."""
-    settings = settings_option(config)
-    if not settings.database_path.exists():
-        _rebuild_error("DATABASE_NOT_INITIALIZED")
-    engine = create_db_engine(settings.database_path)
     try:
+        settings = settings_option(config)
+        if not settings.database_path.exists():
+            _rebuild_error("DATABASE_NOT_INITIALIZED")
+        engine = create_db_engine(settings.database_path)
         with Session(engine) as session:
             rows = build_inventory(session, settings)
         write_private_inventory(settings, resolve_rebuild_path(settings, "state/private/inventory.json"), rows)
         typer.echo(json.dumps(inventory_summary(rows), ensure_ascii=False))
+    except typer.Exit:
+        raise
+    except Exception:  # noqa: BLE001 - never expose local paths or OA details on CLI stdout.
+        _rebuild_error("REBUILD_INVENTORY_FAILED")
     finally:
-        engine.dispose()
+        if "engine" in locals():
+            engine.dispose()
 
 
 @rebuild_app.command("archive")
 def rebuild_archive(
     execute: bool = typer.Option(False, "--execute"),
     run_id: int | None = typer.Option(None, "--run-id", min=1),
-    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),  # noqa: B008
+    config: Path | None = typer.Option(None, "--config", dir_okay=False),  # noqa: B008
 ) -> None:
     """Dry-run by default; execute synchronously only when explicitly requested."""
     if not execute:
         typer.echo(json.dumps({"copied": 0, "failed": 0, "dry_run": True}))
         return
-    settings = settings_option(config)
-    if not settings.database_path.exists():
-        _rebuild_error("DATABASE_NOT_INITIALIZED")
-    engine = create_db_engine(settings.database_path)
     try:
+        settings = settings_option(config)
+        if not settings.database_path.exists():
+            _rebuild_error("DATABASE_NOT_INITIALIZED")
+        engine = create_db_engine(settings.database_path)
         with Session(engine) as session:
             rows = build_inventory(session, settings)
             if run_id is None:
                 run = create_rebuild_run(session, cutoff_at=datetime.now(timezone.utc))  # noqa: UP017
             else:
-                run = session.get(PipelineRun, run_id)
-                if run is None or run.pipeline_type != "data_rebuild":
-                    _rebuild_error("REBUILD_RUN_NOT_FOUND")
+                try:
+                    run = resume_rebuild_run(session, run_id)
+                except ValueError as exc:
+                    _rebuild_error(str(exc))
             enqueued = enqueue_archive_copy(session, run.id, rows)
             result = execute_archive_copy(session, settings, run.id, rows)
             typer.echo(json.dumps({"enqueued": enqueued, **result}, ensure_ascii=False))
@@ -153,19 +164,20 @@ def rebuild_archive(
     except Exception:  # noqa: BLE001 - CLI output must expose only a safe error code.
         _rebuild_error("REBUILD_FAILED")
     finally:
-        engine.dispose()
+        if "engine" in locals():
+            engine.dispose()
 
 
 @rebuild_app.command("status")
 def rebuild_status(
-    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),  # noqa: B008
+    config: Path | None = typer.Option(None, "--config", dir_okay=False),  # noqa: B008
 ) -> None:
     """Report count-only state of local rebuild runs."""
-    settings = settings_option(config)
-    if not settings.database_path.exists():
-        _rebuild_error("DATABASE_NOT_INITIALIZED")
-    engine = create_db_engine(settings.database_path)
     try:
+        settings = settings_option(config)
+        if not settings.database_path.exists():
+            _rebuild_error("DATABASE_NOT_INITIALIZED")
+        engine = create_db_engine(settings.database_path)
         with Session(engine) as session:
             run = session.scalar(select(PipelineRun).where(
                 PipelineRun.pipeline_type == "data_rebuild"
@@ -176,8 +188,13 @@ def rebuild_status(
             tasks = session.scalars(select(PipelineTask).where(PipelineTask.run_id == run.id)).all()
             counts = {status: sum(task.status == status for task in tasks) for status in ("queued", "running", "completed", "failed")}
             typer.echo(json.dumps({"runs": 1, **counts}, ensure_ascii=False))
+    except typer.Exit:
+        raise
+    except Exception:  # noqa: BLE001 - never expose local paths or OA details on CLI stdout.
+        _rebuild_error("REBUILD_STATUS_FAILED")
     finally:
-        engine.dispose()
+        if "engine" in locals():
+            engine.dispose()
 
 
 def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -12,7 +15,14 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, OAItem, PipelineTask, RebuildOutput
+from oa_knowledge.db.models import (
+    ArchivedFile,
+    OAItem,
+    PipelineEvent,
+    PipelineTask,
+    RebuildOutput,
+)
+from oa_knowledge.rebuild import campaign
 from oa_knowledge.rebuild.campaign import (
     create_rebuild_run,
     enqueue_archive_copy,
@@ -110,3 +120,74 @@ def test_resume_recovers_interrupted_archive_task(session, inventory_row) -> Non
 
     assert enqueue_archive_copy(session, run.id, [inventory_row]) == 1
     assert task.status == "queued"
+
+
+def test_resume_recovers_expired_naive_sqlite_lease(session, inventory_row) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    task.status = "running"
+    task.lease_expires_at = datetime(2020, 1, 1)  # noqa: DTZ001 - SQLite legacy value.
+    session.commit()
+
+    assert enqueue_archive_copy(session, run.id, [inventory_row]) == 1
+    assert task.status == "queued"
+
+
+def test_resume_reconciles_successful_output_after_task_completion_crash(
+    session, settings, inventory_row
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    task.status = "running"
+    session.commit()
+
+    campaign.copy_inventory_row(session, settings, inventory_row, run_id=run.id)
+
+    assert enqueue_archive_copy(session, run.id, [inventory_row]) == 0
+    session.refresh(task)
+    assert task.status == "completed"
+    assert session.scalars(select(PipelineEvent).where(
+        PipelineEvent.task_id == task.id,
+        PipelineEvent.event_type == "completed",
+    )).all()
+    execute_archive_copy(session, settings, run.id, [inventory_row])
+    session.refresh(run)
+    assert run.status == "completed"
+
+
+def test_concurrent_execute_claims_and_completes_task_once(
+    session, settings, inventory_row, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    run_id = run.id
+    calls = 0
+    call_lock = threading.Lock()
+
+    def copy_once(*args, **kwargs):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+        time.sleep(0.05)
+        return SimpleNamespace(status="success", error_code=None)
+
+    monkeypatch.setattr(campaign, "copy_inventory_row", copy_once)
+    engine = session.get_bind()
+    barrier = threading.Barrier(2)
+
+    def execute() -> None:
+        with Session(engine) as concurrent_session:
+            barrier.wait()
+            execute_archive_copy(concurrent_session, settings, run_id, [inventory_row])
+
+    first = threading.Thread(target=execute)
+    second = threading.Thread(target=execute)
+    first.start(); second.start(); first.join(); second.join()
+
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
+    assert calls == 1
+    assert [event.event_type for event in events].count("claimed") == 1
+    assert [event.event_type for event in events].count("completed") == 1
