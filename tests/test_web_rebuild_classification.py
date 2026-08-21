@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, OAItem
-from oa_knowledge.web import create_web_app
+from oa_knowledge.db.models import ArchivedFile, OAItem, RebuildClassificationEvent
+from oa_knowledge.web import create_web_app, rebuild_views
 
 
 @pytest.fixture
@@ -145,3 +148,49 @@ def test_suggest_is_explicit_and_summary_is_metadata_only(client: TestClient) ->
     assert response.json() == {"suggested": 1, "needs_review": 0}
     assert summary.status_code == 200
     assert summary.json()["internal"]["suggested"] == 1
+
+
+def test_concurrent_confirmation_allows_one_transition_and_one_audit_event(
+    client: TestClient, seeded_items: dict[str, int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_get = rebuild_views.Session.get
+    barrier = threading.Barrier(2)
+    barrier_lock = threading.Lock()
+    barrier_calls = 0
+
+    def synchronized_get(self, entity, ident, *args, **kwargs):
+        nonlocal barrier_calls
+        item = original_get(self, entity, ident, *args, **kwargs)
+        with barrier_lock:
+            should_wait = entity is OAItem and ident == seeded_items["review"] and barrier_calls < 2
+            barrier_calls += should_wait
+        if should_wait:
+            barrier.wait(timeout=5)
+        return item
+
+    monkeypatch.setattr(rebuild_views.Session, "get", synchronized_get)
+
+    def confirm(issuer: str) -> str:
+        try:
+            rebuild_views.confirm_rebuild_classification(
+                client.app.state.settings, seeded_items["review"], source_type="external",
+                internal_category=None, external_issuer=issuer,
+            )
+        except RuntimeError:
+            return "conflict"
+        return "confirmed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(confirm, ("Synthetic issuer A", "Synthetic issuer B")))
+
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            events = session.scalars(select(RebuildClassificationEvent).where(
+                RebuildClassificationEvent.oa_item_id == seeded_items["review"],
+            )).all()
+    finally:
+        engine.dispose()
+
+    assert sorted(outcomes) == ["confirmed", "conflict"]
+    assert len(events) == 1

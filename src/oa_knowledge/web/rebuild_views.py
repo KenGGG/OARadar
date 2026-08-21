@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
@@ -115,6 +115,16 @@ def confirm_rebuild_classification(
                 raise LookupError("OA item not found")
             if item.source_channel != "done" or item.classification_state == "confirmed":
                 raise RuntimeError("classification is not eligible for confirmation")
+            claimed = session.execute(
+                update(OAItem).where(
+                    OAItem.id == item_id,
+                    OAItem.source_channel == "done",
+                    OAItem.classification_state != "confirmed",
+                ).values(classification_state=item.classification_state)
+            )
+            if claimed.rowcount != 1:
+                raise RuntimeError("classification is not eligible for confirmation")
+            session.refresh(item)
             confirmed = confirm_classification(
                 session, item_id, source_type=source_type, internal_category=internal_category,
                 external_issuer=external_issuer, confirmed_at=datetime.now(UTC),
