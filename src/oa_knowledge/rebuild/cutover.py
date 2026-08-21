@@ -27,7 +27,11 @@ from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import PipelineRun
 from oa_knowledge.rebuild.paths import resolve_rebuild_root
-from oa_knowledge.rebuild.state_copy import validate_database_copy
+from oa_knowledge.rebuild.state_copy import (
+    _PREPARED_COPY_APPLICATION_ID,
+    _alembic_head,
+    validate_database_copy,
+)
 from oa_knowledge.rebuild.validation import validate_rebuild, validation_passed
 
 KNOWN_USER_UNITS = (
@@ -41,6 +45,7 @@ _AUTHORIZATION_KEY_ENV = "OA_REBUILD_CUTOVER_AUTHORIZATION_KEY"
 _EXTERNAL_BACKUP_PATH_ENV = "OA_REBUILD_CUTOVER_BACKUP_PATH"
 _TOKEN_MAX_AGE = timedelta(minutes=10)
 _BACKUP_MAX_AGE = timedelta(hours=24)
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 class CutoverError(RuntimeError):
@@ -147,16 +152,20 @@ def _same_filesystem(live: Path, rebuilt: Path, legacy: Path) -> bool:
         return False
 
 
-def _git_worktree_is_clean(path: Path) -> bool:
-    """A non-Git data location is clean; a containing worktree must be pristine."""
+def _project_repository_root() -> Path:
+    """Return the deployed code repository whose uncommitted changes block cutover."""
+    return _PROJECT_ROOT
+
+
+def _git_worktree_is_clean(_data_root: Path) -> bool:
+    """Require the deployed project repository, not the data directory, to be pristine."""
     try:
-        probe = next(parent for parent in (path, *path.parents) if parent.exists())
         root = subprocess.run(
-            ["git", "-C", str(probe), "rev-parse", "--show-toplevel"],
+            ["git", "-C", str(_project_repository_root()), "rev-parse", "--show-toplevel"],
             check=False, capture_output=True, text=True, timeout=5,
         )
         if root.returncode != 0:
-            return True
+            return False
         status = subprocess.run(
             ["git", "-C", root.stdout.strip(), "status", "--porcelain"],
             check=False, capture_output=True, text=True, timeout=10,
@@ -164,6 +173,18 @@ def _git_worktree_is_clean(path: Path) -> bool:
         return status.returncode == 0 and not status.stdout.strip()
     except (OSError, StopIteration, subprocess.TimeoutExpired):
         return False
+
+
+def _path_is_inside_git_worktree(path: Path) -> bool:
+    """Reject external backup files inside any Git worktree."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode == 0
 
 
 def _systemctl_show(unit: str) -> bool:
@@ -226,25 +247,57 @@ def _is_beneath(path: Path, root: Path) -> bool:
     return True
 
 
-def _external_backup_is_current(live_root: Path, rebuilt_root: Path, now: datetime) -> bool:
-    """Accept only a recent, readable database snapshot outside both data trees."""
+def _database_fingerprint(database_path: Path) -> str:
+    """Fingerprint logical SQLite content, excluding the copy provenance PRAGMA."""
+    digest = hashlib.sha256()
+    with sqlite3.connect(f"file:{database_path.as_posix()}?mode=ro", uri=True) as connection:
+        for line in connection.iterdump():
+            digest.update(line.encode("utf-8"))
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _external_backup_is_current(
+    live_root: Path,
+    rebuilt_root: Path,
+    now: datetime,
+    *,
+    live_database: Path | None = None,
+) -> bool:
+    """Accept only a current, prepared OARadar snapshot outside data and Git trees."""
     configured = os.environ.get(_EXTERNAL_BACKUP_PATH_ENV, "")
     if not configured:
         return False
     try:
+        current = _require_aware(now)
         backup = _absolute_without_symlinks(Path(configured))
+        source = _absolute_without_symlinks(live_database or live_root / "state" / "oa.db")
+        backup_time = datetime.fromtimestamp(backup.stat().st_mtime, tz=UTC)
+        backup_age = current - backup_time
         if (
             not backup.is_file()
             or backup.is_symlink()
+            or not source.is_file()
+            or source.is_symlink()
             or _is_beneath(backup, live_root)
             or _is_beneath(backup, rebuilt_root)
-            or now - datetime.fromtimestamp(backup.stat().st_mtime, tz=UTC) > _BACKUP_MAX_AGE
+            or _path_is_inside_git_worktree(backup)
+            or backup_age < timedelta()
+            or backup_age > _BACKUP_MAX_AGE
         ):
             return False
         with sqlite3.connect(f"file:{backup.as_posix()}?mode=ro", uri=True) as connection:
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
-        return integrity == ("ok",) and not foreign_keys
+            revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+            application_id = connection.execute("PRAGMA application_id").fetchone()
+        return (
+            integrity == ("ok",)
+            and not foreign_keys
+            and revision == (_alembic_head(),)
+            and application_id == (_PREPARED_COPY_APPLICATION_ID,)
+            and hmac.compare_digest(_database_fingerprint(source), _database_fingerprint(backup))
+        )
     except (OSError, sqlite3.DatabaseError, ValueError):
         return False
 
@@ -281,7 +334,7 @@ def build_cutover_plan(settings: Settings, now: datetime) -> CutoverPlan:
         ),
         database_backup_ok=rebuilt_safe and _rebuilt_database_is_ready(settings, rebuilt),
         external_backup_ok=live_safe and rebuilt_safe and _external_backup_is_current(
-            live, rebuilt, _require_aware(now),
+            live, rebuilt, _require_aware(now), live_database=live / settings.storage.sqlite_path,
         ),
         git_clean=_git_worktree_is_clean(live),
         units_discovered=_all_units_discovered(),
@@ -298,11 +351,15 @@ def _authorization_key() -> bytes:
     return key
 
 
-def _token_paths(plan: CutoverPlan) -> dict[str, str]:
+def _token_path_digests(plan: CutoverPlan) -> dict[str, str]:
+    """Bind a token to exact paths without printing those paths in its payload."""
     return {
-        "legacy_root": str(_absolute_without_symlinks(plan.legacy_root)),
-        "live_root": str(_absolute_without_symlinks(plan.live_root)),
-        "rebuilt_root": str(_absolute_without_symlinks(plan.rebuilt_root)),
+        name: hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+        for name, path in {
+            "legacy_root": _absolute_without_symlinks(plan.legacy_root),
+            "live_root": _absolute_without_symlinks(plan.live_root),
+            "rebuilt_root": _absolute_without_symlinks(plan.rebuilt_root),
+        }.items()
     }
 
 
@@ -329,7 +386,7 @@ def generate_authorization_token(plan: CutoverPlan, *, now: datetime) -> str:
     payload: dict[str, object] = {
         "issued_at": issued.isoformat(),
         "nonce": secrets.token_urlsafe(16),
-        "paths": _token_paths(plan),
+        "path_digests": _token_path_digests(plan),
         "version": 1,
     }
     encoded = _encode_payload(payload)
@@ -350,15 +407,15 @@ def verify_authorization_token(plan: CutoverPlan, token: str, *, now: datetime) 
     payload = _decode_payload(encoded)
     try:
         issued = datetime.fromisoformat(str(payload["issued_at"]))
-        expected_paths = _token_paths(plan)
+        expected_path_digests = _token_path_digests(plan)
     except (KeyError, TypeError, ValueError):
         raise CutoverAuthorizationError("authorization token is malformed") from None
     if (
         payload.get("version") != 1
         or not isinstance(payload.get("nonce"), str)
         or not hmac.compare_digest(
-            json.dumps(payload.get("paths"), sort_keys=True, separators=(",", ":")),
-            json.dumps(expected_paths, sort_keys=True, separators=(",", ":")),
+            json.dumps(payload.get("path_digests"), sort_keys=True, separators=(",", ":")),
+            json.dumps(expected_path_digests, sort_keys=True, separators=(",", ":")),
         )
         or issued.tzinfo is None
         or issued.utcoffset() is None
@@ -407,6 +464,9 @@ def _fsync_directory(directory: Path) -> None:
 
 def _rename(source: Path, target: Path) -> None:
     os.rename(source, target)
+
+
+def _sync_renamed_directories(source: Path, target: Path) -> None:
     _fsync_directory(source.parent)
     if target.parent != source.parent:
         _fsync_directory(target.parent)
@@ -434,8 +494,10 @@ def _rollback(plan: CutoverPlan, *, live_to_legacy: bool, rebuilt_to_live: bool)
     """Undo only completed renames; no business directory is ever deleted."""
     if rebuilt_to_live:
         _rename(plan.live_root, plan.rebuilt_root)
+        _sync_renamed_directories(plan.live_root, plan.rebuilt_root)
     if live_to_legacy:
         _rename(plan.legacy_root, plan.live_root)
+        _sync_renamed_directories(plan.legacy_root, plan.live_root)
 
 
 def execute_cutover(plan: CutoverPlan, *, authorized: bool) -> dict[str, str]:
@@ -452,8 +514,10 @@ def execute_cutover(plan: CutoverPlan, *, authorized: bool) -> dict[str, str]:
         _control_units("stop", plan.units)
         _rename(plan.live_root, plan.legacy_root)
         live_to_legacy = True
+        _sync_renamed_directories(plan.live_root, plan.legacy_root)
         _rename(plan.rebuilt_root, plan.live_root)
         rebuilt_to_live = True
+        _sync_renamed_directories(plan.rebuilt_root, plan.live_root)
         _control_units("start", plan.units)
         if not _smoke(plan):
             raise CutoverSmokeError("post-cutover service smoke failed")

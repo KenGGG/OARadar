@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from oa_knowledge.config import Settings
+from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.rebuild import cutover
 from oa_knowledge.rebuild.cutover import (
     CutoverAuthorizationError,
@@ -19,6 +23,7 @@ from oa_knowledge.rebuild.cutover import (
     generate_authorization_token,
     verify_authorization_token,
 )
+from oa_knowledge.rebuild.state_copy import backup_live_database
 
 
 def _ready_plan(tmp_path: Path) -> CutoverPlan:
@@ -163,6 +168,39 @@ def test_second_rename_failure_restores_the_first_completed_rename(
     ]
 
 
+@pytest.mark.parametrize("failure_number", (1, 2))
+def test_directory_fsync_failure_after_rename_restores_every_mutated_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_number: int,
+) -> None:
+    """A rename has succeeded before its durability fsync can fail."""
+    plan = _ready_plan(tmp_path)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    real_fsync = cutover._fsync_directory
+    fsync_calls = 0
+
+    def fail_once(directory: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == failure_number:
+            raise OSError("synthetic directory fsync failure")
+        real_fsync(directory)
+
+    monkeypatch.setattr(cutover, "_control_units", lambda action, units: calls.append((action, units)))
+    monkeypatch.setattr(cutover, "_fsync_directory", fail_once)
+
+    with pytest.raises(cutover.CutoverError):
+        execute_cutover(plan, authorized=True)
+
+    assert (plan.live_root / "marker").read_text(encoding="utf-8") == "legacy"
+    assert (plan.rebuilt_root / "marker").read_text(encoding="utf-8") == "rebuilt"
+    assert not plan.legacy_root.exists()
+    assert calls == [
+        ("stop", cutover.KNOWN_USER_UNITS),
+        ("stop", cutover.KNOWN_USER_UNITS),
+        ("start", cutover.KNOWN_USER_UNITS),
+    ]
+
+
 def test_authorization_token_is_path_bound_and_short_lived(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,3 +251,83 @@ def test_build_plan_rejects_a_symlinked_live_root(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="symlinks"):
         build_cutover_plan(settings, datetime(2026, 8, 22, 12, tzinfo=UTC))
+
+
+def test_external_backup_requires_current_prepared_oaradar_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integrity alone must not let an unrelated or stale SQLite file authorize cutover."""
+    now = datetime(2026, 8, 22, 12, tzinfo=UTC)
+    live = tmp_path / "live" / "state" / "oa.db"
+    rebuilt = tmp_path / "rebuilt"
+    backup = tmp_path / "external" / "backup.db"
+    live.parent.mkdir(parents=True)
+    rebuilt.mkdir()
+    upgrade_database(live)
+    backup.parent.mkdir()
+    backup_live_database(live, backup)
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(backup))
+
+    assert cutover._external_backup_is_current(live.parents[1], rebuilt, now)
+
+    raw_copy = tmp_path / "external" / "raw-copy.db"
+    with sqlite3.connect(live) as source, sqlite3.connect(raw_copy) as target:
+        source.backup(target)
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(raw_copy))
+    assert not cutover._external_backup_is_current(live.parents[1], rebuilt, now)
+
+    unrelated = tmp_path / "external" / "unrelated.db"
+    sqlite3.connect(unrelated).close()
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(unrelated))
+    assert not cutover._external_backup_is_current(live.parents[1], rebuilt, now)
+
+    wrong_revision = tmp_path / "external" / "wrong-revision.db"
+    with sqlite3.connect(backup) as source, sqlite3.connect(wrong_revision) as target:
+        source.backup(target)
+    with sqlite3.connect(wrong_revision) as connection:
+        connection.execute("UPDATE alembic_version SET version_num = 'synthetic-wrong-head'")
+        connection.commit()
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(wrong_revision))
+    assert not cutover._external_backup_is_current(live.parents[1], rebuilt, now)
+
+    other_live = tmp_path / "other-live" / "state" / "oa.db"
+    other_live.parent.mkdir(parents=True)
+    upgrade_database(other_live)
+    with sqlite3.connect(other_live) as connection:
+        connection.execute("CREATE TABLE synthetic_different_snapshot (value TEXT)")
+        connection.commit()
+    mismatched = tmp_path / "external" / "mismatched.db"
+    backup_live_database(other_live, mismatched)
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(mismatched))
+    assert not cutover._external_backup_is_current(live.parents[1], rebuilt, now)
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    in_repository = repository / "backup.db"
+    backup_live_database(live, in_repository)
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(in_repository))
+    assert not cutover._external_backup_is_current(live.parents[1], rebuilt, now)
+
+    os.utime(backup, (now.timestamp() + 60, now.timestamp() + 60))
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(backup))
+    assert not cutover._external_backup_is_current(live.parents[1], rebuilt, now)
+
+
+def test_dirty_project_repository_blocks_external_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A data root outside Git cannot bypass changes in the deployed project."""
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(project)], check=True)
+    (project / "tracked.txt").write_text("base", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "tracked.txt"], check=True)
+    subprocess.run([
+        "git", "-C", str(project), "-c", "user.name=synthetic",
+        "-c", "user.email=synthetic@example.invalid", "commit", "--quiet", "-m", "base",
+    ], check=True)
+    (project / "tracked.txt").write_text("dirty", encoding="utf-8")
+    monkeypatch.setattr(cutover, "_project_repository_root", lambda: project, raising=False)
+
+    assert not cutover._git_worktree_is_clean(tmp_path / "external-data")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -243,6 +244,34 @@ def test_cutover_execute_requires_a_fresh_path_bound_token(
     assert accepted.exit_code == 0
     assert json.loads(accepted.stdout)["status"] == "cutover_complete"
     assert called == [True]
+
+
+def test_cutover_dry_run_token_does_not_disclose_bound_local_paths(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live = tmp_path / "private-live"
+    rebuilt = tmp_path / "private-rebuilt"
+    legacy = tmp_path / "private-legacy"
+    live.mkdir(); rebuilt.mkdir()
+    plan = CutoverPlan(
+        live_root=live, rebuilt_root=rebuilt, legacy_root=legacy,
+        units=cutover.KNOWN_USER_UNITS,
+        validation_ok=True, database_backup_ok=True, external_backup_ok=True, git_clean=True,
+        units_discovered=True, same_filesystem=True, legacy_available=True,
+    )
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_AUTHORIZATION_KEY", "x" * 32)
+    monkeypatch.setattr(cli, "build_cutover_plan", lambda _settings, _now: plan)
+
+    result = CliRunner().invoke(app, ["rebuild", "cutover", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    token = json.loads(result.stdout)["authorization_token"]
+    assert isinstance(token, str)
+    encoded = token.split(".", 1)[0]
+    decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+    assert str(live) not in decoded
+    assert str(rebuilt) not in decoded
+    assert str(legacy) not in decoded
 
 
 def test_rebuild_help_registers_all_local_commands() -> None:
