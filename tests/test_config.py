@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from oa_knowledge.config import Settings, load_settings
+from oa_knowledge.config import RebuildConfig, Settings, load_settings
 
 
 def test_defaults_are_local_and_depth_ten() -> None:
@@ -21,6 +21,14 @@ def test_defaults_are_local_and_depth_ten() -> None:
     assert settings.storage.archive_dir.as_posix() == "archive/raw/oa"
     assert settings.markdown_root == settings.data_root / "workspace/raw/sources/oa"
     assert settings.markdown_root != settings.workspace_root / "wiki"
+    assert settings.rebuild.external_issuer_aliases == {}
+
+
+def test_rebuild_aliases_require_nonempty_trimmed_names() -> None:
+    with pytest.raises(ValidationError):
+        RebuildConfig(external_issuer_aliases={"  ": "示例市工业和信息化局"})
+    with pytest.raises(ValidationError):
+        RebuildConfig(external_issuer_aliases={"示例市工信局": "  "})
 
 
 def test_markdown_source_dir_cannot_escape_or_target_wiki() -> None:

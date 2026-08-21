@@ -62,6 +62,11 @@ pending_cleanup:
   keep_temp_attachments: false
   allow_force_cleanup: true  # 仅允许人工清理已确认 sent 的数据，不能绕过投递确认
 
+# Deterministic local aliases for external institutions. These only generate
+# reviewable suggestions; no suggestion is automatically confirmed.
+rebuild:
+  external_issuer_aliases: {}
+
 archive:
   max_recursive_depth: 2
   max_members: 10000

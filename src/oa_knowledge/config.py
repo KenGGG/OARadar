@@ -300,6 +300,24 @@ class PendingCleanupConfig(StrictModel):
     allow_force_cleanup: bool = True
 
 
+class RebuildConfig(StrictModel):
+    """Configured, local institution aliases allowed in deterministic suggestions."""
+
+    external_issuer_aliases: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("external_issuer_aliases")
+    @classmethod
+    def nonempty_aliases(cls, value: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for alias, issuer in value.items():
+            alias_name = " ".join(alias.split())
+            issuer_name = " ".join(issuer.split())
+            if not alias_name or not issuer_name:
+                raise ValueError("rebuild.external_issuer_aliases names must be non-empty")
+            normalized[alias_name] = issuer_name
+        return normalized
+
+
 class WebConfig(StrictModel):
     host: str = "127.0.0.1"
     port: int = Field(default=2567, ge=1024, le=65535)
@@ -329,6 +347,7 @@ class Settings(StrictModel):
     conversion: ConversionConfig = ConversionConfig()
     online_audit: OnlineAuditConfig = OnlineAuditConfig()
     pending_cleanup: PendingCleanupConfig = PendingCleanupConfig()
+    rebuild: RebuildConfig = RebuildConfig()
     web: WebConfig = WebConfig()
 
     @model_validator(mode="after")
