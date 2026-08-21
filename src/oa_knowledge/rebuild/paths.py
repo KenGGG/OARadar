@@ -13,9 +13,17 @@ from oa_knowledge.rebuild.classification import INTERNAL_CATEGORIES
 
 _FORBIDDEN_COMPONENT_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]')
 _CONTROL_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
-_REPOSITORY_ROOT = next(
-    parent for parent in Path(__file__).resolve().parents if (parent / "pyproject.toml").is_file()
-)
+
+
+def _find_project_root(start: Path) -> Path | None:
+    """Return the nearest project marker ancestor without assuming one exists."""
+    for parent in (start.resolve(), *start.resolve().parents):
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return None
+
+
+_REPOSITORY_ROOT = _find_project_root(Path(__file__).parent)
 
 
 def _is_relative_to(path: Path, other: Path) -> bool:

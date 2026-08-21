@@ -3,9 +3,10 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from oa_knowledge.config import Settings
+from oa_knowledge.config import Settings, load_settings
 from oa_knowledge.db.models import ArchivedFile, OAItem
 from oa_knowledge.rebuild.paths import (
+    _find_project_root,
     archive_file_relpath,
     archive_item_relpath,
     effective_item_date,
@@ -190,6 +191,25 @@ def test_resolve_rebuild_root_is_anchored_to_live_data_when_cwd_changes(tmp_path
     assert resolve_rebuild_root(settings) == (tmp_path / "data_rebuilt").resolve()
 
 
+def test_load_settings_anchors_relative_data_and_rebuild_roots_to_config_path(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config_path = tmp_path / "project" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        "app:\n  data_root: data\nrebuild:\n  target_root: ../data_rebuilt\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    monkeypatch.chdir(outside)
+    settings = load_settings(config_path)
+
+    assert settings.data_root == config_path.parent / "data"
+    assert resolve_rebuild_root(settings) == config_path.parent / "data_rebuilt"
+
+
 def test_resolve_rebuild_root_rejects_actual_repository_root_when_cwd_changes(tmp_path: Path, monkeypatch) -> None:
     repository_root = Path(__file__).resolve().parents[1]
     settings = Settings(
@@ -202,6 +222,13 @@ def test_resolve_rebuild_root_rejects_actual_repository_root_when_cwd_changes(tm
 
     with pytest.raises(ValueError, match="repository root"):
         resolve_rebuild_root(settings)
+
+
+def test_project_root_discovery_returns_none_without_a_project_marker(tmp_path: Path) -> None:
+    nested = tmp_path / "installed" / "package"
+    nested.mkdir(parents=True)
+
+    assert _find_project_root(nested) is None
 
 
 @pytest.mark.parametrize("target_root", [".", "data", "data/child"])

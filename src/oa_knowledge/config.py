@@ -404,10 +404,16 @@ def _reject_secrets(value: Any, path: tuple[str, ...] = ()) -> None:
 def load_settings(path: Path | None = None) -> Settings:
     raw: dict[str, Any] = {}
     if path:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        config_path = path.expanduser().resolve()
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         if not isinstance(loaded, dict):
             raise ValueError("configuration root must be a mapping")
         raw = loaded
+        app_raw = raw.get("app")
+        if isinstance(app_raw, dict) and "data_root" in app_raw:
+            configured_root = Path(app_raw["data_root"]).expanduser()
+            if not configured_root.is_absolute():
+                app_raw["data_root"] = str(config_path.parent / configured_root)
     # Older local configuration files may still contain inactive fields from
     # the removed remote-provider UI. Ignore those names only; selecting the
     # old provider itself still fails LlmConfig validation.
