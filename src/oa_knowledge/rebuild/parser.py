@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import os
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,14 @@ class RebuildParseResult:
     error_code: str | None
 
 
+@dataclass(frozen=True)
+class _OriginalFingerprint:
+    output_id: int
+    target_relpath: str
+    size_bytes: int
+    sha256: str
+
+
 def _file_matches(path: Path, *, size_bytes: int, sha256: str) -> bool:
     try:
         if not path.is_file() or path.stat().st_size != size_bytes:
@@ -44,32 +53,55 @@ def _file_matches(path: Path, *, size_bytes: int, sha256: str) -> bool:
     return digest.hexdigest() == sha256
 
 
+def _validated_regular_files(directory: Path) -> list[Path]:
+    """Return a strict, resolved regular-file tree or reject the whole product."""
+    root = directory.resolve(strict=True)
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("parser staging root is not a real directory")
+    files: list[Path] = []
+
+    def walk(current: Path) -> None:
+        for entry in sorted(os.scandir(current), key=lambda value: value.name):
+            path = Path(entry.path)
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise ValueError("parser output contains symlink")
+            resolved = path.resolve(strict=True)
+            if root not in (resolved, *resolved.parents):
+                raise ValueError("parser output escaped staging")
+            if stat.S_ISDIR(entry_stat.st_mode):
+                walk(path)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                files.append(path)
+            else:
+                raise ValueError("parser output contains non-regular entry")
+
+    walk(root)
+    return files
+
+
 def _tree_sha256(directory: Path) -> str | None:
-    """Hash every regular parser product deterministically, including assets."""
-    if not directory.is_dir():
+    """Hash the complete, strictly validated regular parser product tree."""
+    files = _validated_regular_files(directory)
+    if not files:
         return None
     digest = hashlib.sha256()
-    found = False
-    for path in sorted(directory.rglob("*"), key=lambda value: value.as_posix()):
-        if not path.is_file() or path.is_symlink():
-            continue
-        found = True
+    for path in files:
         relative = path.relative_to(directory).as_posix().encode("utf-8")
         content = hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii")
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
         digest.update(content)
-    return digest.hexdigest() if found else None
+    return digest.hexdigest()
 
 
 def _fsync_tree(directory: Path) -> None:
-    for path in directory.rglob("*"):
-        if path.is_file() and not path.is_symlink():
-            try:
-                with path.open("rb") as handle:
-                    os.fsync(handle.fileno())
-            except OSError:
-                pass
+    for path in _validated_regular_files(directory):
+        try:
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
     for path in sorted((directory, *directory.rglob("*")), key=lambda value: len(value.parts), reverse=True):
         if not path.is_dir() or path.is_symlink():
             continue
@@ -128,6 +160,50 @@ def _source_output(session: Session, settings: Settings, run_id: int, source_fil
         ):
             return output, source
     return None
+
+
+def _original_fingerprint(output: RebuildOutput, source: ArchivedFile) -> _OriginalFingerprint:
+    if source.size_bytes is None or not source.sha256:
+        raise ValueError("verified original lacks fingerprint")
+    return _OriginalFingerprint(output.id, output.target_relpath, source.size_bytes, source.sha256)
+
+
+def _fresh_original_matches(
+    session: Session, settings: Settings, *, run_id: int, source_file_id: int,
+    fingerprint: _OriginalFingerprint,
+) -> bool:
+    """Bypass ORM identity state and revalidate the exact copied-original snapshot."""
+    bind = session.get_bind()
+    with bind.connect() as connection:
+        row = connection.execute(
+            select(
+                RebuildOutput.id, RebuildOutput.target_relpath, RebuildOutput.sha256,
+                RebuildOutput.status, ArchivedFile.size_bytes, ArchivedFile.sha256,
+            )
+            .join(ArchivedFile, RebuildOutput.source_file_id == ArchivedFile.id)
+            .where(
+                RebuildOutput.id == fingerprint.output_id,
+                RebuildOutput.run_id == run_id,
+                RebuildOutput.source_file_id == source_file_id,
+                RebuildOutput.kind == "original",
+            )
+        ).one_or_none()
+    if row is None:
+        return False
+    output_id, relpath, output_sha, status, size_bytes, source_sha = row
+    if (
+        output_id != fingerprint.output_id
+        or relpath != fingerprint.target_relpath
+        or output_sha != fingerprint.sha256
+        or status != "success"
+        or size_bytes != fingerprint.size_bytes
+        or source_sha != fingerprint.sha256
+    ):
+        return False
+    return _file_matches(
+        resolve_rebuild_path(settings, fingerprint.target_relpath),
+        size_bytes=fingerprint.size_bytes, sha256=fingerprint.sha256,
+    )
 
 
 def _result(source_file_id: int, status: str, engine: str, *, relpath: str | None,
@@ -197,6 +273,7 @@ def parse_rebuilt_source(
                            source_sha256=source.sha256 if source and source.sha256 else "",
                            product_sha256=None, error_code="REBUILT_ORIGINAL_UNAVAILABLE")
         original, source = resolved
+        fingerprint = _original_fingerprint(original, source)
         source_path = resolve_rebuild_path(settings, original.target_relpath)
         source_sha = source.sha256 or ""
         base_relpath = f"parse/{run_id}/{source_file_id}/{source_sha}"
@@ -208,12 +285,12 @@ def parse_rebuilt_source(
             ))
             if existing is None or existing.status != "success":
                 _record_output(ledger, run_id=run_id, source=source, relpath=relpath,
-                               sha256=None, status="success", error_code=None)
+                               sha256=None, status="failed", error_code="UNSUPPORTED_FORMAT")
             _remove_prior_successes(ledger, settings, run_id=run_id,
                                     source_file_id=source_file_id, keep_relpath=relpath)
             return _result(source_file_id, "unsupported", "none", relpath=None,
                            source_sha256=source_sha, product_sha256=None,
-                           error_code="UNSUPPORTED_FILE_TYPE")
+                           error_code="UNSUPPORTED_FORMAT")
 
         existing = list(ledger.scalars(select(RebuildOutput).where(
             RebuildOutput.run_id == run_id, RebuildOutput.source_file_id == source_file_id,
@@ -246,8 +323,10 @@ def parse_rebuilt_source(
 
             # Phase 2 may reconcile a copied original while parsing.  Observe
             # it again but never mutate that source ledger row from here.
-            current = _source_output(ledger, settings, run_id, source_file_id)
-            if current is None or current[0].id != original.id:
+            if not _fresh_original_matches(
+                ledger, settings, run_id=run_id, source_file_id=source_file_id,
+                fingerprint=fingerprint,
+            ):
                 _record_output(ledger, run_id=run_id, source=source,
                                relpath=f"{base_relpath}/failed", sha256=None,
                                status="failed", error_code="REBUILT_ORIGINAL_CHANGED")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -116,9 +117,12 @@ def test_unsupported_is_explicit(session: Session, settings: Settings, run_id: i
 
     assert result.status == "unsupported"
     assert result.engine == "none"
-    assert result.error_code == "UNSUPPORTED_FILE_TYPE"
+    assert result.error_code == "UNSUPPORTED_FORMAT"
     output = session.scalar(select(RebuildOutput).where(RebuildOutput.kind == "parse"))
-    assert output is not None and output.status == "success"
+    assert output is not None
+    assert output.status == "failed"
+    assert output.error_code == "UNSUPPORTED_FORMAT"
+    assert output.sha256 is None
 
 
 def test_parser_reuses_verified_current_run_product(
@@ -182,3 +186,77 @@ def test_engine_failure_is_recorded_without_downgrading_the_original(
     assert session.get(RebuildOutput, original.id).status == "success"
     parse = session.scalar(select(RebuildOutput).where(RebuildOutput.kind == "parse"))
     assert parse is not None and parse.status == "failed"
+
+
+def test_pre_promotion_fence_rejects_same_original_row_repointed_mid_parse(
+    monkeypatch: pytest.MonkeyPatch, session: Session, settings: Settings, run_id: int,
+) -> None:
+    """A current-row mutation must fence a stale parser before directory promotion."""
+    original = _rebuilt_original(session, settings, run_id, name="source.txt", copied=b"first copied bytes")
+    source = session.get(ArchivedFile, original.source_file_id)
+    assert source is not None
+
+    def mutate_original_then_parse(path: Path, parser_settings: Settings, **kwargs) -> ParseResult:
+        replacement = b"second copied bytes"
+        replacement_sha = hashlib.sha256(replacement).hexdigest()
+        replacement_relpath = f"archive/oa/done/synthetic/replaced-{source.id}.txt"
+        replacement_path = resolve_rebuild_path(parser_settings, replacement_relpath)
+        replacement_path.parent.mkdir(parents=True, exist_ok=True)
+        replacement_path.write_bytes(replacement)
+        with Session(session.get_bind()) as concurrent:
+            fresh_source = concurrent.get(ArchivedFile, source.id)
+            fresh_original = concurrent.get(RebuildOutput, original.id)
+            assert fresh_source is not None and fresh_original is not None
+            fresh_source.size_bytes, fresh_source.sha256 = len(replacement), replacement_sha
+            fresh_original.target_relpath, fresh_original.sha256 = replacement_relpath, replacement_sha
+            concurrent.commit()
+        return _stub_parser(path, parser_settings, **kwargs)
+
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", mutate_original_then_parse)
+    result = parse_rebuilt_source(session, settings, run_id, source.id)
+
+    assert result.status == "failed"
+    assert result.error_code == "REBUILT_ORIGINAL_CHANGED"
+    assert not list(resolve_rebuild_path(settings, "parse").glob("**/stub"))
+
+
+@pytest.mark.parametrize("inside", (True, False))
+def test_parser_output_symlink_is_rejected_without_promotion(
+    monkeypatch: pytest.MonkeyPatch, session: Session, settings: Settings, run_id: int, inside: bool,
+) -> None:
+    """Both internal and escaping parser symlinks are unsafe output products."""
+    original = _rebuilt_original(session, settings, run_id, name="source.txt", copied=b"copied bytes")
+
+    def parse_with_symlink(source: Path, parser_settings: Settings, *, output_dir: Path | None = None, **kwargs) -> ParseResult:
+        result = _stub_parser(source, parser_settings, output_dir=output_dir, **kwargs)
+        assert output_dir is not None
+        link_target = result.output_path if inside else source
+        (output_dir / "unexpected-link").symlink_to(link_target)
+        return result
+
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", parse_with_symlink)
+    result = parse_rebuilt_source(session, settings, run_id, original.source_file_id)
+
+    assert result.status == "failed"
+    assert result.error_code == "VALUEERROR"
+    assert not list(resolve_rebuild_path(settings, "parse").glob("**/stub"))
+
+
+def test_parser_special_output_entry_is_rejected_without_promotion(
+    monkeypatch: pytest.MonkeyPatch, session: Session, settings: Settings, run_id: int,
+) -> None:
+    """A FIFO is neither a parser asset nor a regular file and cannot publish."""
+    original = _rebuilt_original(session, settings, run_id, name="source.txt", copied=b"copied bytes")
+
+    def parse_with_fifo(source: Path, parser_settings: Settings, *, output_dir: Path | None = None, **kwargs) -> ParseResult:
+        result = _stub_parser(source, parser_settings, output_dir=output_dir, **kwargs)
+        assert output_dir is not None
+        os.mkfifo(output_dir / "unexpected-fifo")
+        return result
+
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", parse_with_fifo)
+    result = parse_rebuilt_source(session, settings, run_id, original.source_file_id)
+
+    assert result.status == "failed"
+    assert result.error_code == "VALUEERROR"
+    assert not list(resolve_rebuild_path(settings, "parse").glob("**/stub"))
