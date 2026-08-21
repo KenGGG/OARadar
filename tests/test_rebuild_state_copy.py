@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy.orm import Session
 
+from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import (
@@ -20,6 +21,8 @@ from oa_knowledge.db.models import (
     PipelineRun,
     RebuildOutput,
 )
+from oa_knowledge.pipeline import ParsePipeline
+from oa_knowledge.rebuild import state_copy
 from oa_knowledge.rebuild.state_copy import (
     apply_rebuilt_ledger,
     backup_live_database,
@@ -115,13 +118,18 @@ def test_backup_is_consistent_while_source_connection_is_open(tmp_path: Path) ->
     upgrade_database(source)
 
     with sqlite3.connect(source) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        connection.execute("PRAGMA wal_autocheckpoint=0")
         connection.execute("INSERT INTO notifications VALUES (1, ?, ?, ?, ?, ?)", (
             "synthetic-dedupe", "local", "queued", "a" * 64, 0,
         ))
         connection.commit()
+        assert source.with_name(f"{source.name}-wal").is_file()
         backup_live_database(source, target)
 
     assert _integrity_check(target) == "ok"
+    assert not target.with_name(f"{target.name}-wal").exists()
+    assert not target.with_name(f"{target.name}-shm").exists()
     with sqlite3.connect(target) as connection:
         assert connection.execute("SELECT idempotency_key FROM notifications").fetchone()[0] == "synthetic-dedupe"
 
@@ -135,13 +143,13 @@ def test_apply_ledger_updates_only_the_copy_and_preserves_notification_dedupe(tm
 
     result = apply_rebuilt_ledger(copied, run_id)
 
-    assert result == {"files": 1, "markdown_exports": 2, "parse_artifacts": 1}
+    assert result == {"files": 1, "markdown_exports": 2, "parse_artifacts": 0}
     with sqlite3.connect(source) as connection:
         assert connection.execute("SELECT local_relpath FROM files").fetchone()[0] == "retired/source.bin"
         assert connection.execute("SELECT idempotency_key, attempts FROM notifications").fetchone() == ("synthetic-dedupe", 2)
     with sqlite3.connect(copied) as connection:
         assert connection.execute("SELECT local_relpath FROM files").fetchone()[0] == "archive/current/source.bin"
-        assert connection.execute("SELECT output_relpath FROM parse_artifacts").fetchone()[0] == "parse/current/source"
+        assert connection.execute("SELECT output_relpath FROM parse_artifacts").fetchone()[0] == "retired/parse/source"
         exports = connection.execute(
             "SELECT source_relpath, markdown_relpath, assets_relpath FROM markdown_exports ORDER BY id"
         ).fetchall()
@@ -151,6 +159,45 @@ def test_apply_ledger_updates_only_the_copy_and_preserves_notification_dedupe(tm
         ]
         assert connection.execute("SELECT idempotency_key, attempts FROM notifications").fetchone() == ("synthetic-dedupe", 2)
     assert all(check.ok for check in validate_database_copy(copied))
+
+
+def test_apply_keeps_legacy_parse_products_stable_until_the_pipeline_rebuilds_them(tmp_path: Path) -> None:
+    """Writing the rebuild parse directory into a legacy artifact file field breaks its consumers."""
+    source = tmp_path / "live.db"
+    data_root = tmp_path / "rebuilt"
+    copied = data_root / "state" / "oa.db"
+    run_id = _seed_rebuild_copy(source)
+    with sqlite3.connect(source) as connection:
+        connection.execute("UPDATE files SET original_name = 'source.txt'")
+        connection.execute(
+            "UPDATE rebuild_outputs SET target_relpath = 'archive/current/source.txt' "
+            "WHERE run_id = ? AND kind = 'original'", (run_id,)
+        )
+        connection.execute(
+            "UPDATE parse_jobs SET engine = 'markitdown', status = 'completed', output_relpath = 'retired/parse/source'"
+        )
+    backup_live_database(source, copied)
+    original = data_root / "archive" / "current" / "source.txt"
+    original.parent.mkdir(parents=True)
+    original.write_text("synthetic source", encoding="utf-8")
+
+    result = apply_rebuilt_ledger(copied, run_id)
+
+    assert result["parse_artifacts"] == 0
+    with sqlite3.connect(copied) as connection:
+        source_id = connection.execute("SELECT id FROM files").fetchone()[0]
+        assert connection.execute("SELECT output_relpath FROM parse_artifacts").fetchone()[0] == "retired/parse/source"
+        assert connection.execute("SELECT output_relpath FROM parse_jobs").fetchone()[0] == "retired/parse/source"
+
+    settings = Settings(app={"data_root": data_root})
+    engine = create_db_engine(copied)
+    try:
+        assert ParsePipeline(settings, engine).enqueue(source_id) is not None
+        with Session(engine) as session:
+            assert session.get(ParseJob, 1).status == "queued"
+            assert session.get(ParseArtifact, 1).lifecycle_status == "superseded"
+    finally:
+        engine.dispose()
 
 
 def test_apply_ledger_rejects_unmapped_retired_active_path(tmp_path: Path) -> None:
@@ -184,3 +231,64 @@ def test_backup_does_not_replace_target_when_alembic_revision_is_invalid(tmp_pat
         backup_live_database(source, target)
 
     assert target.read_text(encoding="utf-8") == "prior-copy"
+
+
+def test_backup_rejects_source_and_target_symlinks(tmp_path: Path) -> None:
+    """Resolving before testing symlinks would permit a snapshot through an attacker-chosen path."""
+    source = tmp_path / "live.db"
+    linked_source = tmp_path / "linked-live.db"
+    target = tmp_path / "copy.db"
+    linked_target = tmp_path / "linked-copy.db"
+    upgrade_database(source)
+    linked_source.symlink_to(source)
+    linked_target.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        backup_live_database(linked_source, target)
+    with pytest.raises(ValueError, match="symlink"):
+        backup_live_database(source, linked_target)
+
+
+def test_apply_rejects_a_live_database_instead_of_a_prepared_copy(tmp_path: Path) -> None:
+    """Removing the copy provenance check would allow the remapper to mutate its live input."""
+    source = tmp_path / "live.db"
+    run_id = _seed_rebuild_copy(source)
+
+    with pytest.raises(ValueError, match="prepared database copy"):
+        apply_rebuilt_ledger(source, run_id)
+
+
+def test_apply_rejects_a_symlinked_copy_path(tmp_path: Path) -> None:
+    """Checking a path only after resolve would conceal a symlinked copy target."""
+    source = tmp_path / "live.db"
+    copied = tmp_path / "copy.db"
+    linked = tmp_path / "linked-copy.db"
+    run_id = _seed_rebuild_copy(source)
+    backup_live_database(source, copied)
+    linked.symlink_to(copied)
+
+    with pytest.raises(ValueError, match="symlink"):
+        apply_rebuilt_ledger(linked, run_id)
+
+
+def test_backup_fails_closed_when_post_promotion_directory_fsync_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Suppressing the final directory fsync error falsely reports a durable promotion."""
+    source = tmp_path / "live.db"
+    target = tmp_path / "copy.db"
+    upgrade_database(source)
+    real_fsync = state_copy.os.fsync
+    calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(state_copy.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="synthetic fsync failure"):
+        backup_live_database(source, target)
