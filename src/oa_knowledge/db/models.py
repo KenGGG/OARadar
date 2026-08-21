@@ -842,8 +842,13 @@ class RebuildOutput(Base):
             name="ck_rebuild_outputs_kind",
         ),
         CheckConstraint(
-            "status IN ('success', 'failed')",
+            "status IN ('pending', 'success', 'failed')",
             name="ck_rebuild_outputs_status",
+        ),
+        CheckConstraint(
+            "(status IN ('pending', 'success') AND error_code IS NULL) OR "
+            "(status = 'failed' AND error_code IS NOT NULL)",
+            name="ck_rebuild_outputs_status_error_code",
         ),
         UniqueConstraint("run_id", "target_relpath", name="uq_rebuild_outputs_run_target"),
         Index("ix_rebuild_outputs_run_status", "run_id", "status"),

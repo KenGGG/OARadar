@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from oa_knowledge.archive.integrity import sha256_file
@@ -15,6 +17,7 @@ from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, OAItem, PipelineRun, RebuildOutput
+from oa_knowledge.rebuild import archive_copy
 from oa_knowledge.rebuild.archive_copy import copy_inventory_row
 from oa_knowledge.rebuild.inventory import InventoryRow, build_inventory
 from oa_knowledge.rebuild.paths import resolve_rebuild_path
@@ -99,6 +102,113 @@ def test_copy_is_idempotent(
     assert first.status == second.status == "success"
     assert second.id == first.id
     assert session.scalars(select(RebuildOutput)).all() == [first]
+
+
+@pytest.mark.parametrize("damage", ("deleted", "tampered"))
+def test_success_ledger_row_is_reverified_before_reuse(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    inventory_row: InventoryRow,
+    damage: str,
+) -> None:
+    """A stale success row cannot mask a deleted or changed final target."""
+    first = copy_inventory_row(session, settings, inventory_row, run_id=run_id)
+    target = resolve_rebuild_path(settings, first.target_relpath)
+    if damage == "deleted":
+        target.unlink()
+    else:
+        target.write_bytes(b"tampered synthetic target")
+
+    second = copy_inventory_row(session, settings, inventory_row, run_id=run_id)
+
+    assert second.id == first.id
+    assert second.status == ("success" if damage == "deleted" else "failed")
+    assert second.error_code == (None if damage == "deleted" else "TARGET_CONFLICT")
+    assert target.read_bytes() == (
+        b"synthetic original evidence" if damage == "deleted" else b"tampered synthetic target"
+    )
+
+
+def test_atomic_no_clobber_race_preserves_a_concurrent_different_target(
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    inventory_row: InventoryRow,
+) -> None:
+    """A target created after copying but before publish wins without overwrite."""
+    target = resolve_rebuild_path(settings, inventory_row.destination_relpath)
+    def concurrent_target_then_exists(source: str | bytes | os.PathLike, destination: str | bytes | os.PathLike, **kwargs) -> None:
+        Path(destination).write_bytes(b"concurrent synthetic target")
+        raise FileExistsError
+
+    monkeypatch.setattr(archive_copy.os, "link", concurrent_target_then_exists)
+
+    output = copy_inventory_row(session, settings, inventory_row, run_id=run_id)
+
+    assert output.status == "failed"
+    assert output.error_code == "TARGET_CONFLICT"
+    assert target.read_bytes() == b"concurrent synthetic target"
+    assert not list(target.parent.glob(".rebuild-copy-*.tmp"))
+
+
+def test_final_ledger_persistence_failure_compensates_its_own_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    inventory_row: InventoryRow,
+) -> None:
+    """A failed success commit removes only the inode this call linked into place."""
+    target = resolve_rebuild_path(settings, inventory_row.destination_relpath)
+    real_set_status = archive_copy._set_status
+
+    def fail_success_commit(current_session, output, *, status, error_code):
+        if status == "success":
+            raise RuntimeError("synthetic final ledger persistence failure")
+        return real_set_status(current_session, output, status=status, error_code=error_code)
+
+    monkeypatch.setattr(archive_copy, "_set_status", fail_success_commit)
+
+    with pytest.raises(RuntimeError, match="persistence"):
+        copy_inventory_row(session, settings, inventory_row, run_id=run_id)
+
+    assert not target.exists()
+    session.rollback()
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as verifier:
+        persisted = verifier.scalar(select(RebuildOutput))
+    assert persisted is not None
+    assert persisted.status == "pending"
+
+
+def test_persistence_failure_before_publish_leaves_no_final_target(
+    session: Session, settings: Settings, inventory_row: InventoryRow
+) -> None:
+    """A foreign-key persistence failure occurs before any final file is published."""
+    target = resolve_rebuild_path(settings, inventory_row.destination_relpath)
+
+    with pytest.raises(IntegrityError):
+        copy_inventory_row(session, settings, inventory_row, run_id=999_999)
+
+    assert not target.exists()
+
+
+def test_success_is_durable_after_the_callers_rollback(
+    session: Session, settings: Settings, run_id: int, inventory_row: InventoryRow
+) -> None:
+    """A returned success is committed independently of a later caller rollback."""
+    output = copy_inventory_row(session, settings, inventory_row, run_id=run_id)
+    output_id = output.id
+    session.rollback()
+
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as verifier:
+        persisted = verifier.get(RebuildOutput, output_id)
+    assert persisted is not None
+    assert persisted.status == "success"
+    assert resolve_rebuild_path(settings, inventory_row.destination_relpath).is_file()
 
 
 def test_copy_revalidates_source_before_creating_a_target(

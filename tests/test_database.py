@@ -232,6 +232,9 @@ def test_0037_adds_rebuild_output_ledger_without_rebuilding_parents(
         ).fetchone() == before_file
         foreign_keys = connection.execute("PRAGMA foreign_key_list(rebuild_outputs)").fetchall()
         indexes = connection.execute("PRAGMA index_list(rebuild_outputs)").fetchall()
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rebuild_outputs'"
+        ).fetchone()[0]
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert {row[2] for row in foreign_keys} == {"pipeline_runs", "oa_items", "files"}
     assert any(
@@ -242,6 +245,7 @@ def test_0037_adds_rebuild_output_ledger_without_rebuilding_parents(
         ) == ("run_id", "target_relpath")
         for row in indexes
     )
+    assert "ck_rebuild_outputs_status_error_code" in table_sql
 
 
 def test_rebuild_output_model_enforces_one_target_per_run(tmp_path: Path) -> None:
@@ -263,6 +267,31 @@ def test_rebuild_output_model_enforces_one_target_per_run(tmp_path: Path) -> Non
         session.add(RebuildOutput(
             run_id=run.id, oa_item_id=item.id, kind="original", target_relpath="archive/a.bin",
             status="success",
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code"),
+    (("success", "SOURCE_MISSING"), ("failed", None), ("pending", "SOURCE_MISSING")),
+)
+def test_rebuild_output_model_requires_status_error_consistency(
+    tmp_path: Path, status: str, error_code: str | None
+) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    from oa_knowledge.db.models import PipelineRun
+
+    with Session(engine) as session:
+        run = PipelineRun(run_key=f"synthetic-status-{status}-{error_code}", pipeline_type="data_rebuild")
+        item = OAItem(oa_item_key=f"synthetic-status-item-{status}-{error_code}", source_channel="done", title="Synthetic")
+        session.add_all([run, item])
+        session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, kind="original", target_relpath="archive/a.bin",
+            status=status, error_code=error_code,
         ))
         with pytest.raises(IntegrityError):
             session.commit()

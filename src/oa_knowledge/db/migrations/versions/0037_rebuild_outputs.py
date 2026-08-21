@@ -42,7 +42,12 @@ def upgrade() -> None:
             "kind IN ('original', 'parse', 'body_markdown', 'attachment_markdown', 'item_index')",
             name="ck_rebuild_outputs_kind",
         ),
-        sa.CheckConstraint("status IN ('success', 'failed')", name="ck_rebuild_outputs_status"),
+        sa.CheckConstraint("status IN ('pending', 'success', 'failed')", name="ck_rebuild_outputs_status"),
+        sa.CheckConstraint(
+            "(status IN ('pending', 'success') AND error_code IS NULL) OR "
+            "(status = 'failed' AND error_code IS NOT NULL)",
+            name="ck_rebuild_outputs_status_error_code",
+        ),
         sa.UniqueConstraint("run_id", "target_relpath", name="uq_rebuild_outputs_run_target"),
     )
     op.create_index("ix_rebuild_outputs_run_status", "rebuild_outputs", ["run_id", "status"])
