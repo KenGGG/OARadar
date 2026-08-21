@@ -21,5 +21,6 @@ def test_v2_business_routes_are_available(config_file: Path) -> None:
     for path in (
         "/api/simple-status", "/api/pending-notifications", "/api/done-archives",
         "/api/markdown-outputs", "/api/settings", "/api/schedule/status",
+        "/api/rebuild/classifications?group=needs_review", "/api/rebuild/classification-summary",
     ):
         assert client.get(path).status_code == 200

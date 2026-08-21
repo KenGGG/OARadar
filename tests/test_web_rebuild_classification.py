@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from oa_knowledge.config import load_settings
+from oa_knowledge.db.engine import create_db_engine
+from oa_knowledge.db.migrate import upgrade_database
+from oa_knowledge.db.models import ArchivedFile, OAItem
+from oa_knowledge.web import create_web_app
+
+
+@pytest.fixture
+def client(config_file: Path) -> TestClient:
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True)
+    upgrade_database(settings.database_path)
+    return TestClient(create_web_app(settings))
+
+
+@pytest.fixture
+def seeded_items(client: TestClient) -> dict[str, int]:
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            internal = OAItem(
+                oa_item_key="done:internal", source_channel="done", title="内部风险检查事项",
+                document_number="synthetic-001", document_date=date(2026, 8, 20),
+                source_type="internal", internal_category="风险管理", classification_state="suggested",
+                classification_confidence=0.95, classification_source="rule",
+            )
+            review = OAItem(
+                oa_item_key="done:review", source_channel="done", title="Synthetic review item",
+                sender="Synthetic sender", classification_state="needs_review",
+            )
+            confirmed = OAItem(
+                oa_item_key="done:confirmed", source_channel="done", title="Synthetic confirmed item",
+                source_type="external", external_issuer="Synthetic institution", classification_state="confirmed",
+                classification_confidence=1.0, classification_source="manual",
+            )
+            session.add_all((internal, review, confirmed))
+            session.flush()
+            session.add(ArchivedFile(
+                oa_item_id=review.id, original_name="synthetic.pdf", attachment_key="synthetic-file",
+                file_role="direct_attachment", source_container_key="synthetic-container",
+            ))
+            session.commit()
+            return {"internal": internal.id, "review": review.id, "confirmed": confirmed.id}
+    finally:
+        engine.dispose()
+
+
+def _csrf_headers(client: TestClient) -> dict[str, str]:
+    client.get("/api/status")
+    return {"x-csrf-token": client.cookies["oa_csrf"]}
+
+
+def test_needs_review_page_redacts_body(client: TestClient, seeded_items: dict[str, int]) -> None:
+    payload = client.get("/api/rebuild/classifications?group=needs_review").json()
+
+    assert set(payload["items"][0]) == {
+        "id", "title", "document_number", "sender", "item_date",
+        "source_type", "internal_category", "external_issuer",
+        "classification_state", "has_document_number", "attachment_count",
+    }
+    assert "body" not in payload["items"][0]
+    assert payload["items"][0]["id"] == seeded_items["review"]
+    assert payload["items"][0]["attachment_count"] == 1
+    assert payload["total"] == 1
+
+
+def test_classification_groups_paginate_done_items(client: TestClient, seeded_items: dict[str, int]) -> None:
+    payload = client.get("/api/rebuild/classifications?group=internal&page=1&page_size=1").json()
+
+    assert payload["page"] == 1
+    assert payload["page_size"] == 1
+    assert payload["total"] == 1
+    assert payload["items"][0]["id"] == seeded_items["internal"]
+    assert client.get("/api/rebuild/classifications?group=external").json()["items"][0]["id"] == seeded_items["confirmed"]
+
+
+def test_confirm_requires_valid_transition_and_shape(client: TestClient, seeded_items: dict[str, int]) -> None:
+    headers = _csrf_headers(client)
+
+    invalid_shape = client.post(
+        f"/api/rebuild/classifications/{seeded_items['review']}/confirm",
+        json={"source_type": "internal", "internal_category": "invalid", "external_issuer": None}, headers=headers,
+    )
+    confirmed = client.post(
+        f"/api/rebuild/classifications/{seeded_items['review']}/confirm",
+        json={"source_type": "external", "internal_category": None, "external_issuer": "Synthetic issuer"}, headers=headers,
+    )
+    invalid_transition = client.post(
+        f"/api/rebuild/classifications/{seeded_items['review']}/confirm",
+        json={"source_type": "external", "internal_category": None, "external_issuer": "Synthetic issuer"}, headers=headers,
+    )
+
+    assert invalid_shape.status_code == 422
+    assert confirmed.status_code == 200
+    assert confirmed.json()["classification_state"] == "confirmed"
+    assert invalid_transition.status_code == 409
+
+
+def test_confirm_unknown_item_is_json_404(client: TestClient) -> None:
+    response = client.post(
+        "/api/rebuild/classifications/99999/confirm",
+        json={"source_type": "external", "internal_category": None, "external_issuer": "Synthetic issuer"},
+        headers=_csrf_headers(client),
+    )
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_bulk_confirm_does_not_confirm_needs_review(client: TestClient, seeded_items: dict[str, int]) -> None:
+    response = client.post(
+        "/api/rebuild/classifications/bulk-confirm", json={"source_type": "internal"}, headers=_csrf_headers(client),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["confirmed"] == 1
+    assert response.json()["needs_review_unchanged"] > 0
+
+
+def test_suggest_is_explicit_and_summary_is_metadata_only(client: TestClient) -> None:
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            session.add(OAItem(
+                oa_item_key="done:unseeded", source_channel="done", title="内部风险检查事项",
+            ))
+            session.commit()
+    finally:
+        engine.dispose()
+
+    assert client.get("/api/rebuild/classifications?group=internal").json()["total"] == 0
+    response = client.post("/api/rebuild/classifications/suggest", headers=_csrf_headers(client))
+    summary = client.get("/api/rebuild/classification-summary")
+
+    assert response.status_code == 200
+    assert response.json() == {"suggested": 1, "needs_review": 0}
+    assert summary.status_code == 200
+    assert summary.json()["internal"]["suggested"] == 1

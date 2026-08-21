@@ -24,12 +24,19 @@ from oa_knowledge.web.console_views import (
     retry_done_archive,
     retry_pending_delivery,
     retry_pending_summary,
-    sync_pending_occurrence,
     settings_view,
+    sync_pending_occurrence,
     update_settings,
 )
-from oa_knowledge.web.simple_status import simple_status, _ALLOWED_SIMPLE_STATES
+from oa_knowledge.web.rebuild_views import (
+    bulk_confirm_rebuild_classifications,
+    classification_list,
+    classification_summary,
+    confirm_rebuild_classification,
+    seed_rebuild_classification_suggestions,
+)
 from oa_knowledge.web.schedule_views import schedule_status
+from oa_knowledge.web.simple_status import _ALLOWED_SIMPLE_STATES, simple_status
 from oa_knowledge.web.status import dashboard_status
 
 
@@ -65,6 +72,16 @@ class DataGovernancePlanRequest(BaseModel):
 
 class DataGovernanceActionRequest(BaseModel):
     confirmation: str | None = Field(default=None, max_length=100)
+
+
+class ClassificationConfirmationRequest(BaseModel):
+    source_type: str
+    internal_category: str | None = None
+    external_issuer: str | None = None
+
+
+class ClassificationBulkConfirmRequest(BaseModel):
+    source_type: str
 
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -163,6 +180,45 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
         if not secrets.compare_digest(payload.token, expected):
             raise HTTPException(status_code=401, detail="invalid bootstrap token")
         request.session["authenticated"] = True
+
+    @app.get("/api/rebuild/classifications")
+    def get_rebuild_classifications(
+        group: str = Query(..., pattern="^(internal|external|needs_review)$"),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+    ) -> dict:
+        return classification_list(settings, group=group, page=page, page_size=page_size)
+
+    @app.get("/api/rebuild/classification-summary")
+    def get_rebuild_classification_summary() -> dict:
+        return classification_summary(settings)
+
+    @app.post("/api/rebuild/classifications/suggest")
+    def post_rebuild_classification_suggestions() -> dict:
+        return seed_rebuild_classification_suggestions(settings)
+
+    @app.post("/api/rebuild/classifications/bulk-confirm")
+    def post_rebuild_classification_bulk_confirm(payload: ClassificationBulkConfirmRequest) -> dict:
+        try:
+            return bulk_confirm_rebuild_classifications(settings, source_type=payload.source_type)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/rebuild/classifications/{item_id}/confirm")
+    def post_rebuild_classification_confirm(
+        item_id: int, payload: ClassificationConfirmationRequest,
+    ) -> dict:
+        try:
+            return confirm_rebuild_classification(
+                settings, item_id, source_type=payload.source_type,
+                internal_category=payload.internal_category, external_issuer=payload.external_issuer,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/audits/online")
     def get_online_audit(
