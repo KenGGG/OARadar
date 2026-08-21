@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -190,4 +190,142 @@ def test_concurrent_execute_claims_and_completes_task_once(
     events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
     assert calls == 1
     assert [event.event_type for event in events].count("claimed") == 1
+    assert [event.event_type for event in events].count("completed") == 1
+
+
+def test_heartbeat_keeps_blocking_copy_owned_during_concurrent_resume(
+    session, settings, inventory_row, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A still-running local copier must not be reclaimed after a short lease."""
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    monkeypatch.setattr(campaign, "LEASE_TTL", timedelta(milliseconds=40))
+    monkeypatch.setattr(campaign, "LEASE_HEARTBEAT_INTERVAL", 0.01)
+
+    def blocking_copy(*args, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        entered.set()
+        assert release.wait(2)
+        return SimpleNamespace(status="success", error_code=None)
+
+    monkeypatch.setattr(campaign, "copy_inventory_row", blocking_copy)
+    engine = session.get_bind()
+
+    def execute() -> None:
+        with Session(engine) as worker_session:
+            execute_archive_copy(worker_session, settings, run.id, [inventory_row])
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    assert entered.wait(2)
+    time.sleep(0.12)
+    with Session(engine) as resume_session:
+        assert enqueue_archive_copy(resume_session, run.id, [inventory_row]) == 0
+        execute_archive_copy(resume_session, settings, run.id, [inventory_row])
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
+    assert calls == 1
+    assert [event.event_type for event in events].count("claimed") == 1
+    assert [event.event_type for event in events].count("completed") == 1
+
+
+def test_stale_owner_cannot_complete_task_or_emit_terminal_event(session, inventory_row) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    task.status = "running"
+    task.lease_owner = "new-owner"
+    session.commit()
+
+    assert campaign._complete_owned_task(session, task.id, "stale-owner") is False
+    session.refresh(task)
+    assert task.status == "running"
+    assert session.scalars(select(PipelineEvent).where(
+        PipelineEvent.task_id == task.id,
+        PipelineEvent.event_type == "completed",
+    )).all() == []
+
+
+def test_heartbeat_stops_when_copy_is_interrupted(
+    session, settings, inventory_row, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    monkeypatch.setattr(campaign, "LEASE_TTL", timedelta(milliseconds=40))
+    monkeypatch.setattr(campaign, "LEASE_HEARTBEAT_INTERVAL", 0.01)
+
+    def interrupted_copy(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(campaign, "copy_inventory_row", interrupted_copy)
+    with pytest.raises(KeyboardInterrupt):
+        execute_archive_copy(session, settings, run.id, [inventory_row])
+    time.sleep(0.12)
+    assert enqueue_archive_copy(session, run.id, [inventory_row]) == 1
+
+
+def test_concurrent_first_enqueue_converges_on_one_task(session, inventory_row) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    engine = session.get_bind()
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+
+    def enqueue() -> None:
+        try:
+            with Session(engine) as concurrent_session:
+                barrier.wait()
+                enqueue_archive_copy(concurrent_session, run.id, [inventory_row])
+        except Exception as exc:  # noqa: BLE001 - assertion captures any race leak.
+            errors.append(exc)
+
+    first = threading.Thread(target=enqueue)
+    second = threading.Thread(target=enqueue)
+    first.start(); second.start(); first.join(); second.join()
+
+    tasks = session.scalars(select(PipelineTask).where(
+        PipelineTask.run_id == run.id,
+        PipelineTask.stage == "archive_copy",
+    )).all()
+    assert errors == []
+    assert len(tasks) == 1
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == tasks[0].id)).all()
+    assert [event.event_type for event in events].count("enqueued") == 1
+
+
+def test_concurrent_success_reconciliation_emits_one_completed_event(
+    session, settings, inventory_row
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    task.status = "running"
+    session.commit()
+    campaign.copy_inventory_row(session, settings, inventory_row, run_id=run.id)
+
+    engine = session.get_bind()
+    barrier = threading.Barrier(2)
+
+    def reconcile() -> None:
+        with Session(engine) as concurrent_session:
+            barrier.wait()
+            enqueue_archive_copy(concurrent_session, run.id, [inventory_row])
+
+    first = threading.Thread(target=reconcile)
+    second = threading.Thread(target=reconcile)
+    first.start(); second.start(); first.join(); second.join()
+
+    session.refresh(task)
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
+    assert task.status == "completed"
     assert [event.event_type for event in events].count("completed") == 1

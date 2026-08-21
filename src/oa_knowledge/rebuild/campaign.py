@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -25,6 +26,8 @@ QUEUE_NAME = "data_rebuild"
 ARCHIVE_STAGE = "archive_copy"
 INVENTORY_STAGE = "inventory"
 RESUMABLE_RUN_STATUSES = frozenset({"running", "failed"})
+LEASE_TTL = timedelta(minutes=5)
+LEASE_HEARTBEAT_INTERVAL = 60.0
 
 
 def create_rebuild_run(session: Session, *, cutoff_at: datetime) -> PipelineRun:
@@ -59,20 +62,23 @@ def resume_rebuild_run(session: Session, run_id: int) -> PipelineRun:
     return run
 
 
-def _mark_task_completed(session: Session, task: PipelineTask) -> bool:
-    """Reconcile a durable successful output to one completed task event."""
-    changed = task.status != "completed"
-    task.status = "completed"
-    task.error_code = task.last_error = None
-    task.finished_at = task.finished_at or datetime.now(UTC)
-    task.lease_owner = task.lease_expires_at = None
-    completed_event = session.scalar(select(PipelineEvent.id).where(
-        PipelineEvent.task_id == task.id,
-        PipelineEvent.event_type == "completed",
-    ))
-    if completed_event is None:
-        _add_event(session, task, "completed", "completed")
-    return changed
+def _reconcile_successful_task(session: Session, task_id: int) -> bool:
+    """Atomically turn a durable output into one completed task/event pair."""
+    completed = session.execute(update(PipelineTask).where(
+        PipelineTask.id == task_id,
+        PipelineTask.status != "completed",
+    ).values(
+        status="completed", error_code=None, last_error=None,
+        finished_at=datetime.now(UTC), lease_owner=None, lease_expires_at=None,
+    )).rowcount
+    if completed != 1:
+        session.rollback()
+        return False
+    task = session.get(PipelineTask, task_id)
+    assert task is not None
+    _add_event(session, task, "completed", "completed")
+    session.commit()
+    return True
 
 
 def _success_output(session: Session, run_id: int, row: InventoryRow) -> RebuildOutput | None:
@@ -93,6 +99,35 @@ def _lease_expired(task: PipelineTask) -> bool:
     return expires <= datetime.now(UTC)
 
 
+def _new_archive_task(run_id: int, row: InventoryRow, key: str) -> PipelineTask:
+    return PipelineTask(
+        run_id=run_id, queue_name=QUEUE_NAME, priority=100,
+        logical_item_key=f"rebuild-file:{row.file_id}", stage=ARCHIVE_STAGE,
+        status="queued", idempotency_key=key,
+        payload_json=json.dumps({"file_id": row.file_id, "sha256": row.sha256}, sort_keys=True),
+    )
+
+
+def _get_or_create_archive_task(
+    session: Session, run_id: int, row: InventoryRow, key: str,
+) -> tuple[PipelineTask, bool]:
+    """Insert under a savepoint so concurrent first enqueues converge safely."""
+    task = session.scalar(select(PipelineTask).where(PipelineTask.idempotency_key == key))
+    if task is not None:
+        return task, False
+    task = _new_archive_task(run_id, row, key)
+    try:
+        with session.begin_nested():
+            session.add(task)
+            session.flush()
+    except IntegrityError:
+        task = session.scalar(select(PipelineTask).where(PipelineTask.idempotency_key == key))
+        if task is None:
+            raise
+        return task, False
+    return task, True
+
+
 def enqueue_archive_copy(session: Session, run_id: int, rows: Sequence[InventoryRow]) -> int:
     """Enqueue ready originals once; reset recoverable failures for a resume."""
     run = session.get(PipelineRun, run_id)
@@ -107,27 +142,15 @@ def enqueue_archive_copy(session: Session, run_id: int, rows: Sequence[Inventory
         output = _success_output(session, run_id, row)
         if output is not None:
             if task is None:
-                task = PipelineTask(
-                    run_id=run_id, queue_name=QUEUE_NAME, priority=100,
-                    logical_item_key=f"rebuild-file:{row.file_id}", stage=ARCHIVE_STAGE,
-                    status="completed", idempotency_key=key,
-                    payload_json=json.dumps({"file_id": row.file_id, "sha256": row.sha256}, sort_keys=True),
-                )
-                session.add(task)
-                session.flush()
-            _mark_task_completed(session, task)
+                task, _ = _get_or_create_archive_task(session, run_id, row, key)
+            session.commit()
+            _reconcile_successful_task(session, task.id)
             continue
         if task is None:
-            task = PipelineTask(
-                run_id=run_id, queue_name=QUEUE_NAME, priority=100,
-                logical_item_key=f"rebuild-file:{row.file_id}", stage=ARCHIVE_STAGE,
-                status="queued", idempotency_key=key,
-                payload_json=json.dumps({"file_id": row.file_id, "sha256": row.sha256}, sort_keys=True),
-            )
-            session.add(task)
-            session.flush()
-            _add_event(session, task, "enqueued", "queued")
-            added += 1
+            task, created = _get_or_create_archive_task(session, run_id, row, key)
+            if created:
+                _add_event(session, task, "enqueued", "queued")
+                added += 1
         elif task.status == "failed" and task.recoverable:
             task.status = "queued"
             task.error_code = task.last_error = None
@@ -184,7 +207,7 @@ def _claim_task(session: Session, task_id: int) -> PipelineTask | None:
         PipelineTask.status == "queued",
     ).values(
         status="running", lease_owner=owner, started_at=datetime.now(UTC),
-        lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        lease_expires_at=datetime.now(UTC) + LEASE_TTL,
         attempts=PipelineTask.attempts + 1,
     )).rowcount
     if claimed != 1:
@@ -195,6 +218,75 @@ def _claim_task(session: Session, task_id: int) -> PipelineTask | None:
     _add_event(session, task, "claimed", "running")
     session.commit()
     return task
+
+
+def _start_lease_heartbeat(session: Session, task: PipelineTask) -> tuple[threading.Event, threading.Thread]:
+    """Renew a claimed task while its synchronous local copier is active."""
+    assert task.lease_owner is not None
+    stop = threading.Event()
+    bind = session.get_bind()
+    task_id, owner = task.id, task.lease_owner
+
+    def renew() -> None:
+        while not stop.wait(LEASE_HEARTBEAT_INTERVAL):
+            with Session(bind=bind) as heartbeat_session:
+                renewed = heartbeat_session.execute(update(PipelineTask).where(
+                    PipelineTask.id == task_id,
+                    PipelineTask.status == "running",
+                    PipelineTask.lease_owner == owner,
+                ).values(lease_expires_at=datetime.now(UTC) + LEASE_TTL)).rowcount
+                heartbeat_session.commit()
+            if renewed != 1:
+                return
+
+    thread = threading.Thread(target=renew, name=f"rebuild-lease-{task_id}", daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def _stop_lease_heartbeat(stop: threading.Event, thread: threading.Thread) -> None:
+    stop.set()
+    thread.join()
+
+
+def _complete_owned_task(session: Session, task_id: int, owner: str) -> bool:
+    """Only the current claimant may write its successful terminal transition."""
+    completed = session.execute(update(PipelineTask).where(
+        PipelineTask.id == task_id,
+        PipelineTask.status == "running",
+        PipelineTask.lease_owner == owner,
+    ).values(
+        status="completed", error_code=None, last_error=None,
+        finished_at=datetime.now(UTC), lease_owner=None, lease_expires_at=None,
+    )).rowcount
+    if completed != 1:
+        session.rollback()
+        return False
+    task = session.get(PipelineTask, task_id)
+    assert task is not None
+    _add_event(session, task, "completed", "completed")
+    session.commit()
+    return True
+
+
+def _fail_owned_task(session: Session, task_id: int, owner: str, error_code: str) -> bool:
+    """Only the current claimant may write a failed terminal transition."""
+    failed = session.execute(update(PipelineTask).where(
+        PipelineTask.id == task_id,
+        PipelineTask.status == "running",
+        PipelineTask.lease_owner == owner,
+    ).values(
+        status="failed", error_code=error_code, last_error=None, recoverable=True,
+        finished_at=datetime.now(UTC), lease_owner=None, lease_expires_at=None,
+    )).rowcount
+    if failed != 1:
+        session.rollback()
+        return False
+    task = session.get(PipelineTask, task_id)
+    assert task is not None
+    _add_event(session, task, "failed", "failed", error_code=error_code)
+    session.commit()
+    return True
 
 
 def _finish_run(session: Session, run: PipelineRun) -> None:
@@ -221,7 +313,7 @@ def execute_archive_copy(
         key = f"rebuild:{run_id}:archive:{row.file_id}:{row.sha256}"
         task = session.scalar(select(PipelineTask).where(PipelineTask.idempotency_key == key))
         if task is not None and _success_output(session, run_id, row) is not None:
-            _mark_task_completed(session, task)
+            _reconcile_successful_task(session, task.id)
     session.commit()
     tasks = session.scalars(select(PipelineTask).where(
         PipelineTask.run_id == run_id, PipelineTask.queue_name == QUEUE_NAME,
@@ -232,33 +324,29 @@ def execute_archive_copy(
         task = _claim_task(session, queued_task.id)
         if task is None:
             continue
+        owner = task.lease_owner
+        assert owner is not None
         payload = json.loads(task.payload_json)
         row = by_file_id.get(payload.get("file_id"))
         if row is None or row.sha256 != payload.get("sha256"):
-            task.status, task.error_code, task.recoverable = "failed", "INVENTORY_CHANGED", True
-            task.finished_at = datetime.now(UTC)
-            _add_event(session, task, "failed", "failed", error_code=task.error_code)
-            session.commit()
-            failed += 1
+            if _fail_owned_task(session, task.id, owner, "INVENTORY_CHANGED"):
+                failed += 1
             continue
+        heartbeat_stop, heartbeat_thread = _start_lease_heartbeat(session, task)
         try:
             output = copy_inventory_row(session, settings, row, run_id=run_id)
         except Exception:  # noqa: BLE001 - record a sanitized task failure for any copier crash.
-            task.status, task.error_code, task.recoverable = "failed", "COPY_EXCEPTION", True
-            task.finished_at = datetime.now(UTC)
-            _add_event(session, task, "failed", "failed", error_code=task.error_code)
-            session.commit()
-            failed += 1
-            continue
-        if output.status == "success":
-            _mark_task_completed(session, task)
-            task.recoverable = True
-            copied += 1
+            output = None
+        finally:
+            _stop_lease_heartbeat(heartbeat_stop, heartbeat_thread)
+        if output is None:
+            if _fail_owned_task(session, task.id, owner, "COPY_EXCEPTION"):
+                failed += 1
         else:
-            task.status, task.error_code, task.recoverable = "failed", output.error_code, True
-            task.finished_at = datetime.now(UTC)
-            _add_event(session, task, "failed", "failed", error_code=output.error_code)
-            failed += 1
-        session.commit()
+            if output.status == "success":
+                if _complete_owned_task(session, task.id, owner):
+                    copied += 1
+            elif _fail_owned_task(session, task.id, owner, output.error_code):
+                failed += 1
     _finish_run(session, run)
     return {"copied": copied, "failed": failed}
