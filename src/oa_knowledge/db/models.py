@@ -832,6 +832,44 @@ class PipelineRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class RebuildOutput(Base):
+    """One resumable local rebuild artifact requested by a pipeline run."""
+
+    __tablename__ = "rebuild_outputs"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('original', 'parse', 'body_markdown', 'attachment_markdown', 'item_index')",
+            name="ck_rebuild_outputs_kind",
+        ),
+        CheckConstraint(
+            "status IN ('success', 'failed')",
+            name="ck_rebuild_outputs_status",
+        ),
+        UniqueConstraint("run_id", "target_relpath", name="uq_rebuild_outputs_run_target"),
+        Index("ix_rebuild_outputs_run_status", "run_id", "status"),
+        Index("ix_rebuild_outputs_item_kind", "oa_item_id", "kind"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("pipeline_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    oa_item_id: Mapped[int] = mapped_column(
+        ForeignKey("oa_items.id", ondelete="CASCADE"), nullable=False
+    )
+    source_file_id: Mapped[int | None] = mapped_column(
+        ForeignKey("files.id", ondelete="SET NULL")
+    )
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    target_relpath: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class PipelineTask(Base):
     __tablename__ = "pipeline_tasks"
     id: Mapped[int] = mapped_column(primary_key=True)

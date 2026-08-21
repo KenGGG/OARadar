@@ -19,7 +19,7 @@ def test_curated_migration_adds_versioned_run_and_decision_tables(tmp_path: Path
     with sqlite3.connect(db) as connection:
         assert (
             connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-            == "0036_rebuild_classification_gate"
+            == "0037_rebuild_outputs"
         )
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 

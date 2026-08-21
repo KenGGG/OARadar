@@ -28,6 +28,7 @@ from oa_knowledge.db.models import (
     ParseArtifact,
     ResourceLease,
     RebuildClassificationEvent,
+    RebuildOutput,
     SourceReference,
     SourceAttachment,
     SummaryEvidence,
@@ -203,6 +204,70 @@ def test_0036_adds_rebuild_classification_gate(existing_0035_database: Path) -> 
             )
 
 
+def test_0037_adds_rebuild_output_ledger_without_rebuilding_parents(
+    existing_0035_database: Path,
+) -> None:
+    """The ledger migration preserves existing referenced parent rows and FKs."""
+    command.upgrade(_migration_config(existing_0035_database), "0036_rebuild_classification_gate")
+    with sqlite3.connect(existing_0035_database) as connection:
+        before_item = connection.execute(
+            "SELECT id, oa_item_key FROM oa_items WHERE id = 1"
+        ).fetchone()
+        before_file = connection.execute(
+            "SELECT id, oa_item_id FROM files WHERE id = 3501"
+        ).fetchone()
+
+    upgrade(existing_0035_database)
+
+    assert table_columns(existing_0035_database, "rebuild_outputs") == {
+        "id", "run_id", "oa_item_id", "source_file_id", "kind", "target_relpath",
+        "sha256", "status", "error_code", "created_at", "updated_at",
+    }
+    with sqlite3.connect(existing_0035_database) as connection:
+        assert connection.execute(
+            "SELECT id, oa_item_key FROM oa_items WHERE id = 1"
+        ).fetchone() == before_item
+        assert connection.execute(
+            "SELECT id, oa_item_id FROM files WHERE id = 3501"
+        ).fetchone() == before_file
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(rebuild_outputs)").fetchall()
+        indexes = connection.execute("PRAGMA index_list(rebuild_outputs)").fetchall()
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert {row[2] for row in foreign_keys} == {"pipeline_runs", "oa_items", "files"}
+    assert any(
+        row[2]
+        and tuple(
+            column[2]
+            for column in connection.execute(f"PRAGMA index_info({row[1]})")
+        ) == ("run_id", "target_relpath")
+        for row in indexes
+    )
+
+
+def test_rebuild_output_model_enforces_one_target_per_run(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    from oa_knowledge.db.models import PipelineRun
+
+    with Session(engine) as session:
+        run = PipelineRun(run_key="synthetic-output-run", pipeline_type="data_rebuild")
+        item = OAItem(oa_item_key="synthetic-output-item", source_channel="done", title="Synthetic")
+        session.add_all([run, item])
+        session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, kind="original", target_relpath="archive/a.bin",
+            status="success",
+        ))
+        session.commit()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, kind="original", target_relpath="archive/a.bin",
+            status="success",
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
 def test_oa_item_classification_gate_and_event_audit_model(tmp_path: Path) -> None:
     db = tmp_path / "oa.db"
     upgrade_database(db)
@@ -292,7 +357,7 @@ def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:
     upgrade_database(db)
     upgrade_database(db)
     with sqlite3.connect(db) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0036_rebuild_classification_gate"
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0037_rebuild_outputs"
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {
