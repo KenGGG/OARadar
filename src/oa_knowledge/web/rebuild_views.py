@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import ArchivedFile, OAItem
+from oa_knowledge.rebuild.campaign import rebuild_status_summary
 from oa_knowledge.rebuild.classification import (
     bulk_confirm_suggested,
     confirm_classification,
@@ -167,5 +168,15 @@ def seed_rebuild_classification_suggestions(settings: Settings) -> dict[str, int
             result = seed_classification_suggestions(session, settings.rebuild.external_issuer_aliases)
             session.commit()
             return result
+    finally:
+        engine.dispose()
+
+
+def markdown_rebuild_status(settings: Settings) -> dict[str, object]:
+    """Expose local progress metadata without paths, OA content, or error text."""
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            return rebuild_status_summary(session)
     finally:
         engine.dispose()

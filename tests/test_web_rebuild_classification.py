@@ -266,6 +266,23 @@ def test_suggest_is_explicit_and_summary_is_metadata_only(client: TestClient) ->
     assert summary.json()["internal"]["suggested"] == 1
 
 
+def test_markdown_rebuild_controls_expose_phase4_non_execution_gate(client: TestClient) -> None:
+    """Removing the CAS gate must never let the production API create work."""
+    headers = _csrf_headers(client)
+    status = client.get("/api/rebuild/status")
+    start = client.post("/api/rebuild/start", headers=headers)
+    pause = client.post("/api/rebuild/pause", headers=headers)
+    resume = client.post("/api/rebuild/resume", headers=headers)
+
+    assert status.status_code == 200
+    assert status.json()["execution_allowed"] is False
+    for response in (start, pause, resume):
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": "MARKDOWN_REBUILD_PHASE4_CAS_REQUIRED",
+        }
+
+
 def test_concurrent_confirmation_allows_one_transition_and_one_audit_event(
     client: TestClient, seeded_items: dict[str, int], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

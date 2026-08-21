@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import (
+    ArchivedFile,
+    OAItem,
     PipelineEvent,
     PipelineRun,
     PipelineTask,
@@ -26,10 +28,19 @@ from oa_knowledge.rebuild.archive_copy import (
     reconcile_successful_output,
 )
 from oa_knowledge.rebuild.inventory import InventoryRow
+from oa_knowledge.rebuild.paths import effective_item_date
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
 QUEUE_NAME = "data_rebuild"
 ARCHIVE_STAGE = "archive_copy"
 INVENTORY_STAGE = "inventory"
+REBUILD_PARSE_STAGE = "rebuild_parse"
+REBUILD_PUBLISH_STAGE = "rebuild_publish"
+REBUILD_INDEX_STAGE = "rebuild_index"
+MARKDOWN_REBUILD_STAGES = frozenset({
+    REBUILD_PARSE_STAGE, REBUILD_PUBLISH_STAGE, REBUILD_INDEX_STAGE,
+})
+MARKDOWN_REBUILD_SAFETY_GATE = "MARKDOWN_REBUILD_PHASE4_CAS_REQUIRED"
 RESUMABLE_RUN_STATUSES = frozenset({"running", "failed"})
 BLOCKING_INVENTORY_STATUSES = (
     "depth_limit_reached", "hash_mismatch", "missing", "unsafe_path",
@@ -157,8 +168,13 @@ def rebuild_status_summary(session: Session) -> dict[str, object]:
             "runs": runs,
             "latest_run_id": None,
             "resumable_run_id": None,
+            "latest_started_at": None,
+            "latest_finished_at": None,
             **empty,
             "blockers": inventory_blocker_counts({}),
+            "execution_allowed": False,
+            "safety_gate": MARKDOWN_REBUILD_SAFETY_GATE,
+            "error_codes": [],
         }
     tasks = session.scalars(select(PipelineTask).where(PipelineTask.run_id == latest.id)).all()
     counts = {
@@ -176,9 +192,100 @@ def rebuild_status_summary(session: Session) -> dict[str, object]:
         "runs": runs,
         "latest_run_id": latest.id,
         "resumable_run_id": resumable.id if resumable is not None else None,
+        "latest_started_at": latest.started_at.isoformat() if latest.started_at else None,
+        "latest_finished_at": latest.finished_at.isoformat() if latest.finished_at else None,
         **counts,
         "blockers": blockers,
+        "execution_allowed": False,
+        "safety_gate": MARKDOWN_REBUILD_SAFETY_GATE,
+        "error_codes": sorted({
+            task.error_code for task in tasks if task.error_code
+        }),
     }
+
+
+def _eligible_markdown_rebuild_item(item: OAItem) -> bool:
+    """Admission is metadata-only; worker stages revalidate copied evidence."""
+    if item.source_channel != "done" or item.classification_state != "confirmed":
+        return False
+    try:
+        effective_item_date(item)
+    except ValueError:
+        return False
+    return True
+
+
+def enqueue_markdown_rebuild(
+    session: Session, run_id: int, item_ids: Sequence[int],
+) -> int:
+    """Queue rebuilt-source parsing for confirmed, dated items only.
+
+    This deliberately creates only existing ``PipelineTask`` rows.  Each
+    claimed stage repeats the local-ledger and protected-file verification, so
+    enqueue-time database state alone never authorizes publication.
+    """
+    run = session.get(PipelineRun, run_id)
+    if run is None or run.pipeline_type != "data_rebuild":
+        raise ValueError("REBUILD_RUN_NOT_FOUND")
+    added = 0
+    for item_id in dict.fromkeys(item_ids):
+        item = session.get(OAItem, item_id)
+        if item is None or not _eligible_markdown_rebuild_item(item):
+            continue
+        files = list(session.scalars(select(ArchivedFile).where(
+            ArchivedFile.oa_item_id == item.id,
+            ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+            ArchivedFile.download_status == "verified",
+            ArchivedFile.sha256.is_not(None),
+        ).order_by(ArchivedFile.id)))
+        for source in files:
+            copied = session.scalar(select(RebuildOutput).where(
+                RebuildOutput.run_id == run_id,
+                RebuildOutput.oa_item_id == item.id,
+                RebuildOutput.source_file_id == source.id,
+                RebuildOutput.kind == "original",
+                RebuildOutput.status == "success",
+                RebuildOutput.sha256 == source.sha256,
+            ).order_by(RebuildOutput.id.desc()).limit(1))
+            if copied is None:
+                continue
+            source_sha = source.sha256
+            assert source_sha is not None
+            key = f"rebuild:{run_id}:{REBUILD_PARSE_STAGE}:{source.id}:{source_sha}"
+            task = session.scalar(select(PipelineTask).where(
+                PipelineTask.idempotency_key == key,
+            ))
+            if task is None:
+                task = PipelineTask(
+                    run_id=run_id,
+                    queue_name=QUEUE_NAME,
+                    priority=100,
+                    logical_item_key=f"rebuild-item:{item.id}",
+                    stage=REBUILD_PARSE_STAGE,
+                    status="queued",
+                    idempotency_key=key,
+                    payload_json=json.dumps({
+                        "item_id": item.id,
+                        "source_file_id": source.id,
+                        "source_sha256": source_sha,
+                    }, sort_keys=True),
+                )
+                session.add(task)
+                session.flush()
+                _add_event(session, task, "enqueued", "queued")
+                added += 1
+            elif task.status == "failed" and task.recoverable:
+                task.status = "queued"
+                task.error_code = task.last_error = None
+                task.finished_at = None
+                _add_event(session, task, "requeued", "queued")
+                added += 1
+    if added:
+        run.status = "running"
+        run.finished_at = None
+    session.commit()
+    _finish_run(session, run_id)
+    return added
 
 
 def _reconcile_successful_task(session: Session, task_id: int) -> bool:

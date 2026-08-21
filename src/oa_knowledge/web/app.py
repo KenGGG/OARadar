@@ -33,6 +33,7 @@ from oa_knowledge.web.rebuild_views import (
     classification_list,
     classification_summary,
     confirm_rebuild_classification,
+    markdown_rebuild_status,
     seed_rebuild_classification_suggestions,
 )
 from oa_knowledge.web.schedule_views import schedule_status
@@ -219,6 +220,27 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/rebuild/status")
+    def get_markdown_rebuild_status() -> dict:
+        return markdown_rebuild_status(settings)
+
+    def _markdown_rebuild_execution_gate() -> None:
+        # Phase 3 may display the durable local progress model, but it must not
+        # execute against a real rebuild root until Phase 4's CAS cutover work.
+        raise HTTPException(status_code=409, detail="MARKDOWN_REBUILD_PHASE4_CAS_REQUIRED")
+
+    @app.post("/api/rebuild/start")
+    def post_markdown_rebuild_start() -> None:
+        _markdown_rebuild_execution_gate()
+
+    @app.post("/api/rebuild/pause")
+    def post_markdown_rebuild_pause() -> None:
+        _markdown_rebuild_execution_gate()
+
+    @app.post("/api/rebuild/resume")
+    def post_markdown_rebuild_resume() -> None:
+        _markdown_rebuild_execution_gate()
 
     @app.get("/api/audits/online")
     def get_online_audit(

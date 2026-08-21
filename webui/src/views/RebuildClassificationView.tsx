@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { CircleAlert, RefreshCw, X } from "lucide-react"
 import { api, postApi, time } from "../App"
-import type { ClassificationGroup, RebuildClassificationItem, RebuildClassificationPage, RebuildClassificationSummary } from "../types/rebuild"
+import type { ClassificationGroup, RebuildClassificationItem, RebuildClassificationPage, RebuildClassificationSummary, RebuildExecutionStatus } from "../types/rebuild"
 
 const GROUPS: { id: ClassificationGroup; label: string }[] = [
   { id: "internal", label: "内部事项" },
@@ -83,6 +83,7 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
   const [page, setPage] = useState(1)
   const [data, setData] = useState<RebuildClassificationPage | null>(null)
   const [summary, setSummary] = useState<RebuildClassificationSummary | null>(null)
+  const [execution, setExecution] = useState<RebuildExecutionStatus | null>(null)
   const [selected, setSelected] = useState<RebuildClassificationItem | null>(null)
   const [bulkGroup, setBulkGroup] = useState<"internal" | "external" | null>(null)
   const [sourceType, setSourceType] = useState<"internal" | "external" | "">("")
@@ -95,11 +96,12 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
   const load = async () => {
     setLoading(true); setError("")
     try {
-      const [nextData, nextSummary] = await Promise.all([
+      const [nextData, nextSummary, nextExecution] = await Promise.all([
         api<RebuildClassificationPage>(`/api/rebuild/classifications?group=${group}&page=${page}&page_size=50`),
         api<RebuildClassificationSummary>("/api/rebuild/classification-summary"),
+        api<RebuildExecutionStatus>("/api/rebuild/status"),
       ])
-      setData(nextData); setSummary(nextSummary)
+      setData(nextData); setSummary(nextSummary); setExecution(nextExecution)
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取分类复核数据") }
     finally { setLoading(false) }
   }
@@ -153,6 +155,15 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
       <button className="toolbar-button" disabled={busy || loading} onClick={() => void seedSuggestions()}><RefreshCw size={15}/>生成分类建议</button>
     </div>
     {error && <div className="notice classification-notice" role="alert"><CircleAlert size={17}/><span>{error}</span></div>}
+    <section className="classification-bulk" aria-labelledby="rebuild-progress-title">
+      <div><strong id="rebuild-progress-title">Markdown 重建进度</strong><span>排队 {execution?.queued || 0} · 执行中 {execution?.running || 0} · 已完成 {execution?.completed || 0} · 失败 {execution?.failed || 0}</span></div>
+      <div className="classification-bulk-actions">
+        <button className="toolbar-button" disabled title="需完成 Phase 4 CAS 修复后才能执行">开始重建</button>
+        <button className="toolbar-button" disabled title="需完成 Phase 4 CAS 修复后才能执行">暂停</button>
+        <button className="toolbar-button" disabled title="需完成 Phase 4 CAS 修复后才能执行">继续</button>
+      </div>
+    </section>
+    <div className="notice classification-notice" role="status"><CircleAlert size={17}/><span>安全门已启用：Phase 4 CAS 修复完成前，生产环境仅展示本地进度，不会执行 Markdown 重建。</span></div>
     <div className="classification-tabs" role="tablist" aria-label="分类复核分组">
       {GROUPS.map(item => <button key={item.id} role="tab" aria-selected={group === item.id} className={group === item.id ? "classification-tab-active" : ""} onClick={() => { setGroup(item.id); setPage(1) }}>
         {item.label}<span>{item.id === "needs_review" ? summary?.needs_review.total || 0 : summary?.[item.id].total || 0}</span>

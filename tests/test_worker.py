@@ -12,12 +12,13 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ContentObject, ItemOccurrence, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ContentObject, ItemOccurrence, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineRun, PipelineTask, RebuildOutput, ReviewEntry
 from oa_knowledge.online_audit import start_audit
 from oa_knowledge.web.worker import OperationWorker, _has_verified_attachment
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.notifications.models import DeliveryResult
 from oa_knowledge.archive_migration_campaign import ensure_verified_archive_migration
+from oa_knowledge.rebuild.campaign import enqueue_markdown_rebuild
 
 
 def _record_full_manifest_sync(session: Session, count: int) -> None:
@@ -38,6 +39,87 @@ def test_completed_scheduled_scan_progress_is_never_greater_than_total() -> None
         {"source_total": 13, "created": 13, "updated": 0},
         {"new_items": 25},
     ) == (38, 38)
+
+
+def test_rebuild_worker_advances_confirmed_synthetic_item_to_index(
+    config_file: Path, monkeypatch,
+) -> None:
+    """Removing any rebuild stage must leave the synthetic item without an index."""
+    settings = load_settings(config_file)
+    settings.rebuild.target_root = settings.data_root.parent / "data_rebuilt"
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:rebuild-worker", source_channel="done", title="合成重建事项",
+            document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, attachment_key="rebuild-source", original_name="synthetic.txt",
+            file_role="direct_attachment", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="a" * 64,
+        )
+        session.add(source); session.flush()
+        run = PipelineRun(run_key="synthetic-worker-rebuild", pipeline_type="data_rebuild")
+        session.add(run); session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, source_file_id=source.id, kind="original",
+            target_relpath="archive/synthetic/source.txt", sha256=source.sha256,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        run_id, item_id = run.id, item.id
+
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.parser.parse_rebuilt_source",
+        lambda *_args, **_kwargs: SimpleNamespace(status="success", error_code=None),
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.markdown.publish_rebuilt_attachment",
+        lambda *_args, **_kwargs: SimpleNamespace(status="success"),
+    )
+
+    def publish_index(session, _settings, rebuild_run_id, rebuild_item_id):
+        output = RebuildOutput(
+            run_id=rebuild_run_id, oa_item_id=rebuild_item_id, source_file_id=None,
+            kind="item_index", target_relpath="markdown/synthetic/_index.md", sha256="b" * 64,
+            status="success", error_code=None,
+        )
+        session.add(output); session.commit()
+        return output
+
+    monkeypatch.setattr("oa_knowledge.rebuild.index.publish_rebuilt_index", publish_index)
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_until_idle() == 3
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        assert session.scalar(select(RebuildOutput).where(
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.kind == "item_index",
+            RebuildOutput.status == "success",
+        )) is not None
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id,
+            PipelineTask.stage == "rebuild_parse",
+            PipelineTask.status == "completed",
+        )) is not None
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id,
+            PipelineTask.stage == "rebuild_publish",
+            PipelineTask.status == "completed",
+        )) is not None
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id,
+            PipelineTask.stage == "rebuild_index",
+            PipelineTask.status == "completed",
+        )) is not None
 
 
 def test_oa_login_writes_a_live_logging_in_status_before_browser_access(config_file: Path) -> None:

@@ -10,20 +10,29 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
 from oa_knowledge.archive import atomic_write_bytes
 from oa_knowledge.constants import BatchStatus, LEASE_TTL
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, ItemSnapshot, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OnlineAuditRun, OperationEvent, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry, SourceAttachment, SummaryVersion
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, ItemSnapshot, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OnlineAuditRun, OperationEvent, OperationJob, ParseArtifact, ParseJob, PipelineEvent, PipelineRun, PipelineTask, RebuildOutput, ReviewEntry, SourceAttachment, SummaryVersion
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.ops.audit import audit_database
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.ops.capacity import capacity_report
 from oa_knowledge.web.cli_runner import run_cli
 from oa_knowledge.web.status import _apply_policy_to_pending, execute_archive_job
+from oa_knowledge.rebuild.campaign import (
+    MARKDOWN_REBUILD_STAGES,
+    QUEUE_NAME as REBUILD_QUEUE_NAME,
+    REBUILD_INDEX_STAGE,
+    REBUILD_PARSE_STAGE,
+    REBUILD_PUBLISH_STAGE,
+    _finish_run,
+)
+from oa_knowledge.rebuild.paths import effective_item_date
 
 
 ONLINE_AUDIT_BATCH_SIZE = 25
@@ -104,7 +113,7 @@ class OperationWorker:
 
     def recover_expired(self) -> int:
         now = datetime.now(timezone.utc)
-        with Session(self.engine) as session:
+        with Session(self.engine, expire_on_commit=False) as session:
             candidates = session.scalars(select(OperationJob).where(OperationJob.status.in_(('running', 'queued')))).all()
             jobs = [job for job in candidates if (
                 job.lease_expires_at is None
@@ -136,6 +145,11 @@ class OperationWorker:
         return "oa" in command and "worker" in command
 
     def run_once(self) -> bool:
+        rebuild_task = self._claim_rebuild_task()
+        if rebuild_task is not None:
+            self._write_runtime_status("working", self._pipeline_activity(rebuild_task.stage))
+            self._execute_rebuild_task(rebuild_task)
+            return True
         # This is a cheap no-op while the newest online audit is unfinished. As
         # soon as it completes, the durable migration job is created before any
         # historical knowledge task can be claimed.
@@ -202,6 +216,15 @@ class OperationWorker:
             self._finish(job_id, "failed", f"worker_exception_{type(exc).__name__}")
         return True
 
+    def run_until_idle(self, *, limit: int = 1000) -> int:
+        """Drive synthetic/local worker work until no claimable task remains."""
+        completed = 0
+        while completed < limit and self.run_once():
+            completed += 1
+        if completed == limit:
+            raise RuntimeError("worker did not become idle")
+        return completed
+
     @staticmethod
     def _job_activity(job_type: str) -> str:
         return {
@@ -229,7 +252,290 @@ class OperationWorker:
             "parse": "正在生成已办 Source Markdown",
             "source_publish": "正在发布来源 Markdown",
             "curation": "正在整理知识目录",
+            "rebuild_parse": "正在解析重建原件",
+            "rebuild_publish": "正在发布重建 Markdown",
+            "rebuild_index": "正在生成重建索引",
         }.get(stage, "正在执行 OA 流水线任务")
+
+    def _claim_rebuild_task(self) -> PipelineTask | None:
+        """Claim only a running local rebuild run; paused runs admit no new work."""
+        now = datetime.now(timezone.utc)
+        with Session(self.engine, expire_on_commit=False) as session:
+            task = session.scalar(select(PipelineTask).join(
+                PipelineRun, PipelineRun.id == PipelineTask.run_id,
+            ).where(
+                PipelineTask.queue_name == REBUILD_QUEUE_NAME,
+                PipelineTask.stage.in_(MARKDOWN_REBUILD_STAGES),
+                PipelineTask.status == "queued",
+                PipelineRun.pipeline_type == "data_rebuild",
+                PipelineRun.status == "running",
+            ).order_by(PipelineTask.priority, PipelineTask.id).limit(1))
+            if task is None:
+                return None
+            claimed = session.execute(update(PipelineTask).where(
+                PipelineTask.id == task.id,
+                PipelineTask.status == "queued",
+            ).values(
+                status="running", lease_owner=self.owner, started_at=now,
+                lease_expires_at=now + LEASE_TTL, attempts=PipelineTask.attempts + 1,
+            )).rowcount
+            if claimed != 1:
+                session.rollback()
+                return None
+            session.refresh(task)
+            session.add(PipelineEvent(
+                task_id=task.id, event_type="claimed", stage=task.stage, status="running",
+                details_json="{}",
+            ))
+            session.commit()
+            return task
+
+    @staticmethod
+    def _rebuild_error_code(exc: Exception) -> str:
+        value = str(exc)
+        if value and value.replace("_", "").isalnum() and value.upper() == value and len(value) <= 80:
+            return value
+        return "REBUILD_STAGE_FAILED"
+
+    def _finish_rebuild_task(self, task: PipelineTask, *, error_code: str | None = None) -> None:
+        """Write a redacted, owner-fenced terminal state and refresh run counts."""
+        with Session(self.engine) as session:
+            status = "completed" if error_code is None else "failed"
+            changed = session.execute(update(PipelineTask).where(
+                PipelineTask.id == task.id,
+                PipelineTask.status == "running",
+                PipelineTask.lease_owner == self.owner,
+            ).values(
+                status=status, error_code=error_code, last_error=None,
+                recoverable=error_code is not None,
+                finished_at=datetime.now(timezone.utc), lease_owner=None, lease_expires_at=None,
+            )).rowcount
+            if changed != 1:
+                session.rollback()
+                return
+            current = session.get(PipelineTask, task.id)
+            assert current is not None
+            session.add(PipelineEvent(
+                task_id=current.id, event_type=status, stage=current.stage, status=status,
+                details_json=json.dumps({"error_code": error_code} if error_code else {}),
+            ))
+            session.commit()
+            _finish_run(session, task.run_id)
+
+    @staticmethod
+    def _rebuild_item_admitted(session: Session, item_id: int) -> OAItem | None:
+        item = session.get(OAItem, item_id)
+        if item is None or item.source_channel != "done" or item.classification_state != "confirmed":
+            return None
+        try:
+            effective_item_date(item)
+        except ValueError:
+            return None
+        return item
+
+    @staticmethod
+    def _rebuild_source_is_current(
+        session: Session, *, run_id: int, item_id: int, source_file_id: int, source_sha256: str,
+    ) -> bool:
+        source = session.get(ArchivedFile, source_file_id)
+        if source is None or source.oa_item_id != item_id or source.sha256 != source_sha256:
+            return False
+        return session.scalar(select(RebuildOutput.id).where(
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.source_file_id == source_file_id,
+            RebuildOutput.kind == "original",
+            RebuildOutput.status == "success",
+            RebuildOutput.sha256 == source_sha256,
+        ).limit(1)) is not None
+
+    @staticmethod
+    def _rebuild_task_key(run_id: int, stage: str, target_id: int, source_sha256: str) -> str:
+        return f"rebuild:{run_id}:{stage}:{target_id}:{source_sha256}"
+
+    def _enqueue_rebuild_task(
+        self, session: Session, *, run_id: int, item_id: int, stage: str,
+        target_id: int, source_sha256: str, payload: dict,
+    ) -> bool:
+        key = self._rebuild_task_key(run_id, stage, target_id, source_sha256)
+        if session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == key)) is not None:
+            return False
+        task = PipelineTask(
+            run_id=run_id, queue_name=REBUILD_QUEUE_NAME, priority=100,
+            logical_item_key=f"rebuild-item:{item_id}", stage=stage, status="queued",
+            idempotency_key=key, payload_json=json.dumps(payload, sort_keys=True),
+        )
+        session.add(task)
+        session.flush()
+        session.add(PipelineEvent(
+            task_id=task.id, event_type="enqueued", stage=stage, status="queued", details_json="{}",
+        ))
+        return True
+
+    def _schedule_rebuild_publish(
+        self, session: Session, *, run_id: int, item_id: int, current_task_id: int | None = None,
+    ) -> None:
+        """Admit publish only after all copied-source parse tasks are terminal."""
+        item = self._rebuild_item_admitted(session, item_id)
+        if item is None:
+            return
+        parse_tasks = list(session.scalars(select(PipelineTask).where(
+            PipelineTask.run_id == run_id,
+            PipelineTask.queue_name == REBUILD_QUEUE_NAME,
+            PipelineTask.logical_item_key == f"rebuild-item:{item_id}",
+            PipelineTask.stage == REBUILD_PARSE_STAGE,
+        )))
+        if any(
+            task.status in {"queued", "running"} and task.id != current_task_id
+            for task in parse_tasks
+        ):
+            return
+        from oa_knowledge.rebuild.body_source import select_body_source
+        from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
+
+        files = list(session.scalars(select(ArchivedFile).where(
+            ArchivedFile.oa_item_id == item_id,
+            ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+            ArchivedFile.download_status == "verified",
+            ArchivedFile.sha256.is_not(None),
+        ).order_by(ArchivedFile.id)))
+        current = [source for source in files if self._rebuild_source_is_current(
+            session, run_id=run_id, item_id=item_id, source_file_id=source.id,
+            source_sha256=source.sha256 or "",
+        )]
+        page_output = session.scalar(select(RebuildOutput).join(ArchivedFile).where(
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.kind == "original",
+            RebuildOutput.status == "success",
+            ArchivedFile.id == RebuildOutput.source_file_id,
+            ArchivedFile.file_role == "body_snapshot",
+        ).order_by(RebuildOutput.id.desc()).limit(1))
+        body = select_body_source(item, current, page_output is not None)
+        if body.kind == "attachment" and body.source_file_id is not None:
+            source = session.get(ArchivedFile, body.source_file_id)
+            if source is not None and source.sha256:
+                self._enqueue_rebuild_task(
+                    session, run_id=run_id, item_id=item_id, stage=REBUILD_PUBLISH_STAGE,
+                    target_id=item_id, source_sha256=source.sha256,
+                    payload={"item_id": item_id, "kind": "body", "source_file_id": source.id,
+                             "source_sha256": source.sha256},
+                )
+        elif body.kind == "page_body" and page_output is not None and page_output.sha256:
+            self._enqueue_rebuild_task(
+                session, run_id=run_id, item_id=item_id, stage=REBUILD_PUBLISH_STAGE,
+                target_id=item_id, source_sha256=page_output.sha256,
+                payload={"item_id": item_id, "kind": "body", "source_file_id": page_output.source_file_id,
+                         "source_sha256": page_output.sha256},
+            )
+        body_file_id = body.source_file_id if body.kind == "attachment" else None
+        for source in current:
+            if source.id == body_file_id or not source.sha256:
+                continue
+            self._enqueue_rebuild_task(
+                session, run_id=run_id, item_id=item_id, stage=REBUILD_PUBLISH_STAGE,
+                target_id=source.id, source_sha256=source.sha256,
+                payload={"item_id": item_id, "kind": "attachment", "source_file_id": source.id,
+                         "source_sha256": source.sha256},
+            )
+        session.commit()
+
+    def _schedule_rebuild_index(
+        self, session: Session, *, run_id: int, item_id: int, current_task_id: int | None = None,
+    ) -> None:
+        item = self._rebuild_item_admitted(session, item_id)
+        if item is None:
+            return
+        tasks = list(session.scalars(select(PipelineTask).where(
+            PipelineTask.run_id == run_id,
+            PipelineTask.queue_name == REBUILD_QUEUE_NAME,
+            PipelineTask.logical_item_key == f"rebuild-item:{item_id}",
+            PipelineTask.stage.in_((REBUILD_PARSE_STAGE, REBUILD_PUBLISH_STAGE)),
+        )))
+        if any(
+            task.status in {"queued", "running"} and task.id != current_task_id
+            for task in tasks
+        ):
+            return
+        fingerprints = sorted(
+            str(value) for value in session.scalars(select(RebuildOutput.sha256).where(
+                RebuildOutput.run_id == run_id, RebuildOutput.oa_item_id == item_id,
+                RebuildOutput.kind == "original", RebuildOutput.status == "success",
+                RebuildOutput.sha256.is_not(None),
+            ))
+        )
+        if not fingerprints:
+            return
+        source_sha = hashlib.sha256("\0".join(fingerprints).encode()).hexdigest()
+        self._enqueue_rebuild_task(
+            session, run_id=run_id, item_id=item_id, stage=REBUILD_INDEX_STAGE,
+            target_id=item_id, source_sha256=source_sha,
+            payload={"item_id": item_id, "source_sha256": source_sha},
+        )
+        session.commit()
+
+    def _execute_rebuild_task(self, task: PipelineTask) -> None:
+        """Run local-only rebuild stages with a fresh metadata/evidence fence."""
+        try:
+            payload = json.loads(task.payload_json)
+            item_id = int(payload["item_id"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._finish_rebuild_task(task, error_code="REBUILD_PAYLOAD_INVALID")
+            return
+        with Session(self.engine) as session:
+            if self._rebuild_item_admitted(session, item_id) is None:
+                self._finish_rebuild_task(task, error_code="REBUILD_ITEM_NOT_ADMITTED")
+                return
+            if task.stage != REBUILD_INDEX_STAGE:
+                source_id = payload.get("source_file_id")
+                source_sha = payload.get("source_sha256")
+                if not isinstance(source_id, int) or not isinstance(source_sha, str) or not self._rebuild_source_is_current(
+                    session, run_id=task.run_id, item_id=item_id, source_file_id=source_id,
+                    source_sha256=source_sha,
+                ):
+                    self._finish_rebuild_task(task, error_code="REBUILT_ORIGINAL_UNAVAILABLE")
+                    return
+        try:
+            if task.stage == REBUILD_PARSE_STAGE:
+                from oa_knowledge.rebuild.parser import parse_rebuilt_source
+                with Session(self.engine) as parser_session:
+                    result = parse_rebuilt_source(
+                        parser_session, self.settings, task.run_id, int(payload["source_file_id"]),
+                    )
+                if result.status not in {"success", "unsupported"}:
+                    self._finish_rebuild_task(task, error_code=result.error_code or "REBUILD_PARSE_FAILED")
+                    return
+                with Session(self.engine) as session:
+                    self._schedule_rebuild_publish(
+                        session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                    )
+            elif task.stage == REBUILD_PUBLISH_STAGE:
+                if payload.get("kind") == "body":
+                    from oa_knowledge.rebuild.markdown import publish_rebuilt_body
+                    with Session(self.engine) as session:
+                        publish_rebuilt_body(session, self.settings, task.run_id, item_id)
+                elif payload.get("kind") == "attachment":
+                    from oa_knowledge.rebuild.markdown import publish_rebuilt_attachment
+                    with Session(self.engine) as session:
+                        publish_rebuilt_attachment(session, self.settings, task.run_id, int(payload["source_file_id"]))
+                else:
+                    raise ValueError("REBUILD_PUBLISH_KIND_INVALID")
+                with Session(self.engine) as session:
+                    self._schedule_rebuild_index(
+                        session, run_id=task.run_id, item_id=item_id, current_task_id=task.id,
+                    )
+            elif task.stage == REBUILD_INDEX_STAGE:
+                from oa_knowledge.rebuild.index import publish_rebuilt_index
+                with Session(self.engine) as session:
+                    publish_rebuilt_index(session, self.settings, task.run_id, item_id)
+            else:
+                self._finish_rebuild_task(task, error_code="REBUILD_STAGE_INVALID")
+                return
+        except Exception as exc:  # Rebuild producers expose code-only failures; never persist details.
+            self._finish_rebuild_task(task, error_code=self._rebuild_error_code(exc))
+            return
+        self._finish_rebuild_task(task)
+
 
     def _verify_oa_login(self, browser) -> object:
         self._write_runtime_status("logging_in", "正在验证 OA 登录")

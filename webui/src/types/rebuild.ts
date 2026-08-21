@@ -26,3 +26,19 @@ export type RebuildClassificationSummary = {
   external: { suggested: number; confirmed: number; total: number }
   needs_review: { total: number }
 }
+
+export type RebuildExecutionStatus = {
+  runs: number
+  latest_run_id: number | null
+  resumable_run_id: number | null
+  latest_started_at: string | null
+  latest_finished_at: string | null
+  queued: number
+  running: number
+  completed: number
+  failed: number
+  blockers: Record<string, number>
+  error_codes: string[]
+  execution_allowed: false
+  safety_gate: "MARKDOWN_REBUILD_PHASE4_CAS_REQUIRED"
+}

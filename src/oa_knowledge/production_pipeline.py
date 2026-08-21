@@ -64,6 +64,7 @@ class ProductionQueue:
         with Session(self.engine) as session:
             rows = session.scalars(select(PipelineTask).where(
                 PipelineTask.status == "queued",
+                PipelineTask.queue_name != "data_rebuild",
                 ~PipelineTask.stage.in_(CORE_PIPELINE_STAGES),
             )).all()
             for row in rows:
@@ -425,6 +426,7 @@ class ProductionQueue:
         now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
             conditions = [PipelineTask.status == "queued", PipelineTask.idempotency_key != HISTORY_CONTROL_KEY,
+                          PipelineTask.queue_name != "data_rebuild",
                           or_(PipelineTask.next_retry_at.is_(None), PipelineTask.next_retry_at <= now)]
             if queue_names is not None:
                 conditions.append(PipelineTask.queue_name.in_(queue_names))

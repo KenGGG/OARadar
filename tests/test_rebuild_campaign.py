@@ -27,6 +27,7 @@ from oa_knowledge.rebuild import archive_copy, campaign
 from oa_knowledge.rebuild.campaign import (
     create_rebuild_run,
     enqueue_archive_copy,
+    enqueue_markdown_rebuild,
     execute_archive_copy,
 )
 from oa_knowledge.rebuild.inventory import build_inventory
@@ -93,6 +94,46 @@ def test_enqueue_uses_required_idempotency_key_and_skips_successful_output(
     execute_archive_copy(session, settings, run.id, [inventory_row])
     assert session.scalar(select(RebuildOutput)).status == "success"
     assert enqueue_archive_copy(session, run.id, [inventory_row], settings=settings) == 0
+
+
+def test_confirmed_item_enqueues_rebuild_parse_from_copied_evidence(
+    session, settings, inventory_row
+) -> None:
+    """Removing copied-evidence admission must leave rebuild work unqueued."""
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    execute_archive_copy(session, settings, run.id, [inventory_row])
+    item = session.get(OAItem, inventory_row.item_id)
+    assert item is not None
+    item.classification_state = "confirmed"
+    item.source_type = "internal"
+    item.internal_category = "风险管理"
+    item.document_date = datetime(2026, 8, 20, tzinfo=UTC).date()
+    session.commit()
+
+    assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+
+    task = session.scalar(select(PipelineTask).where(
+        PipelineTask.run_id == run.id, PipelineTask.stage == "rebuild_parse",
+    ))
+    assert task is not None
+    assert task.idempotency_key == (
+        f"rebuild:{run.id}:rebuild_parse:{inventory_row.file_id}:{inventory_row.sha256}"
+    )
+
+
+def test_unconfirmed_item_is_never_enqueued_for_markdown_rebuild(
+    session, settings, inventory_row
+) -> None:
+    """Changing confirmation admission must not create derived-output work."""
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    execute_archive_copy(session, settings, run.id, [inventory_row])
+
+    assert enqueue_markdown_rebuild(session, run.id, [inventory_row.item_id]) == 0
+    assert session.scalar(select(PipelineTask).where(
+        PipelineTask.run_id == run.id, PipelineTask.stage == "rebuild_parse",
+    )) is None
 
 
 def test_execute_drives_enqueued_task_and_run_to_terminal_outcomes(
