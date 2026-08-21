@@ -8,6 +8,7 @@ import os
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -16,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
-from oa_knowledge.db.models import ArchivedFile, OAItem, RebuildOutput
+from oa_knowledge.db.models import ArchivedFile, OAItem, PipelineRun, RebuildOutput
 from oa_knowledge.rebuild.body_source import body_markdown_filename
 from oa_knowledge.rebuild.markdown import (
     _attachment_markdown_filename,
@@ -45,6 +46,9 @@ class ValidationCheck:
 _LINK = re.compile(r"!?\[[^]]*\]\((?P<target>[^)]+)\)")
 _ROOT_DIRS = frozenset({"archive", "parse", "markdown", "state", "runtime"})
 _DERIVED_KINDS = frozenset({"body_markdown", "attachment_markdown", "item_index"})
+_EVIDENCE_SCHEMA_VERSION = 1
+_EVIDENCE_PRODUCER = "oaradar.rebuild.acceptance.v1"
+_MAX_EVIDENCE_AGE = timedelta(hours=24)
 
 
 def _check(code: str, expected: int | None, actual: int | None) -> ValidationCheck:
@@ -109,6 +113,7 @@ def _hash_matches(settings: Settings, output: RebuildOutput, source: ArchivedFil
     return bool(
         target
         and output.status == "success"
+        and source.download_status == "verified"
         and output.sha256 == source.sha256
         and source.size_bytes is not None
         and source.sha256
@@ -270,6 +275,94 @@ def _acceptance_evidence(settings: Settings) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _artifact_sha256(settings: Settings, output: RebuildOutput) -> str | None:
+    """Return a local artifact digest without exposing its location or content."""
+    target = _safe_target(settings, output.target_relpath)
+    if target is None:
+        return None
+    try:
+        if output.kind == "parse":
+            return _tree_sha256(target)
+        if output.kind in {"body_markdown", "attachment_markdown"}:
+            assets = target.parent / "assets" / str(output.source_file_id)
+            return _publication_sha(
+                target, assets if assets.is_dir() and not assets.is_symlink() else None,
+            )
+        return _sha256_file(target)
+    except (OSError, ValueError):
+        return None
+
+
+def _run_artifact_fingerprint(
+    settings: Settings, run_id: int, outputs: Sequence[RebuildOutput],
+) -> str:
+    """Fingerprint successful current-run outputs with redacted ledger bindings."""
+    records = [
+        {
+            "artifact_sha256": _artifact_sha256(settings, output),
+            "kind": output.kind,
+            "ledger_sha256": output.sha256,
+            "oa_item_id": output.oa_item_id,
+            "source_file_id": output.source_file_id,
+            "target_relpath": output.target_relpath,
+        }
+        for output in outputs
+        if output.status == "success"
+    ]
+    payload = {
+        "run_id": run_id,
+        "schema_version": _EVIDENCE_SCHEMA_VERSION,
+        "outputs": sorted(
+            records,
+            key=lambda record: (
+                str(record["kind"]), int(record["oa_item_id"]),
+                -1 if record["source_file_id"] is None else int(record["source_file_id"]),
+                str(record["target_relpath"]),
+            ),
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _evidence_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _as_utc(parsed) if parsed.tzinfo is not None else None
+
+
+def _bound_evidence(
+    evidence: dict[str, object], run: PipelineRun | None, fingerprint: str,
+) -> bool:
+    """Accept only current, schema-bound, locally identified evidence."""
+    if run is None or not isinstance(evidence.get("run_id"), int):
+        return False
+    finished_at = _as_utc(run.finished_at)
+    generated_at = _evidence_timestamp(evidence.get("generated_at"))
+    now = datetime.now(timezone.utc)
+    return (
+        evidence.get("schema_version") == _EVIDENCE_SCHEMA_VERSION
+        and evidence.get("producer") == _EVIDENCE_PRODUCER
+        and evidence["run_id"] == run.id
+        and evidence.get("fingerprint") == fingerprint
+        and finished_at is not None
+        and generated_at is not None
+        and finished_at <= generated_at <= now
+        and now - generated_at <= _MAX_EVIDENCE_AGE
+    )
+
+
 def _retryable_attachment_is_indexed(
     output: RebuildOutput | None, index_texts: dict[int, list[str]], source: ArchivedFile,
 ) -> bool:
@@ -293,6 +386,7 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     metadata, filenames, or local paths can escape this function.
     """
     with session.no_autoflush:
+        run = session.get(PipelineRun, run_id)
         outputs = list(session.scalars(select(RebuildOutput).where(RebuildOutput.run_id == run_id)))
         sources = list(session.scalars(select(ArchivedFile).join(OAItem).where(OAItem.source_channel == "done")))
         items = {item.id: item for item in session.scalars(select(OAItem).where(OAItem.source_channel == "done"))}
@@ -300,12 +394,29 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     originals = [output for output in outputs if output.kind == "original"]
     parses = [output for output in outputs if output.kind == "parse"]
     derived = [output for output in outputs if output.kind in _DERIVED_KINDS]
-    current_originals = [output for output in originals if output.status == "success"]
     valid_originals = [
         output for output in originals
         if (source := source_by_id.get(output.source_file_id)) is not None
         and _valid_original(settings, output, source, items.get(output.oa_item_id))
     ]
+    baseline_source_ids = {output.source_file_id for output in originals}
+    run_succeeded = bool(
+        run
+        and run.pipeline_type == "data_rebuild"
+        and run.status == "completed"
+        and run.total_tasks > 0
+        and run.completed_tasks == run.total_tasks
+        and run.failed_tasks == 0
+        and run.finished_at is not None
+    )
+    originals_complete = bool(
+        run_succeeded
+        and originals
+        and len(baseline_source_ids) == len(originals)
+        and all(output.status == "success" for output in originals)
+        and len(valid_originals) == len(originals)
+        and {output.source_file_id for output in valid_originals} == baseline_source_ids
+    )
     original_source_ids = {output.source_file_id for output in valid_originals}
 
     root = resolve_rebuild_root(settings)
@@ -328,15 +439,12 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     attachments = [output for output in derived if output.kind == "attachment_markdown" and output.status == "success"]
 
     checks: list[ValidationCheck] = []
-    checks.append(_check("ORIGINALS_COMPLETE", len(current_originals), len(valid_originals)))
+    baseline_count = len(originals)
     checks.append(_check(
-        "ORIGINAL_HASHES_MATCH",
-        len(current_originals),
-        sum(
-            (source := source_by_id.get(output.source_file_id)) is not None
-            and _hash_matches(settings, output, source)
-            for output in current_originals
-        ),
+        "ORIGINALS_COMPLETE", baseline_count, baseline_count if originals_complete else -1,
+    ))
+    checks.append(_check(
+        "ORIGINAL_HASHES_MATCH", baseline_count, baseline_count if originals_complete else -1,
     ))
     checks.append(_check("NO_UNKNOWN_ORIGINALS", 0, unknown_originals if archive_tree_safe else unknown_originals + 1))
     checks.append(_check("CONFIRMED_OUTPUTS_ONLY", 0, sum(items.get(output.oa_item_id) is None or items[output.oa_item_id].classification_state != "confirmed" for output in derived)))
@@ -424,6 +532,9 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
         for output in published_outputs
     )
     evidence = _acceptance_evidence(settings)
+    evidence_is_bound = _bound_evidence(
+        evidence, run, _run_artifact_fingerprint(settings, run_id, outputs),
+    )
     index_by_item = {output.oa_item_id: output for output in valid_indexes}
     filterable_items = sum(
         (index := index_by_item.get(item_id)) is not None
@@ -433,13 +544,16 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     checks.append(_check(
         "WEBUI_FILTER_CONTRACT",
         len(confirmed_candidate_ids),
-        filterable_items if evidence.get("webui_filter_contract") is True else 0,
+        filterable_items if evidence_is_bound and evidence.get("webui_filter_contract") is True else 0,
     ))
     checks.append(_check("OBSIDIAN_SEARCH_FIELDS", len(published_outputs), searchable_outputs))
     checks.append(_check(
         "SAMPLE_EVIDENCE_COMPLETE", 200,
-        min(_evidence_count(evidence, "internal_sample_count"), 100)
-        + min(_evidence_count(evidence, "external_sample_count"), 100),
+        (
+            min(_evidence_count(evidence, "internal_sample_count"), 100)
+            + min(_evidence_count(evidence, "external_sample_count"), 100)
+            if evidence_is_bound else 0
+        ),
     ))
 
     try:
@@ -456,7 +570,7 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
                 "automated_tests_passed", "frontend_check_passed", "build_passed",
                 "synthetic_smoke_passed",
             )
-        ),
+        ) if evidence_is_bound else 0,
     ))
     return checks
 
