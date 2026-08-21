@@ -29,6 +29,19 @@ class BodySource:
     reason: str
 
 
+@dataclass(frozen=True)
+class VerifiedPageBody:
+    """Sanitized page text bound to the exact copied snapshot that produced it."""
+
+    text: str
+    output_id: int
+    source_file_id: int
+    oa_item_id: int
+    target_relpath: str
+    sha256: str
+    size_bytes: int
+
+
 _ATTACHMENT_ROLE_PRIORITY = {
     "official_body": 0,
     "official_attachment": 1,
@@ -165,10 +178,10 @@ def _sanitize_html_to_text(content: str) -> str | None:
     return parser.text()
 
 
-def load_verified_page_body(
+def load_verified_page_body_evidence(
     session: Session, settings: Settings, item_id: int, *, run_id: int,
-) -> str | None:
-    """Read sanitized page text solely from one verified copied body snapshot."""
+) -> VerifiedPageBody | None:
+    """Return text and the exact verified copied snapshot as one observation."""
     rows = session.execute(
         select(ArchivedFile, RebuildOutput)
         .join(RebuildOutput, RebuildOutput.source_file_id == ArchivedFile.id)
@@ -199,5 +212,20 @@ def load_verified_page_body(
             or hashlib.sha256(content).hexdigest() != snapshot.sha256
         ):
             continue
-        return _sanitize_html_to_text(content.decode("utf-8", errors="replace"))
+        text = _sanitize_html_to_text(content.decode("utf-8", errors="replace"))
+        if text is None:
+            continue
+        return VerifiedPageBody(
+            text=text, output_id=output.id, source_file_id=snapshot.id,
+            oa_item_id=item_id, target_relpath=output.target_relpath,
+            sha256=snapshot.sha256, size_bytes=snapshot.size_bytes,
+        )
     return None
+
+
+def load_verified_page_body(
+    session: Session, settings: Settings, item_id: int, *, run_id: int,
+) -> str | None:
+    """Compatibility wrapper returning only sanitized verified page text."""
+    evidence = load_verified_page_body_evidence(session, settings, item_id, run_id=run_id)
+    return evidence.text if evidence is not None else None

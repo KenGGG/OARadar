@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,6 +107,11 @@ def test_parser_reads_rebuilt_original_not_live_file(
     target = resolve_rebuild_path(settings, result.output_relpath)
     markdown = next((target / "stub-v1").glob("*.md"))
     assert markdown.read_text(encoding="utf-8") == "# copied bytes\n"
+    manifest = json.loads((target / ".oaradar-parse.json").read_text(encoding="utf-8"))
+    assert manifest == {
+        "engine": "stub", "engine_version": "1",
+        "source_file_id": source.id, "source_sha256": original.sha256,
+    }
     assert not (settings.data_root / "parse").exists()
 
 

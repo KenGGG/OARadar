@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -321,6 +322,13 @@ def parse_rebuilt_source(
             product = parsed.output_path.resolve()
             if not product.is_file() or staging not in (product, *product.parents):
                 raise ValueError("parser output escaped rebuild staging")
+            (staging / ".oaradar-parse.json").write_text(
+                json.dumps({
+                    "engine": parsed.engine, "engine_version": parsed.engine_version,
+                    "source_file_id": source.id, "source_sha256": source_sha,
+                }, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
             product_sha = _tree_sha256(staging)
             if product_sha is None:
                 raise ValueError("parser produced no regular files")

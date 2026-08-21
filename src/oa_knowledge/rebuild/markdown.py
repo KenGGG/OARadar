@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
 
 import yaml
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,7 +22,7 @@ from oa_knowledge.config import Settings
 from oa_knowledge.db.models import ArchivedFile, OAItem, RebuildOutput
 from oa_knowledge.rebuild.body_source import (
     body_markdown_filename,
-    load_verified_page_body,
+    load_verified_page_body_evidence,
     select_body_source,
 )
 from oa_knowledge.rebuild.parser import (
@@ -36,6 +38,7 @@ from oa_knowledge.rebuild.paths import (
     resolve_rebuild_path,
     safe_component,
 )
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
 
 class RebuildPublicationError(RuntimeError):
@@ -57,6 +60,9 @@ class _ParseEvidence:
     original_relpath: str
     source_sha256: str
     source_size: int
+    source_name: str
+    source_role: str
+    source_depth: int
     parser_name: str
     parser_version: str
 
@@ -77,6 +83,22 @@ class _StagedPublication:
     markdown: Path
     assets: Path | None
     sha256: str
+
+
+@dataclass(frozen=True)
+class _ItemFingerprint:
+    item_id: int
+    oa_item_key: str
+    workitem_id_text: str | None
+    title: str
+    document_number: str | None
+    document_date: object
+    initiated_at: object
+    completed_at: object
+    classification_state: str
+    source_type: str | None
+    internal_category: str | None
+    external_issuer: str | None
 
 
 _MARKDOWN_LINK = re.compile(r"(?P<prefix>!?)\[(?P<label>[^]]*)\]\((?P<target>[^)]+)\)")
@@ -123,13 +145,62 @@ def _strict_asset_relpath(value: Path) -> PurePosixPath:
     return relative
 
 
-def _parser_version(parser_name: str, markdown_path: Path, parse_root: Path) -> str:
-    relative = markdown_path.relative_to(parse_root)
-    product = relative.parts[0] if len(relative.parts) > 1 else ""
-    for prefix in (f"{parser_name}-v", f"{parser_name}-"):
-        if product.startswith(prefix) and product[len(prefix) :]:
-            return product[len(prefix) :]
-    return "unknown"
+def _parse_manifest(parse_root: Path, source: ArchivedFile) -> tuple[str, str]:
+    manifest_path = parse_root / ".oaradar-parse.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RebuildPublicationError("PARSE_MANIFEST_INVALID") from exc
+    engine = payload.get("engine")
+    version = payload.get("engine_version")
+    if (
+        not isinstance(engine, str)
+        or not engine
+        or not isinstance(version, str)
+        or not version
+        or payload.get("source_file_id") != source.id
+        or payload.get("source_sha256") != source.sha256
+    ):
+        raise RebuildPublicationError("PARSE_MANIFEST_INVALID")
+    return engine, version
+
+
+def _fingerprint_item(item: OAItem) -> _ItemFingerprint:
+    return _ItemFingerprint(
+        item_id=item.id,
+        oa_item_key=item.oa_item_key,
+        workitem_id_text=item.workitem_id_text,
+        title=item.title,
+        document_number=item.document_number,
+        document_date=item.document_date,
+        initiated_at=item.initiated_at,
+        completed_at=item.completed_at,
+        classification_state=item.classification_state,
+        source_type=item.source_type,
+        internal_category=item.internal_category,
+        external_issuer=item.external_issuer,
+    )
+
+
+def _fresh_item_matches(session: Session, fingerprint: _ItemFingerprint) -> bool:
+    with session.get_bind().connect() as connection:
+        row = connection.execute(
+            select(
+                OAItem.id,
+                OAItem.oa_item_key,
+                OAItem.workitem_id_text,
+                OAItem.title,
+                OAItem.document_number,
+                OAItem.document_date,
+                OAItem.initiated_at,
+                OAItem.completed_at,
+                OAItem.classification_state,
+                OAItem.source_type,
+                OAItem.internal_category,
+                OAItem.external_issuer,
+            ).where(OAItem.id == fingerprint.item_id)
+        ).one_or_none()
+    return row == tuple(fingerprint.__dict__.values())
 
 
 def _resolve_original(
@@ -221,7 +292,7 @@ def _resolve_parse_evidence(
     if len(markdown_files) != 1:
         raise RebuildPublicationError("PARSE_MARKDOWN_AMBIGUOUS")
     markdown_path = markdown_files[0]
-    parser_name = PurePosixPath(success.target_relpath).name
+    parser_name, parser_version = _parse_manifest(parse_root, source)
     evidence = _ParseEvidence(
         output_id=success.id,
         original_output_id=original_output.id,
@@ -232,8 +303,11 @@ def _resolve_parse_evidence(
         original_relpath=original_output.target_relpath,
         source_sha256=source.sha256 or "",
         source_size=source.size_bytes or 0,
+        source_name=source.original_name,
+        source_role=source.file_role,
+        source_depth=source.depth,
         parser_name=parser_name,
-        parser_version=_parser_version(parser_name, markdown_path, parse_root),
+        parser_version=parser_version,
     )
     return evidence, parse_root, markdown_path
 
@@ -278,6 +352,9 @@ def _fresh_parse_matches(
                 ArchivedFile.size_bytes,
                 ArchivedFile.sha256,
                 ArchivedFile.download_status,
+                ArchivedFile.original_name,
+                ArchivedFile.file_role,
+                ArchivedFile.depth,
             ).where(ArchivedFile.id == evidence.source_file_id)
         ).one_or_none()
     if (
@@ -306,6 +383,9 @@ def _fresh_parse_matches(
             evidence.source_size,
             evidence.source_sha256,
             "verified",
+            evidence.source_name,
+            evidence.source_role,
+            evidence.source_depth,
         )
     ):
         return False
@@ -351,7 +431,16 @@ def _rewrite_links(
 ) -> str:
     def replace(match: re.Match[str]) -> str:
         raw_target = match.group("target").strip()
-        target = raw_target.split(maxsplit=1)[0]
+        if raw_target.startswith("<"):
+            closing = raw_target.find(">")
+            if closing < 1:
+                raise RebuildPublicationError("UNSAFE_PARSE_LINK")
+            target = raw_target[1:closing]
+            title = raw_target[closing + 1 :].strip()
+        else:
+            parts = raw_target.split(maxsplit=1)
+            target = parts[0]
+            title = parts[1] if len(parts) == 2 else ""
         parsed = urlparse(target)
         if (
             "\\" in target
@@ -374,7 +463,14 @@ def _rewrite_links(
         final_target = PurePosixPath(asset_name) / _strict_asset_relpath(
             source_asset.relative_to(parse_resolved)
         )
-        return f"{match.group('prefix')}[{match.group('label')}]({final_target.as_posix()})"
+        rendered_target = final_target.as_posix()
+        if " " in rendered_target:
+            rendered_target = f"<{rendered_target}>"
+        suffix = f" {title}" if title else ""
+        return (
+            f"{match.group('prefix')}[{match.group('label')}]"
+            f"({rendered_target}{suffix})"
+        )
 
     return _MARKDOWN_LINK.sub(replace, content)
 
@@ -410,7 +506,7 @@ def _stage_parsed_markdown(
         asset_files = [
             path
             for path in _validated_regular_files(parse_root)
-            if path != parser_markdown
+            if path != parser_markdown and path.name != ".oaradar-parse.json"
         ]
         if asset_files:
             for asset in asset_files:
@@ -493,6 +589,18 @@ def _target_output(
     )
 
 
+def _target_outputs(session: Session, *, target_relpath: str) -> list[RebuildOutput]:
+    return list(
+        session.scalars(
+            select(RebuildOutput)
+            .where(
+                RebuildOutput.target_relpath == target_relpath,
+            )
+            .order_by(RebuildOutput.id)
+        )
+    )
+
+
 def _verified_publication(
     settings: Settings,
     output: RebuildOutput,
@@ -528,18 +636,30 @@ def _ensure_target_available(
     kind: str,
     target_relpath: str,
 ) -> RebuildOutput | None:
-    owner = _target_output(session, target_relpath=target_relpath)
-    if owner is not None:
-        if (
+    owners = _target_outputs(session, target_relpath=target_relpath)
+    foreign = [
+        owner
+        for owner in owners
+        if not (
             owner.run_id == run_id
             and owner.source_file_id == source_file_id
             and owner.kind == kind
-            and _verified_publication(
-                settings, owner, source_file_id=source_file_id, kind=kind
-            )
-        ):
-            return owner
+        )
+    ]
+    if foreign or len(owners) > 1:
         raise RebuildPublicationError("TARGET_CONFLICT")
+    if owners:
+        owner = owners[0]
+        if owner.status == "success":
+            if _verified_publication(
+                settings,
+                owner,
+                source_file_id=source_file_id,
+                kind=kind,
+            ):
+                return owner
+            raise RebuildPublicationError("TARGET_CONFLICT")
+        return owner
     target = resolve_rebuild_path(settings, target_relpath)
     assets = target.parent / "assets" / str(source_file_id)
     if target.exists() or assets.exists():
@@ -557,18 +677,40 @@ def _reserve_output(
     target_relpath: str,
     sha256: str,
 ) -> RebuildOutput:
-    output = RebuildOutput(
-        run_id=run_id,
-        oa_item_id=item_id,
-        source_file_id=source_file_id,
-        kind=kind,
-        target_relpath=target_relpath,
-        sha256=sha256,
-        status="pending",
-        error_code=None,
-    )
-    session.add(output)
     try:
+        session.rollback()
+        session.execute(text("BEGIN IMMEDIATE"))
+        owners = _target_outputs(session, target_relpath=target_relpath)
+        foreign = [
+            owner
+            for owner in owners
+            if not (
+                owner.run_id == run_id
+                and owner.oa_item_id == item_id
+                and owner.source_file_id == source_file_id
+                and owner.kind == kind
+            )
+        ]
+        if foreign or len(owners) > 1:
+            session.rollback()
+            raise RebuildPublicationError("TARGET_CONFLICT")
+        if owners:
+            output = owners[0]
+            output.sha256 = sha256
+            output.status = "pending"
+            output.error_code = None
+        else:
+            output = RebuildOutput(
+                run_id=run_id,
+                oa_item_id=item_id,
+                source_file_id=source_file_id,
+                kind=kind,
+                target_relpath=target_relpath,
+                sha256=sha256,
+                status="pending",
+                error_code=None,
+            )
+            session.add(output)
         session.commit()
     except IntegrityError as exc:
         session.rollback()
@@ -581,20 +723,37 @@ def _publish_staged(
     settings: Settings,
     output: RebuildOutput,
     staged: _StagedPublication,
+    *,
+    validate: Callable[[], bool],
 ) -> RebuildOutput:
     target = resolve_rebuild_path(settings, output.target_relpath)
     if output.source_file_id is None and staged.assets is not None:
         raise RebuildPublicationError("ASSET_OWNER_MISSING")
     assets_target = target.parent / "assets" / str(output.source_file_id)
     try:
+        if not validate():
+            raise RebuildPublicationError("SOURCE_CHANGED")
         if staged.assets is not None:
             assets_target.parent.mkdir(parents=True, exist_ok=True)
-            if not _promote_no_clobber(staged.assets, assets_target):
+            if assets_target.exists():
+                if _tree_sha256(assets_target) != _tree_sha256(staged.assets):
+                    raise RebuildPublicationError("TARGET_CONFLICT")
+            elif not _promote_no_clobber(staged.assets, assets_target):
                 raise RebuildPublicationError("TARGET_CONFLICT")
-        try:
-            os.link(staged.markdown, target)
-        except FileExistsError as exc:
-            raise RebuildPublicationError("TARGET_CONFLICT") from exc
+        elif assets_target.exists():
+            raise RebuildPublicationError("TARGET_CONFLICT")
+        if not validate():
+            raise RebuildPublicationError("SOURCE_CHANGED")
+        if target.exists():
+            if _sha256_bytes(target.read_bytes()) != _sha256_bytes(
+                staged.markdown.read_bytes()
+            ):
+                raise RebuildPublicationError("TARGET_CONFLICT")
+        else:
+            try:
+                os.link(staged.markdown, target)
+            except FileExistsError as exc:
+                raise RebuildPublicationError("TARGET_CONFLICT") from exc
         try:
             descriptor = os.open(
                 target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -634,39 +793,22 @@ def _resolve_page_evidence(
     run_id: int,
     item_id: int,
 ) -> tuple[_PageEvidence, str] | None:
-    text = load_verified_page_body(session, settings, item_id, run_id=run_id)
-    if text is None:
+    verified = load_verified_page_body_evidence(
+        session,
+        settings,
+        item_id,
+        run_id=run_id,
+    )
+    if verified is None:
         return None
-    rows = session.execute(
-        select(ArchivedFile, RebuildOutput)
-        .join(
-            RebuildOutput,
-            RebuildOutput.source_file_id == ArchivedFile.id,
-        )
-        .where(
-            ArchivedFile.oa_item_id == item_id,
-            ArchivedFile.file_role == "body_snapshot",
-            ArchivedFile.download_status == "verified",
-            RebuildOutput.run_id == run_id,
-            RebuildOutput.kind == "original",
-            RebuildOutput.status == "success",
-            RebuildOutput.sha256 == ArchivedFile.sha256,
-        )
-        .order_by(RebuildOutput.id.desc())
-    ).all()
-    for source, output in rows:
-        if source.sha256 and source.size_bytes is not None:
-            path = resolve_rebuild_path(settings, output.target_relpath)
-            if _file_matches(path, size_bytes=source.size_bytes, sha256=source.sha256):
-                return _PageEvidence(
-                    output.id,
-                    source.id,
-                    item_id,
-                    output.target_relpath,
-                    source.sha256,
-                    source.size_bytes,
-                ), text
-    return None
+    return _PageEvidence(
+        verified.output_id,
+        verified.source_file_id,
+        verified.oa_item_id,
+        verified.target_relpath,
+        verified.sha256,
+        verified.size_bytes,
+    ), verified.text
 
 
 def _fresh_page_matches(
@@ -714,6 +856,92 @@ def _fresh_page_matches(
     )
 
 
+def _fresh_body_selection(
+    session: Session,
+    settings: Settings,
+    *,
+    run_id: int,
+    item_id: int,
+):
+    with Session(bind=session.get_bind(), expire_on_commit=False) as fresh:
+        item = fresh.get(OAItem, item_id)
+        if item is None:
+            return None, None
+        files = list(
+            fresh.scalars(
+                select(ArchivedFile).where(
+                    ArchivedFile.oa_item_id == item_id,
+                )
+            )
+        )
+        page = _resolve_page_evidence(
+            fresh,
+            settings,
+            run_id=run_id,
+            item_id=item_id,
+        )
+        return select_body_source(item, files, page is not None), page
+
+
+def _fresh_parsed_publication_matches(
+    session: Session,
+    settings: Settings,
+    *,
+    run_id: int,
+    evidence: _ParseEvidence,
+    item_fingerprint: _ItemFingerprint,
+    kind: str,
+) -> bool:
+    if not _fresh_parse_matches(
+        session, settings, run_id=run_id, evidence=evidence
+    ) or not _fresh_item_matches(session, item_fingerprint):
+        return False
+    selected, _ = _fresh_body_selection(
+        session,
+        settings,
+        run_id=run_id,
+        item_id=item_fingerprint.item_id,
+    )
+    if kind == "body_markdown":
+        return (
+            evidence.source_role in MARKDOWN_SOURCE_ROLES
+            and selected is not None
+            and selected.kind == "attachment"
+            and selected.source_file_id == evidence.source_file_id
+        )
+    return evidence.source_role in MARKDOWN_SOURCE_ROLES and not (
+        selected is not None
+        and selected.kind == "attachment"
+        and selected.source_file_id == evidence.source_file_id
+    )
+
+
+def _fresh_page_publication_matches(
+    session: Session,
+    settings: Settings,
+    *,
+    run_id: int,
+    evidence: _PageEvidence,
+    item_fingerprint: _ItemFingerprint,
+) -> bool:
+    if not _fresh_page_matches(
+        session, settings, run_id=run_id, evidence=evidence
+    ) or not _fresh_item_matches(session, item_fingerprint):
+        return False
+    selected, page = _fresh_body_selection(
+        session,
+        settings,
+        run_id=run_id,
+        item_id=item_fingerprint.item_id,
+    )
+    return (
+        selected is not None
+        and selected.kind == "page_body"
+        and page is not None
+        and page[0] == evidence
+    )
+
+
 def _publish_parsed(
     session: Session,
     settings: Settings,
@@ -724,6 +952,9 @@ def _publish_parsed(
     filename: str,
     kind: str,
 ) -> RebuildOutput:
+    if source.file_role not in MARKDOWN_SOURCE_ROLES:
+        raise RebuildPublicationError("INVALID_ATTACHMENT_ROLE")
+    item_fingerprint = _fingerprint_item(item)
     item_relpath = markdown_item_relpath(item)
     target_relpath = (item_relpath / filename).as_posix()
     existing = _ensure_target_available(
@@ -734,7 +965,7 @@ def _publish_parsed(
         kind=kind,
         target_relpath=target_relpath,
     )
-    if existing is not None:
+    if existing is not None and existing.status == "success":
         return existing
     evidence, parse_root, parser_markdown = _resolve_parse_evidence(
         session,
@@ -753,7 +984,18 @@ def _publish_parsed(
         target_dir=target_dir,
         filename=filename,
     )
-    if not _fresh_parse_matches(session, settings, run_id=run_id, evidence=evidence):
+
+    def validate() -> bool:
+        return _fresh_parsed_publication_matches(
+            session,
+            settings,
+            run_id=run_id,
+            evidence=evidence,
+            item_fingerprint=item_fingerprint,
+            kind=kind,
+        )
+
+    if not validate():
         shutil.rmtree(staged.directory, ignore_errors=True)
         raise RebuildPublicationError("SOURCE_CHANGED")
     output = _reserve_output(
@@ -765,12 +1007,18 @@ def _publish_parsed(
         target_relpath=target_relpath,
         sha256=staged.sha256,
     )
-    if not _fresh_parse_matches(session, settings, run_id=run_id, evidence=evidence):
+    if not validate():
         output.status, output.error_code = "failed", "SOURCE_CHANGED"
         session.commit()
         shutil.rmtree(staged.directory, ignore_errors=True)
         raise RebuildPublicationError("SOURCE_CHANGED")
-    return _publish_staged(session, settings, output, staged)
+    return _publish_staged(
+        session,
+        settings,
+        output,
+        staged,
+        validate=validate,
+    )
 
 
 def publish_rebuilt_attachment(
@@ -784,6 +1032,8 @@ def publish_rebuilt_attachment(
         source = ledger.get(ArchivedFile, source_file_id)
         if source is None:
             raise RebuildPublicationError("SOURCE_NOT_FOUND")
+        if source.file_role not in MARKDOWN_SOURCE_ROLES:
+            raise RebuildPublicationError("INVALID_ATTACHMENT_ROLE")
         item = ledger.get(OAItem, source.oa_item_id)
         if item is None:
             raise RebuildPublicationError("ITEM_NOT_FOUND")
@@ -852,6 +1102,7 @@ def publish_rebuilt_body(
         if selected.kind != "page_body" or page is None:
             raise RebuildPublicationError("BODY_SOURCE_UNAVAILABLE")
         evidence, body = page
+        item_fingerprint = _fingerprint_item(item)
         item_relpath = markdown_item_relpath(item)
         target_relpath = (item_relpath / filename).as_posix()
         existing = _ensure_target_available(
@@ -862,7 +1113,7 @@ def publish_rebuilt_body(
             kind="body_markdown",
             target_relpath=target_relpath,
         )
-        if existing is not None:
+        if existing is not None and existing.status == "success":
             return existing
         target_dir = resolve_rebuild_path(settings, item_relpath)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -873,7 +1124,17 @@ def publish_rebuilt_body(
             target_dir=target_dir,
             filename=filename,
         )
-        if not _fresh_page_matches(ledger, settings, run_id=run_id, evidence=evidence):
+
+        def validate() -> bool:
+            return _fresh_page_publication_matches(
+                ledger,
+                settings,
+                run_id=run_id,
+                evidence=evidence,
+                item_fingerprint=item_fingerprint,
+            )
+
+        if not validate():
             shutil.rmtree(staged.directory, ignore_errors=True)
             raise RebuildPublicationError("SOURCE_CHANGED")
         output = _reserve_output(
@@ -885,9 +1146,15 @@ def publish_rebuilt_body(
             target_relpath=target_relpath,
             sha256=staged.sha256,
         )
-        if not _fresh_page_matches(ledger, settings, run_id=run_id, evidence=evidence):
+        if not validate():
             output.status, output.error_code = "failed", "SOURCE_CHANGED"
             ledger.commit()
             shutil.rmtree(staged.directory, ignore_errors=True)
             raise RebuildPublicationError("SOURCE_CHANGED")
-        return _publish_staged(ledger, settings, output, staged)
+        return _publish_staged(
+            ledger,
+            settings,
+            output,
+            staged,
+            validate=validate,
+        )
