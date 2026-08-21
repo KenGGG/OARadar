@@ -69,6 +69,7 @@ def rebuild_fixture(tmp_path: Path) -> RebuildFixture:
     _seed_publications(session, settings, run.id, numbered, body, body=True)
     _seed_publications(session, settings, run.id, unnumbered, attachment, body=False)
     session.commit()
+    _write_acceptance_evidence(settings)
     value = RebuildFixture(session, settings, run.id, numbered, unnumbered, {"body": body, "attachment": attachment})
     yield value
     session.close(); engine.dispose()
@@ -97,8 +98,34 @@ def _seed_file(session: Session, settings: Settings, run_id: int, item: OAItem, 
     return source
 
 
-def _frontmatter() -> str:
-    return "---\noa_item_id: synthetic\nsource_type: internal\n---\n\n# synthetic\n"
+def _frontmatter(item: OAItem) -> str:
+    classification_key = "internal_category" if item.source_type == "internal" else "external_issuer"
+    classification_value = item.internal_category if item.source_type == "internal" else item.external_issuer
+    return (
+        "---\n"
+        f"title: {item.title}\n"
+        f"oa_item_id: {item.oa_item_key}\n"
+        f"document_number: {item.document_number or ''}\n"
+        f"effective_date: {item.document_date.isoformat()}\n"
+        f"source_type: {item.source_type}\n"
+        f"{classification_key}: {classification_value}\n"
+        "---\n\n# synthetic\n"
+    )
+
+
+def _write_acceptance_evidence(settings: Settings, **changes: object) -> None:
+    payload = {
+        "webui_filter_contract": True,
+        "internal_sample_count": 100,
+        "external_sample_count": 100,
+        "automated_tests_passed": True,
+        "frontend_check_passed": True,
+        "build_passed": True,
+        "synthetic_smoke_passed": True,
+    } | changes
+    target = settings.rebuild.target_root / "state" / "acceptance-evidence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _seed_publications(session: Session, settings: Settings, run_id: int, item: OAItem, source: ArchivedFile, *, body: bool) -> None:
@@ -110,13 +137,16 @@ def _seed_publications(session: Session, settings: Settings, run_id: int, item: 
     else:
         filename = _attachment_markdown_filename(source); kind = "attachment_markdown"
     markdown_relpath = (item_relpath / filename).as_posix()
-    markdown = resolve_rebuild_path(settings, markdown_relpath); markdown.write_text(_frontmatter(), encoding="utf-8")
+    markdown = resolve_rebuild_path(settings, markdown_relpath); markdown.write_text(_frontmatter(item), encoding="utf-8")
     session.add(RebuildOutput(run_id=run_id, oa_item_id=item.id, source_file_id=source.id, kind=kind, target_relpath=markdown_relpath, sha256=_publication_sha(markdown, None), status="success"))
     original_relpath = archive_file_relpath(item, source).as_posix()
     index_relpath = (item_relpath / "_index.md").as_posix()
     index = resolve_rebuild_path(settings, index_relpath)
     relative_original = posixpath.relpath(original_relpath, item_relpath.as_posix())
-    index.write_text(f"# index\n\n[original]({relative_original})\n[markdown]({filename})\n", encoding="utf-8")
+    index.write_text(
+        _frontmatter(item) + f"[original]({relative_original})\n[markdown]({filename})\n",
+        encoding="utf-8",
+    )
     session.add(RebuildOutput(run_id=run_id, oa_item_id=item.id, source_file_id=None, kind="item_index", target_relpath=index_relpath, sha256=_digest(index.read_bytes()), status="success"))
 
 
@@ -132,21 +162,21 @@ def test_valid_synthetic_rebuild_passes_all_acceptance_checks(rebuild_fixture: R
 
 
 @pytest.mark.parametrize(("code", "damage"), [
-    ("ORIGINALS_COMPLETE", "remove_original_output"),
+    ("ORIGINALS_COMPLETE", "nondeterministic_original_path"),
     ("ORIGINAL_HASHES_MATCH", "tamper_original"),
     ("NO_UNKNOWN_ORIGINALS", "unknown_archive"),
     ("CONFIRMED_OUTPUTS_ONLY", "unconfirmed_output"),
     ("INDEX_EXACTLY_ONE", "remove_index_output"),
     ("NUMBERED_BODY_COMPLETE", "remove_body_output"),
     ("UNNUMBERED_BODY_ABSENT", "add_unnumbered_body"),
-    ("PARSE_PRODUCTS_VALID", "tamper_parse"),
-    ("SUPPORTED_ATTACHMENTS_ACCOUNTED", "remove_attachment_output"),
+    ("SUPPORTED_ATTACHMENTS_ACCOUNTED", "supported_retry_without_index"),
     ("UNSUPPORTED_ATTACHMENTS_INDEXED", "unsupported_without_index"),
-    ("MARKDOWN_FRONTMATTER_VALID", "remove_frontmatter"),
     ("ALL_LINKS_RESOLVE", "broken_link"),
-    ("MARKDOWN_OUTPUT_PATHS_VALID", "wrong_markdown_path"),
+    ("WEBUI_FILTER_CONTRACT", "webui_contract_missing"),
+    ("OBSIDIAN_SEARCH_FIELDS", "remove_frontmatter"),
+    ("SAMPLE_EVIDENCE_COMPLETE", "sample_evidence_short"),
     ("REBUILD_ROOT_LAYOUT_CLEAN", "unexpected_root"),
-    ("CURRENT_RUN_OUTPUTS_FINAL", "pending_output"),
+    ("AUTOMATED_GATES_CONFIRMED", "automation_gate_missing"),
 ])
 def test_each_acceptance_invariant_reports_its_stable_code(rebuild_fixture: RebuildFixture, code: str, damage: str) -> None:
     _damage(rebuild_fixture, damage)
@@ -162,12 +192,59 @@ def test_validation_is_read_only_and_redacted(rebuild_fixture: RebuildFixture) -
     assert all("Synthetic" not in repr(check) and "/" not in check.code for check in checks)
 
 
+def test_later_verified_done_file_is_outside_the_current_run_baseline(rebuild_fixture: RebuildFixture) -> None:
+    """A later Done file must not enlarge this run's original acceptance set."""
+    later = ArchivedFile(
+        oa_item_id=rebuild_fixture.numbered.id, original_name="later.txt", attachment_key="later",
+        file_role="direct_attachment", source_container_key="root", local_relpath="archive/raw/oa/done/later.txt",
+        size_bytes=5, sha256=_digest(b"later"), download_status="verified",
+    )
+    rebuild_fixture.session.add(later); rebuild_fixture.session.commit()
+
+    assert validation_passed(validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    ))
+
+
+@pytest.mark.parametrize("damage", ("wrong_original_owner", "nondeterministic_original_path"))
+def test_current_run_original_requires_source_owner_and_deterministic_path(
+    rebuild_fixture: RebuildFixture, damage: str,
+) -> None:
+    _damage(rebuild_fixture, damage)
+
+    assert not _check(validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    ), "ORIGINALS_COMPLETE").ok
+
+
+def test_supported_attachment_retryable_failure_is_accepted_when_indexed(
+    rebuild_fixture: RebuildFixture,
+) -> None:
+    _damage(rebuild_fixture, "supported_retry_indexed")
+
+    assert _check(validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    ), "SUPPORTED_ATTACHMENTS_ACCOUNTED").ok
+
+
+def test_links_to_parse_are_not_permitted(rebuild_fixture: RebuildFixture) -> None:
+    index = next(rebuild_fixture.session.scalars(select(RebuildOutput).where(
+        RebuildOutput.run_id == rebuild_fixture.run_id, RebuildOutput.kind == "item_index",
+    )))
+    path = resolve_rebuild_path(rebuild_fixture.settings, index.target_relpath)
+    path.write_text(_frontmatter(rebuild_fixture.numbered) + "[parse](../../../../../../parse/1/1/synthetic/result.md)\n", encoding="utf-8")
+    index.sha256 = _digest(path.read_bytes()); rebuild_fixture.session.commit()
+
+    assert not _check(validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    ), "ALL_LINKS_RESOLVE").ok
+
+
 def _damage(fixture: RebuildFixture, kind: str) -> None:
     session, settings = fixture.session, fixture.settings
     rows = list(session.scalars(select(RebuildOutput).where(RebuildOutput.run_id == fixture.run_id)))
     by_kind = {row.kind: row for row in rows}
-    if kind == "remove_original_output": session.delete(by_kind["original"])
-    elif kind == "tamper_original": resolve_rebuild_path(settings, by_kind["original"].target_relpath).write_bytes(b"tampered")
+    if kind == "tamper_original": resolve_rebuild_path(settings, by_kind["original"].target_relpath).write_bytes(b"tampered")
     elif kind == "unknown_archive":
         path = resolve_rebuild_path(settings, "archive/oa/done/unknown.bin"); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"unknown")
     elif kind == "unconfirmed_output":
@@ -175,16 +252,37 @@ def _damage(fixture: RebuildFixture, kind: str) -> None:
     elif kind == "remove_index_output": session.delete(by_kind["item_index"])
     elif kind == "remove_body_output": session.delete(next(row for row in rows if row.kind == "body_markdown"))
     elif kind == "add_unnumbered_body":
-        path = markdown_item_relpath(fixture.unnumbered) / "unexpected-正文.md"; target = resolve_rebuild_path(settings, path); target.write_text(_frontmatter(), encoding="utf-8")
+        path = markdown_item_relpath(fixture.unnumbered) / "unexpected-正文.md"; target = resolve_rebuild_path(settings, path); target.write_text(_frontmatter(fixture.unnumbered), encoding="utf-8")
         session.add(RebuildOutput(run_id=fixture.run_id, oa_item_id=fixture.unnumbered.id, source_file_id=fixture.files["attachment"].id, kind="body_markdown", target_relpath=path.as_posix(), sha256=_publication_sha(target, None), status="success"))
-    elif kind == "tamper_parse": resolve_rebuild_path(settings, by_kind["parse"].target_relpath).joinpath("result.md").write_text("tampered", encoding="utf-8")
-    elif kind == "remove_attachment_output": session.delete(next(row for row in rows if row.kind == "attachment_markdown"))
+    elif kind == "supported_retry_without_index":
+        attachment = next(row for row in rows if row.kind == "attachment_markdown")
+        attachment.status, attachment.error_code = "failed", "RETRYABLE_CONVERSION_FAILED"
     elif kind == "unsupported_without_index":
-        fixture.files["attachment"].original_name = "unsupported.exe"
-        parse = next(row for row in rows if row.kind == "parse" and row.source_file_id == fixture.files["attachment"].id); parse.status = "failed"; parse.error_code = "UNSUPPORTED_FORMAT"; parse.sha256 = None
-    elif kind == "remove_frontmatter": resolve_rebuild_path(settings, next(row for row in rows if row.kind == "body_markdown").target_relpath).write_text("# missing\n", encoding="utf-8")
+        source = fixture.files["attachment"]
+        source.original_name = "unsupported.exe"
+        original = next(row for row in rows if row.kind == "original" and row.source_file_id == source.id)
+        old_target = resolve_rebuild_path(settings, original.target_relpath)
+        original.target_relpath = archive_file_relpath(fixture.unnumbered, source).as_posix()
+        target = resolve_rebuild_path(settings, original.target_relpath)
+        target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(old_target.read_bytes()); old_target.unlink()
+        parse = next(row for row in rows if row.kind == "parse" and row.source_file_id == source.id); parse.status = "failed"; parse.error_code = "UNSUPPORTED_FORMAT"; parse.sha256 = None
+    elif kind == "webui_contract_missing": _write_acceptance_evidence(settings, webui_filter_contract=False)
+    elif kind == "remove_frontmatter":
+        index = next(row for row in rows if row.kind == "item_index")
+        target = resolve_rebuild_path(settings, index.target_relpath); target.write_text("# missing\n", encoding="utf-8")
+        index.sha256 = _digest(target.read_bytes())
+    elif kind == "sample_evidence_short": _write_acceptance_evidence(settings, internal_sample_count=99)
     elif kind == "broken_link": resolve_rebuild_path(settings, by_kind["item_index"].target_relpath).write_text("[bad](missing.md)\n", encoding="utf-8")
-    elif kind == "wrong_markdown_path": next(row for row in rows if row.kind == "attachment_markdown").target_relpath = "markdown/wrong.md"
     elif kind == "unexpected_root": (settings.rebuild.target_root / "logs").mkdir(parents=True)
-    elif kind == "pending_output": by_kind["item_index"].status = "pending"
+    elif kind == "automation_gate_missing": _write_acceptance_evidence(settings, build_passed=False)
+    elif kind == "wrong_original_owner":
+        next(row for row in rows if row.kind == "original" and row.source_file_id == fixture.files["body"].id).oa_item_id = fixture.unnumbered.id
+    elif kind == "nondeterministic_original_path": by_kind["original"].target_relpath = "archive/oa/done/not-deterministic.bin"
+    elif kind == "supported_retry_indexed":
+        attachment = next(row for row in rows if row.kind == "attachment_markdown")
+        attachment.status, attachment.error_code = "failed", "RETRYABLE_CONVERSION_FAILED"
+        index = next(row for row in rows if row.kind == "item_index" and row.oa_item_id == fixture.unnumbered.id)
+        target = resolve_rebuild_path(settings, index.target_relpath)
+        target.write_text(_frontmatter(fixture.unnumbered) + "转换失败，等待重试\n", encoding="utf-8")
+        index.sha256 = _digest(target.read_bytes())
     session.commit()

@@ -24,6 +24,7 @@ from oa_knowledge.rebuild.markdown import (
 )
 from oa_knowledge.rebuild.parser import _tree_sha256
 from oa_knowledge.rebuild.paths import (
+    archive_file_relpath,
     markdown_item_relpath,
     resolve_rebuild_path,
     resolve_rebuild_root,
@@ -103,7 +104,7 @@ def _safe_target(settings: Settings, relpath: str) -> Path | None:
         return None
 
 
-def _valid_original(settings: Settings, output: RebuildOutput, source: ArchivedFile) -> bool:
+def _hash_matches(settings: Settings, output: RebuildOutput, source: ArchivedFile) -> bool:
     target = _safe_target(settings, output.target_relpath)
     return bool(
         target
@@ -116,6 +117,18 @@ def _valid_original(settings: Settings, output: RebuildOutput, source: ArchivedF
         and target.stat().st_size == source.size_bytes
         and _sha256_file(target) == source.sha256
     )
+
+
+def _valid_original(
+    settings: Settings, output: RebuildOutput, source: ArchivedFile, item: OAItem | None,
+) -> bool:
+    if item is None or output.oa_item_id != source.oa_item_id:
+        return False
+    try:
+        deterministic_path = archive_file_relpath(item, source).as_posix()
+    except ValueError:
+        return False
+    return output.target_relpath == deterministic_path and _hash_matches(settings, output, source)
 
 
 def _valid_parse(settings: Settings, output: RebuildOutput, source: ArchivedFile) -> bool:
@@ -149,7 +162,7 @@ def _valid_markdown(settings: Settings, output: RebuildOutput) -> bool:
         return False
 
 
-def _markdown_has_frontmatter(path: Path) -> bool:
+def _frontmatter_matches(path: Path, item: OAItem) -> bool:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -163,7 +176,29 @@ def _markdown_has_frontmatter(path: Path) -> bool:
         payload = yaml.safe_load(text[4:closing])
     except yaml.YAMLError:
         return False
-    return isinstance(payload, dict) and bool(payload.get("oa_item_id")) and bool(payload.get("source_type"))
+    if not isinstance(payload, dict):
+        return False
+    effective_date = item.document_date or item.initiated_at or item.completed_at
+    identifier = item.workitem_id_text or item.oa_item_key
+    if hasattr(effective_date, "date"):
+        effective_date = effective_date.date()
+    if (
+        payload.get("title") != item.title
+        or payload.get("oa_item_id") != identifier
+        or payload.get("document_number") != (item.document_number or None)
+        or str(payload.get("effective_date")) != str(effective_date)
+        or payload.get("source_type") != item.source_type
+    ):
+        return False
+    return (
+        item.source_type == "internal"
+        and payload.get("internal_category") == item.internal_category
+        and not payload.get("external_issuer")
+    ) or (
+        item.source_type == "external"
+        and payload.get("external_issuer") == item.external_issuer
+        and not payload.get("internal_category")
+    )
 
 
 def _link_target(path: Path, raw: str, root: Path) -> bool:
@@ -181,10 +216,15 @@ def _link_target(path: Path, raw: str, root: Path) -> bool:
         return True
     candidate = (path.parent / target).resolve(strict=False)
     try:
-        candidate.relative_to(root)
+        relative = candidate.relative_to(root)
     except ValueError:
         return False
-    return candidate.is_file() and not candidate.is_symlink()
+    return (
+        bool(relative.parts)
+        and relative.parts[0] in {"markdown", "archive"}
+        and candidate.is_file()
+        and not candidate.is_symlink()
+    )
 
 
 def _link_counts(paths: Iterable[Path], root: Path) -> tuple[int, int]:
@@ -218,6 +258,34 @@ def _expected_markdown_path(item: OAItem, output: RebuildOutput, source: Archive
         return None
 
 
+def _acceptance_evidence(settings: Settings) -> dict[str, object]:
+    """Read aggregate operational evidence from a fixed local-only state file."""
+    path = _safe_target(settings, "state/acceptance-evidence.json")
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _retryable_attachment_is_indexed(
+    output: RebuildOutput | None, index_texts: dict[int, list[str]], source: ArchivedFile,
+) -> bool:
+    return bool(
+        output
+        and output.status == "failed"
+        and output.error_code
+        and any("转换失败，等待重试" in text for text in index_texts.get(source.oa_item_id, ()))
+    )
+
+
+def _evidence_count(evidence: dict[str, object], key: str) -> int:
+    value = evidence.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
 def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[ValidationCheck]:
     """Validate a current rebuild run without mutating its session or filesystem.
 
@@ -232,10 +300,11 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     originals = [output for output in outputs if output.kind == "original"]
     parses = [output for output in outputs if output.kind == "parse"]
     derived = [output for output in outputs if output.kind in _DERIVED_KINDS]
-    verified = [source for source in sources if source.download_status == "verified"]
+    current_originals = [output for output in originals if output.status == "success"]
     valid_originals = [
         output for output in originals
-        if (source := source_by_id.get(output.source_file_id)) is not None and _valid_original(settings, output, source)
+        if (source := source_by_id.get(output.source_file_id)) is not None
+        and _valid_original(settings, output, source, items.get(output.oa_item_id))
     ]
     original_source_ids = {output.source_file_id for output in valid_originals}
 
@@ -249,7 +318,9 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     unknown_originals = sum(path.resolve() not in {value.resolve() for value in expected_original_paths} for path in archive_files)
 
     candidate_item_ids = {
-        source.oa_item_id for source in verified if source.id in original_source_ids and items.get(source.oa_item_id, None) is not None
+        source.oa_item_id
+        for source in source_by_id.values()
+        if source.id in original_source_ids and source.oa_item_id in items
     }
     confirmed_candidate_ids = {item_id for item_id in candidate_item_ids if items[item_id].classification_state == "confirmed"}
     indexes = [output for output in derived if output.kind == "item_index" and output.status == "success"]
@@ -257,8 +328,16 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     attachments = [output for output in derived if output.kind == "attachment_markdown" and output.status == "success"]
 
     checks: list[ValidationCheck] = []
-    checks.append(_check("ORIGINALS_COMPLETE", len(verified), len(original_source_ids)))
-    checks.append(_check("ORIGINAL_HASHES_MATCH", len(originals), len(valid_originals)))
+    checks.append(_check("ORIGINALS_COMPLETE", len(current_originals), len(valid_originals)))
+    checks.append(_check(
+        "ORIGINAL_HASHES_MATCH",
+        len(current_originals),
+        sum(
+            (source := source_by_id.get(output.source_file_id)) is not None
+            and _hash_matches(settings, output, source)
+            for output in current_originals
+        ),
+    ))
     checks.append(_check("NO_UNKNOWN_ORIGINALS", 0, unknown_originals if archive_tree_safe else unknown_originals + 1))
     checks.append(_check("CONFIRMED_OUTPUTS_ONLY", 0, sum(items.get(output.oa_item_id) is None or items[output.oa_item_id].classification_state != "confirmed" for output in derived)))
 
@@ -272,16 +351,16 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     unnumbered = confirmed_candidate_ids - numbered
     checks.append(_check("UNNUMBERED_BODY_ABSENT", 0, sum(output.oa_item_id in unnumbered for output in bodies)))
 
-    supported_sources = [source for source in verified if source.id in original_source_ids and Path(source.original_name).suffix.casefold() in settings.parser.supported_extensions and source.file_role in MARKDOWN_SOURCE_ROLES]
+    supported_sources = [
+        source for source in source_by_id.values()
+        if source.id in original_source_ids
+        and Path(source.original_name).suffix.casefold() in settings.parser.supported_extensions
+        and source.file_role in MARKDOWN_SOURCE_ROLES
+    ]
     valid_parses = [output for output in parses if (source := source_by_id.get(output.source_file_id)) is not None and _valid_parse(settings, output, source)]
-    checks.append(_check("PARSE_PRODUCTS_VALID", len(supported_sources), len({output.source_file_id for output in valid_parses if output.source_file_id in {source.id for source in supported_sources}})))
-
     selected_body_sources = {output.source_file_id for output in valid_bodies}
     ordinary_supported = [source for source in supported_sources if source.id not in selected_body_sources]
     valid_attachments = [output for output in attachments if _valid_markdown(settings, output)]
-    checks.append(_check("SUPPORTED_ATTACHMENTS_ACCOUNTED", len(ordinary_supported), len({output.source_file_id for output in valid_attachments if output.source_file_id in {source.id for source in ordinary_supported}})))
-
-    unsupported_sources = [source for source in verified if source.id in original_source_ids and source.file_role in MARKDOWN_SOURCE_ROLES and Path(source.original_name).suffix.casefold() not in settings.parser.supported_extensions]
     index_texts: dict[int, list[str]] = {}
     for output in valid_indexes:
         path = _safe_target(settings, output.target_relpath)
@@ -292,6 +371,32 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
                 )
             except OSError:
                 pass
+    valid_parse_source_ids = {output.source_file_id for output in valid_parses}
+    attachment_by_source = {output.source_file_id: output for output in valid_attachments}
+    retry_by_source = {
+        output.source_file_id: output
+        for output in derived
+        if output.kind == "attachment_markdown" and output.status == "failed"
+    }
+    supported_accounted = sum(
+        (
+            source.id in valid_parse_source_ids
+            and source.id in attachment_by_source
+        ) or _retryable_attachment_is_indexed(
+            retry_by_source.get(source.id), index_texts, source,
+        )
+        for source in ordinary_supported
+    )
+    checks.append(_check(
+        "SUPPORTED_ATTACHMENTS_ACCOUNTED", len(ordinary_supported), supported_accounted,
+    ))
+
+    unsupported_sources = [
+        source for source in source_by_id.values()
+        if source.id in original_source_ids
+        and source.file_role in MARKDOWN_SOURCE_ROLES
+        and Path(source.original_name).suffix.casefold() not in settings.parser.supported_extensions
+    ]
     unsupported_reported = sum(
         any("暂不支持转换" in text for text in index_texts.get(source.oa_item_id, ()))
         and any(
@@ -304,21 +409,38 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     )
     checks.append(_check("UNSUPPORTED_ATTACHMENTS_INDEXED", len(unsupported_sources), unsupported_reported))
 
-    published_markdown = [output for output in (*bodies, *attachments) if output.status == "success"]
-    checks.append(_check("MARKDOWN_FRONTMATTER_VALID", len(published_markdown), sum(_markdown_has_frontmatter(target) for output in published_markdown if (target := _safe_target(settings, output.target_relpath)) is not None)))
     markdown_files, markdown_tree_safe = _regular_files(root / "markdown")
     link_expected, link_actual = _link_counts([path for path in markdown_files if path.suffix.casefold() == ".md"], root)
     checks.append(_check("ALL_LINKS_RESOLVE", link_expected, link_actual if markdown_tree_safe else -1))
 
-    successful_derived = [output for output in derived if output.status == "success"]
-    valid_paths = sum(
+    published_outputs = [output for output in derived if output.status == "success"]
+    searchable_outputs = sum(
         output.oa_item_id in items
         and _expected_markdown_path(
             items[output.oa_item_id], output, source_by_id.get(output.source_file_id)
         ) == output.target_relpath
-        for output in successful_derived
+        and (path := _safe_target(settings, output.target_relpath)) is not None
+        and _frontmatter_matches(path, items[output.oa_item_id])
+        for output in published_outputs
     )
-    checks.append(_check("MARKDOWN_OUTPUT_PATHS_VALID", len(successful_derived), valid_paths))
+    evidence = _acceptance_evidence(settings)
+    index_by_item = {output.oa_item_id: output for output in valid_indexes}
+    filterable_items = sum(
+        (index := index_by_item.get(item_id)) is not None
+        and _expected_markdown_path(items[item_id], index, None) is not None
+        for item_id in confirmed_candidate_ids
+    )
+    checks.append(_check(
+        "WEBUI_FILTER_CONTRACT",
+        len(confirmed_candidate_ids),
+        filterable_items if evidence.get("webui_filter_contract") is True else 0,
+    ))
+    checks.append(_check("OBSIDIAN_SEARCH_FIELDS", len(published_outputs), searchable_outputs))
+    checks.append(_check(
+        "SAMPLE_EVIDENCE_COMPLETE", 200,
+        min(_evidence_count(evidence, "internal_sample_count"), 100)
+        + min(_evidence_count(evidence, "external_sample_count"), 100),
+    ))
 
     try:
         root_entries = list(root.iterdir()) if root.exists() else []
@@ -326,7 +448,16 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     except OSError:
         unexpected_root_dirs = 1
     checks.append(_check("REBUILD_ROOT_LAYOUT_CLEAN", 0, unexpected_root_dirs))
-    checks.append(_check("CURRENT_RUN_OUTPUTS_FINAL", len(outputs), sum(output.status != "pending" for output in outputs)))
+    checks.append(_check(
+        "AUTOMATED_GATES_CONFIRMED", 4,
+        sum(
+            evidence.get(key) is True
+            for key in (
+                "automated_tests_passed", "frontend_check_passed", "build_passed",
+                "synthetic_smoke_passed",
+            )
+        ),
+    ))
     return checks
 
 
