@@ -69,9 +69,9 @@ rebuild:
   # A protected sibling of the live app.data_root; never point this at data/.
   target_root: ../data_rebuilt
   item_title_max_chars: 96
-  # `oa rebuild build --execute` requires a private mode-0600 aggregate
-  # attestation file plus this environment variable. Store the HMAC key itself
-  # only in the environment (32+ bytes); never write it into this YAML.
+  # The final `oa rebuild build --execute --acceptance-evidence ...` pass
+  # requires a private mode-0600 aggregate attestation plus this environment
+  # variable. Store the HMAC key only in the environment (32+ bytes).
   acceptance_evidence_key_env: OA_REBUILD_ACCEPTANCE_EVIDENCE_HMAC_KEY
 
 archive:

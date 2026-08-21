@@ -119,7 +119,7 @@ uv run oa doctor --config config.yaml
 
 ### 8.2 只读盘点
 
-真实操作前先在仓库外建立权限为 `0700` 的备份目录，使用 SQLite backup API 备份数据库，并复制本机配置和五个 OARadar user unit。备份路径和明细不得写入报告或 Git。然后只读盘点：
+真实操作前先在仓库外建立权限为 `0700` 的备份目录，使用 SQLite backup API 备份数据库，并复制本机配置和五个 OARadar user unit。这个是操作前恢复备份，不是切换门禁所需的最终数据库副本；build 完成后还必须按 8.4 重新制作与最新 live DB 一致的副本。备份路径和明细不得写入报告或 Git。然后只读盘点：
 
 ```bash
 uv run oa rebuild inventory --config <config.yaml>
@@ -154,7 +154,18 @@ uv run oa rebuild build --run-id <run_id> --config <config.yaml>
 
 默认输出只包含候选数量、分类/日期阻塞数量及是否需要验收证据；不会排队、解析、写 Markdown 或创建数据库副本。`needs_review` 和 `date_missing` 任一非零时，返回 WebUI 完成人工确认，不得执行构建。
 
-显式执行前，操作者必须在仓库和 `data/` 之外创建一个仅含聚合门禁结果的 JSON 文件，并将权限设为 `0600`。文件不得包含 OA 标题、文号、附件名、正文、标识符或本机路径：
+取得本次构建授权后，先运行不带验收文件的第一阶段：
+
+```bash
+uv run oa rebuild build \
+  --execute \
+  --run-id <run_id> \
+  --config <config.yaml>
+```
+
+第一阶段只执行既有重建 Pipeline，生成可供人工检查的解析、Markdown 和 `_index.md`；返回 `acceptance_evidence_required=true`，不写签名验收证据，不建立数据库副本，也不建立切换备份。中断后用同一命令和 `run_id` 恢复，已成功产物不会重复覆盖。
+
+第一阶段完成后才执行 8.5 的自动门禁和内外各 100 项人工抽查。通过后，操作者在仓库和 `data/` 之外创建一个仅含聚合结果的 JSON 文件，并将权限设为 `0600`。文件不得包含 OA 标题、文号、附件名、正文、标识符或本机路径：
 
 ```json
 {
@@ -168,7 +179,7 @@ uv run oa rebuild build --run-id <run_id> --config <config.yaml>
 }
 ```
 
-按 `rebuild.acceptance_evidence_key_env` 配置的环境变量提供至少 32 字节的本机 HMAC 密钥；密钥本身不得写入配置、命令行、报告或 Git。确认本次构建授权后再执行：
+按 `rebuild.acceptance_evidence_key_env` 配置的环境变量提供至少 32 字节的本机 HMAC 密钥；密钥本身不得写入配置、命令行、报告或 Git。另在仓库、`data/` 和 `data_rebuilt/` 之外建立权限为 `0700` 的现有目录，把其中一个绝对、非符号链接文件路径设置到 `OA_REBUILD_CUTOVER_BACKUP_PATH`。该变量必须保持不变直至切换完成。然后用同一 `run_id` 运行第二阶段：
 
 ```bash
 uv run oa rebuild build \
@@ -178,7 +189,7 @@ uv run oa rebuild build \
   --config <config.yaml>
 ```
 
-该受限本机命令继续使用同一 `data_rebuild` 运行和既有 `PipelineTask`/lease，只领取重建队列，依次完成解析、Markdown 与 `_index.md`，写入签名验收证据，执行 15 项验收，然后用 SQLite backup API 建立并应用 `data_rebuilt/state/oa.db`。任一环节失败均返回稳定错误代码，且不得启动切换。重复执行同一 `run_id` 时，已校验成功的原件和产物不得重复覆盖；中断后仍从既有任务/lease 恢复。不得新增任务表或协调框架，也不得通过 WebUI 执行这些构建动作。
+第二阶段会幂等确认既有重建任务，写入签名验收证据，执行 15 项验收，用 SQLite backup API 建立并应用 `data_rebuilt/state/oa.db`，最后在 `OA_REBUILD_CUTOVER_BACKUP_PATH` 原子建立与此时 live DB 逻辑指纹一致、带 prepared provenance 的仓库外副本。成功输出必须同时显示 `database_copy_ready=true` 和 `external_backup_ready=true`。该最终外部副本必须在 24 小时内用于切换；之后任何 live DB 写入都会令其失效，必须重新运行第二阶段。任一环节失败均返回稳定错误代码，且不得启动切换。不得新增任务表或协调框架，也不得通过 WebUI 执行这些构建动作。
 
 ### 8.5 切换前验收
 
@@ -203,7 +214,7 @@ uv run python scripts/check_public_release.py
 - `oaradar-hourly.timer`
 - `oaradar-nightly.timer`
 
-然后运行只读预检：
+保持 8.4 的 `OA_REBUILD_CUTOVER_BACKUP_PATH`，并在另一个环境变量 `OA_REBUILD_CUTOVER_AUTHORIZATION_KEY` 中提供独立的至少 32 字节本机密钥；两项值都不得进入配置、命令行、报告或 Git。然后运行只读预检：
 
 ```bash
 uv run oa rebuild cutover --config <config.yaml>

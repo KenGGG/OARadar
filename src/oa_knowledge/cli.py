@@ -77,7 +77,9 @@ from oa_knowledge.rebuild.cutover import (
     CutoverError,
     build_cutover_plan,
     execute_cutover,
+    external_backup_target,
     generate_authorization_token,
+    prepare_external_backup,
     verify_authorization_token,
 )
 
@@ -326,14 +328,15 @@ def rebuild_build(
         if not execute:
             typer.echo(json.dumps(plan, ensure_ascii=False))
             return
-        if acceptance_evidence is None:
-            _rebuild_error("BUILD_ACCEPTANCE_EVIDENCE_REQUIRED")
-        attestation = _load_build_attestation(acceptance_evidence)
         if any(plan["blockers"].values()):
             _rebuild_error("BUILD_CLASSIFICATION_INCOMPLETE")
-        signing_value = os.environ.get(settings.rebuild.acceptance_evidence_key_env, "")
-        if len(signing_value.encode("utf-8")) < 32:
-            _rebuild_error("BUILD_ACCEPTANCE_SIGNING_KEY_UNAVAILABLE")
+        attestation: dict[str, object] | None = None
+        if acceptance_evidence is not None:
+            attestation = _load_build_attestation(acceptance_evidence)
+            signing_value = os.environ.get(settings.rebuild.acceptance_evidence_key_env, "")
+            if len(signing_value.encode("utf-8")) < 32:
+                _rebuild_error("BUILD_ACCEPTANCE_SIGNING_KEY_UNAVAILABLE")
+            external_backup_target(settings)
 
         with Session(engine) as session:
             item_ids = list(session.scalars(
@@ -356,6 +359,18 @@ def rebuild_build(
         finally:
             worker.close()
 
+        if attestation is None:
+            typer.echo(json.dumps({
+                "acceptance_evidence_required": True,
+                "database_copy_ready": False,
+                "dry_run": False,
+                "enqueued": enqueued,
+                "external_backup_ready": False,
+                "processed": processed,
+                "run_id": run_id,
+            }, ensure_ascii=False))
+            return
+
         with Session(engine) as session:
             write_acceptance_evidence(
                 session,
@@ -375,10 +390,12 @@ def rebuild_build(
         database_checks = validate_database_copy(copied_database)
         if not all(check.ok for check in database_checks):
             _rebuild_error("BUILD_DATABASE_COPY_FAILED")
+        prepare_external_backup(settings)
         typer.echo(json.dumps({
             "database_copy_ready": True,
             "dry_run": False,
             "enqueued": enqueued,
+            "external_backup_ready": True,
             "processed": processed,
             "run_id": run_id,
             "validation_checks": len(checks),
@@ -386,6 +403,8 @@ def rebuild_build(
         }, ensure_ascii=False))
     except typer.Exit:
         raise
+    except CutoverError as exc:
+        _rebuild_error(exc.error_code)
     except ValueError as exc:
         code = str(exc)
         _rebuild_error(code if code.startswith(("BUILD_", "REBUILD_")) else "BUILD_FAILED")

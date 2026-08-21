@@ -15,6 +15,7 @@ import json
 import os
 import secrets
 import sqlite3
+import stat
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,7 @@ from oa_knowledge.rebuild.paths import resolve_rebuild_root
 from oa_knowledge.rebuild.state_copy import (
     _PREPARED_COPY_APPLICATION_ID,
     _alembic_head,
+    backup_live_database,
     validate_database_copy,
 )
 from oa_knowledge.rebuild.validation import validate_rebuild, validation_passed
@@ -300,6 +302,47 @@ def _external_backup_is_current(
         )
     except (OSError, sqlite3.DatabaseError, ValueError):
         return False
+
+
+def external_backup_target(settings: Settings) -> Path:
+    """Resolve the configured repository-external backup without creating it."""
+    configured = os.environ.get(_EXTERNAL_BACKUP_PATH_ENV, "")
+    raw = Path(configured).expanduser()
+    if not configured or not raw.is_absolute():
+        raise CutoverPreflightError("external backup path is unavailable")
+    try:
+        backup = _absolute_without_symlinks(raw)
+        live = _absolute_without_symlinks(settings.data_root)
+        rebuilt = _absolute_without_symlinks(resolve_rebuild_root(settings))
+        parent = backup.parent
+        parent_mode = stat.S_IMODE(parent.stat().st_mode)
+        if (
+            not parent.is_dir()
+            or parent.is_symlink()
+            or parent_mode & 0o077
+            or _is_beneath(backup, live)
+            or _is_beneath(backup, rebuilt)
+            or _path_is_inside_git_worktree(backup)
+            or (backup.exists() and (not backup.is_file() or backup.is_symlink()))
+        ):
+            raise CutoverPreflightError("external backup path is unsafe")
+        return backup
+    except (OSError, ValueError) as exc:
+        raise CutoverPreflightError("external backup path is unsafe") from exc
+
+
+def prepare_external_backup(settings: Settings) -> None:
+    """Create and verify the current live-DB snapshot required by cutover."""
+    backup = external_backup_target(settings)
+    rebuilt = resolve_rebuild_root(settings)
+    backup_live_database(settings.database_path, backup)
+    if not _external_backup_is_current(
+        settings.data_root,
+        rebuilt,
+        datetime.now(UTC),
+        live_database=settings.database_path,
+    ):
+        raise CutoverPreflightError("external backup verification failed")
 
 
 def build_cutover_plan(settings: Settings, now: datetime) -> CutoverPlan:

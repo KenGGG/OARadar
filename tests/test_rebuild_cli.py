@@ -280,8 +280,8 @@ def test_build_command_defaults_to_a_zero_mutation_dry_run(config_file: Path) ->
     assert not (resolve_rebuild_root(settings) / settings.storage.sqlite_path).exists()
 
 
-def test_build_execute_requires_an_explicit_private_acceptance_attestation(
-    config_file: Path,
+def test_build_execute_without_attestation_stops_after_outputs(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _add_build_ready_evidence(config_file)
     archive = CliRunner().invoke(app, [
@@ -289,16 +289,26 @@ def test_build_execute_requires_an_explicit_private_acceptance_attestation(
     ])
     assert archive.exit_code == 0
     run_id = json.loads(archive.stdout)["run_id"]
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", _synthetic_parse)
 
     result = CliRunner().invoke(app, [
         "rebuild", "build", "--execute", "--run-id", str(run_id),
         "--config", str(config_file),
     ])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     assert json.loads(result.stdout) == {
-        "error_code": "BUILD_ACCEPTANCE_EVIDENCE_REQUIRED",
+        "acceptance_evidence_required": True,
+        "database_copy_ready": False,
+        "dry_run": False,
+        "enqueued": 1,
+        "external_backup_ready": False,
+        "processed": 3,
+        "run_id": run_id,
     }
+    settings = load_settings(config_file)
+    assert not (resolve_rebuild_root(settings) / settings.storage.sqlite_path).exists()
+    assert not (resolve_rebuild_root(settings) / "state/acceptance-evidence.json").exists()
 
 
 def test_build_execute_rejects_a_group_readable_acceptance_attestation(
@@ -334,6 +344,13 @@ def test_build_execute_runs_rebuild_validation_and_prepares_database_copy(
     ])
     assert archive.exit_code == 0
     run_id = json.loads(archive.stdout)["run_id"]
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", _synthetic_parse)
+    first_pass = CliRunner().invoke(app, [
+        "rebuild", "build", "--execute", "--run-id", str(run_id),
+        "--config", str(config_file),
+    ])
+    assert first_pass.exit_code == 0
+    assert json.loads(first_pass.stdout)["acceptance_evidence_required"] is True
     attestation = tmp_path / "aggregate-acceptance.json"
     attestation.write_text(json.dumps({
         "automated_tests_passed": True,
@@ -349,28 +366,45 @@ def test_build_execute_runs_rebuild_validation_and_prepares_database_copy(
         "OA_REBUILD_ACCEPTANCE_EVIDENCE_HMAC_KEY",
         "synthetic-build-signing-key-material-at-least-32-bytes",
     )
-    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_file", _synthetic_parse)
+    external_backup = tmp_path / "external-backup" / "live.db"
+    external_backup.parent.mkdir(mode=0o700)
+    monkeypatch.setenv("OA_REBUILD_CUTOVER_BACKUP_PATH", str(external_backup))
+    settings = load_settings(config_file)
+    assert cutover.external_backup_target(settings) == external_backup
 
     result = CliRunner().invoke(app, [
         "rebuild", "build", "--execute", "--run-id", str(run_id),
         "--acceptance-evidence", str(attestation), "--config", str(config_file),
     ])
 
+    assert external_backup.is_file(), result.stdout
+    assert cutover._external_backup_is_current(
+        settings.data_root,
+        resolve_rebuild_root(settings),
+        datetime.now(UTC),
+        live_database=settings.database_path,
+    ), result.stdout
     assert result.exit_code == 0, result.stdout
     payload = json.loads(result.stdout)
     assert payload == {
         "database_copy_ready": True,
         "dry_run": False,
-        "enqueued": 1,
-        "processed": 3,
+        "enqueued": 0,
+        "external_backup_ready": True,
+        "processed": 0,
         "run_id": run_id,
         "updated_files": 1,
         "validation_checks": 15,
     }
-    settings = load_settings(config_file)
     copied_database = resolve_rebuild_root(settings) / settings.storage.sqlite_path
     assert copied_database.is_file()
     assert all(check.ok for check in cli.validate_database_copy(copied_database))
+    assert cutover._external_backup_is_current(
+        settings.data_root,
+        resolve_rebuild_root(settings),
+        datetime.now(UTC),
+        live_database=settings.database_path,
+    )
 
 
 def test_cutover_command_defaults_to_zero_mutation_dry_run(config_file: Path) -> None:
