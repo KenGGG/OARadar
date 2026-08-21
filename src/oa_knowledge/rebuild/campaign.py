@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -20,13 +20,20 @@ from oa_knowledge.db.models import (
     PipelineTask,
     RebuildOutput,
 )
-from oa_knowledge.rebuild.archive_copy import copy_inventory_row
+from oa_knowledge.rebuild.archive_copy import (
+    CopyCancelled,
+    copy_inventory_row,
+    reconcile_successful_output,
+)
 from oa_knowledge.rebuild.inventory import InventoryRow
 
 QUEUE_NAME = "data_rebuild"
 ARCHIVE_STAGE = "archive_copy"
 INVENTORY_STAGE = "inventory"
 RESUMABLE_RUN_STATUSES = frozenset({"running", "failed"})
+BLOCKING_INVENTORY_STATUSES = (
+    "depth_limit_reached", "hash_mismatch", "missing", "unsafe_path",
+)
 LEASE_TTL = timedelta(minutes=5)
 LEASE_HEARTBEAT_INTERVAL = 60.0
 LEASE_HEARTBEAT_RETRY_INITIAL = 1.0
@@ -57,11 +64,19 @@ def create_rebuild_run(session: Session, *, cutoff_at: datetime) -> PipelineRun:
     return run
 
 
-def _add_event(session: Session, task: PipelineTask, event_type: str, status: str, *, error_code: str | None = None) -> None:
-    details = {} if error_code is None else {"error_code": error_code}
+def _add_event(
+    session: Session,
+    task: PipelineTask,
+    event_type: str,
+    status: str,
+    *,
+    error_code: str | None = None,
+    details: dict[str, int] | None = None,
+) -> None:
+    safe_details = details or ({} if error_code is None else {"error_code": error_code})
     session.add(PipelineEvent(
         task_id=task.id, event_type=event_type, stage=task.stage, status=status,
-        details_json=json.dumps(details, sort_keys=True),
+        details_json=json.dumps(safe_details, sort_keys=True),
     ))
 
 
@@ -73,6 +88,97 @@ def resume_rebuild_run(session: Session, run_id: int) -> PipelineRun:
     if run.status not in RESUMABLE_RUN_STATUSES:
         raise ValueError("REBUILD_RUN_NOT_RESUMABLE")
     return run
+
+
+def inventory_blocker_counts(summary: dict[str, int]) -> dict[str, int]:
+    """Return the fixed, safe blocker-count contract used by CLI and events."""
+    return {status: summary.get(status, 0) for status in BLOCKING_INVENTORY_STATUSES}
+
+
+def block_rebuild_run(
+    session: Session, run_id: int, summary: dict[str, int],
+) -> dict[str, int]:
+    """Persist a terminal inventory gate without enqueueing any copy work."""
+    run = session.get(PipelineRun, run_id)
+    if run is None or run.pipeline_type != "data_rebuild":
+        raise ValueError("REBUILD_RUN_NOT_FOUND")
+    blockers = inventory_blocker_counts(summary)
+    if not any(blockers.values()):
+        raise ValueError("INVENTORY_NOT_BLOCKED")
+    key = f"rebuild:{run_id}:inventory"
+    task = session.scalar(select(PipelineTask).where(PipelineTask.idempotency_key == key))
+    if task is None:
+        task = PipelineTask(
+            run_id=run_id,
+            queue_name=QUEUE_NAME,
+            priority=100,
+            logical_item_key=f"rebuild-run:{run_id}",
+            stage=INVENTORY_STAGE,
+            status="failed",
+            idempotency_key=key,
+            progress_current=summary.get("ready", 0),
+            progress_total=summary.get("total", 0),
+            error_code="INVENTORY_BLOCKED",
+            recoverable=True,
+            finished_at=datetime.now(UTC),
+            payload_json=json.dumps(blockers, sort_keys=True),
+        )
+        session.add(task)
+        session.flush()
+    else:
+        task.status = "failed"
+        task.progress_current = summary.get("ready", 0)
+        task.progress_total = summary.get("total", 0)
+        task.error_code = "INVENTORY_BLOCKED"
+        task.recoverable = True
+        task.finished_at = datetime.now(UTC)
+        task.payload_json = json.dumps(blockers, sort_keys=True)
+    _add_event(session, task, "blocked", "failed", details=blockers)
+    session.commit()
+    _finish_run(session, run_id)
+    return blockers
+
+
+def rebuild_status_summary(session: Session) -> dict[str, object]:
+    """Return safe counts and discoverable IDs for the latest rebuild state."""
+    runs = session.scalar(select(func.count()).select_from(PipelineRun).where(
+        PipelineRun.pipeline_type == "data_rebuild"
+    )) or 0
+    latest = session.scalar(select(PipelineRun).where(
+        PipelineRun.pipeline_type == "data_rebuild"
+    ).order_by(PipelineRun.id.desc()))
+    resumable = session.scalar(select(PipelineRun).where(
+        PipelineRun.pipeline_type == "data_rebuild",
+        PipelineRun.status.in_(RESUMABLE_RUN_STATUSES),
+    ).order_by(PipelineRun.id.desc()))
+    empty = {status: 0 for status in ("queued", "running", "completed", "failed")}
+    if latest is None:
+        return {
+            "runs": runs,
+            "latest_run_id": None,
+            "resumable_run_id": None,
+            **empty,
+            "blockers": inventory_blocker_counts({}),
+        }
+    tasks = session.scalars(select(PipelineTask).where(PipelineTask.run_id == latest.id)).all()
+    counts = {
+        status: sum(task.status == status for task in tasks)
+        for status in ("queued", "running", "completed", "failed")
+    }
+    inventory_task = next((task for task in tasks if task.stage == INVENTORY_STAGE), None)
+    blockers = inventory_blocker_counts({})
+    if inventory_task is not None and inventory_task.error_code == "INVENTORY_BLOCKED":
+        try:
+            blockers = inventory_blocker_counts(json.loads(inventory_task.payload_json))
+        except (TypeError, ValueError):
+            pass
+    return {
+        "runs": runs,
+        "latest_run_id": latest.id,
+        "resumable_run_id": resumable.id if resumable is not None else None,
+        **counts,
+        "blockers": blockers,
+    }
 
 
 def _reconcile_successful_task(session: Session, task_id: int) -> bool:
@@ -94,13 +200,10 @@ def _reconcile_successful_task(session: Session, task_id: int) -> bool:
     return True
 
 
-def _success_output(session: Session, run_id: int, row: InventoryRow) -> RebuildOutput | None:
-    return session.scalar(select(RebuildOutput).where(
-        RebuildOutput.run_id == run_id,
-        RebuildOutput.source_file_id == row.file_id,
-        RebuildOutput.sha256 == row.sha256,
-        RebuildOutput.status == "success",
-    ))
+def _success_output(
+    session: Session, settings: Settings, run_id: int, row: InventoryRow,
+) -> RebuildOutput | None:
+    return reconcile_successful_output(session, settings, row, run_id=run_id)
 
 
 def _lease_expired(task: PipelineTask) -> bool:
@@ -119,6 +222,39 @@ def _new_archive_task(run_id: int, row: InventoryRow, key: str) -> PipelineTask:
         status="queued", idempotency_key=key,
         payload_json=json.dumps({"file_id": row.file_id, "sha256": row.sha256}, sort_keys=True),
     )
+
+
+def _recover_expired_task(
+    session: Session,
+    task_id: int,
+    *,
+    observed_status: str,
+    observed_owner: str | None,
+    observed_expiry: datetime | None,
+) -> bool:
+    """Recover only the exact expired lease snapshot previously observed."""
+    recovered = session.execute(update(PipelineTask).where(
+        PipelineTask.id == task_id,
+        PipelineTask.status == observed_status,
+        PipelineTask.lease_owner == observed_owner,
+        PipelineTask.lease_expires_at == observed_expiry,
+    ).values(
+        status="queued",
+        error_code=None,
+        last_error=None,
+        finished_at=None,
+        lease_owner=None,
+        lease_expires_at=None,
+    )).rowcount
+    if recovered != 1:
+        session.expire_all()
+        return False
+    session.expire_all()
+    task = session.get(PipelineTask, task_id)
+    assert task is not None
+    _add_event(session, task, "recovered", "queued")
+    session.commit()
+    return True
 
 
 def _get_or_create_archive_task(
@@ -141,7 +277,12 @@ def _get_or_create_archive_task(
     return task, True
 
 
-def enqueue_archive_copy(session: Session, run_id: int, rows: Sequence[InventoryRow]) -> int:
+def enqueue_archive_copy(
+    session: Session,
+    run_id: int,
+    rows: Sequence[InventoryRow],
+    settings: Settings | None = None,
+) -> int:
     """Enqueue ready originals once; reset recoverable failures for a resume."""
     run = session.get(PipelineRun, run_id)
     if run is None or run.pipeline_type != "data_rebuild":
@@ -152,7 +293,14 @@ def enqueue_archive_copy(session: Session, run_id: int, rows: Sequence[Inventory
             continue
         key = f"rebuild:{run_id}:archive:{row.file_id}:{row.sha256}"
         task = session.scalar(select(PipelineTask).where(PipelineTask.idempotency_key == key))
-        output = _success_output(session, run_id, row)
+        # Without settings there is no protected-path proof, so defer any
+        # success reconciliation to execute_archive_copy instead of trusting
+        # ledger columns alone.
+        output = (
+            _success_output(session, settings, run_id, row)
+            if settings is not None
+            else None
+        )
         if output is not None:
             if task is None:
                 task, _ = _get_or_create_archive_task(session, run_id, row, key)
@@ -178,17 +326,20 @@ def enqueue_archive_copy(session: Session, run_id: int, rows: Sequence[Inventory
             and task.recoverable
             and _lease_expired(task)
         ):
-            task.status = "queued"
-            task.error_code = task.last_error = None
-            task.finished_at = None
-            task.lease_owner = task.lease_expires_at = None
-            _add_event(session, task, "recovered", "queued")
-            added += 1
+            if _recover_expired_task(
+                session,
+                task.id,
+                observed_status=task.status,
+                observed_owner=task.lease_owner,
+                observed_expiry=task.lease_expires_at,
+            ):
+                added += 1
     if added:
-        run.status = "running"
-        run.finished_at = None
+        session.execute(update(PipelineRun).where(PipelineRun.id == run_id).values(
+            status="running", finished_at=None,
+        ))
     session.commit()
-    _finish_run(session, run)
+    _finish_run(session, run_id)
     return added
 
 
@@ -208,6 +359,14 @@ def _complete_inventory_task(session: Session, run_id: int, total: int) -> None:
         except IntegrityError:
             session.rollback()
             return
+        _add_event(session, task, "completed", "completed")
+        session.commit()
+    elif task.status != "completed":
+        task.status = "completed"
+        task.error_code = task.last_error = None
+        task.progress_current = task.progress_total = total
+        task.finished_at = datetime.now(UTC)
+        task.payload_json = "{}"
         _add_event(session, task, "completed", "completed")
         session.commit()
 
@@ -333,7 +492,10 @@ def _fail_owned_task(session: Session, task_id: int, owner: str, error_code: str
     return True
 
 
-def _finish_run(session: Session, run: PipelineRun) -> None:
+def _finish_run(session: Session, run_id: int) -> None:
+    run = session.get(PipelineRun, run_id)
+    if run is None:
+        return
     tasks = session.scalars(select(PipelineTask).where(PipelineTask.run_id == run.id)).all()
     run.total_tasks = len(tasks)
     run.completed_tasks = sum(task.status == "completed" for task in tasks)
@@ -356,7 +518,7 @@ def execute_archive_copy(
     for row in by_file_id.values():
         key = f"rebuild:{run_id}:archive:{row.file_id}:{row.sha256}"
         task = session.scalar(select(PipelineTask).where(PipelineTask.idempotency_key == key))
-        if task is not None and _success_output(session, run_id, row) is not None:
+        if task is not None and _success_output(session, settings, run_id, row) is not None:
             _reconcile_successful_task(session, task.id)
     session.commit()
     tasks = session.scalars(select(PipelineTask).where(
@@ -377,15 +539,21 @@ def execute_archive_copy(
                 failed += 1
             continue
         heartbeat_stop, heartbeat_thread, lease_health = _start_lease_heartbeat(session, task)
+        cancelled = False
         try:
             output = copy_inventory_row(
                 session, settings, row, run_id=run_id,
                 should_continue=lease_health.is_healthy,
             )
+        except CopyCancelled:
+            cancelled = True
+            output = None
         except Exception:  # noqa: BLE001 - record a sanitized task failure for any copier crash.
             output = None
         finally:
             _stop_lease_heartbeat(heartbeat_stop, heartbeat_thread)
+        if cancelled:
+            continue
         if output is None:
             if _fail_owned_task(session, task.id, owner, "COPY_EXCEPTION"):
                 failed += 1
@@ -399,5 +567,5 @@ def execute_archive_copy(
                     copied += 1
             elif _fail_owned_task(session, task.id, owner, output.error_code):
                 failed += 1
-    _finish_run(session, run)
+    _finish_run(session, run.id)
     return {"copied": copied, "failed": failed}

@@ -92,7 +92,7 @@ def test_enqueue_uses_required_idempotency_key_and_skips_successful_output(
 
     execute_archive_copy(session, settings, run.id, [inventory_row])
     assert session.scalar(select(RebuildOutput)).status == "success"
-    assert enqueue_archive_copy(session, run.id, [inventory_row]) == 0
+    assert enqueue_archive_copy(session, run.id, [inventory_row], settings=settings) == 0
 
 
 def test_execute_drives_enqueued_task_and_run_to_terminal_outcomes(
@@ -152,7 +152,7 @@ def test_resume_reconciles_successful_output_after_task_completion_crash(
 
     campaign.copy_inventory_row(session, settings, inventory_row, run_id=run.id)
 
-    assert enqueue_archive_copy(session, run.id, [inventory_row]) == 0
+    assert enqueue_archive_copy(session, run.id, [inventory_row], settings=settings) == 0
     session.refresh(task)
     assert task.status == "completed"
     assert session.scalars(select(PipelineEvent).where(
@@ -162,6 +162,82 @@ def test_resume_reconciles_successful_output_after_task_completion_crash(
     execute_archive_copy(session, settings, run.id, [inventory_row])
     session.refresh(run)
     assert run.status == "completed"
+
+
+@pytest.mark.parametrize("damage", ("missing", "changed"))
+def test_success_reconciliation_revalidates_and_repairs_or_conflicts(
+    session, settings, inventory_row, damage: str
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    task.status = "running"
+    session.commit()
+    output = campaign.copy_inventory_row(session, settings, inventory_row, run_id=run.id)
+    output_id = output.id
+    target = resolve_rebuild_path(settings, output.target_relpath)
+    if damage == "missing":
+        target.unlink()
+    else:
+        target.write_bytes(b"changed synthetic final")
+
+    assert enqueue_archive_copy(session, run.id, [inventory_row], settings=settings) == 1
+    result = execute_archive_copy(session, settings, run.id, [inventory_row])
+
+    session.refresh(task)
+    output = session.get(RebuildOutput, output_id)
+    if damage == "missing":
+        assert result == {"copied": 1, "failed": 0}
+        assert task.status == "completed"
+        assert output.status == "success"
+        assert target.read_bytes() == b"synthetic campaign original"
+    else:
+        assert result == {"copied": 0, "failed": 1}
+        assert task.status == output.status == "failed"
+        assert output.error_code == "TARGET_CONFLICT"
+        assert target.read_bytes() == b"changed synthetic final"
+
+
+def test_expired_recovery_cas_does_not_clear_a_renewed_lease(
+    session, inventory_row
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    task.status = "running"
+    task.lease_owner = "synthetic-owner"
+    task.lease_expires_at = datetime(2020, 1, 1, tzinfo=UTC)
+    session.commit()
+    session.expire_all()
+    observed = session.get(PipelineTask, task.id)
+    observed_status = observed.status
+    observed_owner = observed.lease_owner
+    observed_expiry = observed.lease_expires_at
+
+    engine = session.get_bind()
+    with Session(engine) as renewal_session:
+        renewed = renewal_session.get(PipelineTask, task.id)
+        renewed.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        renewal_session.commit()
+
+    recovered = campaign._recover_expired_task(
+        session,
+        task.id,
+        observed_status=observed_status,
+        observed_owner=observed_owner,
+        observed_expiry=observed_expiry,
+    )
+
+    session.expire_all()
+    current = session.get(PipelineTask, task.id)
+    assert recovered is False
+    assert current.status == "running"
+    assert current.lease_owner == "synthetic-owner"
+    assert current.lease_expires_at != observed_expiry
+    assert session.scalars(select(PipelineEvent).where(
+        PipelineEvent.task_id == task.id,
+        PipelineEvent.event_type == "recovered",
+    )).all() == []
 
 
 def test_concurrent_execute_claims_and_completes_task_once(
@@ -326,7 +402,9 @@ def test_concurrent_success_reconciliation_emits_one_completed_event(
     def reconcile() -> None:
         with Session(engine) as concurrent_session:
             barrier.wait()
-            enqueue_archive_copy(concurrent_session, run.id, [inventory_row])
+            enqueue_archive_copy(
+                concurrent_session, run.id, [inventory_row], settings=settings,
+            )
 
     first = threading.Thread(target=reconcile)
     second = threading.Thread(target=reconcile)
@@ -488,8 +566,8 @@ def test_ownership_loss_after_verification_fences_publish_and_later_owner_resume
     assert first_result == {"copied": 0, "failed": 0}
     assert match_calls == 3
     assert not target.exists()
-    assert output.status == "failed"
-    assert output.error_code == "LEASE_LOST"
+    assert output.status == "pending"
+    assert output.error_code is None
     assert task.status == "running"
     assert task.lease_owner == "later-owner"
     assert task.recoverable is True

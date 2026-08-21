@@ -18,7 +18,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, OAItem, PipelineRun, RebuildOutput
 from oa_knowledge.rebuild import archive_copy
-from oa_knowledge.rebuild.archive_copy import copy_inventory_row
+from oa_knowledge.rebuild.archive_copy import CopyCancelled, copy_inventory_row
 from oa_knowledge.rebuild.inventory import InventoryRow, build_inventory
 from oa_knowledge.rebuild.paths import resolve_rebuild_path
 
@@ -107,12 +107,12 @@ def test_copy_is_idempotent(
 def test_copy_fences_itself_when_lease_health_is_lost(
     session: Session, settings: Settings, run_id: int, inventory_row: InventoryRow
 ) -> None:
-    output = copy_inventory_row(
-        session, settings, inventory_row, run_id=run_id, should_continue=lambda: False,
-    )
+    with pytest.raises(CopyCancelled):
+        copy_inventory_row(
+            session, settings, inventory_row, run_id=run_id, should_continue=lambda: False,
+        )
 
-    assert output.status == "failed"
-    assert output.error_code == "LEASE_LOST"
+    assert session.scalar(select(RebuildOutput)) is None
     assert not resolve_rebuild_path(settings, inventory_row.destination_relpath).exists()
 
 
@@ -131,17 +131,62 @@ def test_empty_copy_rechecks_lease_health_before_publication(
     )
     health_checks = iter((True, True, False))
 
-    output = copy_inventory_row(
-        session,
-        settings,
-        empty_row,
-        run_id=run_id,
-        should_continue=lambda: next(health_checks),
-    )
+    with pytest.raises(CopyCancelled):
+        copy_inventory_row(
+            session,
+            settings,
+            empty_row,
+            run_id=run_id,
+            should_continue=lambda: next(health_checks),
+        )
 
-    assert output.status == "failed"
-    assert output.error_code == "LEASE_LOST"
+    output = session.scalar(select(RebuildOutput))
+    assert output.status == "pending"
+    assert output.error_code is None
     assert not resolve_rebuild_path(settings, empty_row.destination_relpath).exists()
+
+
+def test_stale_cancelled_copier_does_not_downgrade_newer_success(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    inventory_row: InventoryRow,
+) -> None:
+    """Cancellation is control flow, never a shared terminal ledger write."""
+    target = resolve_rebuild_path(settings, inventory_row.destination_relpath)
+    checks = 0
+
+    def cancel_after_newer_success() -> bool:
+        nonlocal checks
+        checks += 1
+        if checks != 4:
+            return True
+        target.write_bytes(b"synthetic original evidence")
+        engine = session.get_bind()
+        with Session(engine) as newer_session:
+            newer = newer_session.scalar(select(RebuildOutput).where(
+                RebuildOutput.run_id == run_id,
+            ))
+            assert newer is not None
+            newer.status = "success"
+            newer.error_code = None
+            newer_session.commit()
+        return False
+
+    with pytest.raises(CopyCancelled):
+        copy_inventory_row(
+            session,
+            settings,
+            inventory_row,
+            run_id=run_id,
+            should_continue=cancel_after_newer_success,
+        )
+
+    session.expire_all()
+    output = session.scalar(select(RebuildOutput).where(RebuildOutput.run_id == run_id))
+    assert output.status == "success"
+    assert output.error_code is None
+    assert target.read_bytes() == b"synthetic original evidence"
 
 
 @pytest.mark.parametrize("damage", ("deleted", "tampered"))

@@ -24,7 +24,7 @@ from oa_knowledge.storage_paths import resolve_data_path
 @dataclass(frozen=True)
 class InventoryRow:
     item_id: int
-    file_id: int
+    file_id: int | None
     source_relpath: str
     destination_relpath: str
     size_bytes: int
@@ -74,14 +74,29 @@ def build_inventory(session: Session, settings: Settings) -> list[InventoryRow]:
         )
     ).label("batch_depth_limited")
     records = session.execute(
-        select(ArchivedFile, OAItem, OAManifestItem, batch_depth_limited)
-        .join(OAItem, ArchivedFile.oa_item_id == OAItem.id)
+        select(OAItem, ArchivedFile, OAManifestItem, batch_depth_limited)
+        .outerjoin(ArchivedFile, ArchivedFile.oa_item_id == OAItem.id)
         .outerjoin(OAManifestItem, OAManifestItem.oa_item_key == OAItem.oa_item_key)
         .where(OAItem.source_channel == "done")
         .order_by(OAItem.id, ArchivedFile.id)
     ).all()
     rows: list[InventoryRow] = []
-    for source, item, manifest, has_batch_depth_limit in records:
+    for item, source, manifest, has_batch_depth_limit in records:
+        if source is None:
+            depth_limited = has_batch_depth_limit or (
+                manifest is not None and manifest.processing_status == "depth_limit_reached"
+            )
+            rows.append(InventoryRow(
+                item_id=item.id,
+                file_id=None,
+                source_relpath="",
+                destination_relpath="",
+                size_bytes=0,
+                sha256="",
+                file_role="",
+                status="depth_limit_reached" if depth_limited else "missing",
+            ))
+            continue
         source_relpath = source.local_relpath or ""
         try:
             destination_relpath = archive_file_relpath(
@@ -111,7 +126,14 @@ def build_inventory(session: Session, settings: Settings) -> list[InventoryRow]:
 
 def inventory_summary(rows: Sequence[InventoryRow]) -> dict[str, int]:
     """Return counts only, so callers never need to expose confidential paths."""
-    summary = dict(sorted(Counter(row.status for row in rows).items()))
+    counts = Counter(row.status for row in rows)
+    summary = {
+        status: counts[status]
+        for status in (
+            "depth_limit_reached", "hash_mismatch", "missing", "ready", "unsafe_path"
+        )
+    }
+    summary.update({status: count for status, count in sorted(counts.items()) if status not in summary})
     summary["total"] = len(rows)
     return summary
 

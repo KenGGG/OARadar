@@ -56,6 +56,7 @@ def _add_file(
     content: bytes | None,
     recorded_sha256: str | None = None,
     depth_limit: bool = False,
+    download_status: str = "verified",
 ) -> tuple[OAItem, ArchivedFile]:
     item = OAItem(
         oa_item_key=f"done:{name}",
@@ -87,7 +88,7 @@ def _add_file(
         local_relpath=relpath,
         size_bytes=len(content or b"missing"),
         sha256=digest,
-        download_status="verified",
+        download_status=download_status,
     )
     session.add(archived)
     session.flush()
@@ -217,6 +218,52 @@ def test_inventory_honors_batch_depth_limit_without_a_manifest_flag(
     )
 
 
+def test_inventory_retains_depth_limited_item_without_an_archived_file(
+    session: Session, settings: Settings
+) -> None:
+    item = OAItem(
+        oa_item_key="done:depth-limited-without-file",
+        source_channel="done",
+        title="合成深度限制事项",
+        initiated_at=datetime(2026, 8, 20, tzinfo=UTC),
+    )
+    session.add(item)
+    session.flush()
+    session.add(OAManifestItem(
+        oa_item_key=item.oa_item_key,
+        title=item.title,
+        list_page=0,
+        processing_status="depth_limit_reached",
+    ))
+    session.flush()
+
+    rows = build_inventory(session, settings)
+
+    assert [row.status for row in rows if row.item_id == item.id] == [
+        "depth_limit_reached"
+    ]
+    row = next(row for row in rows if row.item_id == item.id)
+    assert row.file_id is None
+    assert row.source_relpath == row.destination_relpath == ""
+
+
+def test_matching_file_is_not_ready_without_verified_download_status(
+    session: Session, settings: Settings
+) -> None:
+    _, archived_file = _add_file(
+        session,
+        settings,
+        name="unverified-matching",
+        relpath="archive/raw/oa/done/synthetic/unverified-matching.bin",
+        content=b"matching bytes",
+        download_status="downloaded",
+    )
+
+    row = next(row for row in build_inventory(session, settings) if row.file_id == archived_file.id)
+
+    assert row.status == "missing"
+
+
 def test_inventory_summary_returns_counts_without_printing_confidential_paths(
     capsys,
 ) -> None:
@@ -243,7 +290,14 @@ def test_inventory_summary_returns_counts_without_printing_confidential_paths(
         ),
     ]
 
-    assert inventory_summary(rows) == {"ready": 1, "missing": 1, "total": 2}
+    assert inventory_summary(rows) == {
+        "depth_limit_reached": 0,
+        "hash_mismatch": 0,
+        "missing": 1,
+        "ready": 1,
+        "unsafe_path": 0,
+        "total": 2,
+    }
     assert capsys.readouterr().out == ""
 
 

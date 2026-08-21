@@ -18,6 +18,7 @@ tests/oa_archiver-windows/
 
 # OA runtime and sensitive material
 data/
+/data_rebuilt/
 .claude/
 private/
 deploy/

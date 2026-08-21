@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import ipaddress
-import subprocess
 import re
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
 import yaml
 
 from oa_knowledge.config import Settings, load_settings
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -55,6 +54,11 @@ def test_public_private_git_boundary() -> None:
 
     assert {path for path in local_only if not _is_ignored(path)} == set()
     assert {path for path in public if _is_ignored(path)} == set()
+
+
+def test_default_rebuild_tree_is_ignored_as_a_complete_subtree() -> None:
+    assert _is_ignored("data_rebuilt/")
+    assert _is_ignored("data_rebuilt/archive/synthetic-original.bin")
 
 
 def test_example_config_is_synthetic() -> None:

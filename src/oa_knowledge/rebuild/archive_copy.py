@@ -20,13 +20,13 @@ from oa_knowledge.rebuild.paths import resolve_rebuild_path
 from oa_knowledge.storage_paths import resolve_data_path
 
 
-class _CopyCancelled(Exception):
+class CopyCancelled(Exception):
     """Stop an in-progress copy once its synchronous claimant is fenced."""
 
 
 def _raise_if_cancelled(should_continue: Callable[[], bool] | None) -> None:
     if should_continue is not None and not should_continue():
-        raise _CopyCancelled
+        raise CopyCancelled
 
 
 def _file_matches(path: Path, *, size_bytes: int, sha256: str) -> bool:
@@ -99,7 +99,7 @@ def _ensure_pending(session: Session, row: InventoryRow, *, run_id: int) -> Rebu
             output = _find_output(session, row, run_id)
             if output is None:
                 raise
-    if output.status != "pending":
+    if output.status == "failed":
         output.status, output.error_code, output.sha256 = "pending", None, row.sha256
         session.commit()
     return output
@@ -109,6 +109,27 @@ def _set_status(session: Session, output: RebuildOutput, *, status: str, error_c
     output.status, output.error_code = status, error_code
     session.commit()
     return output
+
+
+def reconcile_successful_output(
+    session: Session,
+    settings: Settings,
+    row: InventoryRow,
+    *,
+    run_id: int,
+) -> RebuildOutput | None:
+    """Revalidate a success against its protected final path before reuse."""
+    output = _find_output(session, row, run_id)
+    if output is None or output.status != "success" or output.sha256 != row.sha256:
+        return None
+    target = resolve_rebuild_path(settings, output.target_relpath)
+    if _file_matches(target, size_bytes=row.size_bytes, sha256=row.sha256):
+        return output
+    if target.exists():
+        _set_status(session, output, status="failed", error_code="TARGET_CONFLICT")
+    else:
+        _set_status(session, output, status="pending", error_code=None)
+    return None
 
 
 def _record_failure(session: Session, row: InventoryRow, *, run_id: int, error_code: str) -> RebuildOutput:
@@ -138,15 +159,13 @@ def _copy_inventory_row(
     """
     if row.status != "ready":
         raise ValueError("only ready inventory rows may be copied")
-    if should_continue is not None and not should_continue():
-        return _record_failure(session, row, run_id=run_id, error_code="LEASE_LOST")
+    _raise_if_cancelled(should_continue)
     try:
         source = resolve_data_path(settings.data_root, row.source_relpath, allowed_prefixes=DONE_ARCHIVE_PREFIXES)
     except ValueError:
         return _record_failure(session, row, run_id=run_id, error_code="SOURCE_UNSAFE")
     source_matches = _file_matches(source, size_bytes=row.size_bytes, sha256=row.sha256)
-    if should_continue is not None and not should_continue():
-        return _record_failure(session, row, run_id=run_id, error_code="LEASE_LOST")
+    _raise_if_cancelled(should_continue)
     if not source_matches:
         error = "SOURCE_MISSING" if not source.exists() else "SOURCE_SIZE_MISMATCH"
         if source.exists() and source.is_file() and source.stat().st_size == row.size_bytes:
@@ -160,6 +179,7 @@ def _copy_inventory_row(
             return output
         if target.exists():
             return _set_status(session, output, status="failed", error_code="TARGET_CONFLICT")
+        output = _set_status(session, output, status="pending", error_code=None)
 
     output = _ensure_pending(session, row, run_id=run_id)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -192,8 +212,8 @@ def _copy_inventory_row(
         if not _file_matches(target, size_bytes=row.size_bytes, sha256=row.sha256):
             return _set_status(session, output, status="failed", error_code="COPY_VERIFICATION_FAILED")
         return _set_status(session, output, status="success", error_code=None)
-    except _CopyCancelled:
-        return _set_status(session, output, status="failed", error_code="LEASE_LOST")
+    except CopyCancelled:
+        raise
     except OSError:
         return _set_status(session, output, status="failed", error_code="COPY_FAILED")
     finally:

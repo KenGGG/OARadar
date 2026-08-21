@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -13,6 +14,7 @@ from oa_knowledge.rebuild.classification import INTERNAL_CATEGORIES
 
 _FORBIDDEN_COMPONENT_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]')
 _CONTROL_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+COMPONENT_MAX_BYTES = 240
 
 
 def _find_project_root(start: Path) -> Path | None:
@@ -34,6 +36,40 @@ def _is_relative_to(path: Path, other: Path) -> bool:
     return True
 
 
+def _git_root_for(path: Path) -> Path | None:
+    """Return the containing Git worktree root without emitting repository data."""
+    existing = next((candidate for candidate in (path, *path.parents) if candidate.exists()), None)
+    if existing is None:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(existing), "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def _require_ignored_rebuild_subtree(target: Path) -> None:
+    """Reject an in-repository target unless Git ignores it and descendants."""
+    repository = _git_root_for(target)
+    if repository is None or not _is_relative_to(target, repository):
+        return
+    relative = target.relative_to(repository).as_posix()
+    probes = (f"{relative}/", f"{relative}/.oaradar-ignore-probe")
+    for probe in probes:
+        ignored = subprocess.run(
+            ["git", "-C", str(repository), "check-ignore", "--quiet", "--no-index", "--", probe],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if ignored.returncode != 0:
+            raise ValueError("in-repository rebuild target must be a fully Git-ignored subtree")
+
+
 def resolve_rebuild_root(settings: Settings) -> Path:
     """Resolve and validate the rebuild target, isolated from the live data tree."""
     configured = settings.rebuild.target_root.expanduser()
@@ -45,13 +81,27 @@ def resolve_rebuild_root(settings: Settings) -> Path:
         raise ValueError("rebuild target must not be the filesystem root, home directory, or repository root")
     if _is_relative_to(target, live_root) or _is_relative_to(live_root, target):
         raise ValueError("rebuild target must resolve outside the live data root")
+    _require_ignored_rebuild_subtree(target)
     return target
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(". ")
+
+
+def _clean_component(value: str) -> str:
+    return _FORBIDDEN_COMPONENT_CHARS.sub("", value).strip().rstrip(". ")
 
 
 def safe_component(value: str, *, max_chars: int = 96) -> str:
     """Produce one deterministic filesystem-safe component from OA-derived text."""
-    cleaned = _FORBIDDEN_COMPONENT_CHARS.sub("", value).strip().rstrip(". ")
-    cleaned = cleaned[:max_chars].rstrip(". ")
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    cleaned = _clean_component(value)
+    cleaned = _truncate_utf8(cleaned[:max_chars].rstrip(". "), COMPONENT_MAX_BYTES)
     if not cleaned:
         raise ValueError("path component becomes empty after sanitization")
     return cleaned
@@ -70,12 +120,25 @@ def effective_item_date(item: OAItem) -> date:
 def _item_folder(item: OAItem, *, item_title_max_chars: int = 96) -> str:
     item_date = effective_item_date(item)
     title = safe_component(item.title, max_chars=item_title_max_chars)
-    parts = [item_date.strftime("%Y%m%d")]
-    if item.document_number is not None:
-        parts.append(safe_component(item.document_number))
-    parts.append(title)
+    date_part = item_date.strftime("%Y%m%d")
     short_key = hashlib.sha256(item.oa_item_key.encode("utf-8")).hexdigest()[:8]
-    return "-".join(parts) + f"--{short_key}"
+    identity_suffix = f"--{short_key}"
+    document_number = item.document_number
+    if document_number is not None and document_number.strip():
+        number = safe_component(document_number)
+        content_budget = COMPONENT_MAX_BYTES - len(date_part.encode("utf-8")) - 2 - len(
+            identity_suffix.encode("utf-8")
+        )
+        title_reserve = min(len(title.encode("utf-8")), content_budget // 2)
+        number = _truncate_utf8(number, content_budget - title_reserve)
+        title = _truncate_utf8(title, content_budget - len(number.encode("utf-8")))
+        parts = [date_part, number, title]
+    else:
+        title_budget = COMPONENT_MAX_BYTES - len(date_part.encode("utf-8")) - 1 - len(
+            identity_suffix.encode("utf-8")
+        )
+        parts = [date_part, _truncate_utf8(title, title_budget)]
+    return "-".join(parts) + identity_suffix
 
 
 def archive_item_relpath(item: OAItem, *, item_title_max_chars: int = 96) -> PurePosixPath:
@@ -92,10 +155,25 @@ def archive_file_relpath(
 ) -> PurePosixPath:
     """Return the archive evidence path without consulting classification fields."""
     identity = f"{source.attachment_key}\0{source.file_role}\0{source.source_container_key}"
-    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
-    return archive_item_relpath(item, item_title_max_chars=item_title_max_chars) / (
-        f"{safe_component(source.original_name)}--{suffix}"
+    short_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    cleaned = _clean_component(source.original_name)
+    if not cleaned:
+        raise ValueError("path component becomes empty after sanitization")
+    original_suffix = PurePosixPath(cleaned).suffix
+    stem = cleaned[:-len(original_suffix)] if original_suffix else cleaned
+    identity_suffix = f"--{short_key}"
+    # Reserve one complete four-byte UTF-8 code point for the stem even when
+    # an unusual source name has an extremely long extension.
+    suffix_budget = COMPONENT_MAX_BYTES - len(identity_suffix.encode("utf-8")) - 4
+    original_suffix = _truncate_utf8(original_suffix, suffix_budget)
+    stem_budget = COMPONENT_MAX_BYTES - len(identity_suffix.encode("utf-8")) - len(
+        original_suffix.encode("utf-8")
     )
+    stem = _truncate_utf8(stem, stem_budget)
+    if not stem:
+        raise ValueError("path component becomes empty after sanitization")
+    filename = f"{stem}{identity_suffix}{original_suffix}"
+    return archive_item_relpath(item, item_title_max_chars=item_title_max_chars) / filename
 
 
 def markdown_item_relpath(item: OAItem, *, item_title_max_chars: int = 96) -> PurePosixPath:

@@ -1,3 +1,4 @@
+import subprocess
 from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
 
@@ -112,9 +113,17 @@ def test_safe_component_rejects_empty_result(value: str) -> None:
         safe_component(value)
 
 
-def test_safe_component_rejects_a_title_truncated_to_empty() -> None:
-    with pytest.raises(ValueError, match="empty"):
-        safe_component("合成", max_chars=0)
+@pytest.mark.parametrize("max_chars", (0, -1))
+def test_safe_component_rejects_non_positive_limits_explicitly(max_chars: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        safe_component("合成", max_chars=max_chars)
+
+
+def test_safe_component_limits_multibyte_names_by_utf8_bytes() -> None:
+    component = safe_component("甲" * 200)
+
+    assert len(component.encode("utf-8")) <= 240
+    assert component
 
 
 def test_archive_item_folder_truncates_title_before_stable_key(item: OAItem) -> None:
@@ -124,6 +133,28 @@ def test_archive_item_folder_truncates_title_before_stable_key(item: OAItem) -> 
     assert folder.startswith("20260819-合成文号-")
     assert folder.endswith("--05e0f449")
     assert "甲" * 97 not in folder
+
+
+def test_complete_item_folder_fits_byte_budget_with_long_number_and_title(
+    item: OAItem,
+) -> None:
+    item.document_number = "文号" * 100
+    item.title = "事项标题" * 100
+
+    folder = archive_item_relpath(item).parts[-1]
+
+    assert len(folder.encode("utf-8")) <= 240
+    assert folder.startswith("20260819-")
+    assert folder.endswith("--05e0f449")
+
+
+def test_blank_document_number_is_treated_as_absent(item: OAItem) -> None:
+    item.document_number = " \t "
+
+    folder = archive_item_relpath(item).parts[-1]
+
+    assert folder.startswith("20260819-合成事项标题--")
+    assert "20260819--" not in folder
 
 
 def test_item_path_builders_accept_a_configured_title_limit(item: OAItem) -> None:
@@ -157,8 +188,10 @@ def test_archive_file_paths_do_not_collide_after_name_sanitization(item: OAItem)
     second_path = archive_file_relpath(item, second)
 
     assert first_path != second_path
-    assert first_path.name.startswith("合成.pdf--")
-    assert second_path.name.startswith("合成.pdf--")
+    assert first_path.name.startswith("合成--")
+    assert second_path.name.startswith("合成--")
+    assert first_path.suffix == ".pdf"
+    assert second_path.suffix == ".pdf"
 
 
 def test_archive_file_paths_do_not_collide_for_exact_duplicate_names(item: OAItem) -> None:
@@ -176,10 +209,87 @@ def test_archive_file_paths_do_not_collide_for_exact_duplicate_names(item: OAIte
     assert archive_file_relpath(item, first) == first_path
 
 
+def test_archive_file_name_retains_suffix_and_hash_within_byte_budget(
+    item: OAItem,
+) -> None:
+    source = ArchivedFile(
+        original_name=f"{'长' * 200}.pdf",
+        attachment_key="long-name",
+        file_role="attachment",
+        source_container_key="container",
+    )
+
+    name = archive_file_relpath(item, source).name
+
+    assert len(name.encode("utf-8")) <= 240
+    assert name.endswith("--900b2bd9.pdf")
+    assert PurePosixPath(name).suffix == ".pdf"
+
+
+def test_archive_file_name_preserves_a_multibyte_stem_with_a_long_extension(
+    item: OAItem,
+) -> None:
+    source = ArchivedFile(
+        original_name=f"合.{('x' * 400)}",
+        attachment_key="long-extension",
+        file_role="attachment",
+        source_container_key="container",
+    )
+
+    name = archive_file_relpath(item, source).name
+
+    assert len(name.encode("utf-8")) <= 240
+    assert name.startswith("合--")
+    assert "--7cff74c4." in name
+
+
 def test_resolve_rebuild_root_is_a_sibling_of_live_data(tmp_path: Path) -> None:
     settings = Settings(app={"data_root": tmp_path / "data"})
 
     assert resolve_rebuild_root(settings) == (tmp_path / "data_rebuilt").resolve()
+
+
+def _init_git_repository(path: Path, ignore_text: str = "") -> None:
+    path.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+    (path / ".gitignore").write_text(ignore_text, encoding="utf-8")
+
+
+def test_default_in_repository_rebuild_target_is_allowed_when_fully_ignored(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "synthetic-repository"
+    _init_git_repository(repository, "/data_rebuilt/\n")
+    settings = Settings(app={"data_root": repository / "data"})
+
+    assert resolve_rebuild_root(settings) == repository / "data_rebuilt"
+
+
+def test_custom_in_repository_rebuild_target_must_be_fully_ignored(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "synthetic-repository"
+    _init_git_repository(repository, "/data_rebuilt/\n")
+    settings = Settings(
+        app={"data_root": repository / "data"},
+        rebuild={"target_root": repository / "custom-rebuild"},
+    )
+
+    with pytest.raises(ValueError, match="Git-ignored"):
+        resolve_rebuild_root(settings)
+
+
+def test_custom_in_repository_rebuild_target_is_allowed_when_fully_ignored(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "synthetic-repository"
+    _init_git_repository(repository, "/custom-rebuild/\n")
+    settings = Settings(
+        app={"data_root": repository / "data"},
+        rebuild={"target_root": repository / "custom-rebuild"},
+    )
+
+    assert resolve_rebuild_root(settings) == repository / "custom-rebuild"
 
 
 def test_resolve_rebuild_root_is_anchored_to_live_data_when_cwd_changes(tmp_path: Path, monkeypatch) -> None:
