@@ -249,6 +249,38 @@ def test_persistent_rollback_fsync_failure_still_restores_live_before_restart(
     assert unsafe_restarts == [False]
 
 
+def test_failed_first_inverse_rename_keeps_services_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live rebuilt tree is not evidence that the legacy layout was restored."""
+    plan = _ready_plan(tmp_path)
+    control_calls: list[str] = []
+    real_rename = cutover._rename
+    real_sync = cutover._sync_renamed_directories
+
+    def fail_first_inverse_rename(source: Path, target: Path) -> None:
+        if source == plan.live_root and target == plan.rebuilt_root:
+            raise OSError("synthetic first inverse rename failure")
+        real_rename(source, target)
+
+    def fail_after_second_forward_rename(source: Path, target: Path) -> None:
+        if source == plan.rebuilt_root and target == plan.live_root:
+            raise OSError("synthetic post-promotion failure")
+        real_sync(source, target)
+
+    monkeypatch.setattr(cutover, "_rename", fail_first_inverse_rename)
+    monkeypatch.setattr(cutover, "_sync_renamed_directories", fail_after_second_forward_rename)
+    monkeypatch.setattr(cutover, "_control_units", lambda action, _units: control_calls.append(action))
+
+    with pytest.raises(cutover.CutoverRollbackError):
+        execute_cutover(plan, authorized=True)
+
+    assert (plan.live_root / "marker").read_text(encoding="utf-8") == "rebuilt"
+    assert (plan.legacy_root / "marker").read_text(encoding="utf-8") == "legacy"
+    assert not plan.rebuilt_root.exists()
+    assert control_calls == ["stop", "stop"]
+
+
 def test_authorization_token_is_path_bound_and_short_lived(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

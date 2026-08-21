@@ -490,6 +490,11 @@ def _runtime_paths_are_safe(plan: CutoverPlan) -> bool:
     )
 
 
+def _legacy_layout_is_restored(plan: CutoverPlan) -> bool:
+    """Require the complete pre-cutover path shape before starting legacy services."""
+    return _runtime_paths_are_safe(plan)
+
+
 def _rollback(
     plan: CutoverPlan, *, live_to_legacy: bool, rebuilt_to_live: bool,
 ) -> list[BaseException]:
@@ -548,7 +553,7 @@ def execute_cutover(plan: CutoverPlan, *, authorized: bool) -> dict[str, str]:
                 rebuilt_to_live=rebuilt_to_live,
             )
         )
-        if _directory_is_safe(plan.live_root):
+        if _legacy_layout_is_restored(plan):
             try:
                 _control_units("start", plan.units)
             except BaseException as restart_exc:  # noqa: BLE001 - restart failure is a rollback failure.
