@@ -282,6 +282,32 @@ def _current_original_fingerprint(session: Session, *, run_id: int, item_id: int
     return hashlib.sha256(evidence.encode()).hexdigest()
 
 
+def _current_index_fingerprint(session: Session, *, run_id: int, item_id: int) -> str:
+    """Fingerprint every local ledger input that can change rendered index state."""
+    originals = _current_original_fingerprint(session, run_id=run_id, item_id=item_id)
+    outputs = session.execute(
+        select(
+            RebuildOutput.kind,
+            RebuildOutput.source_file_id,
+            RebuildOutput.target_relpath,
+            RebuildOutput.sha256,
+            RebuildOutput.status,
+            RebuildOutput.error_code,
+        )
+        .where(
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.oa_item_id == item_id,
+            RebuildOutput.kind.in_(("parse", "body_markdown", "attachment_markdown")),
+        )
+        .order_by(RebuildOutput.kind, RebuildOutput.source_file_id, RebuildOutput.target_relpath)
+    ).all()
+    state = "\0".join(
+        ":".join(str(value or "") for value in row)
+        for row in outputs
+    )
+    return hashlib.sha256(f"{originals}\0{state}".encode()).hexdigest()
+
+
 def _current_page_body_source(
     session: Session, *, run_id: int, item_id: int,
 ) -> ArchivedFile | None:
@@ -358,6 +384,11 @@ def enqueue_markdown_rebuild(
         if files:
             continue
         page = _current_page_body_source(session, run_id=run_id, item_id=item.id)
+        page_body_required = (
+            page is not None
+            and page.sha256 is not None
+            and body_markdown_filename(item) is not None
+        )
         if (
             page is not None
             and page.sha256
@@ -378,20 +409,21 @@ def enqueue_markdown_rebuild(
             )
         ):
             added += 1
-        # A confirmed item with no Markdown-convertible source still has a
-        # useful metadata/original-evidence index.  Page body publication (if
-        # present) is inserted first so this index cannot run ahead of it.
-        fingerprint = _current_original_fingerprint(session, run_id=run_id, item_id=item.id)
-        if _enqueue_markdown_task(
-            session,
-            run_id=run_id,
-            item_id=item.id,
-            stage=REBUILD_INDEX_STAGE,
-            target_id=item.id,
-            source_sha256=fingerprint,
-            payload={"item_id": item.id, "source_sha256": fingerprint},
-        ):
-            added += 1
+        # A numbered page-body item must publish (or terminally fail) its
+        # required body before index work becomes claimable.  Metadata-only
+        # and unnumbered items can publish their explicit no-content index now.
+        if not page_body_required:
+            fingerprint = _current_index_fingerprint(session, run_id=run_id, item_id=item.id)
+            if _enqueue_markdown_task(
+                session,
+                run_id=run_id,
+                item_id=item.id,
+                stage=REBUILD_INDEX_STAGE,
+                target_id=item.id,
+                source_sha256=fingerprint,
+                payload={"item_id": item.id, "source_sha256": fingerprint},
+            ):
+                added += 1
     if added:
         run.status = "running"
         run.finished_at = None

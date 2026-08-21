@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import time
@@ -122,10 +123,10 @@ def test_rebuild_worker_advances_confirmed_synthetic_item_to_index(
         )) is not None
 
 
-def test_rebuild_worker_publishes_page_body_without_markdown_attachment(
+def test_page_body_only_index_waits_for_body_under_interleaved_workers(
     config_file: Path, monkeypatch,
 ) -> None:
-    """Dropping page-body fallback would strand a numbered, body-only item."""
+    """An early index claim must not publish before the required body completes."""
     settings = load_settings(config_file)
     settings.rebuild.target_root = settings.data_root.parent / "data_rebuilt"
     upgrade_database(settings.database_path)
@@ -151,18 +152,29 @@ def test_rebuild_worker_publishes_page_body_without_markdown_attachment(
             status="success", error_code=None,
         ))
         session.commit()
-        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 2
-        run_id, item_id = run.id, item.id
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        run_id, item_id, page_id = run.id, item.id, page.id
 
-    monkeypatch.setattr(
-        "oa_knowledge.rebuild.markdown.publish_rebuilt_body",
-        lambda *_args, **_kwargs: SimpleNamespace(status="success"),
-    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def publish_body(session, _settings, rebuild_run_id, rebuild_item_id):
+        entered.set()
+        assert release.wait(2)
+        output = RebuildOutput(
+            run_id=rebuild_run_id, oa_item_id=rebuild_item_id, source_file_id=page_id,
+            kind="body_markdown", target_relpath="markdown/page-body-only/body.md", sha256="c" * 64,
+            status="success", error_code=None,
+        )
+        session.add(output); session.commit()
+        return output
+
+    monkeypatch.setattr("oa_knowledge.rebuild.markdown.publish_rebuilt_body", publish_body)
 
     def publish_index(session, _settings, rebuild_run_id, rebuild_item_id):
         output = RebuildOutput(
             run_id=rebuild_run_id, oa_item_id=rebuild_item_id, source_file_id=None,
-            kind="item_index", target_relpath="markdown/page-body-only/_index.md", sha256="c" * 64,
+            kind="item_index", target_relpath="markdown/page-body-only/_index.md", sha256="d" * 64,
             status="success", error_code=None,
         )
         session.add(output); session.commit()
@@ -170,9 +182,18 @@ def test_rebuild_worker_publishes_page_body_without_markdown_attachment(
 
     monkeypatch.setattr("oa_knowledge.rebuild.index.publish_rebuilt_index", publish_index)
     worker = OperationWorker(settings, config_path=config_file)
+    interleaved = OperationWorker(settings, config_path=config_file)
     try:
-        assert worker.run_until_idle() == 2
+        active = threading.Thread(target=worker.run_once)
+        active.start()
+        assert entered.wait(2)
+        assert interleaved.run_once() is False
+        release.set()
+        active.join(timeout=2)
+        assert not active.is_alive()
+        assert interleaved.run_once() is True
     finally:
+        interleaved.close()
         worker.close()
 
     with Session(engine) as session:
@@ -301,6 +322,72 @@ def test_rebuild_parse_failure_still_publishes_other_completed_evidence(
             PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_parse",
             PipelineTask.status == "failed",
         )) is not None
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_index",
+            PipelineTask.status == "completed",
+        )) is not None
+
+
+def test_failed_selected_body_parse_never_falls_back_to_page_body(
+    config_file: Path, monkeypatch,
+) -> None:
+    """Choosing from parsed-only sources would wrongly publish the lower-priority page body."""
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:selected-body-failure", source_channel="done", title="合成正文优先级事项",
+            document_number="示例〔2026〕2号", document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        session.add(item); session.flush()
+        official = ArchivedFile(
+            oa_item_id=item.id, attachment_key="selected-official", original_name="正文.pdf",
+            file_role="official_body", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="7" * 64,
+        )
+        page = ArchivedFile(
+            oa_item_id=item.id, attachment_key="selected-page", original_name="body.html",
+            file_role="body_snapshot", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="8" * 64,
+        )
+        session.add_all((official, page)); session.flush()
+        run = PipelineRun(run_key="synthetic-selected-body-failure", pipeline_type="data_rebuild")
+        session.add(run); session.flush()
+        for source in (official, page):
+            session.add(RebuildOutput(
+                run_id=run.id, oa_item_id=item.id, source_file_id=source.id, kind="original",
+                target_relpath=f"archive/synthetic/{source.id}.bin", sha256=source.sha256,
+                status="success", error_code=None,
+            ))
+        session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        run_id = run.id
+
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.parser.parse_rebuilt_source",
+        lambda *_args, **_kwargs: SimpleNamespace(status="failed", error_code="SYNTHETIC_PARSE_FAILED"),
+    )
+    body_calls: list[int] = []
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.markdown.publish_rebuilt_body",
+        lambda _session, _settings, _run_id, rebuild_item_id: body_calls.append(rebuild_item_id),
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.rebuild.index.publish_rebuilt_index",
+        lambda _session, _settings, _run_id, _item_id: SimpleNamespace(status="success"),
+    )
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        assert worker.run_until_idle() == 2
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        assert body_calls == []
+        assert session.scalar(select(PipelineTask).where(
+            PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_publish",
+        )) is None
         assert session.scalar(select(PipelineTask).where(
             PipelineTask.run_id == run_id, PipelineTask.stage == "rebuild_index",
             PipelineTask.status == "completed",
@@ -535,6 +622,80 @@ def test_long_pipeline_stage_refreshes_its_database_lease(config_file: Path, mon
         worker.close()
 
     assert observed["refreshed"] is True
+
+
+def test_active_rebuild_heartbeat_prevents_second_worker_reclaim(
+    config_file: Path, monkeypatch,
+) -> None:
+    """Removing rebuild heartbeats would let a short expired lease duplicate parsing."""
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:active-rebuild-lease", source_channel="done", title="合成活跃租约事项",
+            document_date=datetime(2026, 8, 20, tzinfo=timezone.utc).date(),
+            classification_state="confirmed", source_type="internal", internal_category="风险管理",
+        )
+        session.add(item); session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, attachment_key="active-rebuild-lease", original_name="source.txt",
+            file_role="direct_attachment", source_container_key="root", download_status="verified",
+            size_bytes=9, sha256="6" * 64,
+        )
+        session.add(source); session.flush()
+        run = PipelineRun(run_key="synthetic-active-rebuild-lease", pipeline_type="data_rebuild")
+        session.add(run); session.flush()
+        session.add(RebuildOutput(
+            run_id=run.id, oa_item_id=item.id, source_file_id=source.id, kind="original",
+            target_relpath="archive/synthetic/active-lease.txt", sha256=source.sha256,
+            status="success", error_code=None,
+        ))
+        session.commit()
+        assert enqueue_markdown_rebuild(session, run.id, [item.id]) == 1
+        task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+        assert task is not None
+        task_id = task.id
+
+    monkeypatch.setattr("oa_knowledge.web.worker.LEASE_TTL", timedelta(milliseconds=40))
+    monkeypatch.setattr("oa_knowledge.web.worker.PIPELINE_HEARTBEAT_SECONDS", 0.01)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def slow_parse(*_args, **_kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            attempt = calls
+        entered.set()
+        if attempt == 1:
+            assert release.wait(2)
+        return SimpleNamespace(status="unsupported", error_code="UNSUPPORTED_FORMAT")
+
+    monkeypatch.setattr("oa_knowledge.rebuild.parser.parse_rebuilt_source", slow_parse)
+    first = OperationWorker(settings, config_path=config_file)
+    second = OperationWorker(settings, config_path=config_file)
+    try:
+        active = threading.Thread(target=first.run_once)
+        active.start()
+        assert entered.wait(2)
+        time.sleep(0.12)
+        assert second.run_once() is False
+        release.set()
+        active.join(timeout=2)
+        assert not active.is_alive()
+    finally:
+        second.close()
+        first.close()
+
+    with Session(engine) as session:
+        task = session.get(PipelineTask, task_id)
+        assert task is not None
+        assert calls == 1
+        assert task.status == "completed"
+        assert task.attempts == 1
 
 
 def test_has_verified_attachment_returns_boolean_for_empty_and_existing_sources(config_file: Path) -> None:

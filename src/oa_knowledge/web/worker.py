@@ -30,7 +30,7 @@ from oa_knowledge.rebuild.campaign import (
     REBUILD_INDEX_STAGE,
     REBUILD_PARSE_STAGE,
     REBUILD_PUBLISH_STAGE,
-    _current_original_fingerprint,
+    _current_index_fingerprint,
     _finish_run,
 )
 from oa_knowledge.rebuild.paths import effective_item_date
@@ -353,6 +353,48 @@ class OperationWorker:
             session.commit()
             _finish_run(session, task.run_id)
 
+    def _renew_rebuild_lease(self, task: PipelineTask) -> bool:
+        """Fence a local rebuild file operation to its current worker owner."""
+        with Session(self.engine) as session:
+            renewed = session.execute(update(PipelineTask).where(
+                PipelineTask.id == task.id,
+                PipelineTask.status == "running",
+                PipelineTask.lease_owner == self.owner,
+            ).values(
+                lease_expires_at=datetime.now(timezone.utc) + LEASE_TTL,
+            )).rowcount
+            session.commit()
+            return renewed == 1
+
+    def _run_rebuild_operation(self, task: PipelineTask, operation):
+        """Keep one local producer fenced and heartbeating while it touches files."""
+        if not self._renew_rebuild_lease(task):
+            raise RuntimeError("REBUILD_LEASE_LOST")
+        stop = threading.Event()
+        lost = threading.Event()
+
+        def heartbeat() -> None:
+            while not stop.wait(PIPELINE_HEARTBEAT_SECONDS):
+                try:
+                    if not self._renew_rebuild_lease(task):
+                        lost.set()
+                        return
+                except Exception:
+                    # A transient SQLite lock must not revoke a still-valid
+                    # owner lease; retry on the next heartbeat before expiry.
+                    continue
+
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+        try:
+            result = operation()
+            if lost.is_set():
+                raise RuntimeError("REBUILD_LEASE_LOST")
+            return result
+        finally:
+            stop.set()
+            thread.join(timeout=1)
+
     @staticmethod
     def _rebuild_item_admitted(session: Session, item_id: int) -> OAItem | None:
         item = session.get(OAItem, item_id)
@@ -451,6 +493,7 @@ class OperationWorker:
                 RebuildOutput.sha256.is_not(None),
             ).limit(1)) is not None
         )]
+        parsed_ids = {source.id for source in parsed}
         page_output = session.scalar(select(RebuildOutput).join(ArchivedFile).where(
             RebuildOutput.run_id == run_id,
             RebuildOutput.oa_item_id == item_id,
@@ -459,11 +502,14 @@ class OperationWorker:
             ArchivedFile.id == RebuildOutput.source_file_id,
             ArchivedFile.file_role == "body_snapshot",
         ).order_by(RebuildOutput.id.desc()).limit(1))
-        body = select_body_source(item, parsed, page_output is not None)
+        # Body priority is determined from all current copied originals.  A
+        # failed official/named body must remain that item's retryable body
+        # state, never silently fall through to a lower-priority page snapshot.
+        body = select_body_source(item, current, page_output is not None)
         added = False
         if body.kind == "attachment" and body.source_file_id is not None:
             source = session.get(ArchivedFile, body.source_file_id)
-            if source is not None and source.sha256:
+            if source is not None and source.sha256 and source.id in parsed_ids:
                 added = self._enqueue_rebuild_task(
                     session, run_id=run_id, item_id=item_id, stage=REBUILD_PUBLISH_STAGE,
                     target_id=item_id, source_sha256=source.sha256,
@@ -510,7 +556,7 @@ class OperationWorker:
             for task in tasks
         ):
             return
-        source_sha = _current_original_fingerprint(
+        source_sha = _current_index_fingerprint(
             session, run_id=run_id, item_id=item_id,
         )
         self._enqueue_rebuild_task(
@@ -534,7 +580,7 @@ class OperationWorker:
                 return
             if task.stage == REBUILD_INDEX_STAGE:
                 source_sha = payload.get("source_sha256")
-                current = _current_original_fingerprint(
+                current = _current_index_fingerprint(
                     session, run_id=task.run_id, item_id=item_id,
                 )
                 if not isinstance(source_sha, str) or source_sha != current:
@@ -564,8 +610,12 @@ class OperationWorker:
             if task.stage == REBUILD_PARSE_STAGE:
                 from oa_knowledge.rebuild.parser import parse_rebuilt_source
                 with Session(self.engine) as parser_session:
-                    result = parse_rebuilt_source(
-                        parser_session, self.settings, task.run_id, int(payload["source_file_id"]),
+                    result = self._run_rebuild_operation(
+                        task,
+                        lambda: parse_rebuilt_source(
+                            parser_session, self.settings, task.run_id,
+                            int(payload["source_file_id"]),
+                        ),
                     )
                 if result.status not in {"success", "unsupported"}:
                     with Session(self.engine) as session:
@@ -586,11 +636,19 @@ class OperationWorker:
                 if payload.get("kind") == "body":
                     from oa_knowledge.rebuild.markdown import publish_rebuilt_body
                     with Session(self.engine) as session:
-                        publish_rebuilt_body(session, self.settings, task.run_id, item_id)
+                        self._run_rebuild_operation(
+                            task,
+                            lambda: publish_rebuilt_body(session, self.settings, task.run_id, item_id),
+                        )
                 elif payload.get("kind") == "attachment":
                     from oa_knowledge.rebuild.markdown import publish_rebuilt_attachment
                     with Session(self.engine) as session:
-                        publish_rebuilt_attachment(session, self.settings, task.run_id, int(payload["source_file_id"]))
+                        self._run_rebuild_operation(
+                            task,
+                            lambda: publish_rebuilt_attachment(
+                                session, self.settings, task.run_id, int(payload["source_file_id"]),
+                            ),
+                        )
                 else:
                     raise ValueError("REBUILD_PUBLISH_KIND_INVALID")
                 with Session(self.engine) as session:
@@ -600,7 +658,10 @@ class OperationWorker:
             elif task.stage == REBUILD_INDEX_STAGE:
                 from oa_knowledge.rebuild.index import publish_rebuilt_index
                 with Session(self.engine) as session:
-                    publish_rebuilt_index(session, self.settings, task.run_id, item_id)
+                    self._run_rebuild_operation(
+                        task,
+                        lambda: publish_rebuilt_index(session, self.settings, task.run_id, item_id),
+                    )
             else:
                 self._finish_rebuild_task(task, error_code="REBUILD_STAGE_INVALID")
                 return

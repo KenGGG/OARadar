@@ -48,6 +48,12 @@ class _AttachmentState:
     output: RebuildOutput | None = None
 
 
+@dataclass(frozen=True)
+class _BodyState:
+    state: str
+    output: RebuildOutput | None = None
+
+
 def _error(code: str) -> RebuildIndexError:
     return RebuildIndexError(code)
 
@@ -304,7 +310,7 @@ def _body_output(
     run_id: int,
     item: OAItem,
     originals: dict[int, _OriginalEvidence],
-) -> RebuildOutput | None:
+) -> _BodyState:
     filename = body_markdown_filename(item)
     all_bodies = list(
         session.scalars(
@@ -318,7 +324,7 @@ def _body_output(
     if filename is None:
         if all_bodies:
             raise _error("UNNUMBERED_BODY_MARKDOWN")
-        return None
+        return _BodyState("no_content")
     if len(all_bodies) > 1:
         raise _error("BODY_MARKDOWN_AMBIGUOUS")
     page = load_verified_page_body_evidence(session, settings, item.id, run_id=run_id)
@@ -328,14 +334,21 @@ def _body_output(
         page is not None,
     )
     if selected.kind == "none":
-        return None
+        return _BodyState("no_content")
     source_id = (
         selected.source_file_id
         if selected.kind == "attachment"
         else page.source_file_id
     )
     if source_id is None:
-        return None
+        return _BodyState("no_content")
+    if selected.kind == "attachment":
+        source = originals.get(source_id)
+        if source is None:
+            return _BodyState("no_content")
+        parse_state = _parse_state(session, settings, run_id=run_id, source=source.source)
+        if parse_state in {"retryable", "unsupported"}:
+            return _BodyState(parse_state)
     target = (markdown_item_relpath(item) / filename).as_posix()
     output = _exact_markdown(
         session,
@@ -346,7 +359,20 @@ def _body_output(
         kind="body_markdown",
         target_relpath=target,
     )
-    return output
+    if output is not None:
+        return _BodyState("success", output)
+    failed = session.scalar(
+        select(RebuildOutput.id).where(
+            RebuildOutput.run_id == run_id,
+            RebuildOutput.oa_item_id == item.id,
+            RebuildOutput.source_file_id == source_id,
+            RebuildOutput.kind == "body_markdown",
+            RebuildOutput.status == "failed",
+        ).limit(1)
+    )
+    if failed is not None:
+        return _BodyState("retryable")
+    raise _error("BODY_MARKDOWN_UNAVAILABLE")
 
 
 def _render(
@@ -354,16 +380,21 @@ def _render(
     *,
     item_relpath: PurePosixPath,
     originals: dict[int, _OriginalEvidence],
-    body: RebuildOutput | None,
+    body: _BodyState,
     attachments: list[_AttachmentState],
 ) -> bytes:
     lines = _item_lines(item)
     lines.extend(("", "## 正文", ""))
-    if body is None:
+    if body.state == "no_content":
         lines.append("- 无可用正文证据。")
+    elif body.state == "retryable":
+        lines.append("- 正文：转换失败，等待重试")
+    elif body.state == "unsupported":
+        lines.append("- 正文：暂不支持转换")
     else:
+        assert body.output is not None
         lines.append(
-            f"- [正文]({_relative_link(body.target_relpath, item_relpath=item_relpath)})"
+            f"- [正文]({_relative_link(body.output.target_relpath, item_relpath=item_relpath)})"
         )
     lines.extend(("", "## 原始附件", ""))
     if originals:
@@ -424,9 +455,7 @@ def _build_content(
         run_id=run_id,
         item=item,
         originals=originals,
-        selected_body_id=(
-            selected.source_file_id if selected.kind == "attachment" else None
-        ),
+        selected_body_id=(selected.source_file_id if selected.kind == "attachment" else None),
     )
     return (item_relpath / "_index.md").as_posix(), _render(
         item,

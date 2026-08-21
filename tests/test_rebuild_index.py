@@ -208,13 +208,13 @@ def test_index_is_unique_per_run_and_item(
     assert second.id == first.id
 
 
-def test_index_marks_missing_numbered_body_as_no_content(
+def test_index_rejects_temporary_missing_numbered_body(
     session: Session,
     settings: Settings,
     run_id: int,
     rebuilt_item: OAItem,
 ) -> None:
-    """A missing body must be explicit local no-content, not an item failure."""
+    """Accepting an index before its selected body exists would freeze stale no-content."""
     body = next(
         output
         for output in session.query(RebuildOutput).all()
@@ -222,11 +222,8 @@ def test_index_marks_missing_numbered_body_as_no_content(
     )
     resolve_rebuild_path(settings, body.target_relpath).unlink()
 
-    output = publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
-    text = resolve_rebuild_path(settings, output.target_relpath).read_text(encoding="utf-8")
-
-    assert output.status == "success"
-    assert "- 无可用正文证据。" in text
+    with pytest.raises(RebuildIndexError, match="BODY_MARKDOWN_UNAVAILABLE"):
+        publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
 
 
 def test_index_url_encodes_original_and_markdown_link_destinations(
@@ -413,6 +410,37 @@ def test_index_lists_terminal_unsupported_and_retryable_attachment_failure(
 
     assert "预算表.xlsx：暂不支持转换" in text
     assert "待重试.docx：转换失败，等待重试" in text
+
+
+def test_failed_selected_official_body_stays_retryable_without_page_fallback(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    rebuilt_item: OAItem,
+) -> None:
+    """Selecting from parsed-only evidence would replace the official body with page text."""
+    official = next(
+        source for source in rebuilt_item.files if source.file_role == "official_body"
+    )
+    _source(session, settings, run_id, rebuilt_item, "body.html", "body_snapshot")
+    parse = next(
+        output for output in session.query(RebuildOutput).all()
+        if output.kind == "parse" and output.source_file_id == official.id
+    )
+    body = next(
+        output for output in session.query(RebuildOutput).all()
+        if output.kind == "body_markdown"
+    )
+    parse.status, parse.error_code, parse.sha256 = "failed", "PARSER_TIMEOUT", None
+    body.status, body.error_code = "failed", "PARSER_TIMEOUT"
+    session.commit()
+
+    output = publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
+    text = resolve_rebuild_path(settings, output.target_relpath).read_text(encoding="utf-8")
+
+    assert output.status == "success"
+    assert "- 正文：转换失败，等待重试" in text
+    assert "- [正文](" not in text
 
 
 def test_index_lists_retryable_terminal_attachment_publication_failure(
