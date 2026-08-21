@@ -30,7 +30,7 @@ from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.archive.naming import validate_relative_path
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, OAItem, OAManifestItem, OAManifestSync, OperationEvent, OperationJob, ParseJob, PipelineTask, ReviewEntry, Run
+from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ExclusionPolicy, ItemOccurrence, OAItem, OAManifestItem, OAManifestSync, OperationEvent, OperationJob, ParseJob, PipelineRun, PipelineTask, ReviewEntry, Run
 from oa_knowledge.collector.done import DoneDiscovery
 from oa_knowledge.collector.pending import PENDING_LIST_PATH, PendingAdapter
 from oa_knowledge.collector.pending_detail import extract_pending_detail_identifiers
@@ -50,6 +50,9 @@ from oa_knowledge.scheduled_sync import (
 from oa_knowledge.reconcile import reconcile_done_occurrence
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.markdown_export.service import convert_archive, markdown_status as get_markdown_status
+from oa_knowledge.rebuild.campaign import create_rebuild_run, enqueue_archive_copy, execute_archive_copy
+from oa_knowledge.rebuild.inventory import build_inventory, inventory_summary, write_private_inventory
+from oa_knowledge.rebuild.paths import resolve_rebuild_path
 
 app = typer.Typer(help="OARadar V2 local read-only OA workspace")
 db_app = typer.Typer(help="Database migration commands")
@@ -76,6 +79,8 @@ curate_app = typer.Typer(help="Local-only OA Package to curated knowledge docume
 app.add_typer(curate_app, name="curate", hidden=True)
 data_app = typer.Typer(help="本地数据预检、隔离、恢复与清除")
 app.add_typer(data_app, name="data", hidden=True)
+rebuild_app = typer.Typer(help="Local-only clean archive rebuild")
+app.add_typer(rebuild_app, name="rebuild")
 
 
 def settings_option(config: Path | None) -> Settings:
@@ -92,6 +97,87 @@ def require_engine(settings: Settings):
         typer.echo("database not initialized; run 'oa init' first", err=True)
         raise typer.Exit(1)
     return create_db_engine(settings.database_path)
+
+
+def _rebuild_error(error_code: str) -> None:
+    typer.echo(json.dumps({"error_code": error_code}, ensure_ascii=False))
+    raise typer.Exit(1)
+
+
+@rebuild_app.command("inventory")
+def rebuild_inventory(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),  # noqa: B008
+) -> None:
+    """Build the local inventory and save details only in protected private state."""
+    settings = settings_option(config)
+    if not settings.database_path.exists():
+        _rebuild_error("DATABASE_NOT_INITIALIZED")
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            rows = build_inventory(session, settings)
+        write_private_inventory(settings, resolve_rebuild_path(settings, "state/private/inventory.json"), rows)
+        typer.echo(json.dumps(inventory_summary(rows), ensure_ascii=False))
+    finally:
+        engine.dispose()
+
+
+@rebuild_app.command("archive")
+def rebuild_archive(
+    execute: bool = typer.Option(False, "--execute"),
+    run_id: int | None = typer.Option(None, "--run-id", min=1),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),  # noqa: B008
+) -> None:
+    """Dry-run by default; execute synchronously only when explicitly requested."""
+    if not execute:
+        typer.echo(json.dumps({"copied": 0, "failed": 0, "dry_run": True}))
+        return
+    settings = settings_option(config)
+    if not settings.database_path.exists():
+        _rebuild_error("DATABASE_NOT_INITIALIZED")
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            rows = build_inventory(session, settings)
+            if run_id is None:
+                run = create_rebuild_run(session, cutoff_at=datetime.now(timezone.utc))  # noqa: UP017
+            else:
+                run = session.get(PipelineRun, run_id)
+                if run is None or run.pipeline_type != "data_rebuild":
+                    _rebuild_error("REBUILD_RUN_NOT_FOUND")
+            enqueued = enqueue_archive_copy(session, run.id, rows)
+            result = execute_archive_copy(session, settings, run.id, rows)
+            typer.echo(json.dumps({"enqueued": enqueued, **result}, ensure_ascii=False))
+    except typer.Exit:
+        raise
+    except Exception:  # noqa: BLE001 - CLI output must expose only a safe error code.
+        _rebuild_error("REBUILD_FAILED")
+    finally:
+        engine.dispose()
+
+
+@rebuild_app.command("status")
+def rebuild_status(
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),  # noqa: B008
+) -> None:
+    """Report count-only state of local rebuild runs."""
+    settings = settings_option(config)
+    if not settings.database_path.exists():
+        _rebuild_error("DATABASE_NOT_INITIALIZED")
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            run = session.scalar(select(PipelineRun).where(
+                PipelineRun.pipeline_type == "data_rebuild"
+            ).order_by(PipelineRun.id.desc()))
+            if run is None:
+                typer.echo(json.dumps({"runs": 0, "queued": 0, "running": 0, "completed": 0, "failed": 0}))
+                return
+            tasks = session.scalars(select(PipelineTask).where(PipelineTask.run_id == run.id)).all()
+            counts = {status: sum(task.status == status for task in tasks) for status in ("queued", "running", "completed", "failed")}
+            typer.echo(json.dumps({"runs": 1, **counts}, ensure_ascii=False))
+    finally:
+        engine.dispose()
 
 
 def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:
