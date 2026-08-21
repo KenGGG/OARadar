@@ -103,6 +103,7 @@ def test_0036_adds_rebuild_classification_gate(existing_0035_database: Path) -> 
         ).fetchone()[0]
     assert "ix_oa_items_source_channel_classification_state_source_type" in indexes
     assert "ck_oa_items_classification_state" in table_sql
+    assert "ck_oa_items_classification_source" in table_sql
 
 
 def test_oa_item_classification_gate_and_event_audit_model(tmp_path: Path) -> None:
@@ -132,6 +133,27 @@ def test_oa_item_classification_gate_and_event_audit_model(tmp_path: Path) -> No
         assert persisted_event is not None
         assert persisted_event.oa_item_id == item.id
         assert persisted_event.current_classification_json == '{"classification_state":"confirmed"}'
+
+
+def test_oa_item_classification_source_accepts_only_rule_or_manual(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        session.add_all([
+            OAItem(oa_item_key="classification-rule", source_channel="done", title="Synthetic", classification_source="rule"),
+            OAItem(oa_item_key="classification-manual", source_channel="done", title="Synthetic", classification_source="manual"),
+        ])
+        session.commit()
+
+        session.add(OAItem(
+            oa_item_key="classification-invalid-source",
+            source_channel="done",
+            title="Synthetic",
+            classification_source="generated",
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
 
 
 def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:

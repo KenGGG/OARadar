@@ -37,6 +37,11 @@ def upgrade() -> None:
                 "ck_oa_items_classification_state",
                 "classification_state IN ('suggested', 'needs_review', 'confirmed')",
             )
+        if "ck_oa_items_classification_source" not in existing_constraints:
+            batch.create_check_constraint(
+                "ck_oa_items_classification_source",
+                "classification_source IS NULL OR classification_source IN ('rule', 'manual')",
+            )
         if "ix_oa_items_source_channel_classification_state_source_type" not in existing_indexes:
             batch.create_index(
                 "ix_oa_items_source_channel_classification_state_source_type",
@@ -59,6 +64,7 @@ def downgrade() -> None:
     op.drop_table("rebuild_classification_events")
     with op.batch_alter_table("oa_items", recreate="always") as batch:
         batch.drop_index("ix_oa_items_source_channel_classification_state_source_type")
+        batch.drop_constraint("ck_oa_items_classification_source", type_="check")
         batch.drop_constraint("ck_oa_items_classification_state", type_="check")
         batch.drop_column("classification_source")
         batch.drop_column("classification_confirmed_at")
