@@ -26,7 +26,7 @@ from oa_knowledge.rebuild.inventory import (
     inventory_summary,
     write_private_inventory,
 )
-from oa_knowledge.rebuild.paths import archive_file_relpath
+from oa_knowledge.rebuild.paths import archive_file_relpath, resolve_rebuild_path
 
 
 @pytest.fixture
@@ -247,7 +247,9 @@ def test_inventory_summary_returns_counts_without_printing_confidential_paths(
     assert capsys.readouterr().out == ""
 
 
-def test_private_inventory_is_confined_and_owner_readable_only(tmp_path: Path) -> None:
+def test_private_inventory_is_confined_and_owner_readable_only(
+    settings: Settings,
+) -> None:
     rows = [
         InventoryRow(
             1,
@@ -260,12 +262,49 @@ def test_private_inventory_is_confined_and_owner_readable_only(tmp_path: Path) -
             "ready",
         )
     ]
-    target = tmp_path / "data_rebuilt" / "state" / "private" / "inventory.json"
+    target = resolve_rebuild_path(settings, "state/private/inventory.json")
 
-    write_private_inventory(target, rows)
+    write_private_inventory(settings, target, rows)
 
     assert target.is_file()
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert '"source_relpath": "source.bin"' in target.read_text(encoding="utf-8")
     with pytest.raises(ValueError, match="state/private"):
-        write_private_inventory(tmp_path / "elsewhere.json", rows)
+        write_private_inventory(settings, settings.data_root / "elsewhere.json", rows)
+
+
+@pytest.mark.parametrize(
+    "target_factory",
+    (
+        lambda settings, tmp_path: (
+            settings.data_root / "state" / "private" / "inventory.json"
+        ),
+        lambda settings, tmp_path: (
+            tmp_path / "unrelated" / "state" / "private" / "inventory.json"
+        ),
+    ),
+)
+def test_private_inventory_rejects_lookalike_private_paths_without_writing(
+    settings: Settings,
+    tmp_path: Path,
+    target_factory,
+) -> None:
+    target = target_factory(settings, tmp_path)
+    rows = [
+        InventoryRow(
+            1,
+            2,
+            "source.bin",
+            "archive/destination.bin",
+            1,
+            "a" * 64,
+            "attachment",
+            "ready",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="state/private"):
+        write_private_inventory(settings, target, rows)
+
+    assert not target.exists()
+    assert not target.parent.exists()

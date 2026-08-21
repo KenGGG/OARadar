@@ -17,7 +17,7 @@ from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import ArchivedFile, BatchItem, OAItem, OAManifestItem
 from oa_knowledge.done_archive import DONE_ARCHIVE_PREFIXES
-from oa_knowledge.rebuild.paths import archive_file_relpath
+from oa_knowledge.rebuild.paths import archive_file_relpath, resolve_rebuild_path
 from oa_knowledge.storage_paths import resolve_data_path
 
 
@@ -116,18 +116,11 @@ def inventory_summary(rows: Sequence[InventoryRow]) -> dict[str, int]:
     return summary
 
 
-def _private_inventory_target(target: Path) -> Path:
-    """Accept only a target below a resolved ``state/private`` directory."""
+def _private_inventory_target(settings: Settings, target: Path) -> Path:
+    """Accept only a target below this settings object's private rebuild tree."""
     resolved = target.expanduser().resolve(strict=False)
-    private_root = next(
-        (
-            parent
-            for parent in resolved.parents
-            if parent.name == "private" and parent.parent.name == "state"
-        ),
-        None,
-    )
-    if private_root is None or resolved == private_root:
+    private_root = resolve_rebuild_path(settings, "state/private")
+    if resolved == private_root:
         raise ValueError("private inventory target must be below state/private")
     try:
         resolved.relative_to(private_root)
@@ -138,9 +131,11 @@ def _private_inventory_target(target: Path) -> Path:
     return resolved
 
 
-def write_private_inventory(target: Path, rows: Sequence[InventoryRow]) -> None:
+def write_private_inventory(
+    settings: Settings, target: Path, rows: Sequence[InventoryRow]
+) -> None:
     """Write full rows only to the protected private-inventory subtree."""
-    destination = _private_inventory_target(target)
+    destination = _private_inventory_target(settings, target)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = (
         json.dumps(
