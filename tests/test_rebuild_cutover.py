@@ -201,6 +201,54 @@ def test_directory_fsync_failure_after_rename_restores_every_mutated_tree(
     ]
 
 
+def test_persistent_rollback_fsync_failure_still_restores_live_before_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durability errors cannot prevent the remaining inverse rename or a safe restart."""
+    plan = _ready_plan(tmp_path)
+    control_calls: list[str] = []
+    rename_calls: list[tuple[Path, Path]] = []
+    unsafe_restarts: list[bool] = []
+    real_rename = cutover._rename
+    real_fsync = cutover._fsync_directory
+    fsync_calls = 0
+
+    def record_rename(source: Path, target: Path) -> None:
+        rename_calls.append((source, target))
+        real_rename(source, target)
+
+    def fail_persistently_after_second_forward_sync(directory: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls >= 2:
+            raise OSError("synthetic persistent directory fsync failure")
+        real_fsync(directory)
+
+    def record_control(action: str, _units: tuple[str, ...]) -> None:
+        control_calls.append(action)
+        if action == "start":
+            unsafe_restarts.append(not plan.live_root.exists())
+
+    monkeypatch.setattr(cutover, "_rename", record_rename)
+    monkeypatch.setattr(cutover, "_fsync_directory", fail_persistently_after_second_forward_sync)
+    monkeypatch.setattr(cutover, "_control_units", record_control)
+
+    with pytest.raises(cutover.CutoverRollbackError):
+        execute_cutover(plan, authorized=True)
+
+    assert rename_calls == [
+        (plan.live_root, plan.legacy_root),
+        (plan.rebuilt_root, plan.live_root),
+        (plan.live_root, plan.rebuilt_root),
+        (plan.legacy_root, plan.live_root),
+    ]
+    assert (plan.live_root / "marker").read_text(encoding="utf-8") == "legacy"
+    assert (plan.rebuilt_root / "marker").read_text(encoding="utf-8") == "rebuilt"
+    assert not plan.legacy_root.exists()
+    assert control_calls == ["stop", "stop", "start"]
+    assert unsafe_restarts == [False]
+
+
 def test_authorization_token_is_path_bound_and_short_lived(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -490,14 +490,27 @@ def _runtime_paths_are_safe(plan: CutoverPlan) -> bool:
     )
 
 
-def _rollback(plan: CutoverPlan, *, live_to_legacy: bool, rebuilt_to_live: bool) -> None:
-    """Undo only completed renames; no business directory is ever deleted."""
-    if rebuilt_to_live:
-        _rename(plan.live_root, plan.rebuilt_root)
-        _sync_renamed_directories(plan.live_root, plan.rebuilt_root)
-    if live_to_legacy:
-        _rename(plan.legacy_root, plan.live_root)
-        _sync_renamed_directories(plan.legacy_root, plan.live_root)
+def _rollback(
+    plan: CutoverPlan, *, live_to_legacy: bool, rebuilt_to_live: bool,
+) -> list[BaseException]:
+    """Undo every completed rename, even when durable-directory sync has failed."""
+    errors: list[BaseException] = []
+    for source, target, completed in (
+        (plan.live_root, plan.rebuilt_root, rebuilt_to_live),
+        (plan.legacy_root, plan.live_root, live_to_legacy),
+    ):
+        if not completed:
+            continue
+        try:
+            _rename(source, target)
+        except BaseException as exc:  # noqa: BLE001 - the next inverse rename remains required.
+            errors.append(exc)
+            continue
+        try:
+            _sync_renamed_directories(source, target)
+        except BaseException as exc:  # noqa: BLE001 - preserve error after all renames are attempted.
+            errors.append(exc)
+    return errors
 
 
 def execute_cutover(plan: CutoverPlan, *, authorized: bool) -> dict[str, str]:
@@ -523,22 +536,27 @@ def execute_cutover(plan: CutoverPlan, *, authorized: bool) -> dict[str, str]:
             raise CutoverSmokeError("post-cutover service smoke failed")
         return {"status": "cutover_complete", "rollback": "not_required"}
     except BaseException as exc:
-        rollback_error: BaseException | None = None
+        rollback_errors: list[BaseException] = []
         try:
             _control_units("stop", plan.units)
+        except BaseException as stop_exc:  # noqa: BLE001 - preserve the original failure context.
+            rollback_errors.append(stop_exc)
+        rollback_errors.extend(
             _rollback(
                 plan,
                 live_to_legacy=live_to_legacy,
                 rebuilt_to_live=rebuilt_to_live,
             )
-        except BaseException as rollback_exc:  # noqa: BLE001 - preserve original failure context.
-            rollback_error = rollback_exc
-        try:
-            _control_units("start", plan.units)
-        except BaseException as restart_exc:  # noqa: BLE001 - restart failure is a rollback failure.
-            rollback_error = rollback_error or restart_exc
-        if rollback_error is not None:
-            raise CutoverRollbackError("cutover rollback failed") from rollback_error
+        )
+        if _directory_is_safe(plan.live_root):
+            try:
+                _control_units("start", plan.units)
+            except BaseException as restart_exc:  # noqa: BLE001 - restart failure is a rollback failure.
+                rollback_errors.append(restart_exc)
+        else:
+            rollback_errors.append(CutoverRollbackError("legacy live tree was not restored"))
+        if rollback_errors:
+            raise CutoverRollbackError("cutover rollback failed") from rollback_errors[0]
         if isinstance(exc, CutoverError):
             raise
         raise CutoverError("cutover failed") from exc
