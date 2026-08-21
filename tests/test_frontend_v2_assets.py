@@ -71,3 +71,11 @@ def test_rebuild_item_metadata_shows_document_and_missing_date_status() -> None:
     assert "has_document_number" in source
     assert "需生成正文" in source
     assert "无需生成正文" in source
+
+
+def test_rebuild_page_shows_the_redacted_acceptance_summary() -> None:
+    source = Path("webui/src/views/RebuildClassificationView.tsx").read_text(encoding="utf-8")
+
+    assert 'api<RebuildValidationReport>("/api/rebuild/validation")' in source
+    assert "重建验收" in source
+    assert "validation.checks.filter" in source

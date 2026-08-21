@@ -103,7 +103,106 @@ uv run oa doctor --config config.yaml
 
 回滚时停止服务，恢复代码、数据库和 unit 备份，再 `daemon-reload` 并重启服务。不得以删除 OA 原件、归档或任务账本的方式回滚。合并后在 `main` 进行 24 小时和 7 天自然运行观察；观察期不创建 OA 测试事项、不发送测试飞书。
 
-## 8. 公开发布检查
+## 8. 历史资料重建与安全切换
+
+本节只适用于一次性的历史资料重建。日常 Pending、Done 和 Markdown 流水线不得把这里的命令当作普通调度。重建始终在 `data_rebuilt/` 中完成；验收通过前不得改名、覆盖或删除当前 `data/`，也不得为历史重建重新访问 OA。
+
+### 8.1 合成烟测
+
+先在候选代码上运行完全合成的端到端烟测：
+
+```bash
+./scripts/smoke-data-rebuild.sh
+```
+
+脚本自行创建并清理临时目录，只使用合成事项和合成附件，并以本地解析替身覆盖分类、原件复制、正文选择、解析、Markdown、`_index.md`、验收、切换失败和自动回滚。它不读取 `config.yaml`，不访问正式 `data/`，不调用 OA、飞书、LLM、MinerU 或真实 systemd 服务。
+
+### 8.2 只读盘点
+
+真实操作前先在仓库外建立权限为 `0700` 的备份目录，使用 SQLite backup API 备份数据库，并复制本机配置和五个 OARadar user unit。备份路径和明细不得写入报告或 Git。然后只读盘点：
+
+```bash
+uv run oa rebuild inventory --config <config.yaml>
+uv run oa rebuild status --config <config.yaml>
+```
+
+只记录脱敏汇总数量。出现 `missing`、`hash_mismatch`、`unsafe_path` 或 `depth_limit_reached` 时立即停止。盘点不得下载、修改或补写 OA。
+
+### 8.3 人工分类确认
+
+在 WebUI“资料重建”页面依次处理“内部事项”“外部事项”“待确认事项”。内部事项必须确认内容类型，外部事项必须确认具体机构；`needs_review` 和 `date_missing` 必须都归零。未确认事项可以保留原件，但不得进入正式 Markdown 目录。分类确认只写本地分类字段和审计时间，不写真实正文。
+
+### 8.4 建立新资料库
+
+第一次执行前再次检查盘点汇总和可用空间。以下命令默认只演练，不写新库：
+
+```bash
+uv run oa rebuild archive --config <config.yaml>
+```
+
+只有取得本次“建立新资料库”的明确授权后，才能执行复制：
+
+```bash
+uv run oa rebuild archive --execute --config <config.yaml>
+```
+
+后续解析与 Markdown 重建继续使用同一 `data_rebuild` 运行和既有 `PipelineTask`/lease；不得新增任务表或协调框架。中断后从同一运行继续，已校验成功的原件和产物不得重复覆盖。构建过程中不得启动切换。
+
+### 8.5 切换前验收
+
+WebUI“重建验收”必须显示全部 15 项检查通过；`GET /api/rebuild/validation` 只返回检查代码、是否通过和汇总数量，不得返回标题、文号、附件名、正文或本地路径。还必须完成至少 100 个内部事项和 100 个外部事项的本机抽查，并确认：原件逐个哈希一致、每个正式事项恰好一个 `_index.md`、有文号事项恰好一个正文 Markdown、无文号事项没有正文 Markdown、附件成功或在索引中明确标记、全部链接有效、新库顶层目录干净、数据库副本完整。
+
+任一检查未通过时不得切换。完整自动门禁为：
+
+```bash
+uv run pytest
+uv run python scripts/check_public_release.py
+(cd webui && npm ci && npm run check && npm run build)
+./scripts/smoke-data-rebuild.sh
+```
+
+### 8.6 授权与切换
+
+切换前必须同时满足：候选提交工作树干净、数据库副本及仓库外备份有效、以下五个已知 user unit 全部发现、新旧目录位于同一文件系统、目标 legacy 目录不存在、验收全部通过：
+
+- `oaradar-web.service`
+- `oaradar-worker.service`
+- `oaradar-markdown-worker.service`
+- `oaradar-hourly.timer`
+- `oaradar-nightly.timer`
+
+然后运行只读预检：
+
+```bash
+uv run oa rebuild cutover --config <config.yaml>
+```
+
+预检不停止服务、不改名目录。只有用户在查看本次脱敏验收证据后对本次切换作出单独明确授权，才使用预检产生的短时、路径绑定 token 执行：
+
+```bash
+uv run oa rebuild cutover \
+  --execute \
+  --authorization-token <fresh-path-bound-token> \
+  --config <config.yaml>
+```
+
+执行器只停止和重启五个已知 unit，只做同盘目录改名，不递归删除任何目录。不得把“允许建立 `data_rebuilt/`”理解为“允许切换”。
+
+### 8.7 自动回滚与人工核验
+
+切换后的本地冒烟失败时，执行器必须停止这些 unit，反向恢复两次目录改名，再启动旧部署。此时保留新旧两套业务数据，不做删除。若自动回滚报告失败，保持所有 unit 停止，人工核对三个精确目录状态后再恢复；不得猜测目录身份，也不得用递归删除腾挪路径。
+
+切换命令成功后立即核验 WebUI、数据库、Worker、timers、原件读取、Markdown 和 `_index.md`。报告只记录聚合数量和稳定错误代码。
+
+### 8.8 24 小时与 7 天观察
+
+切换完成后先观察 24 小时，再在 `main` 上连续观察满 7 天。观察期检查：新已办事项进入正确目录、新有文号事项生成正文、新附件生成 Markdown、分类修改不丢文件或破坏链接、WebUI 和 Obsidian 可打开资料、原始附件未缺失或覆盖。观察期不创建 OA 测试事项、不发送测试飞书，也不阻塞已经完成的开发阶段。
+
+### 8.9 legacy 删除必须再次授权
+
+7 天观察通过只允许生成脱敏的 legacy 拟删除清单（类别、数量、空间占用），不等于删除授权。永久删除 `data_legacy_<日期>/` 必须另行取得用户对精确目录的明确授权；Git 标签、远程分支、旧代码、旧数据库表和其他路径不包含在该授权中。未经该授权，legacy 保持只读保留。
+
+## 9. 公开发布检查
 
 每次公开提交前运行：
 

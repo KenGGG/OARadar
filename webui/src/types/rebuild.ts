@@ -42,3 +42,17 @@ export type RebuildExecutionStatus = {
   execution_allowed: false
   safety_gate: "MARKDOWN_REBUILD_PHASE4_CAS_REQUIRED"
 }
+
+export type RebuildValidationCheck = {
+  code: string
+  ok: boolean
+  expected: number | null
+  actual: number | null
+}
+
+export type RebuildValidationReport = {
+  available: boolean
+  run_id: number | null
+  passed: boolean
+  checks: RebuildValidationCheck[]
+}

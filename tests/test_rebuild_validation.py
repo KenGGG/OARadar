@@ -189,6 +189,30 @@ def test_valid_synthetic_rebuild_passes_all_acceptance_checks(rebuild_fixture: R
     assert all(check.expected is None or check.expected >= 0 for check in checks)
 
 
+def test_unconfirmed_original_is_not_required_to_have_attachment_markdown(
+    rebuild_fixture: RebuildFixture,
+) -> None:
+    """Classification review prevents derived output, not evidence archival."""
+    rebuild_fixture.unnumbered.classification_state = "needs_review"
+    rebuild_fixture.unnumbered.source_type = None
+    rebuild_fixture.unnumbered.external_issuer = None
+    rebuild_fixture.session.query(RebuildOutput).filter(
+        RebuildOutput.run_id == rebuild_fixture.run_id,
+        RebuildOutput.oa_item_id == rebuild_fixture.unnumbered.id,
+        RebuildOutput.kind != "original",
+    ).delete(synchronize_session=False)
+    rebuild_fixture.session.commit()
+    _write_acceptance_evidence(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    )
+
+    checks = validate_rebuild(
+        rebuild_fixture.session, rebuild_fixture.settings, rebuild_fixture.run_id,
+    )
+
+    assert validation_passed(checks)
+
+
 @pytest.mark.parametrize("status", ("pending", "failed"))
 def test_nonterminal_or_failed_current_run_cannot_pass_artifact_gates(
     rebuild_fixture: RebuildFixture, status: str,

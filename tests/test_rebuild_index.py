@@ -195,6 +195,22 @@ def test_numbered_index_links_body_originals_and_markdown(
     assert str(settings.rebuild.target_root) not in text
 
 
+def test_index_has_the_same_searchable_frontmatter_as_other_published_markdown(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    rebuilt_item: OAItem,
+) -> None:
+    """The validator must not reject an index emitted by the production publisher."""
+    output = publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
+    text = resolve_rebuild_path(settings, output.target_relpath).read_text(encoding="utf-8")
+
+    assert text.startswith("---\n")
+    assert "title: 合成索引事项" in text
+    assert "source_type: internal" in text
+    assert "internal_category: 风险管理" in text
+
+
 def test_index_is_unique_per_run_and_item(
     session: Session,
     settings: Settings,

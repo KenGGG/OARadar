@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { CircleAlert, RefreshCw, X } from "lucide-react"
 import { api, postApi, time } from "../App"
-import type { ClassificationGroup, RebuildClassificationItem, RebuildClassificationPage, RebuildClassificationSummary, RebuildExecutionStatus } from "../types/rebuild"
+import type { ClassificationGroup, RebuildClassificationItem, RebuildClassificationPage, RebuildClassificationSummary, RebuildExecutionStatus, RebuildValidationReport } from "../types/rebuild"
 
 const GROUPS: { id: ClassificationGroup; label: string }[] = [
   { id: "internal", label: "内部事项" },
@@ -84,6 +84,7 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
   const [data, setData] = useState<RebuildClassificationPage | null>(null)
   const [summary, setSummary] = useState<RebuildClassificationSummary | null>(null)
   const [execution, setExecution] = useState<RebuildExecutionStatus | null>(null)
+  const [validation, setValidation] = useState<RebuildValidationReport | null>(null)
   const [selected, setSelected] = useState<RebuildClassificationItem | null>(null)
   const [bulkGroup, setBulkGroup] = useState<"internal" | "external" | null>(null)
   const [sourceType, setSourceType] = useState<"internal" | "external" | "">("")
@@ -96,12 +97,13 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
   const load = async () => {
     setLoading(true); setError("")
     try {
-      const [nextData, nextSummary, nextExecution] = await Promise.all([
+      const [nextData, nextSummary, nextExecution, nextValidation] = await Promise.all([
         api<RebuildClassificationPage>(`/api/rebuild/classifications?group=${group}&page=${page}&page_size=50`),
         api<RebuildClassificationSummary>("/api/rebuild/classification-summary"),
         api<RebuildExecutionStatus>("/api/rebuild/status"),
+        api<RebuildValidationReport>("/api/rebuild/validation"),
       ])
-      setData(nextData); setSummary(nextSummary); setExecution(nextExecution)
+      setData(nextData); setSummary(nextSummary); setExecution(nextExecution); setValidation(nextValidation)
     } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取分类复核数据") }
     finally { setLoading(false) }
   }
@@ -163,7 +165,11 @@ export function RebuildClassificationView({ refreshKey }: { refreshKey: number }
         <button className="toolbar-button" disabled title="需完成 Phase 4 CAS 修复后才能执行">继续</button>
       </div>
     </section>
-    <div className="notice classification-notice" role="status"><CircleAlert size={17}/><span>安全门已启用：Phase 4 CAS 修复完成前，生产环境仅展示本地进度，不会执行 Markdown 重建。</span></div>
+    <section className="classification-bulk" aria-labelledby="rebuild-validation-title">
+      <div><strong id="rebuild-validation-title">重建验收</strong><span>{!validation ? "正在读取验收状态" : !validation.available ? "尚无可验证的重建运行" : validation.passed ? `全部 ${validation.checks.length} 项验收已通过` : `未通过 ${validation.checks.filter(check => !check.ok).length}/${validation.checks.length} 项验收`}</span></div>
+      {validation?.available && !validation.passed && <div className="classification-bulk-actions" aria-label="未通过的验收项目">{validation.checks.filter(check => !check.ok).map(check => <span className="status status-warn" key={check.code}>{check.code}</span>)}</div>}
+    </section>
+    <div className="notice classification-notice" role="status"><CircleAlert size={17}/><span>安全门已启用：生产环境不从 Web 控制台执行重建；仅在本机验证和明确授权后由受限命令执行。</span></div>
     <div className="classification-tabs" role="tablist" aria-label="分类复核分组">
       {GROUPS.map(item => <button key={item.id} role="tab" aria-selected={group === item.id} className={group === item.id ? "classification-tab-active" : ""} onClick={() => { setGroup(item.id); setPage(1) }}>
         {item.label}<span>{item.id === "needs_review" ? summary?.needs_review.total || 0 : summary?.[item.id].total || 0}</span>

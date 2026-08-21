@@ -10,13 +10,14 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import ArchivedFile, OAItem
+from oa_knowledge.db.models import ArchivedFile, OAItem, PipelineRun
 from oa_knowledge.rebuild.campaign import rebuild_status_summary
 from oa_knowledge.rebuild.classification import (
     bulk_confirm_suggested,
     confirm_classification,
     seed_classification_suggestions,
 )
+from oa_knowledge.rebuild.validation import validate_rebuild, validation_passed
 
 ClassificationGroup = Literal["internal", "external", "needs_review"]
 
@@ -178,5 +179,62 @@ def markdown_rebuild_status(settings: Settings) -> dict[str, object]:
     try:
         with Session(engine) as session:
             return rebuild_status_summary(session)
+    finally:
+        engine.dispose()
+
+
+def rebuild_validation_summary(settings: Settings) -> dict[str, object]:
+    """Return the newest rebuild's aggregate acceptance checks only.
+
+    This deliberately presents stable check codes and counts, never the local
+    file paths, OA metadata, parser messages, or report evidence examined by
+    the validator.  A validation exception is also represented as one stable
+    failed aggregate check instead of leaking exception text through the Web
+    console.
+    """
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            run = session.scalar(
+                select(PipelineRun)
+                .where(PipelineRun.pipeline_type == "data_rebuild")
+                .order_by(PipelineRun.id.desc())
+                .limit(1)
+            )
+            if run is None:
+                return {
+                    "available": False,
+                    "run_id": None,
+                    "passed": False,
+                    "checks": [],
+                }
+            try:
+                checks = validate_rebuild(session, settings, run.id)
+            except Exception:  # noqa: BLE001 - acceptance errors remain redacted.
+                return {
+                    "available": True,
+                    "run_id": run.id,
+                    "passed": False,
+                    "checks": [{
+                        "code": "VALIDATION_UNAVAILABLE",
+                        "ok": False,
+                        "expected": 1,
+                        "actual": 0,
+                    }],
+                }
+            return {
+                "available": True,
+                "run_id": run.id,
+                "passed": validation_passed(checks),
+                "checks": [
+                    {
+                        "code": check.code,
+                        "ok": check.ok,
+                        "expected": check.expected,
+                        "actual": check.actual,
+                    }
+                    for check in checks
+                ],
+            }
     finally:
         engine.dispose()

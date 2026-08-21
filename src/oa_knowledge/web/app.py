@@ -34,6 +34,7 @@ from oa_knowledge.web.rebuild_views import (
     classification_summary,
     confirm_rebuild_classification,
     markdown_rebuild_status,
+    rebuild_validation_summary,
     seed_rebuild_classification_suggestions,
 )
 from oa_knowledge.web.schedule_views import schedule_status
@@ -224,6 +225,10 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     @app.get("/api/rebuild/status")
     def get_markdown_rebuild_status() -> dict:
         return markdown_rebuild_status(settings)
+
+    @app.get("/api/rebuild/validation")
+    def get_rebuild_validation() -> dict:
+        return rebuild_validation_summary(settings)
 
     def _markdown_rebuild_execution_gate() -> None:
         # Phase 3 may display the durable local progress model, but it must not

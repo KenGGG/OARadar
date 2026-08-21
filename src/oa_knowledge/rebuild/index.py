@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
+import yaml
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -27,7 +28,11 @@ from oa_knowledge.rebuild.markdown import (
     _publication_sha,
 )
 from oa_knowledge.rebuild.parser import _file_matches, _tree_sha256
-from oa_knowledge.rebuild.paths import markdown_item_relpath, resolve_rebuild_path
+from oa_knowledge.rebuild.paths import (
+    effective_item_date,
+    markdown_item_relpath,
+    resolve_rebuild_path,
+)
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
 
@@ -110,6 +115,20 @@ def _item_lines(item: OAItem) -> list[str]:
         f"- 分类：{classification}",
         f"- 生效日期：{date_text}",
     ]
+
+
+def _index_frontmatter(item: OAItem) -> str:
+    """Render the common, searchable item fields on the index itself."""
+    payload = {
+        "title": item.title,
+        "oa_item_id": item.workitem_id_text or item.oa_item_key,
+        "document_number": item.document_number,
+        "effective_date": effective_item_date(item).isoformat(),
+        "source_type": item.source_type,
+        "internal_category": item.internal_category,
+        "external_issuer": item.external_issuer,
+    }
+    return f"---\n{yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).rstrip()}\n---\n\n"
 
 
 def _valid_original(
@@ -383,7 +402,7 @@ def _render(
     body: _BodyState,
     attachments: list[_AttachmentState],
 ) -> bytes:
-    lines = _item_lines(item)
+    lines = [_index_frontmatter(item).rstrip(), *_item_lines(item)]
     lines.extend(("", "## 正文", ""))
     if body.state == "no_content":
         lines.append("- 无可用正文证据。")

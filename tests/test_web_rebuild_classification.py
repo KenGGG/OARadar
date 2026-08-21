@@ -13,7 +13,13 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, OAItem, RebuildClassificationEvent
+from oa_knowledge.db.models import (
+    ArchivedFile,
+    OAItem,
+    PipelineRun,
+    RebuildClassificationEvent,
+)
+from oa_knowledge.rebuild.validation import ValidationCheck
 from oa_knowledge.web import create_web_app, rebuild_views
 
 
@@ -281,6 +287,55 @@ def test_markdown_rebuild_controls_expose_phase4_non_execution_gate(client: Test
         assert response.json() == {
             "detail": "MARKDOWN_REBUILD_PHASE4_CAS_REQUIRED",
         }
+
+
+def test_rebuild_validation_endpoint_exposes_aggregate_checks_only(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation report must never leak titles, paths, or source text."""
+    engine = create_db_engine(client.app.state.settings.database_path)
+    try:
+        with Session(engine) as session:
+            run = PipelineRun(
+                run_key="synthetic-validation-web", pipeline_type="data_rebuild",
+                status="completed", total_tasks=1, completed_tasks=1,
+            )
+            session.add(run)
+            session.commit()
+            run_id = run.id
+    finally:
+        engine.dispose()
+    monkeypatch.setattr(
+        rebuild_views,
+        "validate_rebuild",
+        lambda _session, _settings, observed_run_id: [
+            ValidationCheck("SYNTHETIC_CHECK", observed_run_id == run_id, 3, 3),
+        ],
+    )
+    monkeypatch.setattr(rebuild_views, "validation_passed", lambda _checks: True)
+
+    response = client.get("/api/rebuild/validation")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "available": True,
+        "run_id": run_id,
+        "passed": True,
+        "checks": [{"code": "SYNTHETIC_CHECK", "ok": True, "expected": 3, "actual": 3}],
+    }
+
+
+def test_rebuild_validation_endpoint_is_empty_when_no_run_exists(client: TestClient) -> None:
+    """The no-run response is a safe aggregate, not an exceptional detail leak."""
+    response = client.get("/api/rebuild/validation")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "available": False,
+        "run_id": None,
+        "passed": False,
+        "checks": [],
+    }
 
 
 def test_concurrent_confirmation_allows_one_transition_and_one_audit_event(

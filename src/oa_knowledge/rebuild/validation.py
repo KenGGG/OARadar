@@ -647,6 +647,7 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     supported_sources = [
         source for source in source_by_id.values()
         if source.id in original_source_ids
+        and source.oa_item_id in confirmed_candidate_ids
         and Path(source.original_name).suffix.casefold() in settings.parser.supported_extensions
         and source.file_role in MARKDOWN_SOURCE_ROLES
     ]
@@ -694,6 +695,7 @@ def validate_rebuild(session: Session, settings: Settings, run_id: int) -> list[
     unsupported_sources = [
         source for source in source_by_id.values()
         if source.id in original_source_ids
+        and source.oa_item_id in confirmed_candidate_ids
         and source.file_role in MARKDOWN_SOURCE_ROLES
         and Path(source.original_name).suffix.casefold() not in settings.parser.supported_extensions
     ]
