@@ -68,6 +68,28 @@ def test_unclear_item_requires_review(done_item: OAItem) -> None:
     assert suggest_classification(done_item, {}).state == "needs_review"
 
 
+def test_external_company_name_without_alias_requires_review(done_item: OAItem) -> None:
+    done_item.title = "财务风险检查事项"
+    done_item.sender = "广州凯得金融服务集团有限公司"
+
+    result = suggest_classification(done_item, {})
+
+    assert result.state == "needs_review"
+    assert result.confidence < 0.90
+    assert result.internal_category is None
+
+
+def test_multiple_internal_category_matches_require_review(done_item: OAItem) -> None:
+    done_item.title = "内部财务风险检查事项"
+
+    result = suggest_classification(done_item, {})
+
+    assert result.source_type == "internal"
+    assert result.internal_category is None
+    assert result.state == "needs_review"
+    assert result.confidence < 0.90
+
+
 def test_external_alias_config_requires_nonempty_names() -> None:
     with pytest.raises(ValidationError):
         RebuildConfig(external_issuer_aliases={"示例简称": ""})

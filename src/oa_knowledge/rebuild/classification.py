@@ -27,7 +27,7 @@ _CATEGORY_RULES = (
     ("公司治理", ("董事会", "股东", "治理", "章程", "决议")),
     ("经营管理", ("经营", "管理", "会议", "计划", "通知")),
 )
-_INTERNAL_MARKERS = ("内部", "本公司", "公司", "部门")
+_INTERNAL_MARKERS = ("内部", "本公司")
 
 
 @dataclass(frozen=True)
@@ -69,10 +69,16 @@ def suggest_classification(item: OAItem, issuer_aliases: dict[str, str]) -> Clas
 
     combined = f"{title} {sender or ''}"
     if any(marker in combined for marker in _INTERNAL_MARKERS):
-        category = next(
-            (name for name, keywords in _CATEGORY_RULES if any(keyword in combined for keyword in keywords)),
-            "其他内部",
-        )
+        categories = [
+            name for name, keywords in _CATEGORY_RULES
+            if any(keyword in combined for keyword in keywords)
+        ]
+        if len(categories) > 1:
+            return ClassificationDecision(
+                source_type="internal", internal_category=None, external_issuer=None,
+                confidence=0.0, state="needs_review",
+            )
+        category = categories[0] if categories else "其他内部"
         confidence = 0.95
         return ClassificationDecision(
             source_type="internal", internal_category=category, external_issuer=None,
