@@ -14,7 +14,10 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, OAItem, PipelineRun, RebuildOutput
 from oa_knowledge.rebuild.index import RebuildIndexError, publish_rebuilt_index
-from oa_knowledge.rebuild.markdown import _publication_sha
+from oa_knowledge.rebuild.markdown import (
+    _attachment_markdown_filename,
+    _publication_sha,
+)
 from oa_knowledge.rebuild.parser import _tree_sha256
 from oa_knowledge.rebuild.paths import markdown_item_relpath, resolve_rebuild_path
 
@@ -146,7 +149,7 @@ def _markdown(
     filename = (
         "示例〔2026〕12号-合成索引事项-正文.md"
         if kind == "body_markdown"
-        else f"{source.original_name}.md"
+        else _attachment_markdown_filename(source)
     )
     relpath = (item_path / filename).as_posix()
     target = resolve_rebuild_path(settings, relpath)
@@ -220,6 +223,68 @@ def test_index_rejects_missing_numbered_body(
     resolve_rebuild_path(settings, body.target_relpath).unlink()
 
     with pytest.raises(RebuildIndexError, match="BODY_MARKDOWN_UNAVAILABLE"):
+        publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
+
+
+def test_index_url_encodes_original_and_markdown_link_destinations(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    rebuilt_item: OAItem,
+) -> None:
+    """Fragment, query, and closing-parenthesis bytes must remain part of local links."""
+    source = _source(
+        session,
+        settings,
+        run_id,
+        rebuilt_item,
+        "附件#?).pdf",
+        "associated_document",
+    )
+    _markdown(
+        session, settings, run_id, rebuilt_item, source, kind="attachment_markdown"
+    )
+
+    output = publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
+    content = resolve_rebuild_path(settings, output.target_relpath).read_text(
+        encoding="utf-8"
+    )
+
+    assert f"{source.id}-附件%23%3F%29.pdf" in content
+    assert "附件%23%29.pdf.md" in content
+    assert "附件#?).pdf)" not in content
+
+
+def test_index_rejects_additional_numbered_body_ledger_rows(
+    session: Session,
+    settings: Settings,
+    run_id: int,
+    rebuilt_item: OAItem,
+) -> None:
+    """A second body row would make a numbered item's required body ambiguous."""
+    body = next(
+        output
+        for output in session.query(RebuildOutput).all()
+        if output.kind == "body_markdown"
+    )
+    extra_relpath = (markdown_item_relpath(rebuilt_item) / "第二份正文.md").as_posix()
+    extra_target = resolve_rebuild_path(settings, extra_relpath)
+    extra_target.write_text("# synthetic extra body\n", encoding="utf-8")
+    session.add(
+        RebuildOutput(
+            run_id=run_id,
+            oa_item_id=rebuilt_item.id,
+            source_file_id=body.source_file_id,
+            kind="body_markdown",
+            target_relpath=extra_relpath,
+            sha256=_publication_sha(extra_target, None),
+            status="success",
+            error_code=None,
+        )
+    )
+    session.commit()
+
+    with pytest.raises(RebuildIndexError, match="BODY_MARKDOWN_AMBIGUOUS"):
         publish_rebuilt_index(session, settings, run_id, rebuilt_item.id)
 
 

@@ -9,6 +9,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -64,7 +65,13 @@ def _relative_link(source: str, *, item_relpath: PurePosixPath) -> str:
     candidate = PurePosixPath(relative)
     if candidate.is_absolute() or "\\" in relative or not relative:
         raise _error("UNSAFE_LINK_TARGET")
-    return f"<{relative}>" if " " in relative else relative
+    return "".join(
+        quote(character, safe="")
+        if character in {"#", "%", "?", "(", ")", "<", ">", '"', "'"}
+        or character.isspace()
+        else character
+        for character in relative
+    )
 
 
 def _item_lines(item: OAItem) -> list[str]:
@@ -300,6 +307,8 @@ def _body_output(
         if all_bodies:
             raise _error("UNNUMBERED_BODY_MARKDOWN")
         return None
+    if len(all_bodies) > 1:
+        raise _error("BODY_MARKDOWN_AMBIGUOUS")
     page = load_verified_page_body_evidence(session, settings, item.id, run_id=run_id)
     selected = select_body_source(
         item,
