@@ -52,17 +52,38 @@ def existing_0035_database(tmp_path: Path) -> Path:
     with sqlite3.connect(database_path) as connection:
         # Migration 0001 creates the current SQLAlchemy metadata, so remove
         # fields that did not exist at revision 0035 before exercising 0036.
-        historical_columns = (
-            "id", "oa_item_key", "logical_item_id", "workitem_id_text", "source_channel", "process_id_text",
-            "title", "sender", "department", "document_number", "initiated_at", "received_at", "completed_at",
-            "oa_status", "pipeline_status", "archive_relpath", "content_sha256", "source_type",
-            "internal_category", "external_issuer", "classification_version", "first_seen_at", "last_seen_at",
-        )
-        connection.execute(
-            f"CREATE TABLE oa_items_0035 AS SELECT {', '.join(historical_columns)} FROM oa_items"
-        )
         connection.execute("DROP TABLE oa_items")
-        connection.execute("ALTER TABLE oa_items_0035 RENAME TO oa_items")
+        connection.execute("""
+            CREATE TABLE oa_items (
+                id INTEGER NOT NULL,
+                oa_item_key VARCHAR NOT NULL,
+                logical_item_id INTEGER,
+                workitem_id_text VARCHAR,
+                source_channel VARCHAR NOT NULL,
+                process_id_text VARCHAR,
+                title TEXT NOT NULL,
+                sender TEXT,
+                department TEXT,
+                document_number VARCHAR,
+                initiated_at DATETIME,
+                received_at DATETIME,
+                completed_at DATETIME,
+                oa_status VARCHAR,
+                pipeline_status VARCHAR NOT NULL,
+                archive_relpath TEXT,
+                content_sha256 VARCHAR(64),
+                source_type VARCHAR(20),
+                internal_category VARCHAR(80),
+                external_issuer TEXT,
+                classification_version VARCHAR(20),
+                first_seen_at DATETIME NOT NULL,
+                last_seen_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                UNIQUE (oa_item_key),
+                FOREIGN KEY(logical_item_id) REFERENCES logical_items (id) ON DELETE SET NULL
+            )
+        """)
+        connection.execute("CREATE INDEX ix_oa_items_logical_item_id ON oa_items (logical_item_id)")
         connection.execute("DROP TABLE rebuild_classification_events")
         connection.execute(
             "INSERT INTO oa_items (oa_item_key, source_channel, title, pipeline_status, first_seen_at, last_seen_at) "
@@ -88,6 +109,23 @@ def fetch_item(database_path: Path) -> sqlite3.Row:
 
 
 def test_0036_adds_rebuild_classification_gate(existing_0035_database: Path) -> None:
+    with sqlite3.connect(existing_0035_database) as connection:
+        historical_columns = connection.execute("PRAGMA table_info(oa_items)").fetchall()
+        historical_indexes = connection.execute("PRAGMA index_list(oa_items)").fetchall()
+        historical_foreign_keys = connection.execute("PRAGMA foreign_key_list(oa_items)").fetchall()
+        unique_index_columns = {
+            tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})"))
+            for index in historical_indexes if index[2]
+        }
+    assert {row[1] for row in historical_columns if row[5]} == {"id"}
+    assert {"oa_item_key", "source_type", "classification_version"} <= {row[1] for row in historical_columns}
+    assert ("oa_item_key",) in unique_index_columns
+    assert "ix_oa_items_logical_item_id" in {index[1] for index in historical_indexes}
+    assert any(
+        foreign_key[2] == "logical_items" and foreign_key[3] == "logical_item_id" and foreign_key[6] == "SET NULL"
+        for foreign_key in historical_foreign_keys
+    )
+
     upgrade(existing_0035_database)
     columns = table_columns(existing_0035_database, "oa_items")
     assert {
