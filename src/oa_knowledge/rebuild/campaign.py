@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
@@ -28,6 +29,18 @@ INVENTORY_STAGE = "inventory"
 RESUMABLE_RUN_STATUSES = frozenset({"running", "failed"})
 LEASE_TTL = timedelta(minutes=5)
 LEASE_HEARTBEAT_INTERVAL = 60.0
+LEASE_HEARTBEAT_RETRY_INITIAL = 1.0
+LEASE_HEARTBEAT_RETRY_MAX = 15.0
+
+
+@dataclass
+class _LeaseHealth:
+    """Shared, in-process fence for one synchronous copy claim."""
+
+    lost: threading.Event = field(default_factory=threading.Event)
+
+    def is_healthy(self) -> bool:
+        return not self.lost.is_set()
 
 
 def create_rebuild_run(session: Session, *, cutoff_at: datetime) -> PipelineRun:
@@ -220,28 +233,59 @@ def _claim_task(session: Session, task_id: int) -> PipelineTask | None:
     return task
 
 
-def _start_lease_heartbeat(session: Session, task: PipelineTask) -> tuple[threading.Event, threading.Thread]:
+def _renew_lease(session: Session, *, task_id: int, owner: str) -> bool:
+    """Attempt one owner-conditional renewal using the heartbeat session."""
+    renewed = session.execute(update(PipelineTask).where(
+        PipelineTask.id == task_id,
+        PipelineTask.status == "running",
+        PipelineTask.lease_owner == owner,
+    ).values(lease_expires_at=datetime.now(UTC) + LEASE_TTL)).rowcount
+    session.commit()
+    return renewed == 1
+
+
+def _heartbeat_retry_guard() -> float:
+    return max(LEASE_HEARTBEAT_INTERVAL * 2, LEASE_TTL.total_seconds() / 4)
+
+
+def _start_lease_heartbeat(
+    session: Session, task: PipelineTask,
+) -> tuple[threading.Event, threading.Thread, _LeaseHealth]:
     """Renew a claimed task while its synchronous local copier is active."""
     assert task.lease_owner is not None
     stop = threading.Event()
+    health = _LeaseHealth()
     bind = session.get_bind()
     task_id, owner = task.id, task.lease_owner
 
     def renew() -> None:
-        while not stop.wait(LEASE_HEARTBEAT_INTERVAL):
-            with Session(bind=bind) as heartbeat_session:
-                renewed = heartbeat_session.execute(update(PipelineTask).where(
-                    PipelineTask.id == task_id,
-                    PipelineTask.status == "running",
-                    PipelineTask.lease_owner == owner,
-                ).values(lease_expires_at=datetime.now(UTC) + LEASE_TTL)).rowcount
-                heartbeat_session.commit()
+        delay = LEASE_HEARTBEAT_INTERVAL
+        retry_delay = LEASE_HEARTBEAT_RETRY_INITIAL
+        deadline = datetime.now(UTC) + LEASE_TTL
+        while not stop.wait(delay):
+            try:
+                with Session(bind=bind) as heartbeat_session:
+                    renewed = _renew_lease(heartbeat_session, task_id=task_id, owner=owner)
+            except SQLAlchemyError:
+                # A separate Session owns this transaction; closing it rolls back
+                # any failed SQLite statement before the bounded retry.
+                remaining = (deadline - datetime.now(UTC)).total_seconds()
+                if remaining <= _heartbeat_retry_guard():
+                    health.lost.set()
+                    return
+                delay = min(retry_delay, max(0.001, remaining - _heartbeat_retry_guard()))
+                retry_delay = min(retry_delay * 2, LEASE_HEARTBEAT_RETRY_MAX)
+                continue
             if renewed != 1:
+                health.lost.set()
                 return
+            deadline = datetime.now(UTC) + LEASE_TTL
+            delay = LEASE_HEARTBEAT_INTERVAL
+            retry_delay = LEASE_HEARTBEAT_RETRY_INITIAL
 
     thread = threading.Thread(target=renew, name=f"rebuild-lease-{task_id}", daemon=True)
     thread.start()
-    return stop, thread
+    return stop, thread, health
 
 
 def _stop_lease_heartbeat(stop: threading.Event, thread: threading.Thread) -> None:
@@ -332,9 +376,12 @@ def execute_archive_copy(
             if _fail_owned_task(session, task.id, owner, "INVENTORY_CHANGED"):
                 failed += 1
             continue
-        heartbeat_stop, heartbeat_thread = _start_lease_heartbeat(session, task)
+        heartbeat_stop, heartbeat_thread, lease_health = _start_lease_heartbeat(session, task)
         try:
-            output = copy_inventory_row(session, settings, row, run_id=run_id)
+            output = copy_inventory_row(
+                session, settings, row, run_id=run_id,
+                should_continue=lease_health.is_healthy,
+            )
         except Exception:  # noqa: BLE001 - record a sanitized task failure for any copier crash.
             output = None
         finally:
@@ -342,6 +389,10 @@ def execute_archive_copy(
         if output is None:
             if _fail_owned_task(session, task.id, owner, "COPY_EXCEPTION"):
                 failed += 1
+        elif not lease_health.is_healthy():
+            # The copier cooperatively fences real copies; this also fences a
+            # late-returning implementation that cannot be interrupted mid-call.
+            _fail_owned_task(session, task.id, owner, "LEASE_HEALTH_LOST")
         else:
             if output.status == "success":
                 if _complete_owned_task(session, task.id, owner):

@@ -104,6 +104,18 @@ def test_copy_is_idempotent(
     assert [output.id for output in session.scalars(select(RebuildOutput))] == [first.id]
 
 
+def test_copy_fences_itself_when_lease_health_is_lost(
+    session: Session, settings: Settings, run_id: int, inventory_row: InventoryRow
+) -> None:
+    output = copy_inventory_row(
+        session, settings, inventory_row, run_id=run_id, should_continue=lambda: False,
+    )
+
+    assert output.status == "failed"
+    assert output.error_code == "LEASE_LOST"
+    assert not resolve_rebuild_path(settings, inventory_row.destination_relpath).exists()
+
+
 @pytest.mark.parametrize("damage", ("deleted", "tampered"))
 def test_success_ledger_row_is_reverified_before_reuse(
     session: Session,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from sqlalchemy import select
@@ -17,6 +18,10 @@ from oa_knowledge.done_archive import DONE_ARCHIVE_PREFIXES
 from oa_knowledge.rebuild.inventory import InventoryRow
 from oa_knowledge.rebuild.paths import resolve_rebuild_path
 from oa_knowledge.storage_paths import resolve_data_path
+
+
+class _CopyCancelled(Exception):
+    """Stop an in-progress copy once its synchronous claimant is fenced."""
 
 
 def _file_matches(path: Path, *, size_bytes: int, sha256: str) -> bool:
@@ -45,13 +50,17 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _copy_to_temporary(source: Path, destination_dir: Path) -> Path:
+def _copy_to_temporary(
+    source: Path, destination_dir: Path, *, should_continue: Callable[[], bool] | None,
+) -> Path:
     descriptor, name = tempfile.mkstemp(dir=destination_dir, prefix=".rebuild-copy-", suffix=".tmp")
     temporary = Path(name)
     try:
         with source.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
             descriptor = -1
             for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                if should_continue is not None and not should_continue():
+                    raise _CopyCancelled
                 writer.write(chunk)
             writer.flush()
             os.fsync(writer.fileno())
@@ -114,7 +123,10 @@ def _publish_no_clobber(temporary: Path, target: Path) -> bool:
     return True
 
 
-def _copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, *, run_id: int) -> RebuildOutput:
+def _copy_inventory_row(
+    session: Session, settings: Settings, row: InventoryRow, *, run_id: int,
+    should_continue: Callable[[], bool] | None = None,
+) -> RebuildOutput:
     """Durably ledger and atomically publish one verified ready original.
 
     The function owns commits for its ledger transition, so a caller rollback
@@ -122,6 +134,8 @@ def _copy_inventory_row(session: Session, settings: Settings, row: InventoryRow,
     """
     if row.status != "ready":
         raise ValueError("only ready inventory rows may be copied")
+    if should_continue is not None and not should_continue():
+        return _record_failure(session, row, run_id=run_id, error_code="LEASE_LOST")
     try:
         source = resolve_data_path(settings.data_root, row.source_relpath, allowed_prefixes=DONE_ARCHIVE_PREFIXES)
     except ValueError:
@@ -149,7 +163,7 @@ def _copy_inventory_row(session: Session, settings: Settings, row: InventoryRow,
 
     temporary: Path | None = None
     try:
-        temporary = _copy_to_temporary(source, target.parent)
+        temporary = _copy_to_temporary(source, target.parent, should_continue=should_continue)
         if not _file_matches(temporary, size_bytes=row.size_bytes, sha256=row.sha256):
             return _set_status(session, output, status="failed", error_code="COPY_VERIFICATION_FAILED")
         if not _file_matches(source, size_bytes=row.size_bytes, sha256=row.sha256):
@@ -164,6 +178,8 @@ def _copy_inventory_row(session: Session, settings: Settings, row: InventoryRow,
         if not _file_matches(target, size_bytes=row.size_bytes, sha256=row.sha256):
             return _set_status(session, output, status="failed", error_code="COPY_VERIFICATION_FAILED")
         return _set_status(session, output, status="success", error_code=None)
+    except _CopyCancelled:
+        return _set_status(session, output, status="failed", error_code="LEASE_LOST")
     except OSError:
         return _set_status(session, output, status="failed", error_code="COPY_FAILED")
     finally:
@@ -171,7 +187,10 @@ def _copy_inventory_row(session: Session, settings: Settings, row: InventoryRow,
             temporary.unlink(missing_ok=True)
 
 
-def copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, *, run_id: int) -> RebuildOutput:
+def copy_inventory_row(
+    session: Session, settings: Settings, row: InventoryRow, *, run_id: int,
+    should_continue: Callable[[], bool] | None = None,
+) -> RebuildOutput:
     """Copy using a dedicated ledger session without committing caller work.
 
     Referenced run, item, and file rows must already be committed. A final
@@ -179,4 +198,6 @@ def copy_inventory_row(session: Session, settings: Settings, row: InventoryRow, 
     verified final intact; a later call revalidates and finalizes it.
     """
     with Session(bind=session.get_bind(), expire_on_commit=False) as ledger_session:
-        return _copy_inventory_row(ledger_session, settings, row, run_id=run_id)
+        return _copy_inventory_row(
+            ledger_session, settings, row, run_id=run_id, should_continue=should_continue,
+        )

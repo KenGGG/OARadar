@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import Settings
@@ -29,6 +30,11 @@ from oa_knowledge.rebuild.campaign import (
     execute_archive_copy,
 )
 from oa_knowledge.rebuild.inventory import build_inventory
+
+
+def _execute_in_session(engine, settings, run_id: int, inventory_row) -> None:
+    with Session(engine) as worker_session:
+        execute_archive_copy(worker_session, settings, run_id, [inventory_row])
 
 
 @pytest.fixture
@@ -329,3 +335,102 @@ def test_concurrent_success_reconciliation_emits_one_completed_event(
     events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
     assert task.status == "completed"
     assert [event.event_type for event in events].count("completed") == 1
+
+
+def test_transient_heartbeat_database_error_retries_without_reclaiming_copy(
+    session, settings, inventory_row, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    original_renew = campaign._renew_lease
+    failures = 0
+
+    monkeypatch.setattr(campaign, "LEASE_TTL", timedelta(milliseconds=100))
+    monkeypatch.setattr(campaign, "LEASE_HEARTBEAT_INTERVAL", 0.01)
+    monkeypatch.setattr(campaign, "LEASE_HEARTBEAT_RETRY_INITIAL", 0.005)
+
+    def transient_failure(*args, **kwargs):
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise OperationalError("update", {}, RuntimeError("busy"))
+        return original_renew(*args, **kwargs)
+
+    def blocking_copy(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(2)
+        return SimpleNamespace(status="success", error_code=None)
+
+    monkeypatch.setattr(campaign, "_renew_lease", transient_failure)
+    monkeypatch.setattr(campaign, "copy_inventory_row", blocking_copy)
+    engine = session.get_bind()
+
+    worker = threading.Thread(target=lambda: _execute_in_session(
+        engine, settings, run.id, inventory_row,
+    ))
+    worker.start()
+    assert entered.wait(2)
+    time.sleep(0.15)
+    with Session(engine) as resume_session:
+        assert enqueue_archive_copy(resume_session, run.id, [inventory_row]) == 0
+    release.set()
+    worker.join(timeout=2)
+
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
+    assert failures >= 2
+    assert calls == 1
+    assert [event.event_type for event in events].count("claimed") == 1
+    assert [event.event_type for event in events].count("completed") == 1
+
+
+def test_ownership_loss_fences_cooperative_copy_without_terminal_write(
+    session, settings, inventory_row, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = create_rebuild_run(session, cutoff_at=datetime(2026, 8, 21, tzinfo=UTC))
+    enqueue_archive_copy(session, run.id, [inventory_row])
+    engine = session.get_bind()
+    entered = threading.Event()
+
+    monkeypatch.setattr(campaign, "LEASE_TTL", timedelta(milliseconds=100))
+    monkeypatch.setattr(campaign, "LEASE_HEARTBEAT_INTERVAL", 0.01)
+
+    def lose_owner(*args, **kwargs):
+        task_id = kwargs["task_id"]
+        with Session(engine) as thief_session:
+            thief = thief_session.get(PipelineTask, task_id)
+            assert thief is not None
+            thief.lease_owner = "other-owner"
+            thief.lease_expires_at = datetime.now(UTC) + timedelta(seconds=1)
+            thief_session.commit()
+        return False
+
+    def cooperative_copy(*args, **kwargs):
+        entered.set()
+        while kwargs["should_continue"]():
+            time.sleep(0.005)
+        return SimpleNamespace(status="failed", error_code="LEASE_LOST")
+
+    monkeypatch.setattr(campaign, "_renew_lease", lose_owner)
+    monkeypatch.setattr(campaign, "copy_inventory_row", cooperative_copy)
+    worker = threading.Thread(target=lambda: _execute_in_session(
+        engine, settings, run.id, inventory_row,
+    ))
+    worker.start()
+    assert entered.wait(2)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+
+    task = session.scalar(select(PipelineTask).where(PipelineTask.run_id == run.id))
+    events = session.scalars(select(PipelineEvent).where(PipelineEvent.task_id == task.id)).all()
+    assert task.status == "running"
+    assert task.lease_owner == "other-owner"
+    assert enqueue_archive_copy(session, run.id, [inventory_row]) == 0
+    assert [event.event_type for event in events].count("claimed") == 1
+    assert [event.event_type for event in events].count("completed") == 0
+    assert [event.event_type for event in events].count("failed") == 0
