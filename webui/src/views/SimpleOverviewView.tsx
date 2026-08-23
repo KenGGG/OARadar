@@ -34,6 +34,15 @@ function manifestProgressText(done: SimpleStatusResponse["done"], oa: SimpleStat
   return `已处理 ${(oa.progress_current || 0).toLocaleString()} / ${oa.progress_total.toLocaleString()} 项；待下载 ${pending.toLocaleString()} 项。`
 }
 
+function manifestDownloadCounters(done: SimpleStatusResponse["done"]) {
+  return {
+    discovered: done.oa_total,
+    archiveComplete: done.archive_complete,
+    pending: Math.max(0, done.oa_total - done.archive_complete - done.excluded),
+    excluded: done.excluded,
+  }
+}
+
 function SimpleCard({ title, status, icon: Icon, children }: {
   title: string
   status: BusinessTone
@@ -55,6 +64,7 @@ export function SimpleOverviewView({ data, onJump }: {
   const pending = data.pending
   const oa = data.oa_activity
   const manifestProgress = manifestProgressText(done, oa)
+  const manifestCounters = manifestDownloadCounters(done)
 
   return <section className="simple-overview">
     <div className={`simple-banner simple-banner-${banner.tone}`}>
@@ -101,6 +111,12 @@ export function SimpleOverviewView({ data, onJump }: {
       <SimpleCard title="OA 后台状态" status={oa.status === "unknown" ? "unknown" : oa.status === "disconnected" || oa.status === "logging_in" ? "working" : oa.status === "working" ? "working" : "normal"} icon={Server}>
         <p className="simple-headline">{oa.label}</p>
         <p className="simple-detail">{oa.detail}</p>
+        <div className="simple-metrics">
+          <div className="simple-metric"><span>已发现</span><strong>{num(manifestCounters.discovered, "尚未取得")}</strong></div>
+          <div className="simple-metric"><span>原件完整</span><strong>{num(manifestCounters.archiveComplete, "尚未取得")}</strong></div>
+          <div className="simple-metric"><span>待下载</span><strong>{num(manifestCounters.pending, "尚未取得")}</strong></div>
+          <div className="simple-metric"><span>已排除</span><strong>{num(manifestCounters.excluded, "尚未取得")}</strong></div>
+        </div>
         {manifestProgress && <p className="simple-detail">{manifestProgress}</p>}
         {oa.progress_total != null && oa.progress_total > 0 && <div className="simple-meta"><span>进度 {oa.progress_current || 0} / {oa.progress_total}</span></div>}
         <div className="simple-meta"><span>最后心跳：{time(oa.heartbeat_at)}</span></div>

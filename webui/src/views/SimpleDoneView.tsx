@@ -63,7 +63,7 @@ function SimpleDoneDrawer({ item, close }: {
           <div className="info"><span>附件数量</span><strong>{item.file_count == null ? "尚未取得" : String(item.file_count)}</strong></div>
           <div className="info"><span>发起人</span><strong>{item.sender || "-"}</strong></div>
           <div className="info"><span>发起时间</span><strong>{time(item.initiated_at)}</strong></div>
-          <div className="info"><span>最后更新</span><strong>{time(item.updated_at)}</strong></div>
+          <div className="info"><span>最近成功同步</span><strong>{time(item.updated_at)}</strong></div>
         </div>
         <h3>附件名称</h3>
         {item.attachment_names.length ? <div className="attachment-name-list">
@@ -117,7 +117,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       <th>发起时间</th>
       <th>附件数量</th>
       <th>当前状态</th>
-      <th>最后更新</th>
+      <th>最近成功同步</th>
       <th aria-label="操作"/>
     </tr></thead><tbody>
       {rows.map(row => (

@@ -21,6 +21,20 @@ def test_v2_overview_explains_manifest_download_progress_before_oa_total_is_know
     assert "正在扫描更多页面" in source
 
 
+def test_v2_overview_groups_all_manifest_download_counters_together() -> None:
+    source = (Path(__file__).parents[1] / "webui/src/views/SimpleOverviewView.tsx").read_text(encoding="utf-8")
+
+    for label in ("已发现", "原件完整", "待下载", "已排除"):
+        assert label in source
+
+
+def test_done_view_labels_the_sync_timestamp_without_claiming_it_is_an_oa_update() -> None:
+    source = (Path(__file__).parents[1] / "webui/src/views/SimpleDoneView.tsx").read_text(encoding="utf-8")
+
+    assert "最近成功同步" in source
+    assert "最后更新" not in source
+
+
 def test_markdown_view_reports_an_outdated_web_api() -> None:
     source = (Path(__file__).parents[1] / "webui/src/App.tsx").read_text(encoding="utf-8")
 
