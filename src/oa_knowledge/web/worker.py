@@ -801,7 +801,7 @@ class OperationWorker:
                     source_path = resolve_data_path(
                         self.settings.data_root,
                         source.local_relpath,
-                        allowed_prefixes=("raw/done", "archive/raw/oa/done"),
+                        allowed_prefixes=("originals",),
                     )
                 except ValueError:
                     self.production_queue.fail(
@@ -849,19 +849,10 @@ class OperationWorker:
                     progress_current=0, progress_total=len(files),
                 )
                 return
-            try:
-                for source in publishable_files:
-                    publish_active_artifact(session, self.settings, source.id)
-                session.commit()
-            except (FileNotFoundError, ValueError):
-                session.rollback()
-                self.production_queue.advance(
-                    task.id, self.owner, "attachment_inventory",
-                    progress_current=0, progress_total=len(files),
-                )
-                return
+            # Classification chooses the final directory.  Do not publish a
+            # transient unclassified copy and move it later.
         self.production_queue.advance(
-            task.id, self.owner, "classify", progress_current=len(files), progress_total=len(files),
+            task.id, self.owner, "classify", progress_current=0, progress_total=len(files),
         )
 
     def _pipeline_classify(self, task: PipelineTask) -> None:
@@ -869,7 +860,26 @@ class OperationWorker:
 
         with Session(self.engine) as session:
             classify_done_item(session, task.logical_item_key)
-            session.commit()
+            item = session.scalar(select(OAItem).where(OAItem.oa_item_key == task.logical_item_key))
+            files = [] if item is None else [
+                source for source in self._historical_source_files(session.scalars(select(ArchivedFile).where(
+                    ArchivedFile.oa_item_id == item.id,
+                    ArchivedFile.download_status == "verified",
+                    ArchivedFile.local_relpath.is_not(None),
+                ).order_by(ArchivedFile.id)).all())
+                if source.content_object_id is not None and session.scalar(select(ParseArtifact.id).where(
+                    ParseArtifact.content_object_id == source.content_object_id,
+                    ParseArtifact.lifecycle_status == "valid",
+                ).limit(1)) is not None
+            ]
+            try:
+                for source in files:
+                    publish_active_artifact(session, self.settings, source.id)
+                session.commit()
+            except (FileNotFoundError, ValueError):
+                session.rollback()
+                self.production_queue.advance(task.id, self.owner, "attachment_inventory")
+                return
         self.production_queue.advance(task.id, self.owner, "index_publish")
 
     def _pipeline_index_publish(self, task: PipelineTask) -> None:
