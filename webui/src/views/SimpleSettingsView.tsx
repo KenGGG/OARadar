@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react"
 import {
-  Archive, Bell, BookOpen, BrainCircuit, Save,
+  Archive, Bell, BookOpen, BrainCircuit, Save, Trash2,
 } from "lucide-react"
 import type { SettingsData } from "../App"
 import {
-  postApi, Field, NumberField, Toggle, SecretState,
+  api, postApi, deleteApi, Field, NumberField, Toggle, SecretState,
 } from "../App"
+
+type TitleExclusionPolicy = { id: number; pattern: string; action: string; scope: string; enabled: boolean }
 
 export function SimpleSettingsView({ initial }: {
   initial: SettingsData
@@ -13,8 +15,39 @@ export function SimpleSettingsView({ initial }: {
   const [form, setForm] = useState<SettingsData>(initial)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState("")
+  const [titleKeywords, setTitleKeywords] = useState("")
+  const [policies, setPolicies] = useState<TitleExclusionPolicy[]>([])
 
   useEffect(() => { setForm(initial) }, [initial])
+  const loadPolicies = async () => {
+    const result = await api<TitleExclusionPolicy[]>("/api/policies")
+    setPolicies(result.filter(policy => policy.scope === "title" && policy.action === "skip" && policy.enabled))
+  }
+  useEffect(() => { void loadPolicies() }, [])
+
+  const saveTitleKeywords = async () => {
+    if (!titleKeywords.trim()) return
+    setSaving(true); setMessage("")
+    try {
+      const result = await postApi<{ keyword_count: number; applied_count: number }>("/api/policies/bulk", {
+        text: titleKeywords, action: "skip", scope: "title",
+      })
+      setTitleKeywords("")
+      await loadPolicies()
+      setMessage(`已保存 ${result.keyword_count} 个标题排除关键词；后续已办同步会在进入详情页前应用。`)
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : "保存失败") }
+    finally { setSaving(false) }
+  }
+
+  const removeTitleKeyword = async (policy: TitleExclusionPolicy) => {
+    setSaving(true); setMessage("")
+    try {
+      const result = await deleteApi<{ affected_count: number }>(`/api/policies/${policy.id}`)
+      await loadPolicies()
+      setMessage(`已删除“${policy.pattern}”；已重新判定 ${result.affected_count} 个事项。`)
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : "删除失败") }
+    finally { setSaving(false) }
+  }
 
   const save = async () => {
     setSaving(true); setMessage("")
@@ -89,6 +122,15 @@ export function SimpleSettingsView({ initial }: {
         <div className="info"><span>永久归档根目录</span><strong>{initial.done_archive.archive_dir}</strong></div>
         <div className="info"><span>计算 SHA256</span><strong>{initial.done_archive.compute_sha256 ? "是" : "否"}</strong></div>
         <div className="info"><span>压缩包展开深度</span><strong>{String(initial.done_archive.max_attachment_depth)}</strong></div>
+      </div>
+      <div className="settings-sub"><h3>标题排除关键词</h3>
+        <p className="settings-help">命中关键词的已办事项不会进入详情页，也不会下载附件。每行一个关键词。</p>
+        <textarea className="settings-textarea" value={titleKeywords} onChange={e => setTitleKeywords(e.target.value)} placeholder="例如：会议通知" />
+        <div className="policy-actions"><button className="button-primary" onClick={() => void saveTitleKeywords()} disabled={saving || !titleKeywords.trim()}><Save size={16}/>保存关键词</button></div>
+        <div className="policy-list">
+          {policies.map(policy => <div className="policy-row" key={policy.id}><span>{policy.pattern}</span><button className="icon-button" title={`删除 ${policy.pattern}`} onClick={() => void removeTitleKeyword(policy)} disabled={saving}><Trash2 size={15}/></button></div>)}
+          {!policies.length && <span className="settings-help">尚未设置标题排除关键词。</span>}
+        </div>
       </div>
     </div>
 

@@ -208,13 +208,14 @@ def done_list(
                 )
             ) or 0
             rows = session.scalars(statement.order_by(
-                OAManifestItem.completed_at.desc(), OAManifestItem.id.desc(),
+                OAManifestItem.list_page, OAManifestItem.list_ordinal, OAManifestItem.id,
             ).offset((page - 1) * page_size).limit(page_size)).all()
             items = []
             for row in rows:
                 archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == row.oa_item_key))
                 items.append({
                     "id": row.id, "item_id": row.workitem_id_text, "title": row.title, "sender": row.sender,
+                    "initiated_at": row.initiated_at.isoformat() if row.initiated_at else None,
                     "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                     "pipeline_status": row.processing_status,
                     "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),

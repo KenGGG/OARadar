@@ -166,6 +166,12 @@ async function postApi<T>(path: string, body?: unknown): Promise<T> {
   if (!response.ok) throw new Error(text || `操作失败 (${response.status})`)
   try { return JSON.parse(text) as T } catch { return undefined as unknown as T }
 }
+async function deleteApi<T>(path: string): Promise<T> {
+  const response = await fetch(path, { method: "DELETE", headers: { "x-csrf-token": csrf() } })
+  const text = await response.text()
+  if (!response.ok) throw new Error(text || `操作失败 (${response.status})`)
+  try { return JSON.parse(text) as T } catch { return undefined as unknown as T }
+}
 const time = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "-"
 const size = (value: number | null) => value == null ? "-" : value < 1024 * 1024 ? `${(value / 1024).toFixed(1)} KB` : value < 1024 ** 3 ? `${(value / 1024 / 1024).toFixed(1)} MB` : `${(value / 1024 ** 3).toFixed(2)} GB`
 
@@ -211,7 +217,7 @@ const SERVICE_TITLES: Record<string, string> = {
 
 // 供高级维护视图复用（不删除既有能力，仅折叠到高级维护）。
 export {
-  api, postApi, csrf, time, size,
+  api, postApi, deleteApi, csrf, time, size,
   Badge, Metric, Info, Progress, SearchBox, Field, NumberField, Toggle, SecretState, ServiceCard,
   SERVICE_TITLES,
 }

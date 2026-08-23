@@ -22,7 +22,6 @@ def client(config_file: Path) -> TestClient:
     "/api/audits/online",
     "/api/governance/inventory",
     "/api/reviews",
-    "/api/policies",
     "/api/batches",
     "/api/backfill/status",
     "/api/maintenance",
@@ -42,7 +41,6 @@ def test_retired_v2_routes_are_not_registered(client: TestClient) -> None:
         "/api/audits",
         "/api/governance",
         "/api/reviews",
-        "/api/policies",
         "/api/batches",
         "/api/backfill",
         "/api/lifecycle/knowledge",
@@ -54,3 +52,17 @@ def test_retired_v2_routes_are_not_registered(client: TestClient) -> None:
     assert not [
         path for path in registered_paths if path.startswith(retired_prefixes)
     ]
+
+
+def test_title_exclusion_policy_routes_are_available_from_system_settings(client: TestClient) -> None:
+    """Removing the live policy route would make title exclusions uneditable."""
+    csrf = client.get("/").cookies.get("oa_csrf")
+    response = client.post(
+        "/api/policies/bulk",
+        json={"text": "合成排除关键词", "action": "skip", "scope": "title"},
+        headers={"x-csrf-token": csrf or ""},
+    )
+    assert response.status_code == 200
+    policies = client.get("/api/policies")
+    assert policies.status_code == 200
+    assert any(policy["pattern"] == "合成排除关键词" and policy["action"] == "skip" for policy in policies.json())

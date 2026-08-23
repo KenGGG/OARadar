@@ -113,6 +113,39 @@ def test_done_archives_exposes_simple_status_fields(config_file: Path) -> None:
     assert item["updated_at"] is not None
 
 
+def test_done_archives_keeps_online_oa_page_and_row_order_and_exposes_initiator_fields(config_file: Path) -> None:
+    """Changing the OA page/row order must change the user-visible Done order."""
+    client = _client(config_file)
+    engine = create_db_engine(load_settings(config_file).database_path)
+    with Session(engine) as session:
+        session.add_all([
+            OAManifestItem(
+                oa_item_key="oa:page-2", title="第二页第一条", sender="发起人乙",
+                initiated_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+                completed_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+                list_page=2, list_ordinal=1, processing_status="discovered",
+            ),
+            OAManifestItem(
+                oa_item_key="oa:page-1-second", title="第一页第二条", sender="发起人甲二",
+                initiated_at=datetime(2026, 8, 1, 11, tzinfo=timezone.utc),
+                completed_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+                list_page=1, list_ordinal=2, processing_status="discovered",
+            ),
+            OAManifestItem(
+                oa_item_key="oa:page-1-first", title="第一页第一条", sender="发起人甲一",
+                initiated_at=datetime(2026, 8, 1, 10, tzinfo=timezone.utc),
+                completed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                list_page=1, list_ordinal=1, processing_status="discovered",
+            ),
+        ])
+        session.commit()
+
+    payload = client.get("/api/done-archives?page=1&page_size=50&simple_status=waiting_download").json()
+    assert [item["title"] for item in payload["items"]] == ["第一页第一条", "第一页第二条", "第二页第一条"]
+    assert payload["items"][0]["sender"] == "发起人甲一"
+    assert payload["items"][0]["initiated_at"] == "2026-08-01T10:00:00"
+
+
 def test_done_archives_filters_by_simple_status_server_side(config_file: Path) -> None:
     client = _client(config_file)
     settings = load_settings(config_file)

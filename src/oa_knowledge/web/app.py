@@ -30,7 +30,10 @@ from oa_knowledge.web.console_views import (
 )
 from oa_knowledge.web.simple_status import simple_status, _ALLOWED_SIMPLE_STATES
 from oa_knowledge.web.schedule_views import schedule_status
-from oa_knowledge.web.status import dashboard_status
+from oa_knowledge.web.status import (
+    create_policies_bulk, create_policy, dashboard_status, delete_policy,
+    list_policies, preview_policy_hits,
+)
 
 
 class AuthLoginRequest(BaseModel):
@@ -72,7 +75,7 @@ RETIRED_API_PREFIXES = (
     "/api/audits", "/api/lifecycle", "/api/knowledge", "/api/data-governance",
     "/api/maintenance", "/api/system/provider-settings", "/api/items", "/api/manifest",
     "/api/batches", "/api/backfill", "/api/notifications", "/api/jobs",
-    "/api/events", "/api/discovery-jobs", "/api/policies", "/api/reviews",
+    "/api/events", "/api/discovery-jobs", "/api/reviews",
 )
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",

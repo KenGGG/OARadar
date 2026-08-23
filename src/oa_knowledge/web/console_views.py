@@ -554,7 +554,7 @@ def done_archives_list(
                     stmt = stmt.where(False)
                 total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
                 rows = session.scalars(
-                    stmt.order_by(OAManifestItem.completed_at.desc(), OAManifestItem.id.desc())
+                    stmt.order_by(OAManifestItem.list_page, OAManifestItem.list_ordinal, OAManifestItem.id)
                     .offset((page - 1) * page_size).limit(page_size)
                 ).all()
                 items = []
@@ -576,6 +576,7 @@ def done_archives_list(
                         "item_id": row.workitem_id_text,
                         "title": row.title,
                         "sender": row.sender,
+                        "initiated_at": row.initiated_at.isoformat() if row.initiated_at else None,
                         "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                         "pipeline_status": row.processing_status,
                         "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),

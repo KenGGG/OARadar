@@ -86,6 +86,7 @@ export interface SimpleDoneItem {
   item_id: string
   title: string
   sender: string | null
+  initiated_at: string | null
   completed_at: string | null
   pipeline_status: string
   archive_relpath: string | null

@@ -60,8 +60,9 @@ function SimpleDoneDrawer({ item, close }: {
           <div className="info"><span>原件</span><strong>{facts.original}</strong></div>
           <div className="info"><span>Markdown</span><strong>{facts.markdown}</strong></div>
           <div className="info"><span>归类发布</span><strong>{facts.publish}</strong></div>
-          <div className="info"><span>原件数量</span><strong>{item.file_count == null ? "尚未取得" : String(item.file_count)}</strong></div>
-          <div className="info"><span>办结时间</span><strong>{time(item.completed_at)}</strong></div>
+          <div className="info"><span>附件数量</span><strong>{item.file_count == null ? "尚未取得" : String(item.file_count)}</strong></div>
+          <div className="info"><span>发起人</span><strong>{item.sender || "-"}</strong></div>
+          <div className="info"><span>发起时间</span><strong>{time(item.initiated_at)}</strong></div>
           <div className="info"><span>最后更新</span><strong>{time(item.updated_at)}</strong></div>
         </div>
         {isAttention && item.attention_reason && (
@@ -108,8 +109,9 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
     </div>
     <div className="table-wrap"><table style={{ minWidth: 920 }}><thead><tr>
       <th className="title-col">事项标题</th>
-      <th>办结时间</th>
-      <th>原件数量</th>
+      <th>发起人</th>
+      <th>发起时间</th>
+      <th>附件数量</th>
       <th>当前状态</th>
       <th>最后更新</th>
       <th aria-label="操作"/>
@@ -117,14 +119,15 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       {rows.map(row => (
         <tr key={row.id} onClick={() => setSelected(row)} tabIndex={0} onKeyDown={e => e.key === "Enter" && setSelected(row)}>
           <td className="title-cell"><strong>{row.title}</strong><small>{row.item_id}</small></td>
-          <td className="nowrap">{time(row.completed_at)}</td>
+          <td>{row.sender || "-"}</td>
+          <td className="nowrap">{time(row.initiated_at)}</td>
           <td>{row.file_count == null ? "-" : row.file_count}</td>
           <td><span className={`status status-${statusTone(row.simple_status)}`}>{row.simple_status_label}</span></td>
           <td className="nowrap">{time(row.updated_at)}</td>
           <td><ChevronRight size={17}/></td>
         </tr>
       ))}
-      {!rows.length && <tr><td colSpan={6} className="empty">没有符合条件的已办资料</td></tr>}
+      {!rows.length && <tr><td colSpan={8} className="empty">没有符合条件的已办资料</td></tr>}
     </tbody></table></div>
     <div className="pagination">
       <button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button>

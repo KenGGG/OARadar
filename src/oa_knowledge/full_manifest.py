@@ -53,6 +53,7 @@ def upsert_manifest_page(
                 initiated_at=source.created_at,
                 completed_at=source.completed_at,
                 list_page=source.list_page,
+                list_ordinal=source.ordinal,
                 first_seen_at=now,
                 last_synced_at=now,
                 processing_status="discovered",
@@ -65,6 +66,7 @@ def upsert_manifest_page(
             row.initiated_at = source.created_at or row.initiated_at
             row.completed_at = source.completed_at
             row.list_page = source.list_page
+            row.list_ordinal = source.ordinal
             row.last_synced_at = now
     session.flush()
 
