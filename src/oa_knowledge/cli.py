@@ -451,6 +451,7 @@ def manifest_run(
     all_items: dict[str, object] = {}
     scanned_rows = 0
     pages_scanned = 0
+    auth_retry_counts: dict[int, int] = {}
     with BrowserSession(settings, headed=headed) as browser:
         if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
             typer.echo("OA authentication required", err=True); raise typer.Exit(3)
@@ -508,6 +509,39 @@ def manifest_run(
                             row.processing_status = "download_failed"; row.retry_count += 1
                             row.last_error = proxy.last_error or _attachment_failure_summary(capture); row.failure_stage = "attachment"
                         session.commit()
+                except AuthRequiredError as exc:
+                    # OA sessions can expire during a long full scan.  Restore
+                    # the authenticated list page and append this row back to
+                    # the current page's work queue instead of letting a stale
+                    # frame abort the whole manifest process.
+                    auth_retry_counts[row_id] = auth_retry_counts.get(row_id, 0) + 1
+                    if (
+                        auth_retry_counts[row_id] <= 2
+                        and browser.login_with_saved_credentials(30) == LoginState.AUTHENTICATED
+                    ):
+                        frame = list_adapter.navigate_to_page(
+                            page_number, settings.collector.list_page_delay_seconds,
+                        )
+                        with Session(engine) as session:
+                            row = session.get(OAManifestItem, row_id)
+                            if row is not None:
+                                row.processing_status = "pending_download"
+                                row.last_error = None
+                                row.failure_stage = None
+                                row.last_retry_at = datetime.now(timezone.utc)
+                                session.commit()
+                        row_ids.append(row_id)
+                        continue
+                    with Session(engine) as session:
+                        row = session.get(OAManifestItem, row_id)
+                        if row is not None:
+                            row.processing_status = "auth_required"
+                            row.last_error = _sanitize_operational_error(exc)
+                            row.failure_stage = "authentication"
+                            row.last_retry_at = datetime.now(timezone.utc)
+                            session.commit()
+                    typer.echo("OA authentication required", err=True)
+                    raise typer.Exit(3)
                 except Exception as exc:
                     with Session(engine) as session:
                         row = session.get(OAManifestItem, row_id)

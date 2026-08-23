@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.cli import _sanitize_operational_error, app
 from oa_knowledge.collector import LoginState
+from oa_knowledge.collector.detail import AuthRequiredError
 from oa_knowledge.collector.done import DiscoveredDoneItem
 from oa_knowledge.collector.pending import DiscoveredPendingItem, PendingDiscovery
 from oa_knowledge.config import load_settings
@@ -114,6 +115,63 @@ def test_bounded_manifest_run_uses_existing_direct_detail_capture(config_file: P
 
     assert result.exit_code == 0, result.output
     assert observed == {"direct": True, "list_click": False}
+
+
+def test_manifest_run_reauthenticates_and_retries_the_same_item_after_session_expiry(config_file: Path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+    item = DiscoveredDoneItem(
+        workitem_id_text="synthetic-auth-workitem", title="合成会话恢复事项",
+        created_at=datetime(2026, 8, 23, tzinfo=timezone.utc), completed_at=None,
+        sender="合成人员", deadline_text=None, category=None, ordinal=1,
+    )
+    observed = {"login_calls": 0, "direct_calls": 0, "reopened_page": None}
+
+    class FakePage:
+        def wait_for_timeout(self, _milliseconds): pass
+
+    class FakeBrowser:
+        base_url = "https://oa.invalid"
+        page = FakePage()
+        def __init__(self, *_args, **_kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def login_with_saved_credentials(self, _seconds):
+            observed["login_calls"] += 1
+            return LoginState.AUTHENTICATED
+
+    class FakeDone:
+        def __init__(self, *_args, **_kwargs): pass
+        def open_list(self): return object()
+        def _list_stats(self, _frame): return 1, 1
+        def _discover_frame(self, *_args): return [item]
+        def navigate_to_page(self, page_number, _delay):
+            observed["reopened_page"] = page_number
+            return object()
+
+    class FakeDetail:
+        def __init__(self, *_args, **_kwargs): pass
+        def capture_direct(self, *_args, **_kwargs):
+            observed["direct_calls"] += 1
+            if observed["direct_calls"] == 1:
+                raise AuthRequiredError("synthetic expiry")
+            return type("Capture", (), {"attachments": (), "related_containers": ()})()
+
+    def archive_as_no_attachment(_session, proxy, _capture, _data_root):
+        proxy.archive_status = "archived"
+        proxy.last_error = None
+
+    monkeypatch.setattr("oa_knowledge.cli.BrowserSession", FakeBrowser)
+    monkeypatch.setattr("oa_knowledge.cli.DoneAdapter", FakeDone)
+    monkeypatch.setattr("oa_knowledge.cli.CollaborationDetailAdapter", FakeDetail)
+    monkeypatch.setattr("oa_knowledge.cli.archive_collaboration_detail", archive_as_no_attachment)
+
+    result = runner.invoke(app, [
+        "manifest", "run", "--max-pages", "1", "--max-items", "1",
+        "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert observed == {"login_calls": 2, "direct_calls": 2, "reopened_page": 1}
 
 
 def test_curate_plan_is_read_only_and_commands_are_registered(config_file: Path) -> None:
