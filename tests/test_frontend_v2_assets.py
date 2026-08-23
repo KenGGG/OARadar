@@ -13,6 +13,14 @@ def test_v2_overview_component_has_its_required_styles() -> None:
         assert f".{class_name}" in styles
 
 
+def test_v2_overview_explains_manifest_download_progress_before_oa_total_is_known() -> None:
+    source = (Path(__file__).parents[1] / "webui/src/views/SimpleOverviewView.tsx").read_text(encoding="utf-8")
+
+    assert "已发现" in source
+    assert "待下载" in source
+    assert "正在扫描更多页面" in source
+
+
 def test_markdown_view_reports_an_outdated_web_api() -> None:
     source = (Path(__file__).parents[1] / "webui/src/App.tsx").read_text(encoding="utf-8")
 

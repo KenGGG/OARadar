@@ -25,6 +25,15 @@ function num(value: number | null, missing: string): string {
   return value == null ? missing : value.toLocaleString()
 }
 
+function manifestProgressText(done: SimpleStatusResponse["done"], oa: SimpleStatusResponse["oa_activity"]): string | null {
+  if (oa.status !== "working") return null
+  const pending = Math.max(0, done.oa_total - done.archive_complete - done.excluded)
+  if (oa.progress_total == null || oa.progress_total <= 0) {
+    return `已发现 ${done.oa_total.toLocaleString()} 项，正在扫描更多页面；待下载 ${pending.toLocaleString()} 项。`
+  }
+  return `已处理 ${(oa.progress_current || 0).toLocaleString()} / ${oa.progress_total.toLocaleString()} 项；待下载 ${pending.toLocaleString()} 项。`
+}
+
 function SimpleCard({ title, status, icon: Icon, children }: {
   title: string
   status: BusinessTone
@@ -45,6 +54,7 @@ export function SimpleOverviewView({ data, onJump }: {
   const done = data.done
   const pending = data.pending
   const oa = data.oa_activity
+  const manifestProgress = manifestProgressText(done, oa)
 
   return <section className="simple-overview">
     <div className={`simple-banner simple-banner-${banner.tone}`}>
@@ -91,7 +101,8 @@ export function SimpleOverviewView({ data, onJump }: {
       <SimpleCard title="OA 后台状态" status={oa.status === "unknown" ? "unknown" : oa.status === "disconnected" || oa.status === "logging_in" ? "working" : oa.status === "working" ? "working" : "normal"} icon={Server}>
         <p className="simple-headline">{oa.label}</p>
         <p className="simple-detail">{oa.detail}</p>
-        {oa.progress_total != null && <div className="simple-meta"><span>进度 {oa.progress_current || 0} / {oa.progress_total}</span></div>}
+        {manifestProgress && <p className="simple-detail">{manifestProgress}</p>}
+        {oa.progress_total != null && oa.progress_total > 0 && <div className="simple-meta"><span>进度 {oa.progress_current || 0} / {oa.progress_total}</span></div>}
         <div className="simple-meta"><span>最后心跳：{time(oa.heartbeat_at)}</span></div>
       </SimpleCard>
     </div>
