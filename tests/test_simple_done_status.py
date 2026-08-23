@@ -188,6 +188,7 @@ def test_done_archives_counts_files_present_in_originals_directory(config_file: 
 
     payload = client.get("/api/done-archives?page=1&page_size=50").json()
     assert payload["items"][0]["file_count"] == 3
+    assert payload["items"][0]["attachment_names"] == ["正文乙.docx", "附件丙.xlsx", "附件甲.pdf"]
     assert payload["metrics"]["verified_attachments"] == 3
 
 

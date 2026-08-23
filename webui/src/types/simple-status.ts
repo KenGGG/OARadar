@@ -91,6 +91,7 @@ export interface SimpleDoneItem {
   pipeline_status: string
   archive_relpath: string | null
   file_count: number | null
+  attachment_names: string[]
   simple_status: SimpleDoneState
   simple_status_label: string
   attention_reason: string | null

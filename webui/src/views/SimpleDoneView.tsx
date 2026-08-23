@@ -65,6 +65,10 @@ function SimpleDoneDrawer({ item, close }: {
           <div className="info"><span>发起时间</span><strong>{time(item.initiated_at)}</strong></div>
           <div className="info"><span>最后更新</span><strong>{time(item.updated_at)}</strong></div>
         </div>
+        <h3>附件名称</h3>
+        {item.attachment_names.length ? <div className="attachment-name-list">
+          {item.attachment_names.map(name => <div key={name}>{name}</div>)}
+        </div> : <p className="settings-help">暂无附件。</p>}
         {isAttention && item.attention_reason && (
           <div className="settings-message" role="alert"><CircleAlert size={16}/>{item.attention_reason}</div>
         )}

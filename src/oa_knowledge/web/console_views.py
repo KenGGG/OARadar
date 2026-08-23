@@ -16,7 +16,7 @@ import yaml
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from oa_knowledge.archive_paths import count_original_files
+from oa_knowledge.archive_paths import count_original_files, original_file_names
 from oa_knowledge.config import Settings, load_settings, validate_feishu_runtime_config
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
@@ -576,6 +576,7 @@ def done_archives_list(
                         "pipeline_status": row.processing_status,
                         "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
                         "file_count": file_count,
+                        "attachment_names": original_file_names(settings.data_root, archive_relpath),
                         "simple_status": simple["state"],
                         "simple_status_label": simple["label"],
                         "attention_reason": simple["reason"],

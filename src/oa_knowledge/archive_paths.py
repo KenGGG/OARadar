@@ -55,22 +55,37 @@ def is_current_archive_path(rel: PurePosixPath) -> bool:
     return len(parts) >= 2 and parts[:1] == ARCHIVE_PREFIX.parts
 
 
-def count_original_files(data_root: Path, archive_relpath: str | None) -> int:
-    """Count files actually present in one current originals directory safely."""
+def _original_archive_directory(data_root: Path, archive_relpath: str | None) -> Path | None:
     if not archive_relpath:
-        return 0
+        return None
     relpath = PurePosixPath(archive_relpath)
     if not is_current_archive_path(relpath):
-        return 0
+        return None
     data_root_resolved = data_root.resolve()
     archive_dir = (data_root / Path(*relpath.parts)).resolve()
     try:
         archive_dir.relative_to(data_root_resolved)
     except ValueError:
-        return 0
+        return None
     if not archive_dir.is_dir():
-        return 0
-    return sum(path.is_file() for path in archive_dir.rglob("*"))
+        return None
+    return archive_dir
+
+
+def original_file_names(data_root: Path, archive_relpath: str | None) -> list[str]:
+    """Return the actual file names a user sees in one originals directory."""
+    archive_dir = _original_archive_directory(data_root, archive_relpath)
+    if archive_dir is None:
+        return []
+    return sorted(
+        (path.relative_to(archive_dir).as_posix() for path in archive_dir.rglob("*") if path.is_file()),
+        key=str.casefold,
+    )
+
+
+def count_original_files(data_root: Path, archive_relpath: str | None) -> int:
+    """Count files actually present in one current originals directory safely."""
+    return len(original_file_names(data_root, archive_relpath))
 
 
 def replace_archive_prefix(value: str | None, old: str, new: str) -> str | None:

@@ -9,7 +9,7 @@ from urllib.request import urlopen
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from oa_knowledge.archive_paths import count_original_files
+from oa_knowledge.archive_paths import count_original_files, original_file_names
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
@@ -214,15 +214,17 @@ def done_list(
             items = []
             for row in rows:
                 archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == row.oa_item_key))
+                archive_relpath = row.archive_relpath or (archived.archive_relpath if archived else None)
                 items.append({
                     "id": row.id, "item_id": row.workitem_id_text, "title": row.title, "sender": row.sender,
                     "initiated_at": row.initiated_at.isoformat() if row.initiated_at else None,
                     "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                     "pipeline_status": row.processing_status,
-                    "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
+                    "archive_relpath": archive_relpath,
                     "file_count": count_original_files(
-                        settings.data_root, row.archive_relpath or (archived.archive_relpath if archived else None),
-                    ) if archived or row.archive_relpath else None,
+                        settings.data_root, archive_relpath,
+                    ) if archive_relpath else None,
+                    "attachment_names": original_file_names(settings.data_root, archive_relpath),
                 })
             return {
                 "items": items,
