@@ -3,6 +3,11 @@ app:
   data_root: ./data
   privacy_mode: local_only
 
+runtime:
+  # Application state is local-only but intentionally outside data/.
+  state_root: ~/.local/state/oaradar
+  cache_root: ~/.cache/oaradar
+
 browser:
   # Copy this file to config.yaml, then replace the reserved example values
   # below with paths from your own OA installation. config.yaml is ignored.
@@ -10,7 +15,7 @@ browser:
   context_path: /oa
   login_path: /oa/login
   executable_path: /usr/bin/google-chrome
-  user_data_dir: runtime/browser-profile
+  user_data_dir: browser-profile
   headless: true
   ignore_https_errors: false
   done_list_path: /oa/done
@@ -25,17 +30,17 @@ collector:
   download_timeout_seconds: 300
   attachment_total_timeout_seconds: 1500
 storage:
-  sqlite_path: state/oa.db
-  archive_dir: archive/raw/oa
+  sqlite_path: oa.db
+  archive_dir: originals
   journal_mode: WAL
   compute_sha256: true
 
 markdown_export:
   enabled: true
-  workspace_root: workspace
+  workspace_root: .
   # The generated Markdown is atomically published here and picked up by the
   # external llm_wiki project as its OA source directory (plan-0807-1 §9.4 交接).
-  source_markdown_dir: raw/sources/oa
+  source_markdown_dir: markdown
   preserve_source_tree: true
   filename_mode: append_md
   write_frontmatter: true

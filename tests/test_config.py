@@ -18,9 +18,11 @@ def test_defaults_are_local_and_depth_ten() -> None:
     assert settings.mineru.api_url == "http://127.0.0.1:58000"
     assert settings.online_audit.item_timeout_seconds == 120
     assert settings.online_audit.download_timeout_seconds == 30
-    assert settings.storage.archive_dir.as_posix() == "archive/raw/oa"
-    assert settings.markdown_root == settings.data_root / "workspace/raw/sources/oa"
-    assert settings.markdown_root != settings.workspace_root / "wiki"
+    assert settings.storage.archive_dir.as_posix() == "originals"
+    assert settings.database_path == settings.state_root / "oa.db"
+    assert settings.browser_profile_path == settings.cache_root / "browser-profile"
+    assert settings.markdown_root == settings.data_root / "markdown"
+    assert settings.markdown_root != settings.archive_root
 
 
 def test_markdown_source_dir_cannot_escape_or_target_wiki() -> None:

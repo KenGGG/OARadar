@@ -30,12 +30,28 @@ class AppConfig(StrictModel):
     privacy_mode: str = "local_only"
 
 
+class RuntimeConfig(StrictModel):
+    """Local application state that must never live below ``data_root``."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+    state_root: Path = Path("~/.local/state/oaradar")
+    cache_root: Path = Path("~/.cache/oaradar")
+
+    @field_validator("state_root", "cache_root")
+    @classmethod
+    def absolute_runtime_root(cls, value: Path, info) -> Path:
+        expanded = value.expanduser()
+        if not expanded.is_absolute():
+            raise ValueError(f"runtime.{info.field_name} must be an absolute local path")
+        return expanded.resolve()
+
+
 class BrowserConfig(StrictModel):
     base_url: str = "https://oa.example.invalid"
     context_path: str = "/oa"
     login_path: str = "/oa/login"
     executable_path: Path = Path("/usr/bin/google-chrome")
-    user_data_dir: Path = Path("runtime/browser-profile")
+    user_data_dir: Path = Path("browser-profile")
     headless: bool = True
     ignore_https_errors: bool = False
     done_list_path: str = "/oa/done"
@@ -65,8 +81,8 @@ class CollectorConfig(StrictModel):
 
 
 class StorageConfig(StrictModel):
-    sqlite_path: Path = Path("state/oa.db")
-    archive_dir: Path = Path("archive/raw/oa")
+    sqlite_path: Path = Path("oa.db")
+    archive_dir: Path = Path("originals")
     journal_mode: str = "WAL"
     compute_sha256: bool = True
 
@@ -315,6 +331,7 @@ class WebConfig(StrictModel):
 
 class Settings(StrictModel):
     app: AppConfig = AppConfig()
+    runtime: RuntimeConfig = RuntimeConfig()
     browser: BrowserConfig = BrowserConfig()
     collector: CollectorConfig = CollectorConfig()
     storage: StorageConfig = StorageConfig()
@@ -335,10 +352,14 @@ class Settings(StrictModel):
     def local_only(self) -> "Settings":
         if self.app.privacy_mode != "local_only":
             raise ValueError("privacy_mode must be local_only")
-        if self.markdown_root == self.archive_root.resolve():
+        for name, root in (("runtime.state_root", self.state_root), ("runtime.cache_root", self.cache_root)):
+            try:
+                root.relative_to(self.data_root)
+            except ValueError:
+                continue
+            raise ValueError(f"{name} must be outside app.data_root")
+        if self.markdown_root == self.archive_root:
             raise ValueError("Markdown output must not target the raw archive")
-        if self.markdown_root == (self.workspace_root / "wiki").resolve():
-            raise ValueError("OARadar must not write workspace/wiki")
         return self
 
     @property
@@ -347,20 +368,39 @@ class Settings(StrictModel):
 
     @property
     def database_path(self) -> Path:
-        return self.data_root / self.storage.sqlite_path
+        return (self.state_root / self.storage.sqlite_path).resolve()
+
+    @property
+    def state_root(self) -> Path:
+        return self.runtime.state_root
+
+    @property
+    def cache_root(self) -> Path:
+        return self.runtime.cache_root
+
+    @property
+    def browser_profile_path(self) -> Path:
+        return (self.cache_root / self.browser.user_data_dir).resolve()
+
+    @property
+    def parse_work_root(self) -> Path:
+        return self.cache_root / "work"
+
+    @property
+    def originals_root(self) -> Path:
+        return self.data_root / "originals"
 
     @property
     def archive_root(self) -> Path:
-        return self.data_root / self.storage.archive_dir
+        return self.originals_root
 
     @property
     def workspace_root(self) -> Path:
-        value = self.markdown_export.workspace_root.expanduser()
-        return value.resolve() if value.is_absolute() else (self.data_root / value).resolve()
+        return self.data_root
 
     @property
     def markdown_root(self) -> Path:
-        return (self.workspace_root / self.markdown_export.source_markdown_dir).resolve()
+        return self.data_root / "markdown"
 
 
 def ensure_relative(value: Path, field: str) -> Path:
