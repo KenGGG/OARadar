@@ -66,3 +66,27 @@ def test_title_exclusion_policy_routes_are_available_from_system_settings(client
     policies = client.get("/api/policies")
     assert policies.status_code == 200
     assert any(policy["pattern"] == "合成排除关键词" and policy["action"] == "skip" for policy in policies.json())
+
+
+def test_title_exclusion_policy_can_be_edited_by_id(client: TestClient) -> None:
+    """A legacy title rule must remain visible and become editable in settings."""
+    csrf = client.get("/").cookies.get("oa_csrf")
+    created = client.post(
+        "/api/policies/bulk",
+        json={"text": "旧的合成标题规则", "action": "metadata_only", "scope": "title"},
+        headers={"x-csrf-token": csrf or ""},
+    )
+    assert created.status_code == 200
+    policy_id = created.json()["policies"][0]["id"]
+
+    response = client.put(
+        f"/api/policies/{policy_id}",
+        json={"pattern": "更新后的合成标题规则"},
+        headers={"x-csrf-token": csrf or ""},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["pattern"] == "更新后的合成标题规则"
+    assert response.json()["action"] == "skip"
+    policies = client.get("/api/policies").json()
+    assert any(policy["id"] == policy_id and policy["pattern"] == "更新后的合成标题规则" for policy in policies)

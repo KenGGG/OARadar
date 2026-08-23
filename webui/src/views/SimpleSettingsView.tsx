@@ -1,13 +1,13 @@
 import { useEffect, useState } from "react"
 import {
-  Archive, Bell, BookOpen, BrainCircuit, Save, Trash2,
+  Archive, Bell, BookOpen, BrainCircuit, Pencil, Save, Trash2, X,
 } from "lucide-react"
 import type { SettingsData } from "../App"
 import {
-  api, postApi, deleteApi, Field, NumberField, Toggle, SecretState,
+  api, postApi, putApi, deleteApi, Field, NumberField, Toggle, SecretState,
 } from "../App"
 
-type TitleExclusionPolicy = { id: number; pattern: string; action: string; scope: string; enabled: boolean }
+type TitleExclusionPolicy = { id: number; pattern: string; action: string; scope: string; enabled: boolean; updated_at: string | null }
 
 export function SimpleSettingsView({ initial }: {
   initial: SettingsData
@@ -17,11 +17,13 @@ export function SimpleSettingsView({ initial }: {
   const [message, setMessage] = useState("")
   const [titleKeywords, setTitleKeywords] = useState("")
   const [policies, setPolicies] = useState<TitleExclusionPolicy[]>([])
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [editingPattern, setEditingPattern] = useState("")
 
   useEffect(() => { setForm(initial) }, [initial])
   const loadPolicies = async () => {
     const result = await api<TitleExclusionPolicy[]>("/api/policies")
-    setPolicies(result.filter(policy => policy.scope === "title" && policy.action === "skip" && policy.enabled))
+    setPolicies(result.filter(policy => policy.scope === "title"))
   }
   useEffect(() => { void loadPolicies() }, [])
 
@@ -46,6 +48,24 @@ export function SimpleSettingsView({ initial }: {
       await loadPolicies()
       setMessage(`已删除“${policy.pattern}”；已重新判定 ${result.affected_count} 个事项。`)
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : "删除失败") }
+    finally { setSaving(false) }
+  }
+
+  const startEditingTitleKeyword = (policy: TitleExclusionPolicy) => {
+    setEditingId(policy.id)
+    setEditingPattern(policy.pattern)
+    setMessage("")
+  }
+
+  const saveEditedTitleKeyword = async (policy: TitleExclusionPolicy) => {
+    if (!editingPattern.trim()) return
+    setSaving(true); setMessage("")
+    try {
+      await putApi(`/api/policies/${policy.id}`, { pattern: editingPattern })
+      setEditingId(null); setEditingPattern("")
+      await loadPolicies()
+      setMessage(`已更新“${policy.pattern}”；后续已办同步会使用新关键词。`)
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : "更新失败") }
     finally { setSaving(false) }
   }
 
@@ -128,7 +148,12 @@ export function SimpleSettingsView({ initial }: {
         <textarea className="settings-textarea" value={titleKeywords} onChange={e => setTitleKeywords(e.target.value)} placeholder="例如：会议通知" />
         <div className="policy-actions"><button className="button-primary" onClick={() => void saveTitleKeywords()} disabled={saving || !titleKeywords.trim()}><Save size={16}/>保存关键词</button></div>
         <div className="policy-list">
-          {policies.map(policy => <div className="policy-row" key={policy.id}><span>{policy.pattern}</span><button className="icon-button" title={`删除 ${policy.pattern}`} onClick={() => void removeTitleKeyword(policy)} disabled={saving}><Trash2 size={15}/></button></div>)}
+          {policies.map(policy => <div className="policy-row" key={policy.id}>
+            {editingId === policy.id ? <input className="policy-edit-input" value={editingPattern} onChange={e => setEditingPattern(e.target.value)} aria-label="编辑标题排除关键词" /> : <span>{policy.pattern}</span>}
+            <div className="policy-row-actions">
+              {editingId === policy.id ? <><button className="icon-button policy-save" title="保存修改" onClick={() => void saveEditedTitleKeyword(policy)} disabled={saving || !editingPattern.trim()}><Save size={15}/></button><button className="icon-button" title="取消编辑" onClick={() => { setEditingId(null); setEditingPattern("") }} disabled={saving}><X size={15}/></button></> : <><button className="icon-button" title={`编辑 ${policy.pattern}`} onClick={() => startEditingTitleKeyword(policy)} disabled={saving}><Pencil size={15}/></button><button className="icon-button policy-delete" title={`删除 ${policy.pattern}`} onClick={() => void removeTitleKeyword(policy)} disabled={saving}><Trash2 size={15}/></button></>}
+            </div>
+          </div>)}
           {!policies.length && <span className="settings-help">尚未设置标题排除关键词。</span>}
         </div>
       </div>

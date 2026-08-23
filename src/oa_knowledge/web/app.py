@@ -32,7 +32,7 @@ from oa_knowledge.web.simple_status import simple_status, _ALLOWED_SIMPLE_STATES
 from oa_knowledge.web.schedule_views import schedule_status
 from oa_knowledge.web.status import (
     create_policies_bulk, create_policy, dashboard_status, delete_policy,
-    list_policies, preview_policy_hits,
+    list_policies, preview_policy_hits, update_title_policy,
 )
 
 
@@ -44,6 +44,10 @@ class BulkPolicyRequest(BaseModel):
     text: str = Field(min_length=1, max_length=20000)
     action: str = "metadata_only"
     scope: str = "title"
+
+
+class UpdateTitlePolicyRequest(BaseModel):
+    pattern: str = Field(min_length=1, max_length=120)
 
 
 class ArchiveStartRequest(BaseModel):
@@ -822,6 +826,16 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     @app.delete("/api/policies/{policy_id}")
     def delete_policy_route(policy_id: int) -> dict:
         result = delete_policy(settings, policy_id=policy_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="policy not found")
+        return result
+
+    @app.put("/api/policies/{policy_id}")
+    def update_title_policy_route(policy_id: int, payload: UpdateTitlePolicyRequest) -> dict:
+        try:
+            result = update_title_policy(settings, policy_id=policy_id, pattern=payload.pattern)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if result is None:
             raise HTTPException(status_code=404, detail="policy not found")
         return result

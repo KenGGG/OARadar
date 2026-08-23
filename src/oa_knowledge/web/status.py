@@ -1868,6 +1868,52 @@ def create_policies_bulk(
         engine.dispose()
 
 
+def update_title_policy(settings: Settings, policy_id: int, pattern: str) -> dict[str, Any] | None:
+    """Edit one title exclusion policy without replacing its audit identity."""
+    pattern = pattern.strip()
+    if not pattern or len(pattern) > 120:
+        raise ValueError("policy pattern must contain 1 to 120 characters")
+
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            policy = session.get(ExclusionPolicy, policy_id)
+            if policy is None:
+                return None
+            if policy.scope != "title":
+                raise ValueError("only title exclusion policies can be edited here")
+
+            old_pattern = policy.pattern
+            policy.pattern = pattern
+            policy.action = "skip"
+            policy.enabled = True
+            current_version = int(policy.version.removeprefix("v")) if policy.version.removeprefix("v").isdigit() else 1
+            policy.version = f"v{current_version + 1}"
+            policy.updated_at = datetime.now(timezone.utc)
+            session.flush()
+            _record_policy_revision(session, policy, "updated")
+            applied_count = _apply_policy_to_pending(session, policy)
+            impact = _reclassify_policy_matches(session, old_pattern, settings.data_root)
+            payload = {
+                "id": policy.id,
+                "name": policy.name,
+                "description": policy.description,
+                "pattern": policy.pattern,
+                "action": policy.action,
+                "scope": policy.scope,
+                "enabled": policy.enabled,
+                "version": policy.version,
+                "created_at": policy.created_at.isoformat() if policy.created_at else None,
+                "updated_at": policy.updated_at.isoformat() if policy.updated_at else None,
+                "applied_count": applied_count,
+                **impact,
+            }
+            session.commit()
+            return payload
+    finally:
+        engine.dispose()
+
+
 def _parse_policy_lines(text: str) -> list[str]:
     patterns: list[str] = []
     seen: set[str] = set()
