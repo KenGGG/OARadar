@@ -17,7 +17,8 @@ def test_browser_session_enables_download_events(monkeypatch: pytest.MonkeyPatch
         def close(self): pass
 
     class Chromium:
-        def launch_persistent_context(self, _profile, **kwargs):
+        def launch_persistent_context(self, profile, **kwargs):
+            captured["profile"] = profile
             captured.update(kwargs)
             return Context()
 
@@ -32,6 +33,7 @@ def test_browser_session_enables_download_events(monkeypatch: pytest.MonkeyPatch
         pass
 
     assert captured["accept_downloads"] is True
+    assert Path(captured["profile"]) == settings.cache_root / "browser-profile"
 
 
 def test_download_payload_rejects_html_and_empty_files(tmp_path: Path) -> None:

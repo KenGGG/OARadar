@@ -28,7 +28,7 @@ class BrowserSession:
 
     def __enter__(self) -> "BrowserSession":
         self._playwright = sync_playwright().start()
-        profile = self.settings.data_root / self.settings.browser.user_data_dir
+        profile = self.settings.browser_profile_path
         profile.mkdir(parents=True, exist_ok=True, mode=0o700)
         configured_port = urlsplit(self.settings.browser.base_url).port
         browser_args = [f"--explicitly-allowed-ports={configured_port}"] if configured_port else []
@@ -119,7 +119,7 @@ class BrowserSession:
                 button.click()
                 return True
             self.page.wait_for_timeout(250)
-        profile = self.settings.data_root / self.settings.browser.user_data_dir
+        profile = self.settings.browser_profile_path
         credential = load_chrome_saved_credential(profile, self.base_url)
         if credential:
             username.fill(credential.username)
