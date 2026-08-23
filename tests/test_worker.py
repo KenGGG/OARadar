@@ -43,19 +43,21 @@ def test_completed_scheduled_scan_progress_is_never_greater_than_total() -> None
 def test_oa_login_writes_a_live_logging_in_status_before_browser_access(config_file: Path) -> None:
     settings = load_settings(config_file)
     settings.data_root.mkdir(parents=True, exist_ok=True)
+    runtime_status = settings.state_root / "runtime" / "operation-worker.json"
     worker = OperationWorker(settings, config_path=config_file)
 
     class Browser:
         def login_with_saved_credentials(self, _timeout: int) -> str:
-            payload = json.loads((settings.data_root / "runtime" / "operation-worker.json").read_text(encoding="utf-8"))
+            payload = json.loads(runtime_status.read_text(encoding="utf-8"))
             assert payload["status"] == "logging_in"
             assert payload["activity"] == "正在验证 OA 登录"
             return "authenticated"
 
     try:
         assert worker._verify_oa_login(Browser()) == "authenticated"
-        payload = json.loads((settings.data_root / "runtime" / "operation-worker.json").read_text(encoding="utf-8"))
+        payload = json.loads(runtime_status.read_text(encoding="utf-8"))
         assert payload["status"] == "working"
+        assert not (settings.data_root / "runtime").exists()
     finally:
         worker.close()
 

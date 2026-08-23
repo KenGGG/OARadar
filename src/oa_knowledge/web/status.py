@@ -569,7 +569,7 @@ def dashboard_status(settings: Settings) -> dict[str, Any]:
 
 
 def _worker_runtime(settings: Settings) -> dict[str, Any] | None:
-    path = settings.data_root / "runtime" / "operation-worker.json"
+    path = settings.runtime_root / "operation-worker.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         heartbeat = datetime.fromisoformat(payload["heartbeat_at"])

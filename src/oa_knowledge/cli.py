@@ -936,7 +936,7 @@ def web(
 
     typer.echo(f"OA Web console: http://{settings.web.host}:{settings.web.port}")
     from oa_knowledge.web.app import _load_or_create_bootstrap_token
-    bootstrap_token = _load_or_create_bootstrap_token(settings.data_root)
+    bootstrap_token = _load_or_create_bootstrap_token(settings.runtime_root)
     if settings.web.require_auth:
         typer.echo("Web API authentication is ENABLED.")
         typer.echo(f"Console bootstrap token: {bootstrap_token}")
@@ -953,7 +953,7 @@ def worker(
     """Run the single durable worker for Web-enqueued read-only OA jobs."""
     settings = settings_option(config)
     require_engine(settings).dispose()
-    lock_path = settings.data_root / "runtime" / "operation-worker.lock"
+    lock_path = settings.runtime_root / "operation-worker.lock"
     secure_dir(lock_path.parent)
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         try:
@@ -984,7 +984,7 @@ def markdown_worker_command(
 ) -> None:
     """Run the local-only Markdown conversion worker."""
     settings = settings_option(config); require_engine(settings).dispose()
-    lock_path=settings.data_root / "runtime" / "markdown-worker.lock"; secure_dir(lock_path.parent)
+    lock_path=settings.runtime_root / "markdown-worker.lock"; secure_dir(lock_path.parent)
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         try: fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc: raise typer.Exit(1) from exc
@@ -1080,7 +1080,7 @@ def batch_discover(
 ) -> None:
     settings = settings_option(config)
     engine = require_engine(settings)
-    lock_path = settings.data_root / "runtime" / "discovery.lock"
+    lock_path = settings.runtime_root / "discovery.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     discovery_lock = lock_path.open("a+")
     try:

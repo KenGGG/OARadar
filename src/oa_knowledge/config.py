@@ -381,6 +381,10 @@ class Settings(StrictModel):
         return self.runtime.cache_root
 
     @property
+    def runtime_root(self) -> Path:
+        return self.state_root / "runtime"
+
+    @property
     def browser_profile_path(self) -> Path:
         return (self.cache_root / self.browser.user_data_dir).resolve()
 

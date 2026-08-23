@@ -101,8 +101,8 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     """
     if not settings.database_path.exists():
         raise RuntimeError("database not initialized; run 'oa init' first")
-    secret = _load_or_create_session_secret(settings.data_root)
-    bootstrap_token = _load_or_create_bootstrap_token(settings.data_root)
+    secret = _load_or_create_session_secret(settings.runtime_root)
+    bootstrap_token = _load_or_create_bootstrap_token(settings.runtime_root)
     app = FastAPI(title="OA Knowledge Hub", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.bootstrap_token = bootstrap_token
@@ -919,8 +919,7 @@ def _allowed_origins(settings: Settings) -> set[str]:
     }
 
 
-def _load_or_create_session_secret(data_root: Path) -> str:
-    runtime = data_root / "runtime"
+def _load_or_create_session_secret(runtime: Path) -> str:
     runtime.mkdir(parents=True, exist_ok=True)
     os.chmod(runtime, 0o700)
     path = runtime / "web-session.key"
@@ -932,7 +931,7 @@ def _load_or_create_session_secret(data_root: Path) -> str:
     return path.read_text(encoding="ascii").strip()
 
 
-def _load_or_create_bootstrap_token(data_root: Path) -> str:
+def _load_or_create_bootstrap_token(runtime: Path) -> str:
     """One-time provisioning credential printed to the launching user's terminal.
 
     Any local process that can read this file (owner-only, mode 0600) may exchange
@@ -942,7 +941,6 @@ def _load_or_create_bootstrap_token(data_root: Path) -> str:
     host. Treat it like a Jupyter notebook token: shown once at startup, paste it
     into the console login screen.
     """
-    runtime = data_root / "runtime"
     runtime.mkdir(parents=True, exist_ok=True)
     os.chmod(runtime, 0o700)
     path = runtime / "web-bootstrap.token"

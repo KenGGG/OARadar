@@ -28,6 +28,19 @@ def _client(config_file: Path) -> TestClient:
     return TestClient(create_web_app(settings, config_path=config_file))
 
 
+def test_web_runtime_secrets_stay_outside_data(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    upgrade_database(settings.database_path)
+    from oa_knowledge.web import create_web_app
+
+    create_web_app(settings, config_path=config_file)
+
+    assert (settings.runtime_root / "web-session.key").is_file()
+    assert (settings.runtime_root / "web-bootstrap.token").is_file()
+    assert not (settings.data_root / "runtime").exists()
+
+
 def test_dashboard_reports_three_chains(config_file: Path) -> None:
     client = _client(config_file)
     resp = client.get("/api/dashboard")
@@ -43,8 +56,8 @@ def test_dashboard_surfaces_a_live_oa_login_activity_without_oa_content(config_f
     """Regression: the overview must expose a current login state, not only past scans."""
     settings = load_settings(config_file)
     settings.data_root.mkdir(parents=True, exist_ok=True)
-    runtime = settings.data_root / "runtime"
-    runtime.mkdir()
+    runtime = settings.runtime_root
+    runtime.mkdir(parents=True)
     (runtime / "operation-worker.json").write_text(json.dumps({
         "owner": "worker-synthetic", "pid": 1, "status": "logging_in",
         "activity": "正在验证 OA 登录", "heartbeat_at": datetime.now(timezone.utc).isoformat(),
@@ -62,8 +75,8 @@ def test_dashboard_reports_that_oa_session_is_closed_between_scheduled_tasks(con
     """The overview must not present an idle worker as an active OA session."""
     settings = load_settings(config_file)
     settings.data_root.mkdir(parents=True, exist_ok=True)
-    runtime = settings.data_root / "runtime"
-    runtime.mkdir()
+    runtime = settings.runtime_root
+    runtime.mkdir(parents=True)
     (runtime / "operation-worker.json").write_text(json.dumps({
         "owner": "worker-synthetic", "pid": 1, "status": "idle",
         "activity": "当前未登录 OA，等待下次定时任务",

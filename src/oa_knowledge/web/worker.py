@@ -90,7 +90,7 @@ class OperationWorker:
 
     def close(self) -> None:
         self.engine.dispose()
-        (self.settings.data_root / "runtime" / "operation-worker.json").unlink(missing_ok=True)
+        (self.settings.runtime_root / "operation-worker.json").unlink(missing_ok=True)
 
     @staticmethod
     def _retry_progress(total_targets: int, resumed: int, completed_after_resume: int) -> int:
@@ -1494,7 +1494,7 @@ class OperationWorker:
             "activity": activity,
             "heartbeat_at": datetime.now(timezone.utc).isoformat(),
         }).encode("utf-8")
-        destination = atomic_write_bytes(payload, self.settings.data_root, "runtime/operation-worker.json")
+        destination = atomic_write_bytes(payload, self.settings.state_root, "runtime/operation-worker.json")
         os.chmod(destination, 0o600)
 
     def _claim_next(self) -> int | None:
