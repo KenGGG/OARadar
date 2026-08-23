@@ -32,7 +32,7 @@ def test_internal_classification_updates_only_current_four_fields(tmp_path) -> N
         assert item.source_type == "internal"
         assert item.internal_category == "财务资金"
         assert item.external_issuer is None
-        assert item.classification_version == "v1"
+        assert item.classification_version == "v2-rules"
 
 
 def test_external_classification_uses_sender_as_normalized_issuer(tmp_path) -> None:
@@ -49,7 +49,7 @@ def test_external_classification_uses_sender_as_normalized_issuer(tmp_path) -> N
         assert item.source_type == "external"
         assert item.internal_category is None
         assert item.external_issuer == "示例省国资委"
-        assert item.classification_version == "v1"
+        assert item.classification_version == "v2-rules"
 
 
 def test_item_index_ledger_migration_enforces_document_kind_and_unique_item_schema(tmp_path) -> None:
@@ -72,7 +72,7 @@ def test_no_attachment_item_publishes_stable_index_without_moving_archive_path(t
     engine = create_db_engine(settings.database_path)
     with Session(engine) as session:
         item = _item(session, title="内部工作会议", sender="本公司综合部")
-        item.archive_relpath = "archive/raw/oa/done/synthetic/item"
+        item.archive_relpath = "originals/done/synthetic/item"
         classify_done_item(session, item.oa_item_key)
         first = publish_item_index(session, settings, item.oa_item_key)
         first_mtime = first.stat().st_mtime_ns

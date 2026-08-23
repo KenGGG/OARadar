@@ -53,11 +53,14 @@ def _source_tree(settings: Settings, local_relpath: str) -> PurePosixPath:
     return tree
 
 
-def _destination(settings: Settings, source: ArchivedFile) -> Path:
+def _destination(settings: Settings, source: ArchivedFile, item: OAItem | None) -> Path:
     if not source.local_relpath:
         raise FileNotFoundError("verified source path unavailable")
     tree = _source_tree(settings, source.local_relpath)
-    return settings.markdown_root.joinpath(*tree.parts[:-1], f"{tree.name}.md")
+    from oa_knowledge.markdown_delivery import _classification_directory, _item_leaf
+    if item is None:
+        raise FileNotFoundError("source OA item unavailable")
+    return settings.markdown_root / _classification_directory(item) / _item_leaf(item) / f"{tree.name}.md"
 
 
 def _existing_is_current(record: MarkdownExport, artifact: ParseArtifact, destination: Path) -> bool:
@@ -79,7 +82,8 @@ def publish_active_artifact(
     source = session.get(ArchivedFile, source_file_id)
     if source is None or source.download_status != "verified" or not source.local_relpath:
         raise FileNotFoundError("verified source unavailable")
-    destination = _destination(settings, source)
+    item = session.get(OAItem, source.oa_item_id)
+    destination = _destination(settings, source, item)
     markdown_relpath = destination.relative_to(settings.workspace_root).as_posix()
     record = session.scalar(select(MarkdownExport).where(
         MarkdownExport.source_file_id == source.id,
@@ -97,7 +101,6 @@ def publish_active_artifact(
     if artifact.product_sha256 and artifact.product_sha256 != product_sha256:
         raise ValueError("parse artifact product hash mismatch")
 
-    item = session.get(OAItem, source.oa_item_id)
     record = record or MarkdownExport(
         source_file_id=source.id,
         source_relpath=source.local_relpath,

@@ -16,6 +16,7 @@ from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, ParseJo
 from oa_knowledge.markdown_export.render import SCHEMA_VERSION
 from oa_knowledge.source_markdown.service import _source_tree
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
+from oa_knowledge.archive.naming import safe_filename
 
 
 INTERNAL_CATEGORIES = (
@@ -68,8 +69,8 @@ def classify_done_item(session: Session, oa_item_key: str) -> OAItem:
             "其他内部",
         )
     else:
-        item.source_type = "unknown"
-    item.classification_version = "v1"
+        item.source_type = "unclassified"
+    item.classification_version = "v2-rules"
     session.flush()
     return item
 
@@ -82,8 +83,7 @@ def publish_item_index(session: Session, settings, oa_item_key: str) -> Path:
     ))
     if item is None or not item.archive_relpath:
         raise FileNotFoundError("done archive directory unavailable")
-    tree = _source_tree(settings, item.archive_relpath)
-    destination = settings.markdown_root.joinpath(*tree.parts, "_index.md")
+    destination = settings.markdown_root / _classification_directory(item) / _item_leaf(item) / "_index.md"
     files = session.scalars(select(ArchivedFile).where(
         ArchivedFile.oa_item_id == item.id,
         ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
@@ -184,3 +184,16 @@ def publish_item_index(session: Session, settings, oa_item_key: str) -> Path:
     record.generated_at = datetime.now(timezone.utc)
     session.flush()
     return destination
+
+
+def _item_leaf(item: OAItem) -> str:
+    """Stable per-item leaf that does not expose a database identifier to the model."""
+    return safe_filename(item.workitem_id_text or item.oa_item_key.replace(":", "-"), 120)
+
+
+def _classification_directory(item: OAItem) -> Path:
+    if item.source_type == "internal" and item.internal_category in INTERNAL_CATEGORIES:
+        return Path("internal") / item.internal_category
+    if item.source_type == "external" and item.external_issuer:
+        return Path("external") / safe_filename(item.external_issuer, 100)
+    return Path("unclassified")
