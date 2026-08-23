@@ -21,7 +21,11 @@ from sqlalchemy.orm import Session
 from oa_knowledge.collector import BrowserSession, DoneAdapter, LoginState
 from oa_knowledge.collector.pending import PENDING_LIST_PATH, PendingAdapter
 from oa_knowledge.db.models import OAManifestItem, PipelineTask, Run
-from oa_knowledge.full_manifest import synchronize_manifest
+from oa_knowledge.full_manifest import (
+    classify_manifest_rows,
+    effective_exclusion_keywords,
+    synchronize_manifest,
+)
 from oa_knowledge.pending_sync import PendingSyncResult, sync_pending_discovery
 from oa_knowledge.production_pipeline import QUEUE_PRIORITY, ProductionQueue
 from oa_knowledge.resources import ResourceCoordinator
@@ -372,10 +376,14 @@ def run_hourly_scan(engine, settings, *, headed: bool = False) -> dict:
                     row = ensure_manifest_item(session, item.oa_item_key, title=item.title)
                     session.flush()
                     row.discovery_hash = _done_signature(item)
-                    created, _ = enqueue_realtime_done(
-                        session, item.oa_item_key, manifest_id=row.id, discovery_hash=_done_signature(item),
+                    classify_manifest_rows(
+                        session, [row], effective_exclusion_keywords(session), settings.data_root,
                     )
-                    enqueued += int(created)
+                    if row.processing_status != "skipped":
+                        created, _ = enqueue_realtime_done(
+                            session, item.oa_item_key, manifest_id=row.id, discovery_hash=_done_signature(item),
+                        )
+                        enqueued += int(created)
                 done_summary = {
                     "source_total_pages": boundary.source_total_pages,
                     "pages_scanned": boundary.pages_scanned,
@@ -416,6 +424,10 @@ def run_nightly_scan(engine, settings, *, headed: bool = False) -> dict:
             discovery = done_adapter.discover_all_pages()
             with Session(engine) as session:
                 sync = synchronize_manifest(session, discovery)
+                rows = list(session.scalars(select(OAManifestItem)).all())
+                classify_manifest_rows(
+                    session, rows, effective_exclusion_keywords(session), settings.data_root,
+                )
                 version_summary = sync_done_versions_and_enqueue(
                     session, discovery.items, known_hashes,
                 )
@@ -465,6 +477,10 @@ def run_bootstrap_scan(engine, settings, *, headed: bool = False) -> dict:
             discovery = done_adapter.discover_all_pages()
             with Session(engine) as session:
                 sync = synchronize_manifest(session, discovery)
+                rows = list(session.scalars(select(OAManifestItem)).all())
+                classify_manifest_rows(
+                    session, rows, effective_exclusion_keywords(session), settings.data_root,
+                )
                 version_summary = sync_done_versions_and_enqueue(
                     session, discovery.items, known_hashes,
                 )

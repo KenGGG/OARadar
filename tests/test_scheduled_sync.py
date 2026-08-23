@@ -1,7 +1,7 @@
 """Tests for scheduled sync orchestration (plan-0805-02 §2)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,9 +11,10 @@ from sqlalchemy.orm import Session
 from oa_knowledge.collector import LoginState
 from oa_knowledge.collector.done import DiscoveredDoneItem, DoneDiscovery
 from oa_knowledge.collector.pending import DiscoveredPendingItem
+from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import OAManifestItem, PipelineTask, Run
+from oa_knowledge.db.models import ExclusionPolicy, OAManifestItem, PipelineTask, Run
 from oa_knowledge.scheduled_sync import (
     close_scheduled_run,
     enqueue_realtime_done,
@@ -288,3 +289,45 @@ def test_run_nightly_scan_records_run_without_nested_session(tmp_path: Path) -> 
         runs = session.scalars(select(Run).where(Run.stage == "scheduled_nightly")).all()
         assert len(runs) == 1
         assert runs[0].status == "completed"
+
+
+def test_nightly_scan_excludes_title_before_enqueuing_detail_capture(tmp_path: Path) -> None:
+    """A title-only exclusion must prevent any OA detail capture task."""
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    settings = Settings.model_validate({"app": {"data_root": str(tmp_path / "data")}})
+    with Session(engine) as session:
+        session.add(ExclusionPolicy(
+            name="synthetic-title-gate", pattern="无需下载", action="metadata_only",
+            scope="title", enabled=True, version=1,
+        ))
+        session.commit()
+
+    item = DiscoveredDoneItem(
+        "excluded", "无需下载的合成事项", None, datetime(2026, 8, 17, tzinfo=timezone.utc),
+        "合成发送人", None, "协同", 1,
+    )
+    discovery = DoneDiscovery(
+        (item,), pages_scanned=1, query_count=1, scanned_row_count=1,
+        source_total_count=1, source_total_pages=1,
+    )
+    with patch("oa_knowledge.scheduled_sync.ResourceCoordinator") as RC, \
+         patch("oa_knowledge.scheduled_sync.BrowserSession") as BS, \
+         patch("oa_knowledge.scheduled_sync.DoneAdapter") as DA:
+        RC.return_value.acquire.return_value = 1
+        browser = BS.return_value.__enter__.return_value
+        browser.login_with_saved_credentials.return_value = LoginState.AUTHENTICATED
+        browser.page = MagicMock()
+        browser.base_url = "http://oa"
+        DA.return_value.discover_all_pages.return_value = discovery
+
+        result = run_nightly_scan(engine, settings)
+
+    assert result["download_jobs_enqueued"] == 0
+    with Session(engine) as session:
+        manifest = session.scalar(select(OAManifestItem))
+        assert manifest is not None
+        assert manifest.processing_status == "skipped"
+        assert manifest.matched_exclusion_keyword == "无需下载"
+        assert session.scalars(select(PipelineTask)).all() == []
