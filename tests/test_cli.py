@@ -52,10 +52,14 @@ def test_schedule_enqueue_creates_worker_job_without_opening_browser(config_file
         assert job.status == "queued"
 
 
-def test_manifest_pilot_command_is_registered() -> None:
+def test_manifest_run_exposes_bounded_first_page_options_without_a_separate_pilot() -> None:
     result = runner.invoke(app, ["manifest", "--help"])
     assert result.exit_code == 0, result.output
-    assert "pilot" in result.output
+    assert "pilot" not in result.output
+    run_help = runner.invoke(app, ["manifest", "run", "--help"])
+    assert run_help.exit_code == 0, run_help.output
+    assert "--max-pages" in run_help.output
+    assert "--max-items" in run_help.output
 
 
 def test_curate_plan_is_read_only_and_commands_are_registered(config_file: Path) -> None:
