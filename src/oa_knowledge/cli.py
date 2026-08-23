@@ -434,6 +434,116 @@ def manifest_refresh_head(
     typer.echo(json.dumps({"oa_total_count": source_total, "local_manifest_count": local_count, "source_total_pages": source_pages, "pages_scanned": discovery.pages_scanned, "new_items": max(0, local_count - before)}, ensure_ascii=False))
 
 
+@manifest_app.command("pilot")
+def manifest_pilot(
+    headed: bool = typer.Option(False, "--headed"),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Run one bounded test: the first 20 Done-list rows only, then stop.
+
+    Title exclusions are applied before any detail page is opened.  This is a
+    direct, one-shot command: it neither enables nor enqueues scheduled work.
+    """
+    settings = settings_option(config)
+    engine = require_engine(settings)
+    coordinator = ResourceCoordinator(engine)
+    owner = f"done-pilot:{uuid4().hex}"
+    lease_id = coordinator.acquire("oa_browser", owner, ttl_seconds=1800, uses_local_gpu=False)
+    if lease_id is None:
+        typer.echo("OA browser is busy", err=True)
+        raise typer.Exit(2)
+    try:
+        with BrowserSession(settings, headed=headed) as browser:
+            if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
+                typer.echo("OA authentication required", err=True)
+                raise typer.Exit(3)
+            assert browser.page
+            list_adapter = DoneAdapter(browser.page, f"{browser.base_url}{settings.browser.done_list_path}")
+            page_items = list_adapter.discover_current_page(limit=20)
+            keys = [item.oa_item_key for item in page_items]
+            with Session(engine) as session:
+                upsert_manifest_page(session, page_items)
+                rows = session.scalars(select(OAManifestItem).where(
+                    OAManifestItem.oa_item_key.in_(keys)
+                )).all() if keys else []
+                classify_manifest_rows(session, rows, effective_exclusion_keywords(session), settings.data_root)
+                row_ids = [row.id for row in rows if row.processing_status in {"pending_download", "download_failed"}]
+                skipped = sum(row.processing_status == "skipped" for row in rows)
+                session.commit()
+
+            detail_adapter = CollaborationDetailAdapter(
+                browser.page, attachment_resolver=verified_attachment_resolver(engine, settings.data_root),
+            )
+            downloaded = no_attachment = failed = 0
+            for row_id in row_ids:
+                with Session(engine) as session:
+                    row = session.get(OAManifestItem, row_id)
+                    assert row is not None
+                    row.processing_status = "processing"
+                    row.last_retry_at = datetime.now(timezone.utc)
+                    workitem_id = row.workitem_id_text
+                    session.commit()
+                try:
+                    if not workitem_id:
+                        raise RuntimeError("OA item identifier unavailable")
+                    capture = detail_adapter.capture(
+                        workitem_id, max_depth=10,
+                        total_timeout_seconds=settings.collector.attachment_total_timeout_seconds,
+                        download_timeout_seconds=settings.collector.download_timeout_seconds,
+                    )
+                    with Session(engine) as session:
+                        row = session.get(OAManifestItem, row_id)
+                        assert row is not None
+                        proxy = archive_proxy(row)
+                        manifest = archive_collaboration_detail(session, proxy, capture, settings.data_root)
+                        row.archive_relpath = session.scalar(select(OAItem.archive_relpath).where(
+                            OAItem.oa_item_key == row.oa_item_key
+                        ))
+                        attachments = list(capture.attachments) + [
+                            attachment for container in capture.related_containers for attachment in container.attachments
+                        ]
+                        if manifest.depth_limit_reached:
+                            row.processing_status = "depth_limit_reached"
+                            row.last_error = "depth_limit_reached"
+                            row.failure_stage = "attachment"
+                            failed += 1
+                        elif proxy.archive_status == "archived":
+                            if attachments or _has_verified_attachment(session, row.oa_item_key):
+                                row.processing_status = "downloaded"
+                                downloaded += 1
+                            else:
+                                row.processing_status = "no_attachment"
+                                no_attachment += 1
+                            row.last_error = None
+                            row.failure_stage = None
+                        else:
+                            row.processing_status = "download_failed"
+                            row.retry_count += 1
+                            row.last_error = proxy.last_error or _attachment_failure_summary(capture)
+                            row.failure_stage = "attachment"
+                            failed += 1
+                        session.commit()
+                except Exception as exc:
+                    with Session(engine) as session:
+                        row = session.get(OAManifestItem, row_id)
+                        if row is not None:
+                            row.processing_status = "download_failed"
+                            row.retry_count += 1
+                            row.last_error = _sanitize_operational_error(exc)
+                            row.failure_stage = "detail_or_download"
+                            row.last_retry_at = datetime.now(timezone.utc)
+                            session.commit()
+                    failed += 1
+                browser.page.wait_for_timeout(int(settings.collector.item_delay_seconds * 1000))
+    finally:
+        coordinator.release(lease_id, owner)
+    typer.echo(json.dumps({
+        "mode": "done_first_page_pilot", "pages_scanned": 1,
+        "items_read": len(page_items), "skipped_by_title": skipped,
+        "downloaded": downloaded, "no_attachment": no_attachment, "failed": failed,
+    }, ensure_ascii=False))
+
+
 @manifest_app.command("run")
 def manifest_run(
     headed: bool = typer.Option(False, "--headed"),

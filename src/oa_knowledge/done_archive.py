@@ -22,7 +22,7 @@ ATTACHMENT_ROLES = frozenset({
     str(FileRole.ASSOCIATED_DOCUMENT),
     str(FileRole.OPINION_ATTACHMENT),
 })
-DONE_ARCHIVE_PREFIXES = ("archive/raw/oa/done", "raw/done")
+DONE_ARCHIVE_PREFIXES = ("originals", "archive/raw/oa/done", "raw/done")
 
 
 @dataclass(frozen=True)

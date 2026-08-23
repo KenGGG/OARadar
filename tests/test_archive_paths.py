@@ -17,16 +17,15 @@ from oa_knowledge.archive_paths import (
 )
 
 
-def test_done_archive_directory_uses_unified_prefix_and_initiation_month() -> None:
+def test_done_archive_directory_uses_initiation_date_and_title_directory() -> None:
     rel = done_archive_directory("事项", "42", datetime(2022, 4, 22, 9, 0))
     assert rel.parts[:1] == ARCHIVE_PREFIX.parts
-    assert rel.parts[1] == "done"
-    assert rel.parts[2:4] == ("2022", "04")
-    assert rel.as_posix() == "originals/done/2022/04/事项_42"
+    assert rel.parts[1:3] == ("2022", "04")
+    assert rel.as_posix() == "originals/2022/04/2022-04-22_事项"
 
 
 def test_done_archive_directory_falls_back_to_unknown_period() -> None:
-    assert done_archive_directory("事项", "42", None).as_posix() == "originals/done/unknown/事项_42"
+    assert done_archive_directory("事项", "42", None).as_posix() == "originals/unknown/unknown_事项"
 
 
 def test_pending_archive_directory_uses_unified_prefix() -> None:
@@ -53,9 +52,9 @@ def test_is_legacy_archive_path(rel: PurePosixPath, expected: bool) -> None:
     [
         (PurePosixPath("originals/done/2022/04/x"), True),
         (PurePosixPath("originals/pending/7/99"), True),
-        # Full-prefix validation: a bare archive/raw prefix is NOT "correct".
+        (PurePosixPath("originals/2022/04/2022-04-22_事项/source.pdf"), True),
         (PurePosixPath("archive/raw/done/x"), False),
-        (PurePosixPath("originals/other/x"), False),
+        (PurePosixPath("data/other/x"), False),
         (PurePosixPath("raw/done/2022/04/x"), False),
     ],
 )

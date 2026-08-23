@@ -306,8 +306,8 @@ def test_successful_retry_replaces_failed_attachment_with_same_name(tmp_path: Pa
 
 
 def test_done_archive_directory_uses_initiation_month_and_never_completion_time() -> None:
-    assert done_archive_directory("事项", "42", datetime(2022, 4, 22, 9, 0)).as_posix() == "originals/done/2022/04/事项_42"
-    assert done_archive_directory("事项", "42", None).as_posix() == "originals/done/unknown/事项_42"
+    assert done_archive_directory("事项", "42", datetime(2022, 4, 22, 9, 0)).as_posix() == "originals/2022/04/2022-04-22_事项"
+    assert done_archive_directory("事项", "42", None).as_posix() == "originals/unknown/unknown_事项"
 
 
 def test_successful_archive_does_not_enqueue_legacy_markdown_task(tmp_path: Path) -> None:

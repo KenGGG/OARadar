@@ -157,7 +157,7 @@ def archive_proxy(row: OAManifestItem) -> SimpleNamespace:
     """Shape expected by the existing read-only detail archiver."""
     return SimpleNamespace(
         oa_item_key=row.oa_item_key, workitem_id_text=row.workitem_id_text or "",
-        title=row.title, sender=row.sender, created_at=None, completed_at=row.completed_at,
+        title=row.title, sender=row.sender, created_at=row.initiated_at, completed_at=row.completed_at,
         category=None, oa_item_id=None, detail_url=None, archive_manifest_relpath=None,
         archive_status="processing", archived_at=None, last_error=None,
     )

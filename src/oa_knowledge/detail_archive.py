@@ -39,7 +39,7 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     # Detail metadata and page snapshots are process evidence.  Keeping them
     # in data would violate the two-tree data contract (originals + markdown).
     for attachment in capture.attachments:
-        files.append(_write_attachment(data_root, directory / "attachments" / _attachment_relname(attachment), oa_item, attachment, root_container_key))
+        files.append(_write_attachment(data_root, directory / _attachment_relname(attachment), oa_item, attachment, root_container_key))
 
     containers = [ContainerManifest(
         container_key=root_container_key,
@@ -51,7 +51,7 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     for related in capture.related_containers:
         related_files: list[FileManifest] = []
         for attachment in related.attachments:
-            relpath = directory / "containers" / safe_filename(related.container_key) / "files" / _attachment_relname(attachment)
+            relpath = directory / _attachment_relname(attachment)
             related_files.append(_write_attachment(data_root, relpath, oa_item, attachment, related.container_key, related.depth))
         containers.append(ContainerManifest(
             container_key=related.container_key,

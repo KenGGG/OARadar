@@ -52,6 +52,12 @@ def test_schedule_enqueue_creates_worker_job_without_opening_browser(config_file
         assert job.status == "queued"
 
 
+def test_manifest_pilot_command_is_registered() -> None:
+    result = runner.invoke(app, ["manifest", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "pilot" in result.output
+
+
 def test_curate_plan_is_read_only_and_commands_are_registered(config_file: Path) -> None:
     assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
     help_result = runner.invoke(app, ["curate", "--help"])
