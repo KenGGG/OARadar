@@ -464,7 +464,7 @@ def test_pipeline_enqueue_valid_file(tmp_path: Path) -> None:
     engine = create_db_engine(db_path)
 
     # Create the actual file on disk
-    raw_dir = tmp_path / "raw"
+    raw_dir = tmp_path / "originals"
     raw_dir.mkdir(exist_ok=True)
     pdf_file = raw_dir / "test.pdf"
     pdf_file.write_bytes(b"%PDF-1.4\nfake pdf content\n")
@@ -478,12 +478,12 @@ def test_pipeline_enqueue_valid_file(tmp_path: Path) -> None:
             oa_item_id=item.id,
             attachment_key="test.pdf",
             original_name="test.pdf",
-            local_relpath="raw/test.pdf",
+            local_relpath="originals/test.pdf",
             file_role="direct_attachment",
             source_container_key="test",
             depth=1,
             download_status="verified",
-            sha256="abc123",
+            sha256=hashlib.sha256(pdf_file.read_bytes()).hexdigest(),
         )
         session.add(file_rec)
         session.commit()
@@ -510,7 +510,7 @@ def test_pipeline_enqueue_idempotent(tmp_path: Path) -> None:
     engine = create_db_engine(db_path)
 
     # Create the actual file on disk
-    raw_dir = tmp_path / "raw"
+    raw_dir = tmp_path / "originals"
     raw_dir.mkdir(exist_ok=True)
     pdf_file = raw_dir / "idem.pdf"
     pdf_file.write_bytes(b"%PDF-1.4\nfake idem pdf\n")
@@ -523,12 +523,12 @@ def test_pipeline_enqueue_idempotent(tmp_path: Path) -> None:
             oa_item_id=item.id,
             attachment_key="idem.pdf",
             original_name="idem.pdf",
-            local_relpath="raw/idem.pdf",
+            local_relpath="originals/idem.pdf",
             file_role="direct_attachment",
             source_container_key="test",
             depth=1,
             download_status="verified",
-            sha256="xyz789",
+            sha256=hashlib.sha256(pdf_file.read_bytes()).hexdigest(),
         )
         session.add(file_rec)
         session.commit()
@@ -544,7 +544,7 @@ def test_pipeline_requeues_completed_job_when_active_product_is_missing(tmp_path
     settings = Settings(app={"data_root": str(tmp_path)})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    raw = tmp_path / "raw"
+    raw = tmp_path / "originals"
     raw.mkdir()
     source_path = raw / "regenerate.txt"
     source_path.write_text("synthetic source", encoding="utf-8")
@@ -553,7 +553,7 @@ def test_pipeline_requeues_completed_job_when_active_product_is_missing(tmp_path
         session.add(item); session.flush()
         source = ArchivedFile(
             oa_item_id=item.id, attachment_key="regenerate", original_name="regenerate.txt",
-            local_relpath="raw/regenerate.txt", file_role="direct_attachment",
+            local_relpath="originals/regenerate.txt", file_role="direct_attachment",
             source_container_key="root", depth=1, download_status="verified",
             sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
         )
@@ -565,7 +565,7 @@ def test_pipeline_requeues_completed_job_when_active_product_is_missing(tmp_path
         source = session.get(ArchivedFile, source_id)
         artifact_id = session.get(ContentObject, source.content_object_id).active_parse_artifact_id
         artifact = session.get(ParseArtifact, artifact_id)
-        product = tmp_path / "parse" / artifact.output_relpath
+        product = settings.cache_root / artifact.output_relpath
     product.unlink()
 
     assert pipeline.enqueue(source_id) == job_id
@@ -589,7 +589,7 @@ def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
     settings = Settings(app={"data_root": str(tmp_path)})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    raw = tmp_path / "raw"
+    raw = tmp_path / "originals"
     raw.mkdir()
     source_path = raw / "low-quality.txt"
     source_path.write_text("x", encoding="utf-8")
@@ -601,7 +601,7 @@ def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
             oa_item_id=item.id,
             attachment_key="low-quality",
             original_name="low-quality.txt",
-            local_relpath="raw/low-quality.txt",
+            local_relpath="originals/low-quality.txt",
             file_role="direct_attachment",
             source_container_key="root",
             depth=1,
@@ -633,7 +633,7 @@ def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
         artifact = session.scalar(select(ParseArtifact).where(ParseArtifact.parse_job_id == job_id))
         assert artifact is not None
         assert artifact.lifecycle_status == "rejected"
-        assert (tmp_path / "parse" / artifact.output_relpath).is_file()
+        assert (settings.cache_root / artifact.output_relpath).is_file()
 
     assert pipeline.enqueue(source_id) == job_id
     with Session(engine) as session:
@@ -646,7 +646,7 @@ def test_pipeline_does_not_silently_fallback_when_mineru_is_unavailable(
     settings = Settings(app={"data_root": str(tmp_path)})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    raw = tmp_path / "raw"
+    raw = tmp_path / "originals"
     raw.mkdir()
     source = raw / "scan.pdf"
     source.write_bytes(b"%PDF-1.4\nsynthetic scan\n")
@@ -657,8 +657,8 @@ def test_pipeline_does_not_silently_fallback_when_mineru_is_unavailable(
         session.flush()
         record = ArchivedFile(
             oa_item_id=item.id, attachment_key="scan.pdf", original_name="scan.pdf",
-            local_relpath="raw/scan.pdf", file_role="direct_attachment",
-            source_container_key="root", depth=1, download_status="verified", sha256="c" * 64,
+            local_relpath="originals/scan.pdf", file_role="direct_attachment",
+            source_container_key="root", depth=1, download_status="verified", sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         )
         session.add(record)
         session.commit()
@@ -676,7 +676,7 @@ def test_pipeline_does_not_enqueue_oa_technical_metadata(tmp_path: Path) -> None
     db_path = tmp_path / "state" / "oa.db"
     upgrade_database(db_path)
     engine = create_db_engine(db_path)
-    raw = tmp_path / "raw"
+    raw = tmp_path / "originals"
     raw.mkdir()
     metadata = raw / "metadata.json"
     metadata.write_text("{}", encoding="utf-8")
@@ -686,8 +686,8 @@ def test_pipeline_does_not_enqueue_oa_technical_metadata(tmp_path: Path) -> None
         session.flush()
         record = ArchivedFile(
             oa_item_id=item.id, attachment_key="metadata", original_name="metadata.json",
-            local_relpath="raw/metadata.json", file_role="metadata", source_container_key="root",
-            depth=1, download_status="verified", sha256="b" * 64,
+            local_relpath="originals/metadata.json", file_role="metadata", source_container_key="root",
+            depth=1, download_status="verified", sha256=hashlib.sha256(metadata.read_bytes()).hexdigest(),
         )
         session.add(record)
         session.commit()

@@ -331,7 +331,7 @@ class WebConfig(StrictModel):
 
 class Settings(StrictModel):
     app: AppConfig = AppConfig()
-    runtime: RuntimeConfig = RuntimeConfig()
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     browser: BrowserConfig = BrowserConfig()
     collector: CollectorConfig = CollectorConfig()
     storage: StorageConfig = StorageConfig()

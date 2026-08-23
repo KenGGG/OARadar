@@ -18,7 +18,7 @@ from oa_knowledge.db.models import ArchivedFile, ContentObject, MarkdownExport, 
 from oa_knowledge.markdown_export.publisher import publish_markdown
 from oa_knowledge.markdown_export.render import ExportMetadata, SCHEMA_VERSION, render_markdown
 from oa_knowledge.markdown_export.service import rewrite_parser_asset_links, sanitize_parser_markdown
-from oa_knowledge.storage_paths import resolve_data_path
+from oa_knowledge.runtime_paths import resolve_cache_path
 
 
 def _active_artifact(session: Session, source: ArchivedFile) -> ParseArtifact | None:
@@ -38,26 +38,19 @@ def _active_artifact(session: Session, source: ArchivedFile) -> ParseArtifact | 
 
 
 def _artifact_path(settings: Settings, artifact: ParseArtifact) -> Path:
-    relative = PurePosixPath(artifact.output_relpath)
-    full = relative.as_posix() if relative.parts and relative.parts[0] == "parse" else f"parse/{relative.as_posix()}"
-    return resolve_data_path(settings.data_root, full, allowed_prefixes=("parse",))
+    return resolve_cache_path(settings, artifact.output_relpath)
 
 
 def _source_tree(settings: Settings, local_relpath: str) -> PurePosixPath:
     relative = PurePosixPath(local_relpath)
-    prefixes = {
-        PurePosixPath(settings.storage.archive_dir.as_posix()),
-        PurePosixPath("archive/raw/oa"),
-        PurePosixPath("raw"),
-    }
-    for prefix in sorted(prefixes, key=lambda value: len(value.parts), reverse=True):
-        try:
-            tree = relative.relative_to(prefix)
-        except ValueError:
-            continue
-        if tree.parts:
-            return tree
-    raise ValueError("source file path is outside supported OA archive roots")
+    prefix = PurePosixPath("originals")
+    try:
+        tree = relative.relative_to(prefix)
+    except ValueError as exc:
+        raise ValueError("source file path is outside data/originals") from exc
+    if not tree.parts:
+        raise ValueError("source file path is not an original file")
+    return tree
 
 
 def _destination(settings: Settings, source: ArchivedFile) -> Path:
@@ -86,7 +79,15 @@ def publish_active_artifact(
     source = session.get(ArchivedFile, source_file_id)
     if source is None or source.download_status != "verified" or not source.local_relpath:
         raise FileNotFoundError("verified source unavailable")
+    destination = _destination(settings, source)
+    markdown_relpath = destination.relative_to(settings.workspace_root).as_posix()
+    record = session.scalar(select(MarkdownExport).where(
+        MarkdownExport.source_file_id == source.id,
+        MarkdownExport.schema_version == SCHEMA_VERSION,
+    ))
     artifact = _active_artifact(session, source)
+    if artifact is not None and record is not None and _existing_is_current(record, artifact, destination):
+        return record
     if artifact is None:
         raise FileNotFoundError("valid parse artifact unavailable")
     parsed_path = _artifact_path(settings, artifact)
@@ -95,15 +96,6 @@ def publish_active_artifact(
     product_sha256 = sha256_file(parsed_path)
     if artifact.product_sha256 and artifact.product_sha256 != product_sha256:
         raise ValueError("parse artifact product hash mismatch")
-
-    destination = _destination(settings, source)
-    markdown_relpath = destination.relative_to(settings.workspace_root).as_posix()
-    record = session.scalar(select(MarkdownExport).where(
-        MarkdownExport.source_file_id == source.id,
-        MarkdownExport.schema_version == SCHEMA_VERSION,
-    ))
-    if record is not None and _existing_is_current(record, artifact, destination):
-        return record
 
     item = session.get(OAItem, source.oa_item_id)
     record = record or MarkdownExport(
@@ -177,6 +169,11 @@ def publish_active_artifact(
         record.last_error = None
         record.generated_at = datetime.now(timezone.utc)
         session.flush()
+        work_root = settings.parse_work_root.resolve()
+        artifact_dir = parsed_path.parent.resolve()
+        if work_root not in artifact_dir.parents:
+            raise ValueError("parse artifact directory is outside the parse work root")
+        shutil.rmtree(artifact_dir)
         return record
     except Exception as exc:
         record.status = "failed"

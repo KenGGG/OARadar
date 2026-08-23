@@ -19,18 +19,18 @@ def _seed(tmp_path: Path):
     settings = Settings(app={"data_root": tmp_path / "data"})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    original_relpath = "archive/raw/oa/done/2026/08/OA-SYNTHETIC/report.docx"
+    original_relpath = "originals/done/2026/08/OA-SYNTHETIC/report.docx"
     original = settings.data_root / original_relpath
     original.parent.mkdir(parents=True)
     original.write_bytes(b"original-binary-content")
     artifact_body = "# 已解析正文\n\n这是唯一的来源内容。"
-    artifact_path = settings.data_root / "parse/item-1/document.md"
+    artifact_path = settings.parse_work_root / "parse/item-1/document.md"
     artifact_path.parent.mkdir(parents=True)
     artifact_path.write_text(artifact_body, encoding="utf-8")
     with Session(engine) as session:
         item = OAItem(
             oa_item_key="done:synthetic", source_channel="done", title="合成事项",
-            archive_relpath="archive/raw/oa/done/2026/08/OA-SYNTHETIC",
+            archive_relpath="originals/done/2026/08/OA-SYNTHETIC",
         )
         session.add(item); session.flush()
         content = ContentObject(
@@ -52,7 +52,7 @@ def _seed(tmp_path: Path):
         session.add(job); session.flush()
         artifact = ParseArtifact(
             parse_job_id=job.id, content_object_id=content.id, engine="synthetic",
-            engine_version="1", output_relpath="item-1/document.md",
+            engine_version="1", output_relpath="work/parse/item-1/document.md",
             source_sha256=content.sha256,
             product_sha256=hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
             config_hash="c" * 64, lifecycle_status="valid", quality_score=0.95,
@@ -77,10 +77,11 @@ def test_publish_uses_active_artifact_and_never_reparses_original(monkeypatch, t
         destination = settings.workspace_root / record.markdown_relpath
         content = destination.read_text(encoding="utf-8")
 
-    assert artifact_path.read_text(encoding="utf-8") in content
+    assert "这是唯一的来源内容。" in content
     assert "original-binary-content" not in content
     assert "parse_artifact_id:" in content
-    assert "source_relpath: archive/raw/oa/done/" in content
+    assert "source_relpath: originals/done/" in content
+    assert not artifact_path.parent.exists()
 
 
 def test_same_artifact_is_idempotent_and_new_product_atomically_replaces(tmp_path: Path) -> None:
@@ -97,10 +98,11 @@ def test_same_artifact_is_idempotent_and_new_product_atomically_replaces(tmp_pat
 
         old = session.get(ParseArtifact, again.parse_artifact_id)
         old.lifecycle_status = "superseded"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text("# 新解析正文\n\n替换内容", encoding="utf-8")
         replacement = ParseArtifact(
             parse_job_id=old.parse_job_id, content_object_id=old.content_object_id,
-            engine="synthetic", engine_version="2", output_relpath="item-1/document.md",
+            engine="synthetic", engine_version="2", output_relpath="work/parse/item-1/document.md",
             source_sha256=old.source_sha256,
             product_sha256=hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
             config_hash="d" * 64, lifecycle_status="valid", quality_score=1.0,

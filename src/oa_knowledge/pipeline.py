@@ -26,6 +26,7 @@ from oa_knowledge.parsers.mineru_parser import parse_with_mineru, mineru_availab
 from oa_knowledge.parsers.eligibility import evaluate_eligibility
 from oa_knowledge.parsers.quality import assess_quality
 from oa_knowledge.parsers.router import ParseResult, preflight
+from oa_knowledge.runtime_paths import ensure_owned_directory, resolve_cache_path, resolve_original_path
 
 
 class ParsePipeline:
@@ -43,10 +44,24 @@ class ParsePipeline:
         return self._engine
 
     def _get_output_base(self) -> Path:
-        """Return the parse output directory under data_root."""
-        parse_dir = self.settings.data_root / "parse"
-        parse_dir.mkdir(parents=True, exist_ok=True)
-        return parse_dir
+        """Return the private rebuildable parse-output directory."""
+        return ensure_owned_directory(self.settings.parse_work_root / "parse")
+
+    def _verified_original_path(self, file_rec: ArchivedFile) -> Path | None:
+        """Return a protected original only if its recorded integrity still holds."""
+        if not file_rec.local_relpath:
+            return None
+        try:
+            path = resolve_original_path(self.settings, file_rec.local_relpath)
+        except ValueError:
+            return None
+        if not path.is_file():
+            return None
+        if file_rec.size_bytes is not None and path.stat().st_size != file_rec.size_bytes:
+            return None
+        if file_rec.sha256 and sha256_file(path) != file_rec.sha256:
+            return None
+        return path
 
     def enqueue(
         self,
@@ -82,12 +97,8 @@ class ParsePipeline:
             if file_rec is None or file_rec.download_status != "verified":
                 return None
 
-            if file_rec.local_relpath is None:
-                return None
-
-            relative = safe_filename(Path(file_rec.local_relpath).name)
-            file_path = self.settings.data_root / file_rec.local_relpath
-            if not file_path.is_file():
+            file_path = self._verified_original_path(file_rec)
+            if file_path is None:
                 return None
 
             eligibility = evaluate_eligibility(file_path)
@@ -127,10 +138,7 @@ class ParsePipeline:
                         .order_by(ParseArtifact.id.desc())
                         .limit(1)
                     )
-                    product = (
-                        self.settings.data_root / "parse" / artifact.output_relpath
-                        if artifact is not None else None
-                    )
+                    product = resolve_cache_path(self.settings, artifact.output_relpath) if artifact is not None else None
                     product_is_current = bool(
                         artifact is not None
                         and product is not None
@@ -204,12 +212,12 @@ class ParsePipeline:
             if file_rec is None or file_rec.local_relpath is None:
                 raise ValueError(f"File for job {job_id} not found")
 
-            file_path = self.settings.data_root / file_rec.local_relpath
-            if not file_path.is_file():
+            file_path = self._verified_original_path(file_rec)
+            if file_path is None:
                 job.status = "failed"
-                job.error_code = "file_missing"
+                job.error_code = "original_missing_or_changed"
                 session.commit()
-                raise FileNotFoundError(f"File not found: {file_path}")
+                raise FileNotFoundError("verified original file is missing or changed")
 
             # Increment attempts
             job.attempts += 1
@@ -270,7 +278,7 @@ class ParsePipeline:
             # Update job
             job.status = "completed"
             job.quality_score = result.quality_score
-            job.output_relpath = str(result.output_path.relative_to(output_base))
+            job.output_relpath = str(result.output_path.relative_to(self.settings.cache_root))
             job.config_hash = result.config_hash
 
             # Update item pipeline status
@@ -284,7 +292,7 @@ class ParsePipeline:
             source_sha = file_rec.sha256 or sha256_file(file_path)
             product_sha = sha256_file(result.output_path) if result.output_path.is_file() else None
 
-            output_relpath = str(result.output_path.relative_to(output_base))
+            output_relpath = str(result.output_path.relative_to(self.settings.cache_root))
             artifact = session.scalar(select(ParseArtifact).where(
                 ParseArtifact.parse_job_id == job.id,
                 ParseArtifact.engine == result.engine,

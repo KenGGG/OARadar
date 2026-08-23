@@ -73,8 +73,9 @@ def test_archive_depth_is_independent_and_bounded() -> None:
 
 
 def test_environment_overrides_data_root(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("OA_APP__DATA_ROOT", str(tmp_path))
-    assert load_settings().data_root == tmp_path.resolve()
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("OA_APP__DATA_ROOT", str(data_root))
+    assert load_settings().data_root == data_root.resolve()
 
 
 @pytest.mark.parametrize("path", ["/tmp/oa.db", "../oa.db", "C:\\oa.db"])

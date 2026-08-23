@@ -33,3 +33,17 @@ def resolve_original_path(settings: "Settings", relpath: str) -> Path:
         relpath,
         allowed_prefixes=("originals",),
     )
+
+
+def resolve_cache_path(settings: "Settings", relpath: str) -> Path:
+    """Resolve a relative rebuildable product below the private cache root."""
+    relative = Path(relpath)
+    if not relpath or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("cache path must be a non-empty relative path")
+    root = settings.cache_root.resolve()
+    candidate = (root / relative).resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("cache path escapes the cache root") from exc
+    return candidate

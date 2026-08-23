@@ -7,7 +7,7 @@ import yaml
 @pytest.fixture(autouse=True)
 def isolate_xdg_runtime_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep default XDG runtime paths in each synthetic test sandbox."""
-    home = tmp_path / "home"
+    home = tmp_path.parent / f"{tmp_path.name}-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
 
