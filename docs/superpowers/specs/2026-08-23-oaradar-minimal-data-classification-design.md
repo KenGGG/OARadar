@@ -1,19 +1,20 @@
-# OARadar minimal data and local classification design
+# OARadar 最小数据目录与本地分类设计
 
-Date: 2026-08-23  
-Status: awaiting user review  
-Baseline: `main@cb32336`
+日期：2026-08-23
 
-## 1. Outcome
+状态：等待用户复核
 
-OARadar exists to run only three business flows:
+实施基线：`main@cb32336`
 
-1. notify the operator about Pending items;
-2. download and preserve original Done attachments;
-3. convert those attachments to Markdown and classify the Markdown.
+## 1. 目标结果
 
-The `data/` directory is a business deliverable, not an application runtime
-directory. After migration it contains exactly two top-level directories:
+OARadar 只负责运行三条业务链路：
+
+1. 向操作人员发送待办事项通知；
+2. 下载并保存已办事项的原始附件；
+3. 将这些附件转换为 Markdown，并对 Markdown 进行分类。
+
+`data/` 是最终业务资料目录，不是应用运行目录。迁移完成后，它只能包含两个一级目录：
 
 ```text
 data/
@@ -21,58 +22,56 @@ data/
 └── markdown/
 ```
 
-This design supersedes the data layout, manual classification page, full
-online-audit gate, clean-database rebuild, and `data_rebuilt/` cutover design in
-`2026-08-21-oaradar-data-cleanup-markdown-rebuild-design.md`. OA remains
-strictly read-only.
+本设计取代 `2026-08-21-oaradar-data-cleanup-markdown-rebuild-design.md`
+中的数据目录结构、人工分类页面、全量在线审计门禁、干净数据库重建和
+`data_rebuilt/` 切换方案。OA 集成继续保持严格只读。
 
-## 2. Storage contract
+## 2. 存储契约
 
 ### 2.1 `data/originals/`
 
-`originals/` contains only immutable files downloaded from OA as Done evidence:
+`originals/` 只保存从 OA 下载、作为已办事实底稿的不可变文件：
 
-- direct attachments;
-- official attachments;
-- an official body file when OA exposes it as a downloaded file;
-- the original downloaded container file, such as a ZIP archive.
+- 直接附件；
+- 正式附件；
+- OA 以下载文件形式提供的正式正文；
+- ZIP 等容器类附件的原始下载文件。
 
-Page snapshots, workflow snapshots, metadata snapshots, extracted container
-members, parser products, reports, logs, backups, quarantine files, browser
-state, database files, and knowledge projections are not originals.
+页面快照、流程快照、元数据快照、容器解压成员、解析产物、报表、日志、备份、
+隔离文件、浏览器状态、数据库文件和知识投影都不属于原件。
 
-Every original must have a database ledger entry containing its OA item key,
-role, size, SHA256, and POSIX path relative to `data_root`. OA identifiers remain
-text. Original files are never edited or overwritten.
+每份原件必须有数据库账本记录，记录其 OA 事项标识、文件角色、大小、SHA256，
+以及相对 `data_root` 的 POSIX 路径。OA 标识继续以文本保存。原件永不编辑、
+永不覆盖。
 
 ### 2.2 `data/markdown/`
 
-`markdown/` contains only final Markdown, one `_index.md` per Done item, and
-assets actually referenced by those Markdown files. It contains no parser JSON,
-debug output, prompt/response capture, or abandoned versions.
+`markdown/` 只保存最终 Markdown、每个已办事项唯一的 `_index.md`，以及这些
+Markdown 实际引用的 assets。不得保存解析器 JSON、调试输出、模型提示词或响应、
+废弃版本。
 
-The classification tree is:
+分类目录结构为：
 
 ```text
 markdown/
-├── internal/<fixed-category>/...
-├── external/<normalized-issuer>/...
+├── internal/<固定类别>/...
+├── external/<规范化发文机构>/...
 └── unclassified/...
 ```
 
-The fixed internal categories remain:
+内部固定类别继续使用：
 
 ```text
 公司治理  经营管理  业务项目  风险管理
 财务资金  人力行政  信息化    其他内部
 ```
 
-`unclassified/` is a valid, non-blocking result. Classification is also written
-to frontmatter and `_index.md` so search does not depend only on folders.
+`unclassified/` 是合法且不阻塞流程的分类结果。分类信息还要写入 frontmatter
+和 `_index.md`，使搜索能力不只依赖目录。
 
-### 2.3 Runtime state outside `data/`
+### 2.3 移出 `data/` 的运行状态
 
-Operational files move to standard local-only directories:
+应用运行文件迁移到标准的本机目录：
 
 ```text
 ~/.local/state/oaradar/
@@ -84,205 +83,169 @@ Operational files move to standard local-only directories:
 └── work/
 ```
 
-Logs use the systemd journal. Temporary parse products live below
-`~/.cache/oaradar/work/` and are removed immediately after an atomic Markdown
-publish succeeds. Failed work retains only the minimum file needed for retry and
-is removed after the configured failure-retention period.
+日志写入 systemd journal。解析临时产物写入 `~/.cache/oaradar/work/`，Markdown
+原子发布成功后立即删除。失败任务只保留重试所需的最小文件，并在配置的失败保留期
+结束后清理。
 
-The state database remains necessary for Pending deduplication, notification
-outcomes, original-file hashes, download idempotency, Markdown idempotency, and
-classification versions. Moving it out of `data/` does not make it optional.
+状态数据库仍然是待办去重、通知结果、原件哈希、下载幂等、Markdown 幂等和分类
+版本的必要账本。将数据库移出 `data/` 并不意味着可以取消数据库。
 
-## 3. Minimal production pipeline
+## 3. 最小生产流水线
 
-### 3.1 Pending
+### 3.1 待办通知
 
 ```text
-discover -> summarize -> Feishu -> erase temporary business content
+发现 -> 摘要 -> 飞书 -> 删除临时业务内容
 ```
 
-Only an explicit `sent` result permits cleanup. `unknown_outcome` is never
-resent or cleaned automatically. The durable state database retains only the
-minimum deduplication and delivery facts.
+只有飞书明确返回 `sent` 才允许清理。`unknown_outcome` 不得自动重发，也不得
+自动清理。持久状态数据库只保留最小去重和投递事实。
 
-### 3.2 Done originals
+### 3.2 已办原件
 
 ```text
-discover -> download -> verify size and SHA256 -> publish immutable original
+发现 -> 下载 -> 校验大小与 SHA256 -> 发布为不可变原件
 ```
 
-Each file is processed independently. One missing or mismatched file does not
-block other items. Container traversal stops at depth 10; an item with deeper
-children is recorded as `depth_limit_reached` and is never reported complete.
+每个文件独立处理。一个文件缺失或哈希不一致，不得阻塞其他事项。容器树最多遍历
+10 层；存在更深子项时必须记录 `depth_limit_reached`，不得把该事项报告为完成。
 
-Historical processing trusts local evidence only after rechecking the current
-file size and SHA256. It does not require a new full OA audit and does not
-require legacy originals to pass through an intermediate canonical directory.
+历史处理只能在重新核对本地文件当前大小和 SHA256 后信任本地证据。它不要求重新
+执行全量 OA 在线审计，也不要求旧路径原件先迁移到某个中间规范目录。
 
-### 3.3 Markdown and classification
+### 3.3 Markdown 与分类
 
 ```text
-verified original
--> bounded temporary parse
--> item-level local classification
--> atomic classified Markdown publish
--> delete temporary parse product
+已核验原件
+-> 有界临时解析
+-> 事项级本地分类
+-> 原子发布分类后的 Markdown
+-> 删除解析临时产物
 ```
 
-Markdown generation is per attachment. Unsupported and failed attachments are
-listed explicitly in `_index.md`; they do not roll back successful attachments.
-Classification failure publishes the item under `unclassified/` and never
-blocks Markdown delivery.
+Markdown 按附件独立生成。不支持和失败的附件在 `_index.md` 中明确列出；它们不得
+撤销已经成功的附件 Markdown。分类失败时把事项发布到 `unclassified/`，不得阻塞
+Markdown 交付。
 
-## 4. Local Qwen classification
+## 4. 本地 Qwen 分类
 
-The configured model is local Ollama `qwen3.5:9b`. Although the installed model
-currently reports a larger maximum window, the classifier never relies on a
-long-context request.
+当前配置模型为本地 Ollama `qwen3.5:9b`。虽然已安装模型目前报告了更大的最大
+上下文窗口，但分类器不得依赖长上下文请求。
 
-### 4.1 Fixed request budgets
+### 4.1 固定请求预算
 
-- chunk map input: at most 2,000 estimated tokens;
-- item reduction input: normally 6,000 and never more than 8,000 estimated
-  tokens;
-- model output: at most 512 tokens;
-- safety margin: at least 1,024 tokens;
-- concurrency: one local model request at a time.
+- 分块映射输入：最多约 2,000 个估算 token；
+- 事项归并输入：通常为 6,000，绝不超过 8,000 个估算 token；
+- 模型输出：最多 512 个 token；
+- 安全余量：至少 1,024 个 token；
+- 并发：同一时间只运行一个本地模型请求。
 
-The existing conservative mixed Chinese/ASCII token estimator is applied before
-every request. Ollama receives an explicit bounded `num_ctx`; an oversized input
-is split locally and is never sent optimistically.
+每次请求前都使用现有的中英文混合文本保守 token 估算器。向 Ollama 明确传入受限
+的 `num_ctx`；输入超限时必须在本地分块，禁止直接发送超长输入。
 
-### 4.2 Rule-first hierarchical classification
+### 4.2 规则优先的分层分类
 
-1. Deterministic rules extract candidates from the OA title, sender, document
-   number, attachment names, file roles, and known issuer aliases.
-2. Each attachment Markdown is split on paragraph boundaries. Qwen maps every
-   chunk to a compact structured signal summary containing only category,
-   issuer, document-number, project, and evidence signals.
-3. Large sets of chunk summaries are reduced in bounded groups until one compact
-   summary remains per attachment.
-4. Attachment summaries are reduced again to one item-level summary.
-5. A final strict JSON Schema request chooses `internal`, `external`, or
-   `unclassified`, one fixed internal category or a normalized external issuer,
-   confidence, and evidence source aliases.
-6. If rules and model disagree, required fields are absent, or confidence is
-   below the threshold, one independent bounded verification request runs.
-7. If verification still cannot establish a valid result, the item is
-   `unclassified`.
+1. 确定性规则先从 OA 标题、发起人、文号、附件名、文件角色和已知机构别名中提取
+   候选分类。
+2. 每份附件 Markdown 按段落边界切分。Qwen 把每个分块映射为紧凑的结构化信号
+   摘要，只保留类别、机构、文号、项目和证据信号。
+3. 分块摘要过多时，按受限大小分组归并，直到每份附件只剩一份紧凑摘要。
+4. 再次归并附件摘要，得到一份事项级摘要。
+5. 最后一次严格 JSON Schema 请求只能选择 `internal`、`external` 或
+   `unclassified`，并返回一个固定内部类别或规范化外部机构、置信度和证据来源别名。
+6. 规则与模型不一致、必填字段缺失或置信度低于阈值时，再执行一次独立的有界复核
+   请求。
+7. 复核后仍不能建立有效结果时，分类为 `unclassified`。
 
-Source aliases such as `S1` are used in prompts instead of durable OA identifiers.
-The response is rejected if it invents a source alias, category, document number,
-or issuer not supported by the supplied evidence. Prompts and responses are not
-written to logs or Git.
+提示词中使用 `S1` 等来源别名，不使用持久 OA 标识。模型虚构来源别名、类别、文号，
+或给出输入证据无法支持的机构时，必须拒绝该响应。提示词和响应不得写入日志或 Git。
 
-Classification is cached by the ordered source SHA256 set, model identity,
-rules version, prompt version, and schema version. A changed version creates a
-new result; it does not alter originals. Republishing a changed category uses an
-atomic target write and removes only the prior OARadar-managed Markdown path
-after the new target validates.
+分类缓存键由有序来源 SHA256 集合、模型标识、规则版本、提示词版本和 Schema 版本
+共同组成。版本变化时生成新结果，不修改原件。分类变化需要重新发布时，先原子写入并
+校验新目标，再只删除旧的 OARadar 管理范围内 Markdown 路径。
 
-## 5. One-time cleanup and rebuild
+## 5. 一次性清理与重建
 
-### 5.1 Preflight
+### 5.1 预检
 
-Before changing files:
+修改文件前必须：
 
-1. stop the Web, OA worker, Markdown worker, and timers;
-2. create a consistent SQLite backup outside `data/`;
-3. inventory every candidate original from the database;
-4. recheck file existence, regular-file type, size, SHA256, and safe relative
-   path;
-5. report aggregate ready, missing, mismatched, depth-limit, file-count, and byte
-   totals without printing OA names;
-6. refuse cleanup if any file marked as an original lacks a safe disposition.
+1. 停止 Web、OA Worker、Markdown Worker 和 timers；
+2. 在 `data/` 之外创建一致的 SQLite 备份；
+3. 根据数据库盘点每一份候选原件；
+4. 重新核对文件是否存在、是否为普通文件、大小、SHA256 和安全相对路径；
+5. 只报告就绪、缺失、哈希不符、深度超限、文件数和字节数等汇总信息，不打印真实
+   OA 名称；
+6. 任何标记为原件的文件没有明确安全去向时，拒绝执行清理。
 
-### 5.2 Fast safe rebuild
+### 5.2 快速且安全的重建
 
-Because the source and target are on the same filesystem, verified originals are
-first hard-linked into a private staging tree. If hard-linking is unavailable,
-the implementation uses copy-plus-SHA256 verification. Staging never modifies a
-source inode.
+由于来源与目标位于同一文件系统，先把已核验原件硬链接到私有暂存目录。如果不能
+使用硬链接，则改为复制并重新校验 SHA256。暂存过程不得修改来源 inode。
 
-The application then:
+随后依次执行：
 
-1. backs up and moves the operational database to the XDG state directory;
-2. builds `data_next/originals/` from verified originals;
-3. rebuilds `data_next/markdown/` using the bounded pipeline;
-4. validates original count and SHA256 parity, Markdown links, indexes,
-   classifications, unsupported outcomes, and retryable failures;
-5. renames the old `data/` to a uniquely named local legacy directory and
-   atomically renames `data_next/` to `data/`;
-6. starts services and runs local smoke checks without contacting OA, Feishu, or
-   the model;
-7. rolls directory names back immediately if smoke checks fail.
+1. 备份运行数据库，并将它迁移到 XDG 状态目录；
+2. 使用已核验原件建立 `data_next/originals/`；
+3. 使用有界流水线重建 `data_next/markdown/`；
+4. 校验原件数量和 SHA256 完全一致，并检查 Markdown 链接、事项索引、分类、不支持
+   结果和可重试失败；
+5. 把旧 `data/` 重命名为唯一命名的本地旧目录，再将 `data_next/` 原子重命名为
+   `data/`；
+6. 启动服务，并执行不访问 OA、飞书或模型的本地冒烟检查；
+7. 冒烟失败时立即反向恢复目录名称。
 
-After successful validation and smoke checks, the user's 2026-08-23 instruction
-authorizes permanent removal of non-original legacy content. Deleting legacy
-hard links does not delete the retained original inode. The cleanup command must
-resolve exact paths, refuse symlinks and unexpected top-level entries, and never
-use an unbounded recursive target.
+验收和冒烟成功后，用户在 2026-08-23 给出的指令授权永久清除旧目录中的非原件
+内容。删除旧目录中的原件硬链接不会删除新目录保留的原件 inode。清理命令必须解析
+精确路径，拒绝符号链接和意外的一级目录，并且不得对未经边界校验的目标执行递归删除。
 
-No historical data is downloaded again from OA for this rebuild.
+本次重建不得从 OA 重新下载历史数据。
 
-## 6. Cleanup review notifications
+## 6. 清理审核提醒
 
-Future quarantine cleanup is never a silent timer:
+未来的隔离区清理不得再使用无提示的静默计时器：
 
-- the dashboard shows an aggregate `待人工审核` alert when retention matures;
-- if Feishu is configured, one aggregate reminder is sent without OA titles,
-  paths, or content;
-- `oa data review <run-id>` reports categories, counts, bytes, missing files,
-  changed files, and recoverability;
-- purge requires the exact run ID and confirmation string;
-- no scheduled task permanently deletes quarantined files.
+- 保留期结束后，首页显示汇总的“待人工审核”提醒；
+- 已配置飞书时发送一次汇总提醒，不包含 OA 标题、路径或内容；
+- `oa data review <run-id>` 显示分类、数量、字节数、缺失文件、变化文件和可恢复性；
+- 永久清除需要精确的运行 ID 和确认字符串；
+- 任何定时任务都不得永久删除隔离文件。
 
-The existing cleanup run `1` is eligible for this review flow. Its previously
-verified scope contains only rebuildable or temporary content; it contains no
-protected Done originals.
+现有清理运行 `1` 进入这套审核流程。它此前核验的范围只包含可重建或临时内容，
+不包含受保护的已办原件。
 
-## 7. Product and code boundaries
+## 7. 产品与代码边界
 
-The WebUI keeps only Overview, Pending notifications, Done materials, Markdown
-output, and Settings. It gains no manual classification page. Retired audit,
-curation, review, policy, backfill, vault, and governance routes are removed from
-the production router after any still-required read-only migration helper is
-extracted.
+WebUI 只保留“总览、待办通知、已办资料、Markdown 输出、系统设置”。不增加人工分类
+页面。从生产路由中移除已经退役的审计、Curated、Review、Policy、Backfill、Vault
+和治理接口；如迁移仍需某个只读辅助函数，先把该函数从退役功能中独立出来。
 
-The production worker admits only the three flows in section 3. Historical
-Markdown work is selected from locally verified originals and cannot be blocked
-by an unrelated online-audit campaign.
+生产 Worker 只允许第 3 节中的三条链路。历史 Markdown 任务直接从本地已核验原件
+选择，不得被无关的在线审计任务阻塞。
 
-## 8. Acceptance criteria
+## 8. 验收标准
 
-1. `data/` has exactly `originals/` and `markdown/` at its top level.
-2. Every retained original has a ledger record and matching size and SHA256.
-3. Every verified historical original has been retained or has a stable,
-   explicit blocking error; no silent loss is allowed.
-4. No database, browser profile, log, report, backup, quarantine, parser product,
-   old projection, or runtime lock remains in `data/`.
-5. Every supported attachment has Markdown or an explicit retryable failure.
-6. Every unsupported attachment is listed in its item index.
-7. Every item has exactly one `_index.md`.
-8. Every item has a valid model/rule classification or is explicitly
-   `unclassified`.
-9. Every model request obeys the fixed budgets, strict schema, local-only
-   endpoint, and single-concurrency rule.
-10. Pending notification, deduplication, successful cleanup, Done incremental
-    download, restart recovery, and Markdown idempotency tests pass after the
-    state move.
-11. Container depth beyond 10 produces `depth_limit_reached` and never a false
-    complete result.
-12. The public-release check, complete synthetic test suite, frontend checks,
-    build, and local smoke tests pass without real OA fixtures.
+1. `data/` 一级目录恰好只有 `originals/` 和 `markdown/`。
+2. 每份保留原件都有账本记录，且大小和 SHA256 一致。
+3. 每份历史已核验原件都已保留，或者具有稳定、明确的阻塞错误；不得静默丢失。
+4. `data/` 中不存在数据库、浏览器 profile、日志、报表、备份、隔离区、解析产物、
+   旧知识投影或运行锁。
+5. 每个支持转换的附件都有 Markdown，或者具有明确的可重试失败状态。
+6. 每个不支持转换的附件都在事项索引中明确列出。
+7. 每个事项恰好有一个 `_index.md`。
+8. 每个事项都有有效的模型/规则分类，或者明确分类为 `unclassified`。
+9. 每个模型请求都符合固定预算、严格 Schema、本机端点和单并发要求。
+10. 状态迁移后，待办通知、去重、成功后清理、已办增量下载、重启恢复和 Markdown
+    幂等测试全部通过。
+11. 容器深度超过 10 时生成 `depth_limit_reached`，不得错误报告完成。
+12. 公开发布检查、完整合成测试、前端检查、构建和本机冒烟全部通过，且不得使用
+    真实 OA fixture。
 
-## 9. Out of scope
+## 9. 不在本次范围内
 
-- modifying, approving, replying to, deleting, or forwarding OA records;
-- re-downloading the historical corpus;
-- a manual classification UI;
-- AI summaries, curated knowledge documents, review queues, knowledge graphs, or
-  online Markdown editing;
-- retaining parser intermediates for possible future use;
-- committing any real OA data, database, profile, log, report, or downloaded
-  file.
+- 修改、审批、回复、删除或转发 OA 记录；
+- 重新下载全部历史资料；
+- 人工分类页面；
+- AI 摘要、Curated 知识文档、Review 队列、知识图谱或在线编辑 Markdown；
+- 为将来可能使用而保留解析中间产物；
+- 提交任何真实 OA 数据、数据库、浏览器 profile、日志、报表或下载文件。
