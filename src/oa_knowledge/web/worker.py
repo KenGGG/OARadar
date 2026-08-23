@@ -136,25 +136,9 @@ class OperationWorker:
         return "oa" in command and "worker" in command
 
     def run_once(self) -> bool:
-        # This is a cheap no-op while the newest online audit is unfinished. As
-        # soon as it completes, the durable migration job is created before any
-        # historical knowledge task can be claimed.
-        from oa_knowledge.archive_migration_campaign import ensure_verified_archive_migration
-        ensure_verified_archive_migration(self.engine)
         job_id = self._claim_next()
         if job_id is None:
-            queue_names = None
-            with Session(self.engine) as session:
-                online_audit_waiting = session.scalar(select(OperationJob.id).where(
-                    OperationJob.job_type == "online_audit",
-                    OperationJob.status.in_(("queued", "running")),
-                ).limit(1)) is not None
-            if online_audit_waiting:
-                # Audit batches deliberately yield for realtime work. Historical
-                # rebuilds wait until verification finishes so a long local-model
-                # call cannot delay the next online comparison batch.
-                queue_names = ("realtime_pending", "realtime_done")
-            task = self.production_queue.claim(self.owner, queue_names=queue_names)
+            task = self.production_queue.claim(self.owner)
             if task is None:
                 return False
             self._write_runtime_status("working", self._pipeline_activity(task.stage))
