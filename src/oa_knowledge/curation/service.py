@@ -188,11 +188,13 @@ def run_curation(
         context_window_cap=settings.llm.context_window_cap,
     )
     budget = ContextBudget(
-        context_window=profile.context_window, max_output_tokens=settings.llm.max_tokens,
+        context_window=min(profile.context_window, 8_192), max_output_tokens=512,
         system_tokens=2000, safety_margin=settings.llm.context_safety_margin,
     )
     max_input = min(settings.curation.max_input_tokens, budget.max_input_tokens)
-    model_client = client or make_llm_client(settings.llm, max_retries=settings.llm.max_retries)
+    model_client = client or make_llm_client(
+        settings.llm, max_retries=settings.llm.max_retries, max_tokens=512,
+    )
     counters = CurationStats()
     with Session(engine) as session:
         item_ids = [item.id for item in _candidate_items(

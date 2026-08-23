@@ -253,7 +253,9 @@ class CurationConfig(StrictModel):
     enabled: bool = False
     batch_limit: int = Field(default=10, ge=1, le=100)
     confidence_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
-    max_input_tokens: int = Field(default=60_000, ge=1024, le=120_000)
+    # Item-level local-Qwen aggregation is deliberately bounded.  Larger
+    # source documents are reduced in chunks before this final request.
+    max_input_tokens: int = Field(default=6_000, ge=1024, le=8_000)
     cpu_weight: int = 50
     io_class: str = "idle"
     pause_on_backfill_degradation: bool = True
