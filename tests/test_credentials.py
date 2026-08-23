@@ -1,6 +1,13 @@
 import sqlite3
 
-from oa_knowledge.collector.credentials import _decrypt_linux_v10, load_chrome_saved_credential
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7
+
+from oa_knowledge.collector.credentials import (
+    _decrypt_linux_chrome_password,
+    _decrypt_linux_v10,
+    load_chrome_saved_credential,
+)
 
 
 def test_rejects_unknown_chrome_credential_format() -> None:
@@ -24,3 +31,17 @@ def test_reads_login_database_while_writer_holds_exclusive_lock(tmp_path) -> Non
     finally:
         writer.rollback()
         writer.close()
+
+
+def test_decrypts_v11_chrome_password_with_keyring_secret() -> None:
+    secret = b"synthetic-keyring-secret"
+    password = "synthetic-password"
+    import hashlib
+
+    key = hashlib.pbkdf2_hmac("sha1", secret, b"saltysalt", 1, dklen=16)
+    padder = PKCS7(128).padder()
+    padded = padder.update(password.encode()) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).encryptor()
+    encrypted = b"v11" + encryptor.update(padded) + encryptor.finalize()
+
+    assert _decrypt_linux_chrome_password(encrypted, keyring_secret=secret) == password

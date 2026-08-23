@@ -17,6 +17,7 @@ dependencies = [
   "sqlalchemy>=2.0,<3",
   "typer>=0.12,<1",
   "cryptography>=49.0.0",
+  "secretstorage>=3.3,<4",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "itsdangerous>=2.2,<3",

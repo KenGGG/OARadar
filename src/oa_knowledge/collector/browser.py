@@ -119,11 +119,18 @@ class BrowserSession:
                 button.click()
                 return True
             self.page.wait_for_timeout(250)
-        profile = self.settings.browser_profile_path
-        credential = load_chrome_saved_credential(profile, self.base_url)
-        if credential:
-            username.fill(credential.username)
-            password.fill(credential.password)
-            button.click()
-            return True
+        credential_profiles = [self.settings.browser_profile_path]
+        external_profile = self.settings.browser.credential_profile_path
+        if external_profile and external_profile not in credential_profiles:
+            credential_profiles.append(external_profile)
+        for profile in credential_profiles:
+            try:
+                credential = load_chrome_saved_credential(profile, self.base_url)
+            except ValueError:
+                continue
+            if credential:
+                username.fill(credential.username)
+                password.fill(credential.password)
+                button.click()
+                return True
         return False

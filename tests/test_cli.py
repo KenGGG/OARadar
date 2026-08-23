@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.cli import _sanitize_operational_error, app
 from oa_knowledge.collector import LoginState
+from oa_knowledge.collector.done import DiscoveredDoneItem
 from oa_knowledge.collector.pending import DiscoveredPendingItem, PendingDiscovery
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
@@ -60,6 +61,59 @@ def test_manifest_run_exposes_bounded_first_page_options_without_a_separate_pilo
     assert run_help.exit_code == 0, run_help.output
     assert "--max-pages" in run_help.output
     assert "--max-items" in run_help.output
+
+
+def test_bounded_manifest_run_uses_existing_direct_detail_capture(config_file: Path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+    item = DiscoveredDoneItem(
+        workitem_id_text="synthetic-workitem",
+        title="合成事项",
+        created_at=datetime(2026, 8, 23, tzinfo=timezone.utc),
+        completed_at=None,
+        sender="合成人员",
+        deadline_text=None,
+        category=None,
+        ordinal=1,
+    )
+    observed = {"direct": False, "list_click": False}
+
+    class FakePage:
+        def wait_for_timeout(self, _milliseconds): pass
+
+    class FakeBrowser:
+        base_url = "https://oa.invalid"
+        page = FakePage()
+        def __init__(self, *_args, **_kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def login_with_saved_credentials(self, _seconds): return LoginState.AUTHENTICATED
+
+    class FakeDone:
+        def __init__(self, *_args, **_kwargs): pass
+        def open_list(self): return object()
+        def _list_stats(self, _frame): return 1, 1
+        def _discover_frame(self, *_args): return [item]
+
+    class FakeDetail:
+        def __init__(self, *_args, **_kwargs): pass
+        def capture_direct(self, *_args, **_kwargs):
+            observed["direct"] = True
+            raise RuntimeError("synthetic direct capture failure")
+        def capture(self, *_args, **_kwargs):
+            observed["list_click"] = True
+            raise RuntimeError("synthetic list click must not be primary")
+
+    monkeypatch.setattr("oa_knowledge.cli.BrowserSession", FakeBrowser)
+    monkeypatch.setattr("oa_knowledge.cli.DoneAdapter", FakeDone)
+    monkeypatch.setattr("oa_knowledge.cli.CollaborationDetailAdapter", FakeDetail)
+
+    result = runner.invoke(app, [
+        "manifest", "run", "--max-pages", "1", "--max-items", "1",
+        "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert observed == {"direct": True, "list_click": False}
 
 
 def test_curate_plan_is_read_only_and_commands_are_registered(config_file: Path) -> None:

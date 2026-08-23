@@ -21,8 +21,16 @@ def test_defaults_are_local_and_depth_ten() -> None:
     assert settings.storage.archive_dir.as_posix() == "originals"
     assert settings.database_path == settings.state_root / "oa.db"
     assert settings.browser_profile_path == settings.cache_root / "browser-profile"
+    assert settings.browser.credential_profile_path is None
     assert settings.markdown_root == settings.data_root / "markdown"
     assert settings.markdown_root != settings.archive_root
+
+
+def test_browser_credential_profile_must_be_absolute(tmp_path: Path) -> None:
+    settings = Settings(browser={"credential_profile_path": str(tmp_path)})
+    assert settings.browser.credential_profile_path == tmp_path.resolve()
+    with pytest.raises(ValidationError):
+        Settings(browser={"credential_profile_path": "relative-profile"})
 
 
 def test_markdown_source_dir_cannot_escape_or_target_wiki() -> None:

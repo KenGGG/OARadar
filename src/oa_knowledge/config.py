@@ -52,6 +52,7 @@ class BrowserConfig(StrictModel):
     login_path: str = "/oa/login"
     executable_path: Path = Path("/usr/bin/google-chrome")
     user_data_dir: Path = Path("browser-profile")
+    credential_profile_path: Path | None = None
     headless: bool = True
     ignore_https_errors: bool = False
     done_list_path: str = "/oa/done"
@@ -61,6 +62,16 @@ class BrowserConfig(StrictModel):
     @classmethod
     def relative_profile(cls, value: Path) -> Path:
         return ensure_relative(value, "browser.user_data_dir")
+
+    @field_validator("credential_profile_path")
+    @classmethod
+    def absolute_credential_profile(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        expanded = value.expanduser()
+        if not expanded.is_absolute():
+            raise ValueError("browser.credential_profile_path must be absolute")
+        return expanded.resolve()
 
 
 class CollectorConfig(StrictModel):

@@ -491,8 +491,8 @@ def manifest_run(
                 try:
                     if not workitem_id:
                         raise RuntimeError("OA item identifier unavailable")
-                    capture = detail_adapter.capture(
-                        workitem_id, max_depth=10,
+                    capture = detail_adapter.capture_direct(
+                        browser.base_url, workitem_id, max_depth=10,
                         total_timeout_seconds=settings.collector.attachment_total_timeout_seconds,
                         download_timeout_seconds=settings.collector.download_timeout_seconds,
                     )
