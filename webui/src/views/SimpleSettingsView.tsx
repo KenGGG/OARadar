@@ -97,18 +97,25 @@ export function SimpleSettingsView({ initial }: {
   const toggle = (group: "summary_model" | "feishu" | "data_cleanup" | "markdown", key: string, value: boolean | string | number) =>
     setForm(f => ({ ...f, [group]: { ...(f[group] as Record<string, unknown>), [key]: value } }))
 
-  return <section className="settings-stack">
-    <div className="settings-panel"><h2><Bell size={18}/>待办监控与飞书</h2>
-      <div className="settings-sub"><h3>扫描计划</h3>
+  return <section className="settings-stack settings-page">
+    <header className="settings-page-header">
+      <div><h2>系统设置</h2><p>调整本地处理与通知规则；修改后统一保存。</p></div>
+      <button className="button-primary" onClick={() => void save()} disabled={saving}><Save size={16}/>{saving ? "保存中" : "保存设置"}</button>
+    </header>
+    {message && <div className="settings-message settings-page-message">{message}</div>}
+
+    <div className="settings-layout">
+    <div className="settings-panel settings-panel-monitor"><header className="settings-panel-header"><span><Bell size={18}/></span><div><h2>待办监控与飞书</h2><p>控制待办扫描、摘要与通知。</p></div></header>
+      <div className="settings-sub settings-sub-card"><h3>扫描计划</h3>
         <Toggle label="启用待办监控（飞书）" checked={form.feishu.enabled} change={v => toggle("feishu", "enabled", v)}/>
         <Toggle label="启用智能摘要" checked={form.summary_model.enabled} change={v => toggle("summary_model", "enabled", v)}/>
       </div>
-      <div className="settings-sub"><h3>摘要模型</h3>
+      <div className="settings-sub settings-sub-card"><h3>摘要模型</h3>
         <div className="field-pair">
           <Field label="API 地址" value={form.summary_model.ollama_base_url} change={v => toggle("summary_model", "ollama_base_url", v)}/>
           <Field label="模型" value={form.summary_model.ollama_model} change={v => toggle("summary_model", "ollama_model", v)}/>
         </div>
-        <div className="field-pair">
+        <div className="field-pair field-pair-4">
           <NumberField label="超时（秒）" value={form.summary_model.timeout_seconds} change={v => toggle("summary_model", "timeout_seconds", v)}/>
           <NumberField label="最大输出" value={form.summary_model.max_tokens} change={v => toggle("summary_model", "max_tokens", v)}/>
           <NumberField label="温度" value={form.summary_model.temperature} step="0.1" change={v => toggle("summary_model", "temperature", v)}/>
@@ -117,14 +124,14 @@ export function SimpleSettingsView({ initial }: {
         <SecretState label={form.feishu.webhook_env || "FEISHU_WEBHOOK"} configured={!!form.feishu.webhook_configured}/>
         <SecretState label={form.feishu.secret_env || "FEISHU_SECRET"} configured={!!form.feishu.secret_configured}/>
       </div>
-      <div className="settings-sub"><h3>飞书通知</h3>
+      <div className="settings-sub settings-sub-card"><h3>飞书通知</h3>
         <div className="field-pair">
           <NumberField label="单次最大事项数" value={form.feishu.max_items_per_section} change={v => toggle("feishu", "max_items_per_section", v)}/>
           <NumberField label="重试次数" value={form.feishu.retry_attempts} change={v => toggle("feishu", "retry_attempts", v)}/>
         </div>
         <Toggle label="通知内容脱敏" checked={form.feishu.redact_confidential} change={v => toggle("feishu", "redact_confidential", v)}/>
       </div>
-      <div className="settings-sub"><h3>数据清理</h3>
+      <div className="settings-sub settings-sub-card"><h3>数据清理</h3>
         <Toggle label="飞书成功后自动清理" checked={form.data_cleanup.auto_cleanup_after_success} change={v => toggle("data_cleanup", "auto_cleanup_after_success", v)}/>
         <div className="field-pair">
           <NumberField label="清理延迟（小时）" value={form.data_cleanup.cleanup_delay_hours} change={v => toggle("data_cleanup", "cleanup_delay_hours", v)}/>
@@ -136,14 +143,14 @@ export function SimpleSettingsView({ initial }: {
       </div>
     </div>
 
-    <div className="settings-panel"><h2><Archive size={18}/>已办归档</h2>
-      <div className="detail-grid">
+    <div className="settings-panel settings-panel-archive"><header className="settings-panel-header"><span><Archive size={18}/></span><div><h2>已办归档</h2><p>附件保留规则与标题排除关键词。</p></div></header>
+      <div className="detail-grid settings-status-grid">
         <div className="info"><span>已办监控</span><strong>{initial.done_archive.enabled ? "已启用" : "未启用"}</strong></div>
         <div className="info"><span>永久归档根目录</span><strong>{initial.done_archive.archive_dir}</strong></div>
         <div className="info"><span>计算 SHA256</span><strong>{initial.done_archive.compute_sha256 ? "是" : "否"}</strong></div>
         <div className="info"><span>压缩包展开深度</span><strong>{String(initial.done_archive.max_attachment_depth)}</strong></div>
       </div>
-      <div className="settings-sub"><h3>标题排除关键词</h3>
+      <div className="settings-sub settings-sub-card policy-manager"><h3>标题排除关键词</h3>
         <p className="settings-help">命中关键词的已办事项不会进入详情页，也不会下载附件。每行一个关键词。</p>
         <textarea className="settings-textarea" value={titleKeywords} onChange={e => setTitleKeywords(e.target.value)} placeholder="例如：会议通知" />
         <div className="policy-actions"><button className="button-primary" onClick={() => void saveTitleKeywords()} disabled={saving || !titleKeywords.trim()}><Save size={16}/>保存关键词</button></div>
@@ -159,17 +166,19 @@ export function SimpleSettingsView({ initial }: {
       </div>
     </div>
 
-    <div className="settings-panel"><h2><BookOpen size={18}/>Source Markdown 生成</h2>
-      <Toggle label="启用 Source Markdown 生成" checked={form.markdown.enabled} change={v => toggle("markdown", "enabled", v)}/>
-      <Field label="中间输出目录" value={String(form.markdown.source_markdown_dir ?? "")} change={v => toggle("markdown", "source_markdown_dir", v)}/>
-      <Field label="Workspace 根目录" value={String(form.markdown.workspace_root ?? "")} change={v => toggle("markdown", "workspace_root", v)}/>
-      <Toggle label="保持来源目录结构" checked={!!form.markdown.preserve_source_tree} change={v => toggle("markdown", "preserve_source_tree", v)}/>
-      <Toggle label="写入 YAML frontmatter" checked={!!form.markdown.write_frontmatter} change={v => toggle("markdown", "write_frontmatter", v)}/>
-      <Toggle label="原子发布" checked={!!form.markdown.atomic_publish} change={v => toggle("markdown", "atomic_publish", v)}/>
+    <div className="settings-panel"><header className="settings-panel-header"><span><BookOpen size={18}/></span><div><h2>Source Markdown 生成</h2><p>原件转换与发布目录设置。</p></div></header>
+      <div className="settings-sub settings-sub-card">
+        <Toggle label="启用 Source Markdown 生成" checked={form.markdown.enabled} change={v => toggle("markdown", "enabled", v)}/>
+        <Field label="中间输出目录" value={String(form.markdown.source_markdown_dir ?? "")} change={v => toggle("markdown", "source_markdown_dir", v)}/>
+        <Field label="Workspace 根目录" value={String(form.markdown.workspace_root ?? "")} change={v => toggle("markdown", "workspace_root", v)}/>
+        <Toggle label="保持来源目录结构" checked={!!form.markdown.preserve_source_tree} change={v => toggle("markdown", "preserve_source_tree", v)}/>
+        <Toggle label="写入 YAML frontmatter" checked={!!form.markdown.write_frontmatter} change={v => toggle("markdown", "write_frontmatter", v)}/>
+        <Toggle label="原子发布" checked={!!form.markdown.atomic_publish} change={v => toggle("markdown", "atomic_publish", v)}/>
+      </div>
     </div>
 
-    <div className="settings-panel"><h2><BrainCircuit size={18}/>知识归档发布</h2>
-      <div className="detail-grid">
+    <div className="settings-panel"><header className="settings-panel-header"><span><BrainCircuit size={18}/></span><div><h2>知识归档发布</h2><p>当前工作区与发布能力状态。</p></div></header>
+      <div className="detail-grid settings-status-grid">
         <div className="info"><span>知识工作区根目录</span><strong>{initial.llm_wiki.workspace_root}</strong></div>
         <div className="info"><span>Source Markdown 目录</span><strong>{initial.llm_wiki.source_dir}</strong></div>
         <div className="info"><span>发布目录存在</span><strong>{initial.llm_wiki.source_dir_exists ? "是" : "否"}</strong></div>
@@ -178,10 +187,11 @@ export function SimpleSettingsView({ initial }: {
         <div className="info"><span>原子发布</span><strong>{initial.llm_wiki.atomic_publish ? "是" : "否"}</strong></div>
       </div>
     </div>
+    </div>
 
-    <div className="settings-head">
+    <div className="settings-page-footer">
+      <span>修改后的可编辑项会在保存后生效。</span>
       <button className="button-primary" onClick={() => void save()} disabled={saving}><Save size={16}/>{saving ? "保存中" : "保存设置"}</button>
     </div>
-    {message && <div className="settings-message">{message}</div>}
   </section>
 }
