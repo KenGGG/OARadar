@@ -19,19 +19,19 @@ from oa_knowledge.archive_paths import (
 
 def test_done_archive_directory_uses_unified_prefix_and_initiation_month() -> None:
     rel = done_archive_directory("事项", "42", datetime(2022, 4, 22, 9, 0))
-    assert rel.parts[:3] == ARCHIVE_PREFIX.parts
-    assert rel.parts[3] == "done"
-    assert rel.parts[4:6] == ("2022", "04")  # initiation month is split into two segments
-    assert rel.as_posix() == "archive/raw/oa/done/2022/04/事项_42"
+    assert rel.parts[:1] == ARCHIVE_PREFIX.parts
+    assert rel.parts[1] == "done"
+    assert rel.parts[2:4] == ("2022", "04")
+    assert rel.as_posix() == "originals/done/2022/04/事项_42"
 
 
 def test_done_archive_directory_falls_back_to_unknown_period() -> None:
-    assert done_archive_directory("事项", "42", None).as_posix() == "archive/raw/oa/done/unknown/事项_42"
+    assert done_archive_directory("事项", "42", None).as_posix() == "originals/done/unknown/事项_42"
 
 
 def test_pending_archive_directory_uses_unified_prefix() -> None:
     rel = pending_archive_directory(7, 99)
-    assert rel.as_posix() == "archive/raw/oa/pending/7/99"
+    assert rel.as_posix() == "originals/pending/7/99"
 
 
 @pytest.mark.parametrize(
@@ -51,11 +51,11 @@ def test_is_legacy_archive_path(rel: PurePosixPath, expected: bool) -> None:
 @pytest.mark.parametrize(
     "rel,expected",
     [
-        (PurePosixPath("archive/raw/oa/done/2022/04/x"), True),
-        (PurePosixPath("archive/raw/oa/pending/7/99"), True),
+        (PurePosixPath("originals/done/2022/04/x"), True),
+        (PurePosixPath("originals/pending/7/99"), True),
         # Full-prefix validation: a bare archive/raw prefix is NOT "correct".
         (PurePosixPath("archive/raw/done/x"), False),
-        (PurePosixPath("archive/raw/oa/other/x"), False),
+        (PurePosixPath("originals/other/x"), False),
         (PurePosixPath("raw/done/2022/04/x"), False),
     ],
 )

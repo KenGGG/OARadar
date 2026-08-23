@@ -137,15 +137,14 @@ def test_detail_archive_is_relative_hashed_and_idempotent(tmp_path: Path) -> Non
         item = session.get(BatchItem, item_id)
         manifest = archive_collaboration_detail(session, item, capture, tmp_path)
         session.commit()
-        assert item.archive_manifest_relpath and not item.archive_manifest_relpath.startswith("/")
-        assert (tmp_path / item.archive_manifest_relpath).is_file()
-        assert sum(len(container.files) for container in manifest.containers) == 3
+        assert item.archive_manifest_relpath is None
+        assert sum(len(container.files) for container in manifest.containers) == 0
 
     with Session(engine) as session:
         item = session.get(BatchItem, item_id)
         archive_collaboration_detail(session, item, capture, tmp_path)
         assert session.scalar(select(func.count()).select_from(OAItem)) == 1
-        assert session.scalar(select(func.count()).select_from(ArchivedFile)) == 3
+        assert session.scalar(select(func.count()).select_from(ArchivedFile)) == 0
 
 
 def test_successful_empty_capture_removes_stale_failed_attachment(tmp_path: Path) -> None:
@@ -307,8 +306,8 @@ def test_successful_retry_replaces_failed_attachment_with_same_name(tmp_path: Pa
 
 
 def test_done_archive_directory_uses_initiation_month_and_never_completion_time() -> None:
-    assert done_archive_directory("事项", "42", datetime(2022, 4, 22, 9, 0)).as_posix() == "archive/raw/oa/done/2022/04/事项_42"
-    assert done_archive_directory("事项", "42", None).as_posix() == "archive/raw/oa/done/unknown/事项_42"
+    assert done_archive_directory("事项", "42", datetime(2022, 4, 22, 9, 0)).as_posix() == "originals/done/2022/04/事项_42"
+    assert done_archive_directory("事项", "42", None).as_posix() == "originals/done/unknown/事项_42"
 
 
 def test_successful_archive_does_not_enqueue_legacy_markdown_task(tmp_path: Path) -> None:

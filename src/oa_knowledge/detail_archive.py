@@ -36,25 +36,8 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     directory = done_archive_directory(item.title, item.workitem_id_text, oa_item.initiated_at)
     files: list[FileManifest] = []
     root_container_key = f"{capture.page_family}:{item.workitem_id_text}"
-    metadata = {
-        "oa_item_key": item.oa_item_key,
-        "workitem_id_text": item.workitem_id_text,
-        "title": item.title,
-        "sender": item.sender,
-        "created_at": item.created_at.isoformat() if item.created_at else None,
-        "completed_at": item.completed_at.isoformat() if item.completed_at else None,
-        "category": item.category,
-        "detail_url": capture.detail_url,
-        "page_family": capture.page_family,
-        "capture_issues": list(capture.capture_issues),
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-    }
-    metadata_path = _write(data_root, directory / "metadata.json", json.dumps(metadata, ensure_ascii=False, indent=2).encode(), oa_item, FileRole.METADATA_SNAPSHOT, "metadata", root_container_key)
-    files.append(metadata_path)
-    for role, snapshots in ((FileRole.BODY_SNAPSHOT, capture.body), (FileRole.WORKFLOW_SNAPSHOT, capture.workflow)):
-        for index, snapshot in enumerate(snapshots):
-            relpath = directory / role / safe_filename(snapshot.name)
-            files.append(_write(data_root, relpath, snapshot.html.encode("utf-8"), oa_item, role, f"{role}:{index}", root_container_key))
+    # Detail metadata and page snapshots are process evidence.  Keeping them
+    # in data would violate the two-tree data contract (originals + markdown).
     for attachment in capture.attachments:
         files.append(_write_attachment(data_root, directory / "attachments" / _attachment_relname(attachment), oa_item, attachment, root_container_key))
 
@@ -67,12 +50,6 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     )]
     for related in capture.related_containers:
         related_files: list[FileManifest] = []
-        for index, snapshot in enumerate(related.snapshots):
-            relpath = directory / "containers" / safe_filename(related.container_key) / safe_filename(snapshot.name)
-            related_files.append(_write(
-                data_root, relpath, snapshot.html.encode("utf-8"), oa_item,
-                FileRole.BODY_SNAPSHOT, f"{related.container_key}:snapshot:{index}", related.container_key, related.depth,
-            ))
         for attachment in related.attachments:
             relpath = directory / "containers" / safe_filename(related.container_key) / "files" / _attachment_relname(attachment)
             related_files.append(_write_attachment(data_root, relpath, oa_item, attachment, related.container_key, related.depth))
@@ -96,8 +73,6 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
         captured_at=datetime.now(timezone.utc),
         containers=containers,
     )
-    manifest_relpath = directory / "manifest.json"
-    atomic_write_bytes(manifest.model_dump_json(indent=2).encode("utf-8"), data_root, manifest_relpath)
     oa_item.archive_relpath = directory.as_posix()
     attachment_files = [
         file for container in manifest.containers for file in container.files
@@ -116,7 +91,7 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     oa_item.pipeline_status = PipelineStatus.FILES_VERIFIED if all_verified and not manifest.depth_limit_reached else PipelineStatus.RAW_SAVED
     item.oa_item_id = oa_item.id
     item.detail_url = capture.detail_url
-    item.archive_manifest_relpath = manifest_relpath.as_posix()
+    item.archive_manifest_relpath = None
     if manifest.depth_limit_reached:
         item.archive_status = "depth_limit_reached"
     elif all_verified:

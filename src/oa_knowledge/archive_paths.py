@@ -14,8 +14,9 @@ from pathlib import PurePosixPath
 
 from oa_knowledge.archive.naming import safe_filename
 
-# Canonical unified prefix for every OA raw artifact.
-ARCHIVE_PREFIX = PurePosixPath("archive", "raw", "oa")
+# Canonical root for immutable OA downloads.  All other acquisition evidence
+# belongs in the runtime database/cache, never in ``data``.
+ARCHIVE_PREFIX = PurePosixPath("originals")
 
 DONE_SEGMENT = "done"
 PENDING_SEGMENT = "pending"
@@ -28,12 +29,12 @@ def _period(initiated_at: datetime | None) -> str:
 def done_archive_directory(
     title: str, workitem_id_text: str, initiated_at: datetime | None
 ) -> PurePosixPath:
-    """Canonical ``archive/raw/oa/done/YYYY/MM/<title>_<workitem>`` directory."""
+    """Canonical ``originals/done/YYYY/MM/<title>_<workitem>`` directory."""
     return ARCHIVE_PREFIX / DONE_SEGMENT / _period(initiated_at) / f"{safe_filename(title, 100)}_{workitem_id_text}"
 
 
 def pending_archive_directory(logical_item_id: int | str, snapshot_id: int | str) -> PurePosixPath:
-    """Canonical ``archive/raw/oa/pending/<logical_item_id>/<snapshot_id>`` directory."""
+    """Canonical ``originals/pending/<logical_item_id>/<snapshot_id>`` directory."""
     return ARCHIVE_PREFIX / PENDING_SEGMENT / str(logical_item_id) / str(snapshot_id)
 
 
@@ -51,9 +52,9 @@ def is_current_archive_path(rel: PurePosixPath) -> bool:
     """
     parts = rel.parts
     return (
-        len(parts) >= 4
-        and parts[:3] == ARCHIVE_PREFIX.parts
-        and parts[3] in (DONE_SEGMENT, PENDING_SEGMENT)
+        len(parts) >= 2
+        and parts[:1] == ARCHIVE_PREFIX.parts
+        and parts[1] in (DONE_SEGMENT, PENDING_SEGMENT)
     )
 
 
