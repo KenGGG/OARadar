@@ -146,6 +146,51 @@ def test_done_archives_keeps_online_oa_page_and_row_order_and_exposes_initiator_
     assert payload["items"][0]["initiated_at"] == "2026-08-01T10:00:00"
 
 
+def test_done_archives_counts_files_present_in_originals_directory(config_file: Path) -> None:
+    """The displayed attachment count must match the files a user sees in originals."""
+    client = _client(config_file)
+    settings = load_settings(config_file)
+    archive_relpath = "originals/2026/08/2026-08-23_合成事项"
+    archive_dir = settings.data_root / archive_relpath
+    archive_dir.mkdir(parents=True)
+    for name in ("附件甲.pdf", "正文乙.docx", "附件丙.xlsx"):
+        (archive_dir / name).write_bytes(b"synthetic")
+
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="oa:actual-files", source_channel="done", title="合成事项",
+            pipeline_status="downloaded", archive_relpath=archive_relpath,
+        )
+        session.add(item)
+        session.flush()
+        session.add_all([
+            ArchivedFile(
+                oa_item_id=item.id, original_name="附件甲.pdf", attachment_key="one",
+                file_role="direct_attachment", source_container_key="synthetic",
+                local_relpath=f"{archive_relpath}/附件甲.pdf", download_status="verified",
+            ),
+            ArchivedFile(
+                oa_item_id=item.id, original_name="正文乙.docx", attachment_key="two",
+                file_role="official_body", source_container_key="synthetic",
+                local_relpath=f"{archive_relpath}/正文乙.docx", download_status="verified",
+            ),
+        ])
+        session.add(OAManifestItem(
+            oa_item_key="oa:actual-files", title="合成事项", list_page=1,
+            processing_status="downloaded", archive_relpath=archive_relpath,
+        ))
+        session.add(OAManifestItem(
+            oa_item_key="oa:actual-files-duplicate", title="合成事项重复记录", list_page=1,
+            list_ordinal=2, processing_status="downloaded", archive_relpath=archive_relpath,
+        ))
+        session.commit()
+
+    payload = client.get("/api/done-archives?page=1&page_size=50").json()
+    assert payload["items"][0]["file_count"] == 3
+    assert payload["metrics"]["verified_attachments"] == 3
+
+
 def test_done_archives_filters_by_simple_status_server_side(config_file: Path) -> None:
     client = _client(config_file)
     settings = load_settings(config_file)

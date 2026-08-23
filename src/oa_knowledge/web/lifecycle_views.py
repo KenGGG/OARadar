@@ -9,6 +9,7 @@ from urllib.request import urlopen
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
+from oa_knowledge.archive_paths import count_original_files
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
@@ -198,15 +199,15 @@ def done_list(
                 .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key)
                 .where(OAManifestItem.processing_status == "downloaded")
             ) or 0
-            verified_attachments = session.scalar(
-                select(func.count(ArchivedFile.id)).select_from(ArchivedFile)
-                .join(OAItem, OAItem.id == ArchivedFile.oa_item_id)
-                .where(
-                    OAItem.source_channel == "done",
-                    ArchivedFile.download_status == "verified",
-                    ArchivedFile.file_role.in_(("direct_attachment", "official_attachment", "opinion_attachment")),
-                )
-            ) or 0
+            archive_paths = session.execute(
+                select(OAManifestItem.archive_relpath, OAItem.archive_relpath)
+                .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key, isouter=True)
+            ).all()
+            verified_attachments = sum(
+                count_original_files(settings.data_root, archive_path)
+                for archive_path in {manifest_path or item_path for manifest_path, item_path in archive_paths}
+                if archive_path
+            )
             rows = session.scalars(statement.order_by(
                 OAManifestItem.list_page, OAManifestItem.list_ordinal, OAManifestItem.id,
             ).offset((page - 1) * page_size).limit(page_size)).all()
@@ -219,12 +220,9 @@ def done_list(
                     "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                     "pipeline_status": row.processing_status,
                     "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
-                    "file_count": sum(
-                        file.download_status == "verified" and file.file_role in {
-                            "direct_attachment", "official_attachment", "opinion_attachment",
-                        }
-                        for file in archived.files
-                    ) if archived else None,
+                    "file_count": count_original_files(
+                        settings.data_root, row.archive_relpath or (archived.archive_relpath if archived else None),
+                    ) if archived or row.archive_relpath else None,
                 })
             return {
                 "items": items,

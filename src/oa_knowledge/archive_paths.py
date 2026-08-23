@@ -8,7 +8,7 @@ process evidence remains in the state/cache roots.
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from oa_knowledge.archive.naming import safe_filename
 
@@ -53,6 +53,24 @@ def is_current_archive_path(rel: PurePosixPath) -> bool:
     """True for the current ``originals/`` archive layout."""
     parts = rel.parts
     return len(parts) >= 2 and parts[:1] == ARCHIVE_PREFIX.parts
+
+
+def count_original_files(data_root: Path, archive_relpath: str | None) -> int:
+    """Count files actually present in one current originals directory safely."""
+    if not archive_relpath:
+        return 0
+    relpath = PurePosixPath(archive_relpath)
+    if not is_current_archive_path(relpath):
+        return 0
+    data_root_resolved = data_root.resolve()
+    archive_dir = (data_root / Path(*relpath.parts)).resolve()
+    try:
+        archive_dir.relative_to(data_root_resolved)
+    except ValueError:
+        return 0
+    if not archive_dir.is_dir():
+        return 0
+    return sum(path.is_file() for path in archive_dir.rglob("*"))
 
 
 def replace_archive_prefix(value: str | None, old: str, new: str) -> str | None:

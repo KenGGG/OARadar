@@ -16,6 +16,7 @@ import yaml
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from oa_knowledge.archive_paths import count_original_files
 from oa_knowledge.config import Settings, load_settings, validate_feishu_runtime_config
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
@@ -558,16 +559,10 @@ def done_archives_list(
                     .offset((page - 1) * page_size).limit(page_size)
                 ).all()
                 items = []
-                verified_roles = {"direct_attachment", "official_attachment", "opinion_attachment"}
                 for row in rows:
                     archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == row.oa_item_key))
-                    file_count = (
-                        sum(
-                            f.download_status == "verified" and f.file_role in verified_roles
-                            for f in archived.files
-                        )
-                        if archived else None
-                    )
+                    archive_relpath = row.archive_relpath or (archived.archive_relpath if archived else None)
+                    file_count = count_original_files(settings.data_root, archive_relpath) if archive_relpath else None
                     simple = _enrich_done_item(session, settings, row, archived, None, None)
                     if simple is None:
                         continue
@@ -591,7 +586,7 @@ def done_archives_list(
                     "total": total,
                     "page": page,
                     "page_size": page_size,
-                    "metrics": _done_list_metrics(session),
+                    "metrics": _done_list_metrics(settings, session),
                     "lifecycle_pilot_status": "validated" if total else "waiting_for_user_completion",
                 }
 
@@ -633,22 +628,22 @@ def done_archives_list(
         engine.dispose()
 
 
-def _done_list_metrics(session: Session) -> dict:
+def _done_list_metrics(settings: Settings, session: Session) -> dict:
     oa_done_total = _counts(session, OAManifestItem)
     downloaded_items = session.scalar(
         select(func.count(func.distinct(OAManifestItem.id))).select_from(OAManifestItem)
         .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key)
         .where(OAManifestItem.processing_status == "downloaded")
     ) or 0
-    verified_attachments = session.scalar(
-        select(func.count(ArchivedFile.id)).select_from(ArchivedFile)
-        .join(OAItem, OAItem.id == ArchivedFile.oa_item_id)
-        .where(
-            OAItem.source_channel == "done",
-            ArchivedFile.download_status == "verified",
-            ArchivedFile.file_role.in_(("direct_attachment", "official_attachment", "opinion_attachment")),
-        )
-    ) or 0
+    archive_paths = session.execute(
+        select(OAManifestItem.archive_relpath, OAItem.archive_relpath)
+        .join(OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key, isouter=True)
+    ).all()
+    verified_attachments = sum(
+        count_original_files(settings.data_root, archive_path)
+        for archive_path in {manifest_path or item_path for manifest_path, item_path in archive_paths}
+        if archive_path
+    )
     return {
         "oa_done_total": oa_done_total,
         "downloaded_items": downloaded_items,
