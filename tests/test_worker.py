@@ -62,6 +62,45 @@ def test_oa_login_writes_a_live_logging_in_status_before_browser_access(config_f
         worker.close()
 
 
+def test_full_manifest_job_runs_list_and_download_pipeline(config_file: Path, monkeypatch) -> None:
+    """A full-manifest Web job must not use the download-only, gated command."""
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        job = OperationJob(
+            job_key="full-manifest-test", job_type="full_manifest", status="queued",
+            idempotency_key="full-manifest-test", parameters_json="{}",
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    commands: list[list[str]] = []
+
+    def complete_pipeline(command, _cwd, heartbeat, poll_interval=5.0):
+        commands.append(command)
+        heartbeat()
+        return 0, json.dumps({"oa_total_count": 3, "manifest_status": "manifest_complete"}), ""
+
+    monkeypatch.setattr("oa_knowledge.web.worker._run_piped", complete_pipeline)
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        worker._execute_full_manifest(job_id)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        job = session.get(OperationJob, job_id)
+        assert job is not None
+        assert job.status == "completed"
+        assert job.progress_total == 3
+    assert commands == [[
+        __import__("sys").executable, "-m", "oa_knowledge.cli", "manifest", "run",
+        "--config", str(config_file),
+    ]]
+
+
 def test_long_pipeline_stage_refreshes_its_database_lease(config_file: Path, monkeypatch) -> None:
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)

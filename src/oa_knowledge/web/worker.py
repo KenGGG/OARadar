@@ -1321,7 +1321,7 @@ class OperationWorker:
             job.progress_total = 0
             self._event(session, job, "manifest_started", "running", {})
             session.commit()
-        command = [sys.executable, "-m", "oa_knowledge.cli", "manifest", "download", "--max-items", "10000"]
+        command = [sys.executable, "-m", "oa_knowledge.cli", "manifest", "run"]
         if self.config_path is not None:
             command.extend(("--config", str(self.config_path)))
 
