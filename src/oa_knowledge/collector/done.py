@@ -230,6 +230,22 @@ class DoneAdapter:
             pass
         return self.search_for_item(title, workitem_id_text)
 
+    def detail_link_for_item(self, workitem_id_text: str) -> str | None:
+        """Return the OA-provided detail URL even when the subject column is hidden."""
+        frame = self._done_frame() or self.open_list()
+        value = frame.evaluate(
+            """workitemId => {
+                const table = document.querySelector('#moreList');
+                if (!table || !window.jQuery) return null;
+                const rows = window.jQuery(table).ajaxgrid()?.p?.datas?.rows;
+                if (!Array.isArray(rows)) return null;
+                const row = rows.find(item => String(item.id) === String(workitemId));
+                return typeof row?.link === 'string' && row.link.trim() ? row.link.trim() : null;
+            }""",
+            workitem_id_text,
+        )
+        return str(value) if value else None
+
     def search_for_item(self, title: str, workitem_id_text: str) -> str:
         frame = self.open_list()
         variants = [title]

@@ -133,6 +133,25 @@ def test_done_adapter_searches_title_and_verifies_workitem_id() -> None:
     assert located_id == "target-1"
 
 
+def test_done_adapter_returns_oa_structured_detail_link_for_hidden_columns() -> None:
+    html = """
+    <table id='moreList'><tbody><tr><td><input name='workitemId' value='target-1'></td></tr></tbody></table>
+    <script>
+      window.jQuery = node => ({ajaxgrid: () => ({p: {datas: {rows: [{
+        id: 'target-1', subject: 'Synthetic', link: '/govdoc/govdoc.do?method=summary&affairId=target-1'
+      }]}}})});
+    </script>
+    """
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path="/usr/bin/google-chrome", headless=True)
+        page = browser.new_page(); page.set_content(html)
+        adapter = DoneAdapter(page); adapter._done_frame = lambda: page.main_frame
+        link = adapter.detail_link_for_item("target-1")
+        browser.close()
+
+    assert link == "/govdoc/govdoc.do?method=summary&affairId=target-1"
+
+
 def test_navigation_uses_actual_page_number_after_list_reopens() -> None:
     html = """
     <input id='x_page_number' value='1'>

@@ -58,6 +58,7 @@ class DetailCapture:
     attachments: tuple[DirectAttachment, ...]
     related_containers: tuple[RelatedContainerCapture, ...] = ()
     capture_issues: tuple[dict[str, object], ...] = ()
+    no_attachment_confirmed: bool = False
 
 
 class AuthRequiredError(RuntimeError):
@@ -81,6 +82,7 @@ class CollaborationDetailAdapter:
         self.inventory_only = inventory_only
         self._capture_issues: list[dict[str, object]] = []
         self._last_download_failure: str | None = None
+        self._last_attachment_inventory_confirmed_empty = False
 
     def _capture_timed_out(self, deadline: float | None, stage: str) -> bool:
         if deadline is None or monotonic() < deadline:
@@ -178,6 +180,7 @@ class CollaborationDetailAdapter:
             body = self._snapshots(detail, "body")
             default_role = "official_attachment" if "/govdoc/govdoc.do" in path else "direct_attachment"
             attachments = self._download_files(detail, default_role, capture_deadline, download_timeout_seconds)
+            no_attachment_confirmed = self._last_attachment_inventory_confirmed_empty
             if "/collaboration/collaboration.do" in path:
                 family = "collaboration"
                 root_key = f"collaboration:{workitem_id_text}"
@@ -216,6 +219,9 @@ class CollaborationDetailAdapter:
                 workflow = ()
             else:
                 raise ValueError(f"unsupported detail page family: {path}")
+            if family in {"collaboration", "govdoc", "meeting"} and not attachments and not no_attachment_confirmed:
+                reason = "OA detail page is blank" if not body else "OA attachment inventory is unavailable"
+                raise LookupError(reason)
             return DetailCapture(
                 detail_url=detail.url,
                 page_family=family,
@@ -224,6 +230,7 @@ class CollaborationDetailAdapter:
                 attachments=attachments,
                 related_containers=tuple(related),
                 capture_issues=tuple(self._capture_issues),
+                no_attachment_confirmed=no_attachment_confirmed,
             )
         finally:
             detail.close()
@@ -469,6 +476,7 @@ class CollaborationDetailAdapter:
         return result
 
     def _download_files(self, page: Page, default_role: str, deadline: float | None = None, download_timeout_seconds: int = 60) -> tuple[DirectAttachment, ...]:
+        self._last_attachment_inventory_confirmed_empty = False
         files: list[DirectAttachment] = []
         seen: set[str] = set()
         for frame in page.frames:
@@ -587,7 +595,146 @@ class CollaborationDetailAdapter:
             and not self._capture_timed_out(deadline, "attachments")
         ):
             files.extend(self._download_cap4_batches(page, default_role, seen, deadline, download_timeout_seconds))
+        if not self._capture_timed_out(deadline, "attachments"):
+            panel_files, confirmed_empty = self._download_attachment_panel(
+                page, default_role, seen, deadline, download_timeout_seconds,
+            )
+            files.extend(panel_files)
+            self._last_attachment_inventory_confirmed_empty = confirmed_empty
         return tuple(files)
+
+    @staticmethod
+    def _find_attachment_descriptor(onclick: str) -> tuple[str, str] | None:
+        """Parse OA's legacy findAttachment(key, date, name, ext, hash) call."""
+        match = re.search(r"\bfindAttachment\s*\((.*?)\)", onclick, re.DOTALL)
+        if not match:
+            return None
+        source = match.group(1)
+        values: list[str] = []
+        index = 0
+        while index < len(source):
+            while index < len(source) and (source[index].isspace() or source[index] == ","):
+                index += 1
+            if index >= len(source) or source[index] not in {"'", '"'}:
+                return None
+            quote = source[index]
+            index += 1
+            value: list[str] = []
+            while index < len(source):
+                char = source[index]
+                if char == "\\" and index + 1 < len(source):
+                    value.append(source[index + 1])
+                    index += 2
+                    continue
+                if char == quote:
+                    index += 1
+                    break
+                value.append(char)
+                index += 1
+            else:
+                return None
+            values.append("".join(value))
+        if len(values) < 4:
+            return None
+        key = values[0].strip() or (values[4].strip() if len(values) > 4 else "")
+        name = values[2].strip()
+        extension = values[3].strip().lstrip(".")
+        if not key or not name:
+            return None
+        filename = name if not extension or name.lower().endswith(f".{extension.lower()}") else f"{name}.{extension}"
+        return key, filename
+
+    def _download_attachment_panel(
+        self,
+        page: Page,
+        default_role: str,
+        seen: set[str],
+        deadline: float | None,
+        download_timeout_seconds: int,
+    ) -> tuple[list[DirectAttachment], bool]:
+        """Open the legacy paperclip panel and consume its findAttachment links."""
+        opener = None
+        for frame in page.frames:
+            try:
+                candidate = frame.locator("[title='查看附件列表']")
+                if candidate.count():
+                    opener = candidate.first
+                    break
+            except PlaywrightError:
+                continue
+        if opener is None:
+            return [], False
+        try:
+            opener.click(force=True)
+        except PlaywrightError:
+            return [], False
+
+        links_by_frame: list[tuple[object, object]] = []
+        confirmed_empty = False
+        for _ in range(20):
+            links_by_frame = []
+            confirmed_empty = False
+            for frame in page.frames:
+                try:
+                    links = frame.locator("a[onclick*='findAttachment(']")
+                    if links.count():
+                        links_by_frame.append((frame, links))
+                    empty = frame.get_by_text("无附件显示", exact=True)
+                    if empty.count() and empty.first.is_visible():
+                        confirmed_empty = True
+                except PlaywrightError:
+                    continue
+            if links_by_frame or confirmed_empty:
+                break
+            if self._capture_timed_out(deadline, "attachment_panel"):
+                break
+            page.wait_for_timeout(100)
+
+        files: list[DirectAttachment] = []
+        for _frame, links in links_by_frame:
+            for index in range(links.count()):
+                if self._capture_timed_out(deadline, "attachment_panel"):
+                    return files, False
+                link = links.nth(index)
+                try:
+                    descriptor = self._find_attachment_descriptor(link.get_attribute("onclick") or "")
+                except PlaywrightError:
+                    continue
+                if descriptor is None:
+                    continue
+                key, filename = descriptor
+                if key in seen:
+                    continue
+                seen.add(key)
+                if self.inventory_only:
+                    files.append(DirectAttachment(
+                        attachment_key=key, filename=filename, file_url=None,
+                        size_bytes=None, mime_type=None, file_role=default_role,
+                        content=None, download_status="discovered",
+                    ))
+                    continue
+                reused = self.attachment_resolver(key) if self.attachment_resolver is not None else None
+                if reused is not None:
+                    content, mime_type = reused
+                else:
+                    content = self._browser_download_payload(
+                        page, lambda target=link: target.click(force=True),
+                        download_timeout_seconds * 1000,
+                    )
+                    mime_type = None
+                status = "downloaded" if content is not None else "download_failed"
+                if content is None:
+                    self._capture_issues.append({
+                        "kind": "attachment_download_failed", "attachment_key": key,
+                        "error": self._last_download_failure or "attachment panel download failed",
+                    })
+                files.append(DirectAttachment(
+                    attachment_key=key, filename=filename, file_url=None,
+                    size_bytes=len(content) if content is not None else None,
+                    mime_type=mime_type, file_role=default_role, content=content,
+                    download_status=status,
+                ))
+        return files, confirmed_empty and not files
 
     def _download_cap4_widgets(
         self,

@@ -13,6 +13,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from uuid import uuid4
+from urllib.parse import urljoin
 
 import typer
 from sqlalchemy import func, select
@@ -57,6 +58,15 @@ batch_app = typer.Typer(help="Immutable historical collection batch planning")
 backfill_app = typer.Typer(help="Stage 2A-7 gated historical backfill")
 parse_app = typer.Typer(help="Stage 3 document parsing pipeline")
 manifest_app = typer.Typer(help="Canonical full Done-list synchronization and selective download")
+
+
+def _oa_detail_url(base_url: str, detail_link: str) -> str:
+    """Resolve OA links whose leading slash is relative to the /seeyon app."""
+    if detail_link.startswith("/seeyon/"):
+        return urljoin(f"{base_url.rstrip('/')}/", detail_link.lstrip("/"))
+    if detail_link.startswith("/"):
+        return f"{base_url.rstrip('/')}/seeyon{detail_link}"
+    return urljoin(f"{base_url.rstrip('/')}/seeyon/", detail_link)
 pending_app = typer.Typer(help="Read-only Pending-list discovery")
 archive_app = typer.Typer(help="Local archive path reconciliation and migration")
 app.add_typer(db_app, name="db")
@@ -492,19 +502,53 @@ def manifest_run(
                 try:
                     if not workitem_id:
                         raise RuntimeError("OA item identifier unavailable")
-                    capture = detail_adapter.capture_direct(
-                        browser.base_url, workitem_id, max_depth=10,
-                        total_timeout_seconds=settings.collector.attachment_total_timeout_seconds,
-                        download_timeout_seconds=settings.collector.download_timeout_seconds,
-                    )
+                    detail_link = list_adapter.detail_link_for_item(workitem_id)
+                    try:
+                        if detail_link:
+                            capture = detail_adapter.capture(
+                                workitem_id, max_depth=10,
+                                total_timeout_seconds=settings.collector.attachment_total_timeout_seconds,
+                                download_timeout_seconds=settings.collector.download_timeout_seconds,
+                                direct_url=_oa_detail_url(browser.base_url, detail_link),
+                            )
+                        else:
+                            capture = detail_adapter.capture_direct(
+                                browser.base_url, workitem_id, max_depth=10,
+                                total_timeout_seconds=settings.collector.attachment_total_timeout_seconds,
+                                download_timeout_seconds=settings.collector.download_timeout_seconds,
+                            )
+                    except AuthRequiredError:
+                        raise
+                    except Exception as direct_exc:
+                        try:
+                            detail_link = list_adapter.detail_link_for_item(workitem_id)
+                            capture = detail_adapter.capture(
+                                workitem_id, max_depth=10,
+                                total_timeout_seconds=settings.collector.attachment_total_timeout_seconds,
+                                download_timeout_seconds=settings.collector.download_timeout_seconds,
+                                direct_url=_oa_detail_url(browser.base_url, detail_link) if detail_link else None,
+                            )
+                        except Exception as fallback_exc:
+                            raise RuntimeError(
+                                f"direct detail failed: {_sanitize_operational_error(direct_exc)}; "
+                                f"list fallback failed: {_sanitize_operational_error(fallback_exc)}"
+                            ) from fallback_exc
                     with Session(engine) as session:
                         row = session.get(OAManifestItem, row_id); assert row is not None
                         proxy = archive_proxy(row); archive_collaboration_detail(session, proxy, capture, settings.data_root)
                         row.archive_relpath = session.scalar(select(OAItem.archive_relpath).where(OAItem.oa_item_key == row.oa_item_key))
                         attachments = list(capture.attachments) + [a for container in capture.related_containers for a in container.attachments]
                         if proxy.archive_status == "archived":
-                            row.processing_status = "downloaded" if attachments or _has_verified_attachment(session, row.oa_item_key) else "no_attachment"
-                            row.last_error = None; row.failure_stage = None
+                            if attachments or _has_verified_attachment(session, row.oa_item_key):
+                                row.processing_status = "downloaded"
+                                row.last_error = None; row.failure_stage = None
+                            elif capture.no_attachment_confirmed:
+                                row.processing_status = "no_attachment"
+                                row.last_error = None; row.failure_stage = None
+                            else:
+                                row.processing_status = "download_failed"; row.retry_count += 1
+                                row.last_error = "OA attachment inventory was not confirmed"
+                                row.failure_stage = "attachment_inventory"
                         else:
                             row.processing_status = "download_failed"; row.retry_count += 1
                             row.last_error = proxy.last_error or _attachment_failure_summary(capture); row.failure_stage = "attachment"
@@ -651,7 +695,7 @@ def manifest_download(
                 if attempted_ids:
                     query = query.where(OAManifestItem.id.not_in(attempted_ids))
                 row = session.scalar(query.order_by(
-                    OAManifestItem.retry_count.asc(), OAManifestItem.processing_status.desc(), OAManifestItem.completed_at.desc(), OAManifestItem.id.desc(),
+                    OAManifestItem.list_ordinal.asc(), OAManifestItem.id.asc(),
                 ).limit(1))
                 if row is None:
                     break
@@ -676,11 +720,25 @@ def manifest_download(
                 # configured total budget instead of shortening later retries.
                 item_total_timeout = settings.collector.attachment_total_timeout_seconds
                 try:
-                    capture = detail_adapter.capture_direct(
-                        browser.base_url, workitem_id, max_depth=10,
-                        total_timeout_seconds=item_total_timeout,
-                        download_timeout_seconds=settings.collector.download_timeout_seconds,
-                    )
+                    if target_page != current_page:
+                        list_adapter.navigate_to_page(
+                            target_page, settings.collector.list_page_delay_seconds,
+                        )
+                        current_page = target_page
+                    detail_link = list_adapter.detail_link_for_item(workitem_id)
+                    if detail_link:
+                        capture = detail_adapter.capture(
+                            workitem_id, max_depth=10,
+                            total_timeout_seconds=item_total_timeout,
+                            download_timeout_seconds=settings.collector.download_timeout_seconds,
+                            direct_url=_oa_detail_url(browser.base_url, detail_link),
+                        )
+                    else:
+                        capture = detail_adapter.capture_direct(
+                            browser.base_url, workitem_id, max_depth=10,
+                            total_timeout_seconds=item_total_timeout,
+                            download_timeout_seconds=settings.collector.download_timeout_seconds,
+                        )
                 except AuthRequiredError:
                     raise
                 except Exception as direct_exc:
@@ -690,10 +748,12 @@ def manifest_download(
                             settings.collector.list_page_delay_seconds,
                         )
                         current_page = target_page
+                        detail_link = list_adapter.detail_link_for_item(located_workitem_id)
                         capture = detail_adapter.capture(
                             located_workitem_id, max_depth=10,
                             total_timeout_seconds=item_total_timeout,
                             download_timeout_seconds=settings.collector.download_timeout_seconds,
+                            direct_url=_oa_detail_url(browser.base_url, detail_link) if detail_link else None,
                         )
                     except Exception as fallback_exc:
                         direct_error = _sanitize_operational_error(direct_exc)
@@ -710,8 +770,17 @@ def manifest_download(
                     row.archive_relpath = session.scalar(select(OAItem.archive_relpath).where(OAItem.oa_item_key == row.oa_item_key))
                     attachments = list(capture.attachments) + [a for container in capture.related_containers for a in container.attachments]
                     if proxy.archive_status == "archived":
-                        row.processing_status = "downloaded" if attachments or _has_verified_attachment(session, row.oa_item_key) else "no_attachment"
-                        row.last_error = None; row.failure_stage = None
+                        if attachments or _has_verified_attachment(session, row.oa_item_key):
+                            row.processing_status = "downloaded"
+                            row.last_error = None; row.failure_stage = None
+                        elif capture.no_attachment_confirmed:
+                            row.processing_status = "no_attachment"
+                            row.last_error = None; row.failure_stage = None
+                        else:
+                            row.processing_status = "download_failed"
+                            row.retry_count += 1
+                            row.last_error = "OA attachment inventory was not confirmed"
+                            row.failure_stage = "attachment_inventory"
                     else:
                         row.processing_status = "download_failed"
                         row.retry_count += 1

@@ -1175,9 +1175,10 @@ class OperationWorker:
         files are queued for Markdown export, and the task advances to
         ``attachment_inventory`` for parsing/knowledge extraction.
         """
-        from oa_knowledge.cli import verified_attachment_resolver
+        from oa_knowledge.cli import _oa_detail_url, verified_attachment_resolver
         from oa_knowledge.collector.browser import BrowserSession, LoginState
         from oa_knowledge.collector.detail import AuthRequiredError, CollaborationDetailAdapter
+        from oa_knowledge.collector.done import DoneAdapter
         from oa_knowledge.detail_archive import archive_collaboration_detail
         from oa_knowledge.full_manifest import archive_proxy
         from oa_knowledge.resources import ResourceCoordinator
@@ -1190,6 +1191,8 @@ class OperationWorker:
                 return
             workitem_id = manifest.workitem_id_text
             manifest_id = manifest.id
+            manifest_page = manifest.list_page
+            manifest_title = manifest.title
         if not workitem_id:
             self.production_queue.fail(task.id, self.owner, "WORKITEM_ID_MISSING", "no workitem id on manifest", recoverable=False)
             return
@@ -1219,6 +1222,32 @@ class OperationWorker:
                 except AuthRequiredError:
                     self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "auth required during detail capture", recoverable=True)
                     return
+                except Exception as direct_exc:
+                    try:
+                        done_adapter = DoneAdapter(
+                            browser.page,
+                            f"{browser.base_url}{self.settings.browser.done_list_path}",
+                        )
+                        done_adapter.open_list()
+                        located_id = done_adapter.locate_item(
+                            manifest_page, manifest_title, workitem_id,
+                            self.settings.collector.list_page_delay_seconds,
+                        )
+                        detail_link = done_adapter.detail_link_for_item(located_id)
+                        capture = detail_adapter.capture(
+                            located_id, max_depth=self.settings.collector.max_attachment_depth,
+                            total_timeout_seconds=self.settings.collector.attachment_total_timeout_seconds,
+                            download_timeout_seconds=self.settings.collector.download_timeout_seconds,
+                            direct_url=_oa_detail_url(browser.base_url, detail_link) if detail_link else None,
+                        )
+                    except AuthRequiredError:
+                        self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "auth required during detail fallback", recoverable=True)
+                        return
+                    except Exception as fallback_exc:
+                        raise RuntimeError(
+                            f"direct detail failed: {type(direct_exc).__name__}; "
+                            f"list fallback failed: {type(fallback_exc).__name__}"
+                        ) from fallback_exc
                 attachments = list(capture.attachments) + [a for container in capture.related_containers for a in container.attachments]
                 with Session(self.engine) as session:
                     manifest = session.get(OAManifestItem, manifest_id)
@@ -1229,11 +1258,19 @@ class OperationWorker:
                         select(OAItem.archive_relpath).where(OAItem.oa_item_key == oa_item_key)
                     )
                     if proxy.archive_status == "archived":
-                        manifest.processing_status = (
-                            "downloaded" if (attachments or _has_verified_attachment(session, oa_item_key)) else "no_attachment"
-                        )
-                        manifest.last_error = None
-                        manifest.failure_stage = None
+                        if attachments or _has_verified_attachment(session, oa_item_key):
+                            manifest.processing_status = "downloaded"
+                            manifest.last_error = None
+                            manifest.failure_stage = None
+                        elif capture.no_attachment_confirmed:
+                            manifest.processing_status = "no_attachment"
+                            manifest.last_error = None
+                            manifest.failure_stage = None
+                        else:
+                            manifest.processing_status = "download_failed"
+                            manifest.retry_count += 1
+                            manifest.last_error = "OA attachment inventory was not confirmed"
+                            manifest.failure_stage = "attachment_inventory"
                     elif proxy.archive_status == "depth_limit_reached":
                         manifest.processing_status = "depth_limit_reached"
                         manifest.last_error = "attachment container depth limit reached"

@@ -6,7 +6,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 from sqlalchemy.orm import Session
 
-from oa_knowledge.cli import _sanitize_operational_error, app
+from oa_knowledge.cli import _oa_detail_url, _sanitize_operational_error, app
 from oa_knowledge.collector import LoginState
 from oa_knowledge.collector.detail import AuthRequiredError
 from oa_knowledge.collector.done import DiscoveredDoneItem
@@ -16,6 +16,15 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import BatchItem, CollectionBatch, OperationJob
 
 runner = CliRunner()
+
+
+def test_oa_detail_url_preserves_the_seeyon_application_prefix() -> None:
+    assert _oa_detail_url("https://oa.synthetic", "/govdoc/govdoc.do?method=summary") == (
+        "https://oa.synthetic/seeyon/govdoc/govdoc.do?method=summary"
+    )
+    assert _oa_detail_url("https://oa.synthetic", "/seeyon/meeting.do?method=mydetail") == (
+        "https://oa.synthetic/seeyon/meeting.do?method=mydetail"
+    )
 
 
 def _last_json(output: str) -> dict:
@@ -64,7 +73,7 @@ def test_manifest_run_exposes_bounded_first_page_options_without_a_separate_pilo
     assert "--max-items" in run_help.output
 
 
-def test_bounded_manifest_run_uses_existing_direct_detail_capture(config_file: Path, monkeypatch) -> None:
+def test_bounded_manifest_run_falls_back_to_current_list_row_when_direct_detail_is_blank(config_file: Path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
     item = DiscoveredDoneItem(
         workitem_id_text="synthetic-workitem",
@@ -94,6 +103,7 @@ def test_bounded_manifest_run_uses_existing_direct_detail_capture(config_file: P
         def open_list(self): return object()
         def _list_stats(self, _frame): return 1, 1
         def _discover_frame(self, *_args): return [item]
+        def detail_link_for_item(self, _workitem_id): return None
 
     class FakeDetail:
         def __init__(self, *_args, **_kwargs): pass
@@ -114,7 +124,7 @@ def test_bounded_manifest_run_uses_existing_direct_detail_capture(config_file: P
     ])
 
     assert result.exit_code == 0, result.output
-    assert observed == {"direct": True, "list_click": False}
+    assert observed == {"direct": True, "list_click": True}
 
 
 def test_manifest_run_reauthenticates_and_retries_the_same_item_after_session_expiry(config_file: Path, monkeypatch) -> None:
@@ -144,6 +154,7 @@ def test_manifest_run_reauthenticates_and_retries_the_same_item_after_session_ex
         def open_list(self): return object()
         def _list_stats(self, _frame): return 1, 1
         def _discover_frame(self, *_args): return [item]
+        def detail_link_for_item(self, _workitem_id): return None
         def navigate_to_page(self, page_number, _delay):
             observed["reopened_page"] = page_number
             return object()
