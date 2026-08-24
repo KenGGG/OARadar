@@ -541,16 +541,20 @@ def manifest_run(
                         if proxy.archive_status == "archived":
                             if attachments or _has_verified_attachment(session, row.oa_item_key):
                                 row.processing_status = "downloaded"
+                                row.no_attachment_confirmed = False
                                 row.last_error = None; row.failure_stage = None
                             elif capture.no_attachment_confirmed:
                                 row.processing_status = "no_attachment"
+                                row.no_attachment_confirmed = True
                                 row.last_error = None; row.failure_stage = None
                             else:
                                 row.processing_status = "download_failed"; row.retry_count += 1
+                                row.no_attachment_confirmed = False
                                 row.last_error = "OA attachment inventory was not confirmed"
                                 row.failure_stage = "attachment_inventory"
                         else:
                             row.processing_status = "download_failed"; row.retry_count += 1
+                            row.no_attachment_confirmed = False
                             row.last_error = proxy.last_error or _attachment_failure_summary(capture); row.failure_stage = "attachment"
                         session.commit()
                 except AuthRequiredError as exc:
@@ -772,17 +776,21 @@ def manifest_download(
                     if proxy.archive_status == "archived":
                         if attachments or _has_verified_attachment(session, row.oa_item_key):
                             row.processing_status = "downloaded"
+                            row.no_attachment_confirmed = False
                             row.last_error = None; row.failure_stage = None
                         elif capture.no_attachment_confirmed:
                             row.processing_status = "no_attachment"
+                            row.no_attachment_confirmed = True
                             row.last_error = None; row.failure_stage = None
                         else:
                             row.processing_status = "download_failed"
+                            row.no_attachment_confirmed = False
                             row.retry_count += 1
                             row.last_error = "OA attachment inventory was not confirmed"
                             row.failure_stage = "attachment_inventory"
                     else:
                         row.processing_status = "download_failed"
+                        row.no_attachment_confirmed = False
                         row.retry_count += 1
                         row.last_error = proxy.last_error or _attachment_failure_summary(capture)
                         row.failure_stage = "attachment"

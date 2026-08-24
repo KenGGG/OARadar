@@ -41,11 +41,12 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     second = runner.invoke(app, ["init", "--config", str(config_file)])
     assert first.exit_code == second.exit_code == 0, first.output + second.output
     data_root = config_file.parent / "data"
+    database_path = load_settings(config_file).database_path
     assert oct(data_root.stat().st_mode & 0o777) == "0o700"
-    assert oct((data_root / "state" / "oa.db").stat().st_mode & 0o777) == "0o600"
+    assert oct(database_path.stat().st_mode & 0o777) == "0o600"
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0035_markdown_item_indexes"
+    assert json.loads(status.output)["schema"] == "0037_no_attachment_evidence"
 
 
 def test_schedule_enqueue_creates_worker_job_without_opening_browser(config_file: Path) -> None:

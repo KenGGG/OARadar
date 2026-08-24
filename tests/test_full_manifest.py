@@ -68,6 +68,28 @@ def test_manifest_classifies_skips_and_exports_every_row(tmp_path: Path) -> None
     assert len(path.read_text(encoding="utf-8-sig").splitlines()) == 3
 
 
+def test_classification_preserves_only_explicit_no_attachment_evidence(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"; upgrade_database(db); engine = create_db_engine(db)
+    discovery = DoneDiscovery((
+        _item("confirmed-empty", "合成确认无附件事项", 1),
+        _item("legacy-empty", "合成历史无附件事项", 2),
+    ), 1, 2, 2, 2, 1)
+    with Session(engine) as session:
+        synchronize_manifest(session, discovery)
+        confirmed, legacy = session.query(OAManifestItem).order_by(OAManifestItem.id).all()
+        confirmed.processing_status = legacy.processing_status = "no_attachment"
+        confirmed.no_attachment_confirmed = True
+        legacy.no_attachment_confirmed = False
+        session.commit()
+
+        classify_manifest(session, (), tmp_path)
+        session.commit()
+
+        assert confirmed.processing_status == "no_attachment"
+        assert legacy.processing_status == "download_failed"
+        assert legacy.failure_stage == "local_verification"
+
+
 def test_precise_expense_rules_do_not_skip_informational_notice(tmp_path: Path) -> None:
     db = tmp_path / "oa.db"; upgrade_database(db); engine = create_db_engine(db)
     discovery = DoneDiscovery((

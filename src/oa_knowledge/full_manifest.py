@@ -119,7 +119,10 @@ def classify_manifest_rows(session: Session, rows: list[OAManifestItem], keyword
         row.matched_exclusion_keyword = None
         if row.processing_status in {"skipped", "discovered", "processing"}:
             row.processing_status = "pending_download"
-        if row.processing_status in {"downloaded", "no_attachment"} and not verified_archive_exists(session, row, data_root):
+        if (
+            row.processing_status in {"downloaded", "no_attachment"}
+            and not verified_archive_exists(session, row, data_root)
+        ):
             row.processing_status = "download_failed"
             row.failure_stage = "local_verification"
             row.last_error = "verified archive file is missing"
@@ -133,16 +136,30 @@ def reuse_existing_archive(session: Session, row: OAManifestItem, data_root: Pat
     if item is None or not item.archive_relpath:
         return False
     files = session.scalars(select(ArchivedFile).where(ArchivedFile.oa_item_id == item.id)).all()
-    if not files or any(f.download_status != "verified" or not f.local_relpath or not (data_root / f.local_relpath).is_file() for f in files):
+    if not files:
+        if row.no_attachment_confirmed:
+            row.processing_status = "no_attachment"
+            row.last_error = None
+            row.failure_stage = None
+            return True
+        return False
+    if any(f.download_status != "verified" or not f.local_relpath or not (data_root / f.local_relpath).is_file() for f in files):
         return False
     row.archive_relpath = item.archive_relpath
-    row.processing_status = "downloaded" if any(f.file_role in ATTACHMENT_ROLES for f in files) else "no_attachment"
+    if any(f.file_role in ATTACHMENT_ROLES for f in files):
+        row.processing_status = "downloaded"
+    elif row.no_attachment_confirmed:
+        row.processing_status = "no_attachment"
+    else:
+        return False
     row.last_error = None
     row.failure_stage = None
     return True
 
 
 def verified_archive_exists(session: Session, row: OAManifestItem, data_root: Path) -> bool:
+    if row.processing_status == "no_attachment" and row.no_attachment_confirmed:
+        return True
     if not row.archive_relpath:
         return False
     item = session.scalar(select(OAItem).where(OAItem.oa_item_key == row.oa_item_key))

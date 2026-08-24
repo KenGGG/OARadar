@@ -1260,23 +1260,28 @@ class OperationWorker:
                     if proxy.archive_status == "archived":
                         if attachments or _has_verified_attachment(session, oa_item_key):
                             manifest.processing_status = "downloaded"
+                            manifest.no_attachment_confirmed = False
                             manifest.last_error = None
                             manifest.failure_stage = None
                         elif capture.no_attachment_confirmed:
                             manifest.processing_status = "no_attachment"
+                            manifest.no_attachment_confirmed = True
                             manifest.last_error = None
                             manifest.failure_stage = None
                         else:
                             manifest.processing_status = "download_failed"
+                            manifest.no_attachment_confirmed = False
                             manifest.retry_count += 1
                             manifest.last_error = "OA attachment inventory was not confirmed"
                             manifest.failure_stage = "attachment_inventory"
                     elif proxy.archive_status == "depth_limit_reached":
                         manifest.processing_status = "depth_limit_reached"
+                        manifest.no_attachment_confirmed = False
                         manifest.last_error = "attachment container depth limit reached"
                         manifest.failure_stage = "archive_verify"
                     else:
                         manifest.processing_status = "download_failed"
+                        manifest.no_attachment_confirmed = False
                         manifest.retry_count += 1
                         manifest.last_error = proxy.last_error
                         manifest.failure_stage = "attachment"

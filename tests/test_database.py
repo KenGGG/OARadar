@@ -37,7 +37,7 @@ def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:
     upgrade_database(db)
     upgrade_database(db)
     with sqlite3.connect(db) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0035_markdown_item_indexes"
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0037_no_attachment_evidence"
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {

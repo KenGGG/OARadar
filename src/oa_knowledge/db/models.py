@@ -60,6 +60,7 @@ class OAManifestItem(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     processing_status: Mapped[str] = mapped_column(String, nullable=False, default="discovered")
+    no_attachment_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     matched_exclusion_keyword: Mapped[str | None] = mapped_column(Text)
     archive_relpath: Mapped[str | None] = mapped_column(Text)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

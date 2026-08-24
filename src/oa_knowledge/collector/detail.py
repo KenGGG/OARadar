@@ -604,7 +604,7 @@ class CollaborationDetailAdapter:
         return tuple(files)
 
     @staticmethod
-    def _find_attachment_descriptor(onclick: str) -> tuple[str, str] | None:
+    def _find_attachment_descriptor(onclick: str) -> tuple[str, str, str, str] | None:
         """Parse OA's legacy findAttachment(key, date, name, ext, hash) call."""
         match = re.search(r"\bfindAttachment\s*\((.*?)\)", onclick, re.DOTALL)
         if not match:
@@ -634,15 +634,17 @@ class CollaborationDetailAdapter:
             else:
                 return None
             values.append("".join(value))
-        if len(values) < 4:
+        if len(values) < 5:
             return None
-        key = values[0].strip() or (values[4].strip() if len(values) > 4 else "")
+        key = values[0].strip() or values[4].strip()
+        create_date = values[1].strip()
         name = values[2].strip()
         extension = values[3].strip().lstrip(".")
+        version = values[4].strip()
         if not key or not name:
             return None
         filename = name if not extension or name.lower().endswith(f".{extension.lower()}") else f"{name}.{extension}"
-        return key, filename
+        return key, create_date, filename, version
 
     def _download_attachment_panel(
         self,
@@ -702,13 +704,20 @@ class CollaborationDetailAdapter:
                     continue
                 if descriptor is None:
                     continue
-                key, filename = descriptor
+                key, create_date, filename, version = descriptor
                 if key in seen:
                     continue
                 seen.add(key)
+                file_url = "/seeyon/fileDownload.do?" + urlencode({
+                    "method": "download",
+                    "v": version,
+                    "fileId": key,
+                    "createDate": create_date,
+                    "filename": filename,
+                })
                 if self.inventory_only:
                     files.append(DirectAttachment(
-                        attachment_key=key, filename=filename, file_url=None,
+                        attachment_key=key, filename=filename, file_url=file_url,
                         size_bytes=None, mime_type=None, file_role=default_role,
                         content=None, download_status="discovered",
                     ))
@@ -717,11 +726,29 @@ class CollaborationDetailAdapter:
                 if reused is not None:
                     content, mime_type = reused
                 else:
-                    content = self._browser_download_payload(
-                        page, lambda target=link: target.click(force=True),
-                        download_timeout_seconds * 1000,
-                    )
-                    mime_type = None
+                    absolute = page.url.split("/seeyon/")[0] + file_url
+                    response = None
+                    for _attempt in range(2):
+                        try:
+                            response = page.context.request.get(
+                                absolute, timeout=download_timeout_seconds * 1000,
+                            )
+                            if response.ok:
+                                break
+                        except PlaywrightError as exc:
+                            self._last_download_failure = f"{type(exc).__name__}: {exc}"
+                    try:
+                        content = response.body() if response is not None and response.ok else None
+                    except PlaywrightError as exc:
+                        self._last_download_failure = f"{type(exc).__name__}: {exc}"
+                        content = None
+                    mime_type = self._response_content_type(response)
+                    if content is not None and (
+                        "text/html" in mime_type
+                        or content.lstrip().lower().startswith((b"<!doctype", b"<html"))
+                    ):
+                        self._last_download_failure = "file download API returned HTML"
+                        content = None
                 status = "downloaded" if content is not None else "download_failed"
                 if content is None:
                     self._capture_issues.append({
@@ -729,7 +756,7 @@ class CollaborationDetailAdapter:
                         "error": self._last_download_failure or "attachment panel download failed",
                     })
                 files.append(DirectAttachment(
-                    attachment_key=key, filename=filename, file_url=None,
+                    attachment_key=key, filename=filename, file_url=file_url,
                     size_bytes=len(content) if content is not None else None,
                     mime_type=mime_type, file_role=default_role, content=content,
                     download_status=status,
