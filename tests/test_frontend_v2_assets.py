@@ -35,6 +35,15 @@ def test_done_view_labels_the_sync_timestamp_without_claiming_it_is_an_oa_update
     assert "最后更新" not in source
 
 
+def test_done_view_supports_direct_page_jump_and_last_page() -> None:
+    source = (Path(__file__).parents[1] / "webui/src/views/SimpleDoneView.tsx").read_text(encoding="utf-8")
+
+    assert 'aria-label="跳转页码"' in source
+    assert ">跳转</button>" in source
+    assert ">末页</button>" in source
+    assert "Math.min(pages, Math.max(1" in source
+
+
 def test_markdown_view_reports_an_outdated_web_api() -> None:
     source = (Path(__file__).parents[1] / "webui/src/App.tsx").read_text(encoding="utf-8")
 

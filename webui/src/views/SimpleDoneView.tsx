@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { ChevronRight, CircleAlert, Search, X } from "lucide-react"
 import type { SimpleDoneItem, SimpleDoneState, SimpleDonePage } from "../types/simple-status"
 import { time } from "../App"
@@ -97,6 +97,20 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
 }) {
   const pages = Math.max(1, Math.ceil(total / 50))
   const [selected, setSelected] = useState<SimpleDoneItem | null>(null)
+  const [pageInput, setPageInput] = useState(String(page))
+
+  useEffect(() => setPageInput(String(page)), [page])
+
+  const goToPage = (requested: number) => {
+    const target = Math.min(pages, Math.max(1, requested))
+    setPage(target)
+    setPageInput(String(target))
+  }
+
+  const submitPageJump = () => {
+    const requested = Number.parseInt(pageInput, 10)
+    goToPage(Number.isFinite(requested) ? requested : page)
+  }
 
   return <section>
     <div className="metrics compact-metrics">
@@ -134,9 +148,18 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       {!rows.length && <tr><td colSpan={8} className="empty">没有符合条件的已办资料</td></tr>}
     </tbody></table></div>
     <div className="pagination">
-      <button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button>
+      <button disabled={page <= 1} onClick={() => goToPage(page - 1)}>上一页</button>
       <span>第 {page}/{pages} 页 · 共 {total.toLocaleString()} 项</span>
-      <button disabled={page >= pages} onClick={() => setPage(page + 1)}>下一页</button>
+      <label className="page-jump">
+        <span>前往</span>
+        <input aria-label="跳转页码" type="number" min="1" max={pages} inputMode="numeric" value={pageInput}
+          onChange={event => setPageInput(event.target.value)}
+          onKeyDown={event => event.key === "Enter" && submitPageJump()}/>
+        <span>页</span>
+      </label>
+      <button onClick={submitPageJump}>跳转</button>
+      <button disabled={page >= pages} onClick={() => goToPage(pages)}>末页</button>
+      <button disabled={page >= pages} onClick={() => goToPage(page + 1)}>下一页</button>
     </div>
     {selected && <SimpleDoneDrawer item={selected} close={() => setSelected(null)}/>}
   </section>
