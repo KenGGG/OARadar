@@ -112,7 +112,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
     goToPage(Number.isFinite(requested) ? requested : page)
   }
 
-  return <section>
+  return <section className="done-page">
     <div className="metrics compact-metrics">
       <div className="metric"><span>已办总数</span><strong>{metrics.oa_done_total.toLocaleString()}</strong></div>
       <div className="metric"><span>成功下载</span><strong>{metrics.downloaded_items.toLocaleString()}</strong></div>
@@ -125,7 +125,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
         {DONE_FILTERS.map(f => <option key={f.key} value={f.key}>{f.label}</option>)}
       </select>
     </div>
-    <div className="table-wrap"><table style={{ minWidth: 920 }}><thead><tr>
+    <div className="table-wrap done-table-wrap"><table style={{ minWidth: 920 }}><thead><tr>
       <th className="title-col">事项标题</th>
       <th>发起人</th>
       <th>发起时间</th>
@@ -136,7 +136,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
     </tr></thead><tbody>
       {rows.map(row => (
         <tr key={row.id} onClick={() => setSelected(row)} tabIndex={0} onKeyDown={e => e.key === "Enter" && setSelected(row)}>
-          <td className="title-cell"><strong>{row.title}</strong><small>{row.item_id}</small></td>
+          <td className="title-cell"><strong>{row.title}</strong></td>
           <td>{row.sender || "-"}</td>
           <td className="nowrap">{time(row.initiated_at)}</td>
           <td>{row.file_count == null ? "-" : row.file_count}</td>

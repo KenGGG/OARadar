@@ -44,6 +44,16 @@ def test_done_view_supports_direct_page_jump_and_last_page() -> None:
     assert "Math.min(pages, Math.max(1" in source
 
 
+def test_done_list_hides_internal_item_id_from_the_title_cell_and_uses_compact_spacing() -> None:
+    root = Path(__file__).parents[1]
+    source = (root / "webui/src/views/SimpleDoneView.tsx").read_text(encoding="utf-8")
+    styles = (root / "webui/src/styles.css").read_text(encoding="utf-8")
+
+    assert '<td className="title-cell"><strong>{row.title}</strong></td>' in source
+    assert "done-table-wrap" in source
+    assert ".done-table-wrap td" in styles
+
+
 def test_markdown_view_reports_an_outdated_web_api() -> None:
     source = (Path(__file__).parents[1] / "webui/src/App.tsx").read_text(encoding="utf-8")
 
