@@ -126,3 +126,34 @@ def test_attachment_panel_explicit_empty_message_is_confirmed() -> None:
 
     assert attachments == ()
     assert confirmed_empty is True
+
+
+def test_meeting_page_hidden_empty_attachment_inventory_is_confirmed() -> None:
+    document = """
+        <html><body>
+          <main>synthetic meeting detail</main>
+          <div id="attachmentTRAtt" style="display:none">
+            <span id="attachmentNumberDivAtt"></span>
+          </div>
+          <div id="attachmentAreaAtt"></div>
+          <div id="attachmentTRSummary" style="display:none">
+            <span id="attachmentNumberDivSummary"></span>
+          </div>
+        </body></html>
+    """
+    playwright, browser, page = _browser_page()
+    page.context.route("**/seeyon/meeting.do**", lambda route: route.fulfill(
+        content_type="text/html", body=document,
+    ))
+    page.goto("https://oa.synthetic/seeyon/meeting.do?method=view&meetingId=synthetic")
+    adapter = CollaborationDetailAdapter(page, inventory_only=True)
+
+    try:
+        attachments = adapter._download_files(page, "direct_attachment", download_timeout_seconds=2)
+        confirmed_empty = adapter._last_attachment_inventory_confirmed_empty
+    finally:
+        browser.close()
+        playwright.stop()
+
+    assert attachments == ()
+    assert confirmed_empty is True

@@ -600,8 +600,38 @@ class CollaborationDetailAdapter:
                 page, default_role, seen, deadline, download_timeout_seconds,
             )
             files.extend(panel_files)
+            if not files and not confirmed_empty:
+                confirmed_empty = self._meeting_inventory_confirmed_empty(page)
             self._last_attachment_inventory_confirmed_empty = confirmed_empty
         return tuple(files)
+
+    @staticmethod
+    def _meeting_inventory_confirmed_empty(page: Page) -> bool:
+        """Recognize OA meeting pages whose canonical attachment rows are all hidden."""
+        if urlsplit(page.url).path.rstrip("/") != "/seeyon/meeting.do":
+            return False
+        for frame in page.frames:
+            try:
+                confirmed = frame.evaluate("""() => {
+                    const primaryRow = document.querySelector('#attachmentTRAtt');
+                    const primaryArea = document.querySelector('#attachmentAreaAtt');
+                    if (!primaryRow || !primaryArea) return false;
+                    const visible = node => Boolean(
+                        node.offsetWidth || node.offsetHeight || node.getClientRects().length
+                    );
+                    const inventoryRows = [
+                        ...document.querySelectorAll('[id^="attachmentTR"], [id^="attachment2TR"]')
+                    ];
+                    return !visible(primaryRow)
+                        && primaryArea.childElementCount === 0
+                        && !(primaryArea.textContent || '').trim()
+                        && inventoryRows.every(row => !visible(row));
+                }""")
+                if confirmed:
+                    return True
+            except PlaywrightError:
+                continue
+        return False
 
     @staticmethod
     def _find_attachment_descriptor(onclick: str) -> tuple[str, str, str, str] | None:
