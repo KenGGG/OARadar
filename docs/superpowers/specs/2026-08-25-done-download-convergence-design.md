@@ -1,243 +1,155 @@
-# Done Download Convergence Design
+# 已办全量下载收敛设计
 
-## Objective
+## 目标
 
-Restore the full OA Done download campaign and make its progress truthful without
-expanding OARadar's production surface. The change is limited to Done manifest
-download correctness, collision-safe storage below `data/originals`, and the
-minimum overview fields needed to distinguish download work from Markdown work.
+恢复 OA 已办事项全量下载，并让进度数据真实可信，同时不扩大 OARadar 的生产功能范围。本次变更仅限于：已办清单下载的正确性、`data/originals` 下的路径防碰撞，以及让总览能够区分下载任务和 Markdown 任务所必需的最少字段。
 
-`data/` must continue to contain exactly two product roots:
+`data/` 必须继续严格只包含两个产品数据根目录：
 
-- `data/originals/` for immutable OA originals;
-- `data/markdown/` for Markdown output.
+- `data/originals/`：保存不可变的 OA 原件；
+- `data/markdown/`：保存 Markdown 输出。
 
-The design does not add another data root, enable timers, redesign the Markdown
-pipeline, or alter OA records. Every OA interaction remains read-only.
+本设计不增加新的数据根目录，不启用定时器，不重构 Markdown 流水线，也不修改任何 OA 记录。所有 OA 交互继续保持只读。
 
-## Current Failure Modes
+## 当前故障模式
 
-The current campaign exposes four coupled correctness problems:
+目前的全量下载任务存在四个相互关联的正确性问题：
 
-1. A long-lived browser closed during a campaign. The command caught the
-   resulting `TargetClosedError` as an item error and marked 771 untouched items
-   as individual download failures.
-2. The durable worker resumes by slicing the immutable target-key list at
-   `progress_current`. Progress counts and target-list positions diverge after
-   local archive reuse and process recovery, so 15 targets were skipped.
-3. A job is marked `completed` when the child command exits zero, even when
-   target items remain pending or failed. Its stored `2808/2879` progress can
-   therefore coexist with a completed status.
-4. Done directories use only initiation date and title. Same-day items with the
-   same normalized title share paths. The current data contains 271 collision
-   groups and six database file records whose expected hashes no longer match
-   the bytes at their shared paths.
+1. 长时间运行的浏览器在任务中途关闭。命令把由此产生的 `TargetClosedError` 当作单个事项错误处理，导致后续 771 个尚未处理的事项被错误地逐项标记为下载失败。
+2. 持久 worker 使用 `progress_current` 作为位置，从不可变的目标 key 列表中切片恢复。由于本地归档复用和进程恢复会使进度计数与目标列表位置发生偏移，最终跳过了 15 个目标。
+3. 只要子命令以零退出，任务就会被标记为 `completed`，即使目标中仍有待下载或失败事项。因此数据库里会同时出现任务已完成和 `2808/2879` 这样的未完成进度。
+4. 已办目录只使用发起日期和标题。同一天、规范化标题相同的事项会共用路径。目前数据中存在 271 组目录碰撞，以及 6 条数据库文件记录的预期哈希与共享路径上的实际字节不一致。
 
-The overview adds a presentation problem: it calls all archive-complete items
-"queued" when they lack Markdown output even though no durable queue entries
-exist. Operators cannot distinguish download backlog from Markdown readiness.
+总览还存在一个展示口径问题：所有已归档但没有 Markdown 输出的事项都会被称为“排队中”，即使数据库里根本没有对应的持久任务。使用者因此无法区分下载积压与等待 Markdown 的事项。
 
-## Chosen Approach
+## 选定方案
 
-Use the existing manifest, operation-job, file, and archive models. Add no new
-pipeline or data root. Correct the retry protocol by deriving progress from
-per-target database facts rather than treating an integer as a list cursor.
-Treat browser loss as a campaign-level interruption, not an item-level result.
-Repair only colliding archive directories; leave non-colliding legacy paths
-unchanged.
+继续使用现有的清单、操作任务、文件和归档模型，不新增流水线或数据根目录。重试进度从每个目标在数据库中的事实推导，不再把整数进度当作目标列表游标。浏览器丢失视为整个任务层面的中断，而不是单个事项的处理结果。只修复发生碰撞的归档目录，不改动未碰撞的历史路径。
 
-This is intentionally narrower than a pipeline rewrite. The historical batch,
-curation, timer, Pending, and Markdown worker behaviors remain out of scope.
+本方案刻意保持克制，不进行流水线重写。历史批次、知识整理、定时器、待办和 Markdown worker 均不在本次范围内。
 
-## Durable Retry Semantics
+## 持久重试语义
 
-### Immutable campaign start
+### 不可变的任务开始时间
 
-`OperationJob.started_at` is set only on the first start. Recovery must not
-replace it. It is the attempt boundary for the campaign.
+`OperationJob.started_at` 只在首次启动时设置。恢复任务时不得覆盖它。该时间是判断本轮任务是否已经尝试过某个事项的边界。
 
-For the job's immutable `oa_item_keys`, a target is considered attempted in the
-current campaign when either:
+对于任务不可变的 `oa_item_keys`，满足以下任一条件即可视为本轮已经处理过：
 
-- it is already terminal (`downloaded`, `no_attachment`, or `skipped`); or
-- `last_retry_at >= job.started_at` and its status records the result of that
-  attempt.
+- 当前已是终态：`downloaded`、`no_attachment` 或 `skipped`；
+- `last_retry_at >= job.started_at`，并且当前状态记录了本轮尝试的结果。
 
-A target is still eligible when it is `pending_download` or `download_failed`
-and has no attempt at or after the campaign start. Recovery queries these facts
-across the full target set. It never slices `oa_item_keys` by
-`progress_current`.
+当目标状态为 `pending_download` 或 `download_failed`，且在任务开始时间之后没有尝试记录时，该目标仍可处理。恢复时必须基于完整目标集合查询这些事实，绝不能再按 `progress_current` 对 `oa_item_keys` 切片。
 
-### Bounded browser sessions
+### 有界浏览器会话
 
-The worker invokes the existing manifest download command in bounded chunks of
-at most 100 eligible targets. Each chunk receives explicit target keys. A fresh
-browser session is created for every chunk, limiting the lifetime and blast
-radius of a browser process.
+worker 使用现有的清单下载命令，每次最多处理 100 个仍可处理的目标，并向每个分块显式传入目标 key。每个分块创建新的浏览器会话，从而限制单个浏览器进程的存活时间和故障影响范围。
 
-After a chunk, the worker recomputes all counts from the database:
+每个分块结束后，worker 从数据库重新计算全部数量：
 
-- `success`: `downloaded` plus `no_attachment` plus `skipped`;
-- `failed`: targets attempted during this campaign whose status is
-  `download_failed`, `auth_required`, `depth_limit_reached`, or `partial`;
-- `remaining`: eligible targets not attempted during this campaign;
-- `progress_current`: `success + failed`;
-- `progress_total`: the immutable target count.
+- `success`：`downloaded`、`no_attachment` 和 `skipped` 的总数；
+- `failed`：本轮已尝试且状态为 `download_failed`、`auth_required`、`depth_limit_reached` 或 `partial` 的目标数；
+- `remaining`：本轮尚未尝试、仍可处理的目标数；
+- `progress_current`：`success + failed`；
+- `progress_total`：不可变的目标总数。
 
-The operation finishes `completed` only when `remaining == 0` and `failed == 0`.
-It finishes `failed` with a summary error code when every target has been
-attempted but one or more targets failed. It must never report completed while
-`progress_current < progress_total`.
+只有在 `remaining == 0` 且 `failed == 0` 时，操作任务才能进入 `completed`。如果所有目标都已经尝试，但仍有失败项，则任务以汇总错误码进入 `failed`。当 `progress_current < progress_total` 时，绝不能报告已完成。
 
-### Browser-loss handling
+### 浏览器丢失处理
 
-The CLI recognizes Playwright target/page/context/browser closure as a systemic
-interruption. For the current item it restores the pre-attempt status and
-`last_retry_at`, then exits with a dedicated operational error. It does not
-continue through later targets and does not increment the item's retry count.
+CLI 必须识别 Playwright 的 target、page、context 或 browser 关闭错误，并将其视为系统性中断。对于当前事项，恢复尝试前的状态和 `last_retry_at`，随后以专用运行错误退出。不得继续处理后续事项，也不得增加当前事项的重试次数。
 
-The durable worker may start a fresh chunk up to three consecutive times for a
-browser-loss error. It recomputes remaining work before every restart. A
-successful chunk resets the consecutive interruption count. After three
-consecutive browser losses, the operation finishes failed while every untouched
-target remains eligible for a later retry job. This prevents both mass false
-failures and an infinite restart loop.
+对于浏览器丢失错误，持久 worker 最多可以连续启动三次新的分块。每次重启前都重新计算剩余工作。只要有一个分块成功，连续中断计数就归零。连续三次浏览器丢失后，操作任务进入失败状态，但所有未触碰的目标仍保持可供后续重试。这样既避免批量误报，也避免无限重启循环。
 
-Authentication loss follows the same stop-the-campaign principle, but remains
-`auth_required` and requires a later authenticated retry. Ordinary item-specific
-capture or attachment errors continue to mark only that item failed.
+登录失效遵循同样的“停止整个任务”原则，但状态保留为 `auth_required`，待恢复登录后重试。普通的单事项详情抓取或附件错误仍然只标记该事项失败。
 
-## Collision-Safe Archive Paths
+## 防碰撞的归档路径
 
-The human-readable legacy directory remains:
+便于人工浏览的历史目录格式保持不变：
 
-`originals/YYYY/MM/YYYY-MM-DD_<normalized title>`
+`originals/YYYY/MM/YYYY-MM-DD_<规范化标题>`
 
-When more than one OA item resolves to that directory, each item in the
-collision group receives a deterministic suffix derived from its confidential
-OA key without exposing the key itself:
+当多个 OA 事项解析到同一个目录时，碰撞组内的每个事项使用一个由机密 OA key 派生、但不暴露原始 key 的确定性后缀：
 
-`originals/YYYY/MM/YYYY-MM-DD_<normalized title>__<10-char SHA-256 prefix>`
+`originals/YYYY/MM/YYYY-MM-DD_<规范化标题>__<SHA-256 前 10 位>`
 
-The suffix is stable and generated locally. OA identifiers remain text in the
-database and are never written verbatim into paths.
+该后缀稳定且只在本地生成。OA 标识继续以文本形式存放在数据库中，不得把原始标识写入路径。
 
-New or retried downloads use the legacy path when it is unambiguous and the
-suffixed path when a collision exists. Existing non-colliding paths are not
-renamed.
+新下载或重试下载时，路径无歧义则沿用历史格式；存在碰撞时使用带后缀的路径。已有且未碰撞的目录不重命名。
 
-## Collision Repair
+## 碰撞修复
 
-Add an idempotent local repair operation restricted to duplicate
-`OAItem.archive_relpath` groups:
+增加一个可重复执行的本地修复操作，仅处理 `OAItem.archive_relpath` 重复的目录组：
 
-1. Detect colliding item directories from database facts.
-2. For every recorded verified file, validate existence, size, and SHA-256
-   against the current physical bytes.
-3. For a matching file, copy it atomically inside `data/originals` to that
-   item's deterministic suffixed directory, then update that item's
-   `OAItem.archive_relpath`, `OAManifestItem.archive_relpath`, and
-   `ArchivedFile.local_relpath` in one database transaction.
-4. If any recorded file for an item does not match, do not copy suspect bytes.
-   Mark the manifest `download_failed` at `local_verification` so the normal
-   read-only OA downloader reacquires that item into its unique directory.
-5. Never delete or overwrite the old shared directory during this repair.
+1. 根据数据库事实识别发生碰撞的事项目录。
+2. 对每条已记录为 verified 的文件，校验物理文件是否存在、大小是否一致以及 SHA-256 是否一致。
+3. 对校验通过的文件，在 `data/originals` 内原子复制到该事项带确定性后缀的新目录；随后在一个数据库事务中更新该事项的 `OAItem.archive_relpath`、`OAManifestItem.archive_relpath` 和 `ArchivedFile.local_relpath`。
+4. 如果一个事项的任意文件校验不通过，不复制可疑字节。将其清单状态设置为 `download_failed`，失败阶段设置为 `local_verification`，由正常的只读 OA 下载器把原件重新下载到唯一目录。
+5. 本次修复绝不删除或覆盖旧的共享目录。
 
-The operation uses only `data/originals`; it does not create staging or report
-directories below `data`. Atomic-write staging continues to use the existing
-runtime state/cache roots outside `data`.
+该操作只使用 `data/originals`，不会在 `data` 下创建临时目录或报告目录。原子写入需要的临时空间继续使用 `data` 之外现有的运行状态或缓存根目录。
 
-Running the repair twice produces the same database paths and file contents.
+重复运行该修复操作，数据库路径和文件内容必须保持一致。
 
-## Overview Contract
+## 总览接口约定
 
-Keep the existing overview and navigation. Add or expose these separate Done
-counts from manifest status:
+保留现有总览和导航。增加或明确暴露以下相互独立的已办统计：
 
-- `download_complete_items`: `downloaded + no_attachment`;
-- `waiting_download_items`: `discovered + pending_download + processing`;
-- `download_failed_items`: `download_failed + auth_required + partial +
-  depth_limit_reached`;
-- `waiting_markdown_items`: archive-complete items without a successful item
-  index;
-- `actual_download_queue_items`: active queued/running Done download targets.
+- `download_complete_items`：`downloaded + no_attachment`；
+- `waiting_download_items`：`discovered + pending_download + processing`；
+- `download_failed_items`：`download_failed + auth_required + partial + depth_limit_reached`；
+- `waiting_markdown_items`：原件已完整但没有成功生成事项索引的事项；
+- `actual_download_queue_items`：真实处于 queued 或 running 状态的已办下载目标数。
 
-The headline must say "等待 Markdown" for the derived Markdown count and must
-not call it a queue. "下载队列" is reserved for durable queued/running work.
-Existing response fields remain during this change for frontend compatibility,
-but the Web UI uses the explicit fields.
+总览文案必须把推导出的 Markdown 数量称为“等待 Markdown”，不能称为“队列”。“下载队列”仅用于真实存在的持久 queued/running 任务。为兼容现有前端，本次变更暂时保留旧响应字段，但 Web UI 改用新的明确字段。
 
-No full-disk hash scan runs on each page request. The collision repair resets
-known mismatches to `download_failed`; the normal status query then remains
-cheap and truthful.
+每次打开页面时不执行全盘哈希扫描。碰撞修复会把已知哈希不一致事项重置为 `download_failed`，随后常规状态查询即可保持轻量和真实。
 
-## Recovery Run
+## 恢复执行
 
-After code verification:
+代码验证完成后：
 
-1. Stop the OA worker cleanly.
-2. Run the collision repair in dry-run mode and verify its aggregate counts.
-3. Run the repair for the collision groups. Do not delete legacy directories.
-4. Run the full local integrity audit. The expected result before redownload is
-   no verified hash mismatches; mismatched items are now explicitly
-   `download_failed`.
-5. Create one retry job containing every current `pending_download` and
-   `download_failed` manifest item. This covers the 15 skipped targets, the 771
-   browser-loss failures, and the six collision-corrupted items without
-   hard-coding those counts.
-6. Restart the OA worker and observe the durable aggregate counts. Do not enable
-   the hourly/nightly timers or Markdown worker as part of this change.
+1. 正常停止 OA worker。
+2. 以 dry-run 模式运行碰撞修复，并核对汇总数量。
+3. 对碰撞目录执行修复，不删除历史目录。
+4. 执行完整的本地完整性审计。重新下载前的预期结果是：不存在仍标记为 verified 的哈希错误；哈希不一致事项已经明确进入 `download_failed`。
+5. 创建一个重试任务，包含当前所有 `pending_download` 和 `download_failed` 清单事项。它会覆盖之前遗漏的 15 项、因浏览器中断失败的 771 项，以及 6 个碰撞损坏事项；实现中不得硬编码这些数量。
+6. 重启 OA worker 并观察持久汇总数据。本次变更不启用 hourly/nightly 定时器，也不启动 Markdown worker。
 
-The recovery job is allowed to continue after implementation handoff. Success
-means it advances with truthful counts and can survive a worker/browser restart;
-it does not require waiting for every OA download to finish before the code
-change is considered deployed.
+实现交付后，恢复任务可以继续在后台运行。成功标准是任务按真实计数向前推进，并且能够经受 worker 或浏览器重启；不要求等待全部 OA 下载结束后才算代码部署完成。
 
-## Testing
+## 测试
 
-All tests use synthetic identifiers, titles, paths, and attachment bytes.
+所有测试必须使用合成的标识、标题、路径和附件字节。
 
-Required regressions:
+必须覆盖以下回归场景：
 
-- a resumed job processes eligible keys before and after the old numeric cursor
-  boundary;
-- terminal targets reconciled locally do not shift or skip unresolved targets;
-- `TargetClosedError` restores the current item and aborts the chunk without
-  touching later items;
-- three consecutive browser-loss interruptions stop without an infinite loop;
-- a job with failed targets cannot be completed;
-- progress is recomputed from target facts and reaches total only when every
-  target has a campaign result;
-- same-day same-title items receive distinct deterministic paths while an
-  unambiguous legacy item keeps its existing path;
-- collision repair copies only hash-valid bytes, resets mismatches for
-  redownload, is idempotent, and never deletes the legacy directory;
-- the overview distinguishes waiting download, failed download, waiting
-  Markdown, and an actual durable queue;
-- an integration fixture proves `data/` contains no product root other than
-  `originals/` and `markdown/`.
+- 恢复后的任务能够处理旧数字游标边界前后的所有可处理 key；
+- 本地复用后进入终态的目标不会导致尚未解决的目标发生偏移或被跳过；
+- `TargetClosedError` 会恢复当前事项并中止当前分块，不触碰后续事项；
+- 连续三次浏览器丢失后停止，不产生无限循环；
+- 仍有失败目标的任务不能进入完成状态；
+- 进度从目标事实重新计算，只有每个目标都有本轮结果时才达到总数；
+- 同一天、同标题的事项获得不同且确定的路径，而无歧义的历史事项继续使用原路径；
+- 碰撞修复只复制哈希有效的字节，把不一致事项重置为待重新下载，支持重复执行，并且不删除历史目录；
+- 总览能够区分等待下载、下载失败、等待 Markdown 和真实持久队列；
+- 集成测试证明 `data/` 中除 `originals/` 和 `markdown/` 外没有其他产品数据根目录。
 
-Targeted tests run first, followed by the complete Python test suite and Web UI
-build. Production recovery begins only after these checks pass.
+先运行相关的定向测试，再运行完整 Python 测试套件和 Web UI 构建。只有全部检查通过后才能开始生产数据恢复。
 
-## Operational and Security Constraints
+## 运维与安全约束
 
-- OA access remains read-only: no approve, reply, delete, forward, or record
-  mutation.
-- Real OA HTML, identifiers, titles, cookies, profiles, databases, downloads,
-  and logs are never committed.
-- Test fixtures are synthetic or irreversibly redacted.
-- Archive paths stored in the database remain relative to `data_root`.
-- Container traversal keeps the existing depth-10 rule and continues to enqueue
-  `depth_limit_reached` rather than reporting completion.
-- The repair performs no deletion. Any later legacy-directory cleanup requires
-  a separate explicit design and approval.
+- OA 访问继续保持只读：不得审批、回复、删除、转发或修改 OA 记录。
+- 真实 OA HTML、标识、标题、Cookie、浏览器配置、数据库、下载文件和日志不得提交。
+- 测试夹具必须使用合成数据或不可逆脱敏数据。
+- 数据库存储的归档路径必须保持为相对于 `data_root` 的路径。
+- 容器遍历继续遵守最大深度 10 的规则；超过深度时必须进入 `depth_limit_reached`，不得报告完成。
+- 本次修复不执行删除。以后如需清理历史共享目录，必须另行设计并取得明确批准。
 
-## Out of Scope
+## 不在本次范围内
 
-- Enabling or changing hourly/nightly timers.
-- Starting or redesigning the Markdown worker.
-- Rebuilding all non-colliding archive paths.
-- Changing Pending collection, Feishu delivery, parsing, curation, or review
-  workflows.
-- Deleting shared legacy directories or adding a third directory below `data/`.
+- 启用或修改 hourly/nightly 定时器。
+- 启动或重构 Markdown worker。
+- 重建所有未碰撞的归档路径。
+- 修改待办采集、飞书投递、解析、知识整理或复核流程。
+- 删除历史共享目录，或在 `data/` 下增加第三个目录。
