@@ -8,6 +8,7 @@ process evidence remains in the state/cache roots.
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 from pathlib import Path, PurePosixPath
 
 from oa_knowledge.archive.naming import safe_filename
@@ -36,6 +37,20 @@ def done_archive_directory(
     del workitem_id_text
     day = initiated_at.strftime("%Y-%m-%d") if initiated_at else "unknown"
     return ARCHIVE_PREFIX / _period(initiated_at) / f"{day}_{safe_filename(title, 100)}"
+
+
+def done_archive_collision_directory(
+    title: str, oa_item_key: str, initiated_at: datetime | None,
+) -> PurePosixPath:
+    """Return a stable, human-browsable collision-safe Done directory.
+
+    The normal path intentionally remains title-based.  Only a conflicting
+    existing item receives this deterministic suffix, so historic paths stay
+    unchanged and every new archive remains below ``originals/``.
+    """
+    base = done_archive_directory(title, oa_item_key, initiated_at)
+    suffix = hashlib.sha256(oa_item_key.encode("utf-8")).hexdigest()[:12]
+    return base.parent / f"{base.name}__{suffix}"
 
 
 def pending_archive_directory(logical_item_id: int | str, snapshot_id: int | str) -> PurePosixPath:

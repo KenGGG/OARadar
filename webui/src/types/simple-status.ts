@@ -21,6 +21,8 @@ export interface SimpleDoneSummary {
   headline: string
   oa_total: number
   archive_complete: number
+  waiting_download_items: number
+  download_issue_items: number
   excluded: number
   no_attachment: number
   markdown_ready_items: number

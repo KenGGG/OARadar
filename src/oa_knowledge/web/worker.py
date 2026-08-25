@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,6 +54,24 @@ def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:
     return count > 0
 
 
+@dataclass(frozen=True)
+class ManifestRetrySnapshot:
+    """Durable facts for one immutable manifest-retry target list."""
+
+    total: int
+    success: int
+    failed: int
+    pending_keys: tuple[str, ...]
+
+    @property
+    def progress_current(self) -> int:
+        return self.success + self.failed
+
+    @property
+    def complete(self) -> bool:
+        return not self.pending_keys and self.failed == 0 and self.progress_current == self.total
+
+
 def _run_piped(command: list[str], cwd: Path, poll_callback, poll_interval: float = 5.0):
     """Run a subprocess with PIPEd stdout/stderr.
 
@@ -95,6 +114,41 @@ class OperationWorker:
     @staticmethod
     def _retry_progress(total_targets: int, resumed: int, completed_after_resume: int) -> int:
         return min(total_targets, resumed + completed_after_resume)
+
+    def _manifest_retry_snapshot(self, job_id: int) -> ManifestRetrySnapshot:
+        """Return retry progress from target facts, never from a list offset."""
+        terminal = {"downloaded", "no_attachment", "skipped"}
+        failed_statuses = {"download_failed", "auth_required", "depth_limit_reached", "partial"}
+        with Session(self.engine) as session:
+            job = session.get(OperationJob, job_id)
+            if job is None:
+                raise LookupError(f"manifest retry job {job_id} is missing")
+            keys = tuple(json.loads(job.parameters_json or "{}").get("oa_item_keys") or ())
+            started_at = job.started_at
+            rows = {
+                row.oa_item_key: row
+                for row in session.scalars(select(OAManifestItem).where(
+                    OAManifestItem.oa_item_key.in_(keys),
+                ))
+            }
+
+        success = 0
+        failed = 0
+        pending: list[str] = []
+        for key in keys:
+            row = rows.get(key)
+            if row is None:
+                failed += 1
+                continue
+            if row.processing_status in terminal:
+                success += 1
+                continue
+            attempted = bool(started_at and row.last_retry_at and row.last_retry_at >= started_at)
+            if attempted and row.processing_status in failed_statuses:
+                failed += 1
+            else:
+                pending.append(key)
+        return ManifestRetrySnapshot(len(keys), success, failed, tuple(pending))
 
     @staticmethod
     def _completed_scan_progress(pending: dict, done: dict) -> tuple[int, int]:
@@ -1434,10 +1488,10 @@ class OperationWorker:
             total_targets = len(keys)
             source_status = params.get("source_status", "download_failed")
             job.status = "running"
-            # A recovered job resumes from its durable item offset. Reset the
-            # timing window so progress only counts rows completed by this run.
-            job.started_at = datetime.now(timezone.utc)
-            job.progress_current = min(job.progress_current or 0, len(keys))
+            # The first start is an immutable attempt boundary. A numeric
+            # progress value cannot safely identify a position in the key list.
+            job.started_at = job.started_at or datetime.now(timezone.utc)
+            job.progress_current = 0
             job.progress_total = total_targets
             job.heartbeat_at = datetime.now(timezone.utc)
             job.lease_expires_at = job.heartbeat_at + LEASE_TTL
@@ -1446,66 +1500,84 @@ class OperationWorker:
         if not keys:
             self._finish(job_id, "completed")
             return
-        processed = 0
-        with Session(self.engine) as session:
-            job = session.get(OperationJob, job_id)
-            resume_at = min(job.progress_current if job else 0, len(keys))
-        if resume_at:
-            keys = keys[resume_at:]
-            processed = resume_at
         last_error: str | None = None
-        command = [sys.executable, "-m", "oa_knowledge.cli", "manifest", "download", "--max-items", str(len(keys))]
-        if source_status != "audit_all":
-            command.extend(("--item-ids", ",".join(keys)))
-        if source_status == "download_failed":
-            command.append("--failed-only")
-        elif source_status == "no_attachment":
-            command.append("--recheck-no-attachment")
-        elif source_status == "audit_all":
-            command.append("--audit-all")
-        if self.config_path is not None:
-            command.extend(("--config", str(self.config_path)))
-        def heartbeat() -> None:
+        stderr = ""
+        browser_restarts = 0
+        while True:
+            snapshot = self._manifest_retry_snapshot(job_id)
             with Session(self.engine) as session:
                 job = session.get(OperationJob, job_id)
                 if job is None:
                     return
-                completed = session.scalar(select(func.count()).select_from(OAManifestItem).where(
-                    OAManifestItem.oa_item_key.in_(keys),
-                    OAManifestItem.last_retry_at.is_not(None),
-                    OAManifestItem.last_retry_at >= (job.started_at or datetime.now(timezone.utc)),
-                    OAManifestItem.processing_status != "processing",
-                )) or 0
-                active = session.scalar(select(OAManifestItem).where(OAManifestItem.processing_status == "processing").order_by(OAManifestItem.last_retry_at.desc(), OAManifestItem.id.desc()).limit(1))
-                job.progress_current = self._retry_progress(total_targets, processed, completed)
+                job.progress_current = snapshot.progress_current
+                job.progress_total = snapshot.total
                 job.heartbeat_at = datetime.now(timezone.utc)
                 job.lease_expires_at = job.heartbeat_at + LEASE_TTL
-                if active:
-                    self._event(session, job, "manifest_retry_item_started", "running", {"oa_item_key": active.oa_item_key, "manifest_id": active.id, "item_id": active.workitem_id_text or active.oa_item_key, "title": active.title, "stage": "正在进入 OA 详情页并识别附件"})
                 session.commit()
+            if not snapshot.pending_keys:
+                break
+            chunk = snapshot.pending_keys[:100]
+            command = [sys.executable, "-m", "oa_knowledge.cli", "manifest", "download", "--max-items", str(len(chunk))]
+            # Target selection is always explicit.  In particular, audit_all
+            # must audit the immutable retry target list, not every manifest row.
+            command.extend(("--item-ids", ",".join(chunk)))
+            if source_status == "download_failed":
+                command.append("--failed-only")
+            elif source_status == "no_attachment":
+                command.append("--recheck-no-attachment")
+            elif source_status == "audit_all":
+                command.append("--audit-all")
+            if self.config_path is not None:
+                command.extend(("--config", str(self.config_path)))
 
-        _returncode, _stdout, stderr = _run_piped(command, Path.cwd(), heartbeat, poll_interval=2.0)
-        if _returncode != 0:
-            last_error = f"retry_exit_{_returncode}"
-        processed = total_targets
+            def heartbeat() -> None:
+                snapshot = self._manifest_retry_snapshot(job_id)
+                with Session(self.engine) as session:
+                    job = session.get(OperationJob, job_id)
+                    if job is None:
+                        return
+                    job.progress_current = snapshot.progress_current
+                    job.progress_total = snapshot.total
+                    job.heartbeat_at = datetime.now(timezone.utc)
+                    job.lease_expires_at = job.heartbeat_at + LEASE_TTL
+                    active = session.scalar(select(OAManifestItem).where(
+                        OAManifestItem.oa_item_key.in_(chunk),
+                        OAManifestItem.processing_status == "processing",
+                    ).order_by(OAManifestItem.last_retry_at.desc(), OAManifestItem.id.desc()).limit(1))
+                    if active:
+                        self._event(session, job, "manifest_retry_item_started", "running", {"oa_item_key": active.oa_item_key, "manifest_id": active.id, "item_id": active.workitem_id_text or active.oa_item_key, "title": active.title, "stage": "正在进入 OA 详情页并识别附件"})
+                    session.commit()
+
+            returncode, _stdout, stderr = _run_piped(command, Path.cwd(), heartbeat, poll_interval=2.0)
+            if returncode == 5 and browser_restarts < 3:
+                # The CLI restored the interrupted target to its pre-attempt
+                # state. A new child process gives the next try a fresh browser.
+                browser_restarts += 1
+                continue
+            if returncode != 0:
+                last_error = f"retry_exit_{returncode}"
+                break
+            updated_snapshot = self._manifest_retry_snapshot(job_id)
+            if updated_snapshot.pending_keys == snapshot.pending_keys:
+                last_error = "retry_made_no_durable_progress"
+                break
+
+        final_snapshot = self._manifest_retry_snapshot(job_id)
         with Session(self.engine) as session:
             job = session.get(OperationJob, job_id)
             if job is None:
                 return
-            job.status = "completed" if last_error is None else "failed"
-            job.last_error_code = last_error
+            job.progress_current = final_snapshot.progress_current
+            job.progress_total = final_snapshot.total
+            job.status = "completed" if final_snapshot.complete and last_error is None else "failed"
+            job.last_error_code = last_error or (None if final_snapshot.failed == 0 else "manifest_retry_item_failures")
             job.finished_at = datetime.now(timezone.utc)
             job.lease_owner = None
             job.lease_expires_at = None
-            if last_error is not None:
-                stale_rows = session.scalars(select(OAManifestItem).where(OAManifestItem.processing_status == "processing")).all()
-                for row in stale_rows:
-                    row.processing_status = "download_failed"
-                    row.failure_stage = "interrupted"
-                    row.last_error = last_error
-                    row.last_retry_at = datetime.now(timezone.utc)
             self._event(session, job, "manifest_retry_finished", job.status, {
-                "processed": processed,
+                "processed": final_snapshot.progress_current,
+                "failed": final_snapshot.failed,
+                "remaining": len(final_snapshot.pending_keys),
                 "stderr_tail": (stderr or "")[-2000:] if last_error is not None else "",
             })
             session.commit()

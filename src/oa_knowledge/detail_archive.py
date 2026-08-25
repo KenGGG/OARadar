@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.archive import atomic_write_bytes, inspect_file, safe_filename, sha256_file
 from oa_knowledge.archive.manifest import ContainerManifest, FileManifest, ItemManifest
-from oa_knowledge.archive_paths import done_archive_directory
+from oa_knowledge.archive_paths import done_archive_collision_directory, done_archive_directory
 from oa_knowledge.collector.detail import DetailCapture
 from oa_knowledge.constants import FileRole, PipelineStatus
 from oa_knowledge.db.models import ArchivedFile, BatchItem, OAItem, ReviewEntry
@@ -34,6 +34,12 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
 
     oa_item.initiated_at = item.created_at or oa_item.initiated_at
     directory = done_archive_directory(item.title, item.workitem_id_text, oa_item.initiated_at)
+    collision = session.scalar(select(OAItem.id).where(
+        OAItem.archive_relpath == directory.as_posix(),
+        OAItem.oa_item_key != item.oa_item_key,
+    ).limit(1))
+    if collision is not None:
+        directory = done_archive_collision_directory(item.title, item.oa_item_key, oa_item.initiated_at)
     files: list[FileManifest] = []
     root_container_key = f"{capture.page_family}:{item.workitem_id_text}"
     # Detail metadata and page snapshots are process evidence.  Keeping them

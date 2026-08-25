@@ -712,6 +712,7 @@ def manifest_download(
                     processed += 1
                     continue
                 previous_status = row.processing_status
+                previous_last_retry_at = row.last_retry_at
                 row.processing_status = "processing"
                 row.last_retry_at = datetime.now(timezone.utc)
                 row_id, target_page, workitem_id, row_title, row_retry_count = row.id, row.list_page, row.workitem_id_text, row.title, row.retry_count
@@ -746,6 +747,8 @@ def manifest_download(
                 except AuthRequiredError:
                     raise
                 except Exception as direct_exc:
+                    if is_systemic_browser_closed(direct_exc):
+                        raise SystemicBrowserClosedError(str(direct_exc)) from direct_exc
                     try:
                         located_workitem_id = list_adapter.locate_item(
                             target_page, row_title, workitem_id,
@@ -760,6 +763,8 @@ def manifest_download(
                             direct_url=_oa_detail_url(browser.base_url, detail_link) if detail_link else None,
                         )
                     except Exception as fallback_exc:
+                        if is_systemic_browser_closed(fallback_exc):
+                            raise SystemicBrowserClosedError(str(fallback_exc)) from fallback_exc
                         direct_error = _sanitize_operational_error(direct_exc)
                         fallback_error = _sanitize_operational_error(fallback_exc)
                         raise RuntimeError(f"direct detail failed: {direct_error}; list fallback failed: {fallback_error}") from fallback_exc
@@ -819,6 +824,17 @@ def manifest_download(
                                         payload_json=json.dumps({"manifest_id": row.id}),
                                     ))
                     session.commit()
+            except SystemicBrowserClosedError:
+                with Session(engine) as session:
+                    row = session.get(OAManifestItem, row_id)
+                    if row is not None:
+                        row.processing_status = previous_status
+                        row.last_retry_at = previous_last_retry_at
+                        row.last_error = None
+                        row.failure_stage = None
+                        session.commit()
+                typer.echo("browser_closed: retry with a fresh browser session", err=True)
+                raise typer.Exit(5)
             except AuthRequiredError as exc:
                 if browser.login_with_saved_credentials(30) == LoginState.AUTHENTICATED:
                     with Session(engine) as session:
@@ -1798,6 +1814,16 @@ def _sanitize_operational_error(exc: Exception) -> str:
     value = re.sub(r"(?im)^\s*-\s*(?:cookie|authorization|proxy-authorization):.*$", "  - [credential header redacted]", value)
     value = re.sub(r"(?i)(?:JSESSIONID|token|password|passwd|secret)=([^;&\s]+)", lambda m: m.group(0).split("=", 1)[0] + "=[redacted]", value)
     return value[:1000]
+
+
+class SystemicBrowserClosedError(RuntimeError):
+    """The browser process vanished; later items were not attempted."""
+
+
+def is_systemic_browser_closed(exc: Exception) -> bool:
+    """Recognize Playwright closure errors without importing its optional type."""
+    value = f"{type(exc).__name__}: {exc}".lower()
+    return "targetclosed" in value or "target page, context or browser has been closed" in value
 
 
 def _attachment_failure_summary(capture) -> str:

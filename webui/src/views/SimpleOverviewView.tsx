@@ -27,7 +27,7 @@ function num(value: number | null, missing: string): string {
 
 function manifestProgressText(done: SimpleStatusResponse["done"], oa: SimpleStatusResponse["oa_activity"]): string | null {
   if (oa.status !== "working") return null
-  const pending = Math.max(0, done.oa_total - done.archive_complete - done.excluded)
+  const pending = done.waiting_download_items
   if (oa.progress_total == null || oa.progress_total <= 0) {
     return `已发现 ${done.oa_total.toLocaleString()} 项，正在扫描更多页面；待下载 ${pending.toLocaleString()} 项。`
   }
@@ -38,7 +38,8 @@ function manifestDownloadCounters(done: SimpleStatusResponse["done"]) {
   return {
     discovered: done.oa_total,
     archiveComplete: done.archive_complete,
-    pending: Math.max(0, done.oa_total - done.archive_complete - done.excluded),
+    pending: done.waiting_download_items,
+    issues: done.download_issue_items,
     excluded: done.excluded,
   }
 }
@@ -82,7 +83,8 @@ export function SimpleOverviewView({ data, onJump }: {
           <div className="simple-metric"><span>原件完整</span><strong>{num(done.archive_complete, "尚未取得")}</strong></div>
           <div className="simple-metric"><span>MD 就绪</span><strong>{num(done.markdown_ready_items, "尚未取得")}</strong></div>
           <div className="simple-metric"><span>最终发布</span><strong>{num(done.published_items, "尚未取得")}</strong></div>
-          <div className="simple-metric"><span>排队中</span><strong>{num(done.queued_items, "尚未取得")}</strong></div>
+          <div className="simple-metric"><span>待下载</span><strong>{num(done.waiting_download_items, "尚未取得")}</strong></div>
+          <div className="simple-metric"><span>待 MD 化</span><strong>{num(done.queued_items, "尚未取得")}</strong></div>
         </div>
         <div className="simple-meta"><span>最近扫描：{time(done.last_scan_at)}</span></div>
         <button className="simple-link" onClick={() => onJump("done")}>查看已办资料 →</button>
@@ -115,6 +117,7 @@ export function SimpleOverviewView({ data, onJump }: {
           <div className="simple-metric"><span>已发现</span><strong>{num(manifestCounters.discovered, "尚未取得")}</strong></div>
           <div className="simple-metric"><span>原件完整</span><strong>{num(manifestCounters.archiveComplete, "尚未取得")}</strong></div>
           <div className="simple-metric"><span>待下载</span><strong>{num(manifestCounters.pending, "尚未取得")}</strong></div>
+          <div className="simple-metric"><span>下载异常</span><strong className={manifestCounters.issues > 0 ? "bad-text" : ""}>{num(manifestCounters.issues, "尚未取得")}</strong></div>
           <div className="simple-metric"><span>已排除</span><strong>{num(manifestCounters.excluded, "尚未取得")}</strong></div>
         </div>
         {manifestProgress && <p className="simple-detail">{manifestProgress}</p>}

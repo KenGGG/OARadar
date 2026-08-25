@@ -128,6 +128,12 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
     archive_complete = sum(1 for _, ps in manifests if ps in {"downloaded", "no_attachment"})
     no_attachment = sum(1 for _, ps in manifests if ps == "no_attachment")
     excluded = sum(1 for _, ps in manifests if ps == "skipped")
+    waiting_download_items = sum(
+        1 for _, ps in manifests if ps in {"discovered", "pending_download", "processing"}
+    )
+    download_issue_items = sum(
+        1 for _, ps in manifests if ps in {"download_failed", "auth_required", "partial", "depth_limit_reached"}
+    )
 
     status_map = _done_simple_status_map(session)
 
@@ -157,7 +163,8 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
     else:
         headline = (
             f"已办知识库尚未完成：已同步 {oa_total} 项，{archive_complete} 项原件完整，"
-            f"{published_items} 项已完成 Markdown 交付，{queued_items} 项仍在排队。"
+            f"{published_items} 项已完成 Markdown 交付，"
+            f"待下载 {waiting_download_items} 项、待 MD 化 {queued_items} 项。"
         )
         if attention_count > 0:
             headline += f"其中 {attention_count} 项需要处理。"
@@ -168,6 +175,8 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
         "headline": headline,
         "oa_total": oa_total,
         "archive_complete": archive_complete,
+        "waiting_download_items": waiting_download_items,
+        "download_issue_items": download_issue_items,
         "excluded": excluded,
         "no_attachment": no_attachment,
         "markdown_ready_items": markdown_ready_items,
