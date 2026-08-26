@@ -365,6 +365,7 @@ Specify:
 - `GET /api/classification/items/export.csv`
 - `GET /api/classification/items/{oa_item_key}`
 - `POST /api/classification/items/{oa_item_key}/manual-decision`
+- `POST /api/classification/items/{oa_item_key}/unlock` with explicit human confirmation
 
 Filters include query, content origin, business category, canonical issuer, decision source, classification status, integrity status, initiator role, confidence range, manual lock, and run ID. CSV must apply the identical filter object and deterministic ordering; no-filter export contains the whole selected run.
 
@@ -378,7 +379,7 @@ Run: `uv run pytest tests/test_classification_views.py tests/test_console_views.
 
 - [ ] **Step 4: Implement query DTO reuse**
 
-Create one `ClassificationFilters` model consumed by list and export paths. Manual requests require origin/category-or-issuer/reason and always create a new locked immutable decision. A correction is another authenticated manual decision that supersedes the prior version; no API may unlock a decision for automation.
+Create one `ClassificationFilters` model consumed by list and export paths. Manual requests require origin/category-or-issuer/reason and always create a new locked immutable decision. A correction is another authenticated manual decision that supersedes the prior version. Explicit unlock is a distinct authenticated human operation with actor/reason/confirmation; it creates a new immutable unlocked decision version and never mutates the prior lock in place. Automation may reconsider only after that explicit version becomes current.
 
 - [ ] **Step 5: Run tests and commit**
 
@@ -418,7 +419,7 @@ Keep users in 已办资料. Add compact chips for origin/status/integrity/source
 
 - [ ] **Step 4: Verify accessibility and build**
 
-Use labeled native controls, keyboard-operable drawer, focus return, status text in addition to color, and confirmation before one manual decision supersedes another. Run:
+Use labeled native controls, keyboard-operable drawer, focus return, status text in addition to color, and confirmation before one manual decision supersedes another or unlocks it for automatic reconsideration. Run:
 
 ```bash
 cd webui && npm run check && npm run build
