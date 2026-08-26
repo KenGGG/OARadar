@@ -63,9 +63,23 @@ def _normalize_legacy_parse_profiles() -> None:
                       AND active.engine = parse_artifacts.engine
                       AND active.engine_version = parse_artifacts.engine_version
                       AND active.config_hash = parse_artifacts.config_hash
+                      AND active.lifecycle_status = 'valid'
                       AND (
                           active.profile_version = 'legacy'
                           OR active.profile_version LIKE 'legacy-duplicate-%'
+                      )
+                ),
+                (
+                    SELECT MIN(valid_candidate.id)
+                    FROM parse_artifacts AS valid_candidate
+                    WHERE valid_candidate.content_object_id = parse_artifacts.content_object_id
+                      AND valid_candidate.engine = parse_artifacts.engine
+                      AND valid_candidate.engine_version = parse_artifacts.engine_version
+                      AND valid_candidate.config_hash = parse_artifacts.config_hash
+                      AND valid_candidate.lifecycle_status = 'valid'
+                      AND (
+                          valid_candidate.profile_version = 'legacy'
+                          OR valid_candidate.profile_version LIKE 'legacy-duplicate-%'
                       )
                 ),
                 (

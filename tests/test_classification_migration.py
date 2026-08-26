@@ -240,6 +240,76 @@ def test_0038_prefers_active_legacy_parse_artifact_as_canonical(tmp_path: Path) 
     ]
 
 
+@pytest.mark.parametrize("set_invalid_active", [False, True])
+def test_0038_prefers_valid_legacy_artifact_over_invalid_history(
+    tmp_path: Path,
+    set_invalid_active: bool,
+) -> None:
+    database_path = tmp_path / f"valid-legacy-{set_invalid_active}.db"
+    upgrade_database(database_path)
+    command.downgrade(_alembic_config(database_path), "0037_no_attachment_evidence")
+
+    with sqlite3.connect(database_path) as connection:
+        artifact_ids = _insert_legacy_parse_artifacts(
+            connection,
+            count=2,
+            content_sha256="4" * 64,
+            config_hash="5" * 64,
+        )
+        connection.execute(
+            "UPDATE parse_artifacts SET lifecycle_status = 'rejected' WHERE id = ?",
+            (artifact_ids[0],),
+        )
+        if set_invalid_active:
+            connection.execute(
+                "UPDATE content_objects SET active_parse_artifact_id = ? WHERE sha256 = ?",
+                (artifact_ids[0], "4" * 64),
+            )
+
+    command.upgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
+
+    with sqlite3.connect(database_path) as connection:
+        profiles = connection.execute(
+            "SELECT id, profile_version FROM parse_artifacts ORDER BY id"
+        ).fetchall()
+    assert profiles == [
+        (artifact_ids[0], f"legacy-duplicate-{artifact_ids[0]}"),
+        (artifact_ids[1], "legacy"),
+    ]
+
+
+def test_0038_uses_stable_minimum_when_no_legacy_artifact_is_valid(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "no-valid-legacy.db"
+    upgrade_database(database_path)
+    command.downgrade(_alembic_config(database_path), "0037_no_attachment_evidence")
+
+    with sqlite3.connect(database_path) as connection:
+        artifact_ids = _insert_legacy_parse_artifacts(
+            connection,
+            count=2,
+            content_sha256="6" * 64,
+            config_hash="7" * 64,
+        )
+        connection.execute("UPDATE parse_artifacts SET lifecycle_status = 'rejected'")
+        connection.execute(
+            "UPDATE content_objects SET active_parse_artifact_id = ? WHERE sha256 = ?",
+            (artifact_ids[1], "6" * 64),
+        )
+
+    command.upgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
+
+    with sqlite3.connect(database_path) as connection:
+        profiles = connection.execute(
+            "SELECT id, profile_version FROM parse_artifacts ORDER BY id"
+        ).fetchall()
+    assert profiles == [
+        (artifact_ids[0], "legacy"),
+        (artifact_ids[1], f"legacy-duplicate-{artifact_ids[1]}"),
+    ]
+
+
 def test_0038_recovers_when_profile_column_exists_without_reuse_index(
     tmp_path: Path,
 ) -> None:
