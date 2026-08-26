@@ -38,6 +38,18 @@
 - 分类 schema 版本；
 - 本机模型名称和提示词版本。
 
+每条 OA 分类决策还必须保存独立的 `decision_input_sha256`。它只描述该 OA Package 的有效输入，至少包含：
+
+- 标题、发起人、文号、完成时间和 manifest 状态；
+- 排除状态与命中策略；
+- 附件清单、角色、容器关系、完整性状态和内容 SHA-256；
+- 已提取的转发关系；
+- 本次实际使用的 ParseArtifact 复用键；
+- 当前人工决策版本；
+- 规则、schema、提示词和私有配置版本。
+
+程序以单项指纹判断是否需要重新分类。一个 OA 的输入变化不得强迫其他未变化事项重新计算。
+
 增量任务与全量任务调用同一套服务，只是目标集合不同。
 
 ## 4. 总体数据流
@@ -68,7 +80,7 @@ MarkdownBuildService 构建 .builds/<run_id>
 PublicationService 数量对账、QA、人工确认和正式切换
 ```
 
-解析不是全量分类的前置步骤。程序必须先运行纯元数据规则，只有无法确定的 OA 才能申请解析附件。相同内容 SHA-256 只能生成一份有效 ParseArtifact。
+解析不是全量分类的前置步骤。程序必须先运行纯元数据规则，只有无法确定的 OA 才能申请解析附件。相同 ParseArtifact 复用键只能生成一份有效解析产物；解析器或 profile 版本不同则允许并存。
 
 ## 5. 两条独立状态轴
 
@@ -109,11 +121,13 @@ initiator_type
 relay_from
 transfer_chain
 issuer
+canonical_issuer
 business_category
 document_number
 document_type
 normalized_title
 decision_source
+decision_input_sha256
 classification_confidence
 classification_reason
 rule_version
@@ -127,11 +141,12 @@ created_at
 
 - `content_origin` 为 `internal` 或 `external`。
 - `business_category` 仅适用于 internal；external 时必须为空。
-- external 必须具有完整、规范化的 `issuer`。
-- issuer 不得等于人员角色表中的任何人员标识或别名。
+- external 必须具有完整的 `canonical_issuer`；`issuer` 保留原始识别值。
+- issuer 和 canonical issuer 均不得等于人员角色表中的任何人员标识或别名。
 - `relay_from` 是便捷查询字段，不替代完整转发链。
 - `transfer_chain` 是有序结构，每一级保存人员标识、顺序、角色类型和证据来源，可表达多级转发。
 - `decision_source` 为 `metadata_rule`、`content_rule`、`local_qwen` 或 `manual`。
+- `decision_input_sha256` 是当前 OA Package 决策输入的稳定 SHA-256；相同输入与相同有效决策必须幂等复用。
 - 分类理由保存结构化规则代码和必要证据，不复制附件全文或完整模型输入。
 
 ## 7. 人工决策
@@ -163,6 +178,13 @@ manual_locked=true
 10. 人工审核。
 
 禁止使用“标题包含银行/政府/公司”等单个普通词直接判断来源。人员角色是默认证据，不得覆盖更明确的文号、模板、发文机关或转发链证据。
+
+每条分类证据必须声明 `evidence_scope`：
+
+- `package`：描述 OA 事项本身，可参与 Package 的 `content_origin`、flow type 和正式目录判断；
+- `attachment`：只描述某个附件，可形成附件级 origin、issuer、文号和 canonical document metadata，不能单独改变 Package 来源。
+
+证据优先级只在相同作用范围内比较。明确的内部工作流可以把 Package 判为 internal；其中某个附件即使具有外部红头、文号或发文机关，也只能记录为 attachment-scope external evidence，不能把整个 Package 改判为 external。
 
 自动发布的最低置信度默认为 `0.85`。正式文号映射、明确标准工作流等确定性规则可以产生更高置信度，但任何高优先级证据冲突都必须进入 `needs_review`，不得用分数相加掩盖冲突。阈值属于版本化分类配置，变更后必须产生新的运行签名和决策版本。
 
@@ -202,6 +224,8 @@ external 事项以真实发文单位作为目录，不使用发起人、转发�
 5. 本机 Qwen 提取；
 6. 人工确认。
 
+识别结果必须先通过机构别名表归一化为 `canonical_issuer`，正式目录只使用 canonical issuer。原始识别文本作为证据保留，不直接作为目录名。无法唯一映射的别名进入 `needs_review`，不得自动新建近似机构目录。
+
 文种只写入 metadata，不作为目录层级。
 
 ## 12. 私有规则配置
@@ -211,6 +235,7 @@ external 事项以真实发文单位作为目录，不使用发起人、转发�
 ```text
 private/classification/initiator_profiles.yaml
 private/classification/document_number_issuers.yaml
+private/classification/issuer_aliases.yaml
 private/classification/title_templates.yaml
 ```
 
@@ -231,14 +256,20 @@ private/classification/title_templates.yaml
 必须区分 OA occurrence 与 canonical document：
 
 - 每条 OA occurrence 均保留独立 Package 和来源关系；
-- 内容 SHA-256 相同的附件复用 ContentObject 和 ParseArtifact；
+- 内容 SHA-256 相同的附件复用 ContentObject；只有解析器身份和解析配置也一致时才复用 ParseArtifact；
 - 正式文号与规范化标题可作为 canonical identity 的补充证据；
 - 不因去重删除任何原始 OA 归档记录；
 - 派生 Markdown 可以在不同 Package 中物化，但不得重复执行昂贵解析。
 
 ## 14. 按需解析与本机 Qwen
 
-ParseCacheService 只接受已经通过原件完整性校验的文件。分类器为不确定事项选择必要来源，并按 ContentObject/SHA-256 请求解析。
+ParseCacheService 只接受已经通过原件完整性校验的文件。分类器为不确定事项选择必要来源，并使用以下复用键请求解析：
+
+```text
+content_sha256 + parser_name + parser_version + parse_profile_version + parse_config_sha256
+```
+
+同内容、同解析器版本和同 profile 才能复用。解析器或 profile 升级必须允许生成新的不可变 ParseArtifact，并由显式的 active artifact 指针选择当前版本，不能被旧缓存锁死。
 
 本机 Qwen 仅处理内容规则仍无法确定的事项。允许输入：
 
@@ -249,7 +280,7 @@ ParseCacheService 只接受已经通过原件完整性校验的文件。分类�
 - 首页或正文前若干千字；
 - 已提取的结构化内容证据。
 
-禁止发送到联网模型。模型必须返回严格结构化结果；低置信、issuer 不完整、字段约束失败或证据冲突均进入 `needs_review`。
+禁止发送到联网模型。模型必须返回严格结构化结果；低置信、canonical issuer 不完整、字段约束失败或证据冲突均进入 `needs_review`。
 
 ## 15. Dry Run 与 WebUI
 
@@ -278,11 +309,24 @@ Dry Run 汇总至少包含分类状态、来源类型、内部目录、外部 is
 data/markdown/.builds/<run_id>/
 ```
 
-正式内容位于：
+通过 QA 的不可变版本位于 `.versions/<release_id>/`；曾经正式发布但当前不再使用的版本位于 `.previous/<release_id>/`。单一活动指针为：
+
+```text
+data/markdown/current -> .versions/<release_id>
+```
+
+为保持既有目录外观，以下入口是初始化后不再改写的稳定链接：
+
+```text
+data/markdown/internal -> current/internal
+data/markdown/external -> current/external
+```
+
+因此正式读取路径仍为：
 
 ```text
 data/markdown/internal/<business_category>/YYYY/MM/<package>/
-data/markdown/external/<issuer>/YYYY/MM/<package>/
+data/markdown/external/<canonical_issuer>/YYYY/MM/<package>/
 ```
 
 Package 目录名必须包含由 OA key 稳定生成的不可逆短标识：
@@ -291,7 +335,7 @@ Package 目录名必须包含由 OA key 稳定生成的不可逆短标识：
 YYYYMMDD-规范化事项标题--oa_<sha256(oa_item_key)短标识>
 ```
 
-禁止使用 `(1)`、`(2)` 等临时重名后缀。每个可发布 OA key 必须且只能对应一个 Package。
+短标识固定为 `SHA256(oa_item_key)` 的前 12 个小写十六进制字符。安全化后的标题部分最多为 120 个 UTF-8 字节，必须按完整 Unicode 码点截断；整个 Package 目录组件最多为 160 个 UTF-8 字节。禁止使用 `(1)`、`(2)` 等临时重名后缀。每个可发布 OA key 必须且只能对应一个 Package。
 
 普通 Package 至少包含：
 
@@ -319,12 +363,13 @@ initiator_type
 relay_from
 transfer_chain
 issuer
+canonical_issuer
 document_number
 document_type
 business_category
 canonical_document_ids
 source_oa_ids
-classification_method
+decision_source
 classification_reason
 classification_confidence
 classification_decision_id
@@ -333,7 +378,7 @@ oa_completed_at
 markdown_generated_at
 ```
 
-附件 Markdown 额外保存原件文件 ID、内容 SHA-256、ParseArtifact ID、解析器版本和附件在 Package 中的角色。
+附件 Markdown 额外保存原件文件 ID、内容 SHA-256、ParseArtifact ID、解析器与 profile 版本、附件在 Package 中的角色，以及 attachment-scope origin、issuer 和文号 metadata。
 
 ## 18. 发布门禁与数量对账
 
@@ -341,7 +386,7 @@ markdown_generated_at
 
 - `classification_status=classified`；
 - internal 具有合法 business category；
-- external 具有完整 issuer，且 issuer 不是人员标识；
+- external 具有完整 canonical issuer，且 issuer/canonical issuer 均不是人员标识；
 - `content_integrity_status` 为 `ok` 或 `no_attachment_confirmed`；
 - 不存在未解决的规则冲突；
 - 当前有效决策已冻结到本次构建输入。
@@ -351,6 +396,17 @@ markdown_generated_at
 ```text
 total = excluded + publishable + integrity_blocked + needs_review
 ```
+
+首次历史全量验收基线固定为：
+
+```text
+total=8119
+excluded=1975
+classification_target=6144
+8119 = 1975 + 其余所有互斥终态
+```
+
+当前已识别的 40 个发起人标识必须全部映射到 `internal`、`external`、`mixed`、`system` 或 `unknown`。`unknown` 允许存在，但必须在 Dry Run 中单独列出，不得静默默认成 internal 或 external。
 
 同时验证：
 
@@ -373,7 +429,11 @@ total = excluded + publishable + integrity_blocked + needs_review
 - 删除 `.previous/` 只能删除 Markdown 派生数据；
 - 删除不得影响 originals、分类历史、人工决策或解析缓存。
 
-由于构建目录位于 `data/markdown/` 内部且 `data/` 顶层不得出现第三个目录，整个 Markdown 根目录无法通过一次祖先/子目录重命名完成切换。PublicationService 因此采用持久化两阶段切换：先冻结并校验构建，再用同文件系统原子重命名逐个替换正式分类子树，最后原子写入活动版本提交标记。切换日志记录每一步的旧路径、新路径和恢复动作；WebUI 只有看到提交标记后才报告新版本正式生效。任何中断都必须自动前滚或回滚到一个完整版本，禁止报告或继续使用无法解释的混合目录。
+正常发布时 current 指向 `.versions/<release_id>`；提交成功后，先前正式版本移入 `.previous/`。回滚时 current 可以直接指向选定的 `.previous/<release_id>`，而回滚前的正式版本移入 `.previous/`。任何被 current 指向的版本都视为当前正式版本，即使其物理位置在 `.previous/`，均禁止删除。
+
+PublicationService 把通过 QA 的构建移动为不可变 `.versions/<release_id>`，创建临时 `current.next` 链接，再使用同文件系统 `os.replace` 一次性替换单一 `current` 指针。`internal` 和 `external` 稳定入口都经由同一个 current 解析，因此外部读取者不会观察到两个分类子树分属不同活动版本。
+
+正式切换必须设置独立的 **Publication 原子性 Gate**。故障注入测试要覆盖构建冻结、版本落位、临时指针创建、current 替换、旧版本登记和状态提交的每一个边界。任一步骤异常退出或进程被终止后，重启必须自动识别并恢复到完整旧版本或完整新版本，不能留下无法识别的指针、半登记版本或混合活动目录。不能通过该 Gate 时，PublicationService 不得开放正式切换功能。
 
 ## 20. 服务边界
 
@@ -412,20 +472,25 @@ total = excluded + publishable + integrity_blocked + needs_review
 自动化测试只使用虚构人员、机构、标题和附件，至少覆盖：
 
 - manifest 排除优先；
+- 单项 `decision_input_sha256` 只使输入变化的 OA 重新分类；
+- 数据库和 Frontmatter 统一使用 `decision_source`；
 - 元数据确定时不解析附件；
 - 只有不确定事项按需解析；
 - 内容规则仍不确定时才调用本机模型；
 - 多级转发链；
 - internal/external 字段互斥；
 - 人工锁定不可自动覆盖；
-- 同 SHA-256 只解析一次；
+- 同一 ParseArtifact 复用键只解析一次，解析器或 profile 变化可产生新版本；
+- package-scope 与 attachment-scope 证据不会相互越权；
+- issuer alias 归一为唯一 canonical issuer；
 - 完整性状态与分类状态相互独立；
 - 无附件事项只生成 `_index.md`；
-- 稳定 OA 短标识和同日同标题冲突；
+- 固定 UTF-8 字节长度、稳定 OA 短标识和同日同标题冲突；
 - 每个 published OA key 恰好对应一个 Package；
 - 全量数量对账；
 - 构建中断不影响正式目录；
 - 切换失败恢复；
+- Publication 原子性逐边界故障注入；
 - 回滚可再次恢复；
 - 历史删除仅影响派生 Markdown；
 - Git 追踪文件中不存在私有人员配置或真实 OA fixture。
@@ -436,13 +501,13 @@ total = excluded + publishable + integrity_blocked + needs_review
 
 实施必须按以下依赖顺序拆分计划：
 
-1. 私有配置 schema、分类决策和构建账本数据模型；
+1. 私有配置 schema、分类决策（含单项输入指纹和证据作用范围）及构建账本数据模型；
 2. ArchiveReadinessService 与元数据规则；
 3. ParseCacheService 按需解析；
 4. 内容规则、本机 Qwen 兜底和人工锁定；
 5. Dry Run API、WebUI 筛选、人工复核和 CSV；
 6. MarkdownBuildService、唯一 Package 路径和 QA；
-7. PublicationService 切换、回滚与历史版本管理；
+7. PublicationService 单一 current 指针、原子性 Gate、回滚与历史版本管理；
 8. 全量 Dry Run、抽样验收和首次人工发布。
 
 在 Dry Run 和人工 QA 通过前，不执行首次正式 Markdown 切换。
