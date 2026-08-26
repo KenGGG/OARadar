@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal
+from collections.abc import Sequence
+from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
@@ -9,6 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 InitiatorRole = Literal["internal", "external", "mixed", "system", "unknown"]
 ContentOrigin = Literal["internal", "external"]
+
+
+class _PatternRule(Protocol):
+    pattern: str
 
 
 def _normalize_alias_mapping(value: object) -> object:
@@ -30,6 +35,23 @@ def _normalize_alias_mapping(value: object) -> object:
         canonical_by_alias[collision_key] = clean_canonical
         normalized[clean_alias] = clean_canonical
     return normalized
+
+
+def _validate_terminal_aliases(aliases: dict[str, str]) -> None:
+    targets_by_alias = {alias.casefold(): canonical for alias, canonical in aliases.items()}
+    for canonical in aliases.values():
+        next_target = targets_by_alias.get(canonical.casefold())
+        if next_target is not None and next_target.casefold() != canonical.casefold():
+            raise ValueError("canonical issuer aliases must resolve directly to terminal targets")
+
+
+def _validate_unique_rule_patterns(rules: Sequence[_PatternRule]) -> None:
+    seen: set[str] = set()
+    for rule in rules:
+        pattern = rule.pattern
+        if pattern in seen:
+            raise ValueError("rule patterns must be unique and order-independent")
+        seen.add(pattern)
 
 
 class StrictClassificationModel(BaseModel):
@@ -91,6 +113,11 @@ class InitiatorProfilesFile(StrictClassificationModel):
 class DocumentNumberIssuersFile(StrictClassificationModel):
     rules: list[DocumentNumberIssuerRule] = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def unique_rule_patterns(self) -> "DocumentNumberIssuersFile":
+        _validate_unique_rule_patterns(self.rules)
+        return self
+
 
 class IssuerAliasesFile(StrictClassificationModel):
     aliases: dict[NonEmptyText, NonEmptyText] = Field(min_length=1)
@@ -100,9 +127,19 @@ class IssuerAliasesFile(StrictClassificationModel):
     def normalize_issuer_aliases(cls, value: object) -> object:
         return _normalize_alias_mapping(value)
 
+    @model_validator(mode="after")
+    def terminal_canonical_targets(self) -> "IssuerAliasesFile":
+        _validate_terminal_aliases(self.aliases)
+        return self
+
 
 class TitleTemplatesFile(StrictClassificationModel):
     templates: list[TitleTemplateRule] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_rule_patterns(self) -> "TitleTemplatesFile":
+        _validate_unique_rule_patterns(self.templates)
+        return self
 
 
 class PrivateClassificationConfig(StrictClassificationModel):
@@ -144,4 +181,13 @@ class PrivateClassificationConfig(StrictClassificationModel):
                 if prior is not None and prior != identifier:
                     raise ValueError("initiator alias is assigned to multiple profiles")
                 owners[normalized] = identifier
+        return self
+
+    @model_validator(mode="after")
+    def order_independent_rule_and_issuer_alias_integrity(
+        self,
+    ) -> "PrivateClassificationConfig":
+        _validate_terminal_aliases(self.issuer_aliases)
+        _validate_unique_rule_patterns(self.document_number_issuers)
+        _validate_unique_rule_patterns(self.title_templates)
         return self

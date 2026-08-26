@@ -113,6 +113,97 @@ aliases:
     assert first_loaded.config_sha256 == second_loaded.config_sha256
 
 
+def test_hash_ignores_unordered_rule_and_initiator_alias_declaration_order(
+    tmp_path: Path,
+) -> None:
+    initiators = """
+initiators:
+  synth.person.internal:
+    role: internal
+    aliases: [Synthetic Internal Alpha, Synthetic Internal Beta]
+  synth.person.unknown:
+    role: unknown
+    aliases: [Synthetic Unknown Alpha, Synthetic Unknown Beta]
+"""
+    document_rules = """
+rules:
+  - pattern: '^SYN-A-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+    document_type: notice
+  - pattern: '^SYN-B-[0-9]+$'
+    canonical_issuer: Synthetic Authority B
+    document_type: circular
+"""
+    title_rules = """
+templates:
+  - pattern: '^Synthetic approval:'
+    content_origin: internal
+    flow_type: approval
+    business_category: 08_synthetic_administration
+  - pattern: '^Synthetic circulation:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Authority A
+"""
+    first = _write_private_config(
+        tmp_path / "first",
+        replacements={
+            "initiator_profiles.yaml": initiators,
+            "document_number_issuers.yaml": document_rules,
+            "title_templates.yaml": title_rules,
+        },
+    )
+    reordered = _write_private_config(
+        tmp_path / "reordered",
+        replacements={
+            "initiator_profiles.yaml": """
+initiators:
+  synth.person.unknown:
+    role: unknown
+    aliases: [Synthetic Unknown Beta, Synthetic Unknown Alpha]
+  synth.person.internal:
+    role: internal
+    aliases: [Synthetic Internal Beta, Synthetic Internal Alpha]
+""",
+            "document_number_issuers.yaml": """
+rules:
+  - pattern: '^SYN-B-[0-9]+$'
+    canonical_issuer: Synthetic Authority B
+    document_type: circular
+  - pattern: '^SYN-A-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+    document_type: notice
+""",
+            "title_templates.yaml": """
+templates:
+  - pattern: '^Synthetic circulation:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Authority A
+  - pattern: '^Synthetic approval:'
+    content_origin: internal
+    flow_type: approval
+    business_category: 08_synthetic_administration
+""",
+        },
+    )
+    semantically_changed = _write_private_config(
+        tmp_path / "changed",
+        replacements={
+            "initiator_profiles.yaml": initiators.replace("role: unknown", "role: mixed"),
+            "document_number_issuers.yaml": document_rules,
+            "title_templates.yaml": title_rules,
+        },
+    )
+
+    first_hash = load_private_classification_config(first).config_sha256
+    reordered_hash = load_private_classification_config(reordered).config_sha256
+    changed_hash = load_private_classification_config(semantically_changed).config_sha256
+
+    assert reordered_hash == first_hash
+    assert changed_hash != first_hash
+
+
 @pytest.mark.parametrize(
     ("filename", "replacement"),
     [
@@ -216,6 +307,79 @@ aliases:
 
 
 @pytest.mark.parametrize(
+    "aliases",
+    [
+        """
+aliases:
+  SAA: Synthetic Authority A
+  Synthetic Authority A: Synthetic Authority B
+  Synthetic Authority B: Synthetic Authority B
+""",
+        """
+aliases:
+  Synthetic Authority A: Synthetic Authority B
+  Synthetic Authority B: Synthetic Authority A
+""",
+        """
+aliases:
+  SAA: Synthetic Authority A
+  Synthetic Authority A: Synthetic Alternate Authority
+""",
+    ],
+    ids=["alias-chain", "alias-cycle", "non-terminal-canonical-target"],
+)
+def test_rejects_non_terminal_canonical_issuer_aliases(
+    tmp_path: Path, aliases: str
+) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={"issuer_aliases.yaml": aliases},
+    )
+
+    with pytest.raises(PrivateConfigError, match="issuer_aliases.yaml"):
+        load_private_classification_config(root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "rules"),
+    [
+        (
+            "document_number_issuers.yaml",
+            """
+rules:
+  - pattern: '^SYN-DUP-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+  - pattern: '^SYN-DUP-[0-9]+$'
+    canonical_issuer: Synthetic Authority B
+""",
+        ),
+        (
+            "title_templates.yaml",
+            """
+templates:
+  - pattern: '^Synthetic duplicate:'
+    content_origin: internal
+    flow_type: approval
+  - pattern: '^Synthetic duplicate:'
+    content_origin: external
+    flow_type: circulation
+""",
+        ),
+    ],
+)
+def test_rejects_rule_patterns_with_order_ambiguous_outcomes(
+    tmp_path: Path, filename: str, rules: str
+) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={filename: rules},
+    )
+
+    with pytest.raises(PrivateConfigError, match=filename):
+        load_private_classification_config(root)
+
+
+@pytest.mark.parametrize(
     "profile",
     [
         "aliases: [Synthetic Unresolved Person]",
@@ -245,6 +409,71 @@ def test_classification_private_directory_is_the_only_settings_entry(monkeypatch
 
     assert settings.classification_private_dir == root.resolve()
     assert "must-not-be-loaded" not in settings.model_dump_json()
+
+
+def test_settings_preserves_root_symlink_for_loader_rejection(monkeypatch, tmp_path: Path) -> None:
+    target = _write_private_config(tmp_path / "classification-target")
+    configured = tmp_path / "classification-link"
+    configured.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("OA_CLASSIFICATION_PRIVATE_DIR", str(configured))
+
+    settings = load_settings()
+
+    assert settings.classification_private_dir == configured.absolute()
+    assert settings.classification_private_dir.is_symlink()
+    with pytest.raises(PrivateConfigError, match="root must not be a symlink"):
+        load_private_classification_config(settings.classification_private_dir)
+
+
+@pytest.mark.parametrize(
+    ("filename", "replacement", "private_fragments"),
+    [
+        (
+            "initiator_profiles.yaml",
+            """
+initiators:
+  TOP-SECRET-SYNTHETIC-ID:
+    role: TOP-SECRET-SYNTHETIC-ROLE
+    aliases: [TOP-SECRET-SYNTHETIC-ALIAS]
+""",
+            (
+                "TOP-SECRET-SYNTHETIC-ID",
+                "TOP-SECRET-SYNTHETIC-ROLE",
+                "TOP-SECRET-SYNTHETIC-ALIAS",
+            ),
+        ),
+        (
+            "issuer_aliases.yaml",
+            """
+aliases:
+  TOP-SECRET-SYNTHETIC-KEY: [TOP-SECRET-SYNTHETIC-YAML
+""",
+            ("TOP-SECRET-SYNTHETIC-KEY", "TOP-SECRET-SYNTHETIC-YAML"),
+        ),
+    ],
+    ids=["schema-validation", "malformed-yaml"],
+)
+def test_private_validation_errors_have_no_input_bearing_exception_chain(
+    tmp_path: Path,
+    filename: str,
+    replacement: str,
+    private_fragments: tuple[str, ...],
+) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={filename: replacement},
+    )
+
+    with pytest.raises(PrivateConfigError) as captured:
+        load_private_classification_config(root)
+
+    error = captured.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    rendered = str(error)
+    assert filename in rendered
+    for fragment in private_fragments:
+        assert fragment not in rendered
 
 
 def test_public_examples_are_synthetic_and_cover_all_initiator_roles() -> None:

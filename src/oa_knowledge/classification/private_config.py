@@ -28,6 +28,22 @@ _REQUIRED_FILES = (
     "title_templates.yaml",
 )
 
+_PUBLIC_SCHEMA_FIELDS = frozenset(
+    {
+        "aliases",
+        "business_category",
+        "canonical_issuer",
+        "content_origin",
+        "document_type",
+        "flow_type",
+        "initiators",
+        "pattern",
+        "role",
+        "rules",
+        "templates",
+    }
+)
+
 
 class PrivateConfigError(ValueError):
     """The local private configuration is missing, unsafe, or invalid."""
@@ -78,6 +94,29 @@ _UniqueKeySafeLoader.add_constructor(
 class LoadedPrivateConfig:
     config: PrivateClassificationConfig
     config_sha256: str
+
+
+def _canonical_hash_payload(config: PrivateClassificationConfig) -> dict[str, Any]:
+    """Return semantic hash input without assigning rule priority by file order.
+
+    The current schema defines initiator aliases and both rule collections as
+    unordered declarations. Exact repeated patterns are rejected by the schema,
+    so sorting here cannot choose between ambiguous outcomes. The parsed config
+    itself retains its declaration order for diagnostics and display.
+    """
+
+    payload = config.model_dump(mode="json")
+    for profile in payload["initiators"].values():
+        profile["aliases"] = sorted(profile["aliases"], key=str.casefold)
+
+    def stable_rule(rule: dict[str, Any]) -> str:
+        return json.dumps(rule, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    payload["document_number_issuers"] = sorted(
+        payload["document_number_issuers"], key=stable_rule
+    )
+    payload["title_templates"] = sorted(payload["title_templates"], key=stable_rule)
+    return payload
 
 
 def _read_required_file(root: Path, filename: str) -> str:
@@ -142,18 +181,21 @@ def _validated(model_type: type[Any], value: object, filename: str) -> Any:
     try:
         return model_type.model_validate(value)
     except ValidationError as exc:
-        fields = sorted({str(error["loc"][-1]) for error in exc.errors() if error["loc"]})
-        field_summary = ", ".join(fields) if fields else "schema"
-        raise PrivateConfigError(f"{filename}: invalid private configuration ({field_summary})") from exc
+        safe_fields = sorted(
+            {
+                component
+                for error in exc.errors(include_input=False)
+                for component in error["loc"]
+                if isinstance(component, str) and component in _PUBLIC_SCHEMA_FIELDS
+            }
+        )
+        category = ", ".join(safe_fields) if safe_fields else "schema"
+        raise PrivateConfigError(
+            f"{filename}: invalid private configuration ({category})"
+        ) from exc
 
 
-def load_private_classification_config(root: Path) -> LoadedPrivateConfig:
-    """Validate and load the four local-only classification rule files.
-
-    No private value or raw YAML is retained outside the parsed object, included
-    in exceptions, or used as part of a filesystem path.
-    """
-
+def _load_private_classification_config(root: Path) -> LoadedPrivateConfig:
     configured_root = Path(root).expanduser()
     if configured_root.is_symlink():
         raise PrivateConfigError("private classification root must not be a symlink")
@@ -196,7 +238,7 @@ def load_private_classification_config(root: Path) -> LoadedPrivateConfig:
         raise PrivateConfigError("private classification configuration has conflicting aliases") from exc
 
     canonical = json.dumps(
-        config.model_dump(mode="json"),
+        _canonical_hash_payload(config),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -205,3 +247,22 @@ def load_private_classification_config(root: Path) -> LoadedPrivateConfig:
         config=config,
         config_sha256=hashlib.sha256(canonical).hexdigest(),
     )
+
+
+def load_private_classification_config(root: Path) -> LoadedPrivateConfig:
+    """Validate and load the four local-only classification rule files.
+
+    Public failures expose only fixed filenames and error categories. The
+    outer exception is raised after the input-bearing implementation exception
+    has left scope, preventing traceback logging from retaining private YAML in
+    ``__cause__`` or ``__context__``.
+    """
+
+    failure_message: str | None = None
+    try:
+        return _load_private_classification_config(root)
+    except PrivateConfigError as error:
+        failure_message = str(error)
+    if failure_message is not None:
+        raise PrivateConfigError(failure_message)
+    raise AssertionError("unreachable private configuration loader state")

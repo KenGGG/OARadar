@@ -370,7 +370,9 @@ class Settings(StrictModel):
         expanded = value.expanduser()
         if not expanded.is_absolute():
             raise ValueError("classification_private_dir must be an absolute local path")
-        return expanded.resolve()
+        # Preserve a final symlink for the private loader's fail-closed check.
+        # abspath normalizes the absolute spelling without dereferencing it.
+        return Path(os.path.abspath(expanded))
 
     @model_validator(mode="after")
     def local_only(self) -> "Settings":
