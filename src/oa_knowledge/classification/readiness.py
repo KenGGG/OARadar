@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import unicodedata
 from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.db.models import (
@@ -34,6 +35,7 @@ ContentIntegrityStatus = Literal[
 ]
 
 _SHA256_HEX = frozenset("0123456789abcdef")
+_QUERY_CHUNK_SIZE = 500
 _FAILED_DOWNLOAD_STATUSES = frozenset(
     {
         "failed",
@@ -124,9 +126,43 @@ def _normalized_json_sha256(raw: str | None) -> tuple[str | None, int | None]:
         return None, None
     if not isinstance(value, list):
         return None, None
+    normalized_by_identity: dict[tuple[str, str], dict[str, object]] = {}
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"role", "key", "size", "sha256"}:
+            return None, None
+        role = entry["role"]
+        key = entry["key"]
+        size = entry["size"]
+        sha256 = entry["sha256"]
+        if not isinstance(role, str) or not isinstance(key, str):
+            return None, None
+        role = unicodedata.normalize("NFC", role).strip()
+        key = unicodedata.normalize("NFC", key).strip()
+        if not role or not key:
+            return None, None
+        if size is not None and (
+            isinstance(size, bool) or not isinstance(size, int) or size < 0
+        ):
+            return None, None
+        if sha256 is not None and not _is_sha256(sha256):
+            return None, None
+        normalized = {
+            "key": key,
+            "role": role,
+            "sha256": sha256.lower() if sha256 is not None else None,
+            "size": size,
+        }
+        identity = (role, key)
+        previous = normalized_by_identity.get(identity)
+        if previous is not None and previous != normalized:
+            return None, None
+        normalized_by_identity[identity] = normalized
+    normalized_rows = [
+        normalized_by_identity[identity] for identity in sorted(normalized_by_identity)
+    ]
     try:
         canonical = json.dumps(
-            value,
+            normalized_rows,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
@@ -134,7 +170,14 @@ def _normalized_json_sha256(raw: str | None) -> tuple[str | None, int | None]:
         ).encode("utf-8")
     except (TypeError, ValueError):
         return None, None
-    return hashlib.sha256(canonical).hexdigest(), len(value)
+    return hashlib.sha256(canonical).hexdigest(), len(normalized_rows)
+
+
+def _chunks(values: Sequence[object]) -> Sequence[tuple[object, ...]]:
+    return tuple(
+        tuple(values[offset : offset + _QUERY_CHUNK_SIZE])
+        for offset in range(0, len(values), _QUERY_CHUNK_SIZE)
+    )
 
 
 def _evidence(manifest: OAManifestItem | None, audit: OnlineAuditItem | None) -> ReadinessEvidence:
@@ -178,26 +221,29 @@ class ArchiveReadinessService:
         if not keys:
             return {}
 
-        manifests = {
-            row.oa_item_key: row
-            for row in session.scalars(
-                select(OAManifestItem).where(OAManifestItem.oa_item_key.in_(keys))
-            )
-        }
-        items = {
-            row.oa_item_key: row
-            for row in session.scalars(
-                select(OAItem).where(
-                    OAItem.oa_item_key.in_(keys), OAItem.source_channel == "done"
+        manifests: dict[str, OAManifestItem] = {}
+        items: dict[str, OAItem] = {}
+        for chunk in _chunks(keys):
+            manifests.update(
+                (row.oa_item_key, row)
+                for row in session.scalars(
+                    select(OAManifestItem).where(OAManifestItem.oa_item_key.in_(chunk))
                 )
             )
-        }
+            items.update(
+                (row.oa_item_key, row)
+                for row in session.scalars(
+                    select(OAItem).where(
+                        OAItem.oa_item_key.in_(chunk), OAItem.source_channel == "done"
+                    )
+                )
+            )
         item_ids = tuple(row.id for row in items.values())
         files_by_item_id: dict[int, list[ArchivedFile]] = defaultdict(list)
-        if item_ids:
+        for chunk in _chunks(item_ids):
             for row in session.scalars(
                 select(ArchivedFile).where(
-                    ArchivedFile.oa_item_id.in_(item_ids),
+                    ArchivedFile.oa_item_id.in_(chunk),
                     ArchivedFile.file_role.in_(AUDIT_ATTACHMENT_ROLES),
                 )
             ):
@@ -208,24 +254,33 @@ class ArchiveReadinessService:
             for row in rows
             if row.content_object_id is not None
         }
-        contents = {
-            row.id: row
-            for row in session.scalars(
-                select(ContentObject).where(ContentObject.id.in_(content_ids))
+        contents: dict[int, ContentObject] = {}
+        content_id_values = tuple(sorted(content_ids))
+        for chunk in _chunks(content_id_values):
+            contents.update(
+                (row.id, row)
+                for row in session.scalars(
+                    select(ContentObject).where(ContentObject.id.in_(chunk))
+                )
             )
-        } if content_ids else {}
 
         latest_audits: dict[str, OnlineAuditItem] = {}
-        for row in session.scalars(
-            select(OnlineAuditItem).where(
-                OnlineAuditItem.oa_item_key.in_(keys),
+        for chunk in _chunks(keys):
+            ranked = select(
+                OnlineAuditItem.id.label("audit_item_id"),
+                func.row_number().over(
+                    partition_by=OnlineAuditItem.oa_item_key,
+                    order_by=(OnlineAuditItem.finished_at.desc(), OnlineAuditItem.id.desc()),
+                ).label("audit_rank"),
+            ).where(
+                OnlineAuditItem.oa_item_key.in_(chunk),
                 OnlineAuditItem.finished_at.is_not(None),
-            )
-        ):
-            previous = latest_audits.get(row.oa_item_key)
-            row_key = (_utc(row.finished_at), row.id)
-            previous_key = (_utc(previous.finished_at), previous.id) if previous else None
-            if previous_key is None or row_key > previous_key:
+            ).subquery()
+            for row in session.scalars(
+                select(OnlineAuditItem)
+                .join(ranked, OnlineAuditItem.id == ranked.c.audit_item_id)
+                .where(ranked.c.audit_rank == 1)
+            ):
                 latest_audits[row.oa_item_key] = row
 
         return {
@@ -321,6 +376,38 @@ class ArchiveReadinessService:
             local_sha, local_count = _normalized_json_sha256(audit.local_evidence_json)
             if online_sha is None or local_sha is None:
                 reasons.update({"AUDIT_EVIDENCE_INVALID", "NOT_CHECKED"})
+            if audit.status == "matched":
+                counts = (
+                    audit.recognized_attachments,
+                    audit.database_attachments,
+                    audit.downloaded_attachments,
+                    online_count,
+                    local_count,
+                )
+                if any(count is None for count in counts) or len(set(counts)) != 1:
+                    reasons.add("AUDIT_INVENTORY_MISMATCH")
+                if online_sha is not None and local_sha is not None and online_sha != local_sha:
+                    reasons.add("AUDIT_INVENTORY_MISMATCH")
+
+                inventory_hashes = (
+                    audit.online_inventory_sha256,
+                    audit.local_inventory_sha256,
+                )
+                if any(value is not None for value in inventory_hashes):
+                    if not all(_is_sha256(value) for value in inventory_hashes):
+                        reasons.update({"AUDIT_EVIDENCE_INVALID", "NOT_CHECKED"})
+                    elif inventory_hashes[0].lower() != inventory_hashes[1].lower():
+                        reasons.add("AUDIT_INVENTORY_MISMATCH")
+
+                content_hashes = (
+                    audit.online_content_sha256,
+                    audit.local_content_sha256,
+                )
+                if any(value is not None for value in content_hashes):
+                    if not all(_is_sha256(value) for value in content_hashes):
+                        reasons.update({"AUDIT_EVIDENCE_INVALID", "NOT_CHECKED"})
+                    elif content_hashes[0].lower() != content_hashes[1].lower():
+                        reasons.add("SHA256_MISMATCH")
             if audit.status in _MISSING_AUDIT_STATUSES:
                 if audit.status == "depth_limit_reached":
                     reasons.add("DEPTH_LIMIT_REACHED")
@@ -334,13 +421,6 @@ class ArchiveReadinessService:
                 reasons.add("NOT_CHECKED")
 
             if zero_pair and audit.status == "matched":
-                counts = (
-                    audit.recognized_attachments,
-                    audit.database_attachments,
-                    audit.downloaded_attachments,
-                    online_count,
-                    local_count,
-                )
                 if any(count is not None and count > 0 for count in counts):
                     reasons.add("ZERO_ATTACHMENT_AUDIT_CONFLICT")
                 elif audit.recognized_attachments is None:

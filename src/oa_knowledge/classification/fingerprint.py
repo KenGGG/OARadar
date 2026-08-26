@@ -318,6 +318,9 @@ def _readiness_row(evidence: ReadinessEvidenceInput) -> dict[str, Any]:
         raise TypeError("manifest_no_attachment_confirmed must be a boolean")
     if not isinstance(evidence.audit_depth_limit_reached, bool):
         raise TypeError("audit_depth_limit_reached must be a boolean")
+    _optional_timestamp(
+        evidence.audit_finished_at, field="readiness_evidence.audit_finished_at"
+    )
     return {
         "manifest_processing_status": _optional_plain_text(
             evidence.manifest_processing_status,
@@ -326,9 +329,6 @@ def _readiness_row(evidence: ReadinessEvidenceInput) -> dict[str, Any]:
         "manifest_no_attachment_confirmed": evidence.manifest_no_attachment_confirmed,
         "audit_status": _optional_plain_text(
             evidence.audit_status, field="readiness_evidence.audit_status"
-        ),
-        "audit_finished_at": _optional_timestamp(
-            evidence.audit_finished_at, field="readiness_evidence.audit_finished_at"
         ),
         "audit_recognized_attachments": _optional_integer(
             evidence.audit_recognized_attachments,
@@ -439,7 +439,14 @@ def _attachment_rows(inputs: Sequence[AttachmentInput]) -> list[dict[str, Any]]:
     if len(keys) != len(set(keys)):
         raise ValueError("attachment parent topology has ambiguous attachment keys")
     key_set = set(keys)
-    container_keys = {row["source_container_key"] for row in rows}
+    container_parents: dict[str, str | None] = {}
+    for row in rows:
+        path = row["container_path"]
+        for index, container_key in enumerate(path):
+            parent = path[index - 1] if index else None
+            if container_key in container_parents and container_parents[container_key] != parent:
+                raise ValueError("container topology declares conflicting parent paths")
+            container_parents[container_key] = parent
     parent_by_key: dict[str, str | None] = {}
     for row in rows:
         path = row["container_path"]
@@ -450,10 +457,11 @@ def _attachment_rows(inputs: Sequence[AttachmentInput]) -> list[dict[str, Any]]:
         ):
             raise ValueError("container topology is inconsistent")
         expected_parent = path[-2] if len(path) > 1 else None
-        if row["parent_container_key"] != expected_parent:
+        if (
+            row["parent_container_key"] != expected_parent
+            or container_parents[row["source_container_key"]] != expected_parent
+        ):
             raise ValueError("container topology has an inconsistent parent")
-        if expected_parent is not None and expected_parent not in container_keys:
-            raise ValueError("container topology references an outside container")
 
         key = row["attachment_key"]
         parent = row["parent_attachment_key"]
@@ -533,6 +541,92 @@ def _relationship_rows(inputs: Sequence[Mapping[str, Any]]) -> list[Any]:
     return sorted(by_identity.values(), key=_canonical_bytes)
 
 
+_MISSING_REASONS = frozenset(
+    {
+        "MANIFEST_MISSING",
+        "ARCHIVED_ITEM_MISSING",
+        "DEPTH_LIMIT_REACHED",
+        "ATTACHMENT_INVENTORY_CONFLICT",
+        "ZERO_ATTACHMENT_AUDIT_CONFLICT",
+        "ARCHIVE_FILE_MISSING",
+        "AUDIT_INVENTORY_MISMATCH",
+    }
+)
+
+
+def _validate_readiness_consistency(
+    content_integrity_status: str, readiness_row: Mapping[str, Any]
+) -> None:
+    reasons = set(readiness_row["reason_codes"])
+    if readiness_row["audit_depth_limit_reached"]:
+        reasons.add("DEPTH_LIMIT_REACHED")
+    manifest_status = readiness_row["manifest_processing_status"]
+    if manifest_status == "depth_limit_reached":
+        reasons.add("DEPTH_LIMIT_REACHED")
+    elif manifest_status in {
+        "failed",
+        "error",
+        "rejected_zero_byte",
+        "rejected_error_page",
+        "rejected_type_mismatch",
+        "download_failed",
+    }:
+        reasons.add("DOWNLOAD_FAILED")
+
+    if reasons.intersection(_MISSING_REASONS):
+        expected = "missing"
+    elif "DOWNLOAD_FAILED" in reasons:
+        expected = "download_failed"
+    elif "SIZE_MISMATCH" in reasons:
+        expected = "size_mismatch"
+    elif "SHA256_MISMATCH" in reasons:
+        expected = "sha256_mismatch"
+    elif reasons.intersection({"NOT_CHECKED", "AUDIT_EVIDENCE_INVALID"}):
+        expected = "not_checked"
+    elif "NO_ATTACHMENT_CONFIRMED" in reasons:
+        expected = "no_attachment_confirmed"
+    elif "VERIFIED_STORED_EVIDENCE" in reasons:
+        expected = "ok"
+    else:
+        raise ValueError("readiness evidence has no deterministic terminal state")
+
+    if content_integrity_status != expected:
+        raise ValueError("content_integrity_status contradicts readiness evidence")
+    if expected == "no_attachment_confirmed" and not (
+        manifest_status == "no_attachment"
+        and readiness_row["manifest_no_attachment_confirmed"] is True
+    ):
+        raise ValueError("readiness evidence contradicts no-attachment status")
+    if expected == "ok" and readiness_row["manifest_no_attachment_confirmed"]:
+        raise ValueError("readiness evidence contradicts verified attachment status")
+
+
+def readiness_evidence_from_assessment(assessment: object) -> ReadinessEvidenceInput:
+    """Losslessly adapt the readiness service result for decision fingerprinting."""
+    from oa_knowledge.classification.readiness import IntegrityAssessment
+
+    if not isinstance(assessment, IntegrityAssessment):
+        raise TypeError("assessment must be an IntegrityAssessment value")
+    evidence = assessment.evidence
+    return ReadinessEvidenceInput(
+        manifest_processing_status=evidence.manifest_processing_status,
+        manifest_no_attachment_confirmed=evidence.manifest_no_attachment_confirmed,
+        audit_status=evidence.audit_status,
+        audit_finished_at=evidence.audit_finished_at,
+        audit_recognized_attachments=evidence.audit_recognized_attachments,
+        audit_database_attachments=evidence.audit_database_attachments,
+        audit_downloaded_attachments=evidence.audit_downloaded_attachments,
+        audit_online_inventory_sha256=evidence.audit_online_inventory_sha256,
+        audit_local_inventory_sha256=evidence.audit_local_inventory_sha256,
+        audit_online_content_sha256=evidence.audit_online_content_sha256,
+        audit_local_content_sha256=evidence.audit_local_content_sha256,
+        audit_online_evidence_sha256=evidence.audit_online_evidence_sha256,
+        audit_local_evidence_sha256=evidence.audit_local_evidence_sha256,
+        audit_depth_limit_reached=evidence.audit_depth_limit_reached,
+        reason_codes=assessment.reason_codes,
+    )
+
+
 def decision_input_sha256(inputs: DecisionInputs) -> str:
     """Hash exactly one OA package's normalized effective decision inputs."""
     if not isinstance(inputs, DecisionInputs):
@@ -544,6 +638,11 @@ def decision_input_sha256(inputs: DecisionInputs) -> str:
     )
     if integrity_status not in _INTEGRITY_STATUSES:
         raise ValueError("content_integrity_status is not supported")
+    readiness_row = _readiness_row(inputs.readiness_evidence)
+    manifest_status = _plain_text(inputs.manifest_status, field="manifest_status")
+    if manifest_status != readiness_row["manifest_processing_status"]:
+        raise ValueError("manifest status must match readiness evidence")
+    _validate_readiness_consistency(integrity_status, readiness_row)
     if inputs.manual_decision_version is not None:
         _integer(
             inputs.manual_decision_version,
@@ -553,21 +652,20 @@ def decision_input_sha256(inputs: DecisionInputs) -> str:
 
     attachment_rows = _attachment_rows(inputs.attachments)
     package_content_hashes = {
-        value
+        row["content_sha256"]
         for row in attachment_rows
-        for value in (row["content_sha256"], row["sha256"])
-        if value is not None
+        if row["content_sha256"] is not None
     }
     payload = {
         "oa_item_key": _text(inputs.oa_item_key, field="oa_item_key"),
         "normalized_metadata": _metadata_row(inputs.normalized_metadata),
-        "manifest_status": _plain_text(inputs.manifest_status, field="manifest_status"),
+        "manifest_status": manifest_status,
         "excluded": inputs.excluded,
         "exclusion_matches": sorted(
             {_text(value, field="exclusion_match") for value in inputs.exclusion_matches}
         ),
         "content_integrity_status": integrity_status,
-        "readiness_evidence": _readiness_row(inputs.readiness_evidence),
+        "readiness_evidence": readiness_row,
         "attachments": attachment_rows,
         "transfer_evidence": _relationship_rows(inputs.transfer_evidence),
         "used_parse_artifacts": _parse_rows(

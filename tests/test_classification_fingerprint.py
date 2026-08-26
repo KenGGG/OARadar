@@ -17,7 +17,9 @@ from oa_knowledge.classification.fingerprint import (
     ParseArtifactIdentity,
     ReadinessEvidenceInput,
     decision_input_sha256,
+    readiness_evidence_from_assessment,
 )
+from oa_knowledge.classification.readiness import IntegrityAssessment, ReadinessEvidence
 
 
 HASH_A = "a" * 64
@@ -130,7 +132,16 @@ def test_fingerprint_is_a_lowercase_sha256_and_stable_across_row_mapping_and_rel
             value,
             normalized_metadata=replace(value.normalized_metadata, normalized_title="Changed"),
         ),
-        lambda value: replace(value, manifest_status="download_failed"),
+        lambda value: replace(
+            value,
+            manifest_status="download_failed",
+            content_integrity_status="download_failed",
+            readiness_evidence=replace(
+                value.readiness_evidence,
+                manifest_processing_status="download_failed",
+                reason_codes=("DOWNLOAD_FAILED",),
+            ),
+        ),
         lambda value: replace(value, excluded=True),
         lambda value: replace(value, exclusion_matches=("policy-synthetic-2",)),
         lambda value: replace(
@@ -154,9 +165,17 @@ def test_fingerprint_is_a_lowercase_sha256_and_stable_across_row_mapping_and_rel
         lambda value: replace(value, schema_version="classification-v2"),
         lambda value: replace(value, prompt_version="qwen-v2"),
         lambda value: replace(value, private_config_sha256=HASH_A),
-        lambda value: replace(value, content_integrity_status="missing"),
         lambda value: replace(
             value,
+            content_integrity_status="missing",
+            readiness_evidence=replace(
+                value.readiness_evidence,
+                reason_codes=("AUDIT_INVENTORY_MISMATCH",),
+            ),
+        ),
+        lambda value: replace(
+            value,
+            content_integrity_status="missing",
             readiness_evidence=replace(
                 value.readiness_evidence,
                 audit_status="missing_download",
@@ -449,10 +468,7 @@ def test_attachment_contract_captures_filenames_and_complete_container_topology(
 @pytest.mark.parametrize(
     ("field", "changed"),
     [
-        ("manifest_processing_status", "download_failed"),
-        ("manifest_no_attachment_confirmed", True),
         ("audit_status", "matched"),
-        ("audit_finished_at", "2026-08-26T09:00:00Z"),
         ("audit_recognized_attachments", 1),
         ("audit_database_attachments", 1),
         ("audit_downloaded_attachments", 1),
@@ -462,8 +478,6 @@ def test_attachment_contract_captures_filenames_and_complete_container_topology(
         ("audit_local_content_sha256", HASH_A),
         ("audit_online_evidence_sha256", HASH_A),
         ("audit_local_evidence_sha256", HASH_A),
-        ("audit_depth_limit_reached", True),
-        ("reason_codes", ("NOT_CHECKED",)),
     ],
 )
 def test_each_normalized_readiness_evidence_change_updates_fingerprint(
@@ -479,6 +493,19 @@ def test_each_normalized_readiness_evidence_change_updates_fingerprint(
     assert decision_input_sha256(updated) != decision_input_sha256(inputs)
 
 
+def test_audit_timestamp_alone_does_not_invalidate_unchanged_effective_inputs() -> None:
+    inputs = _inputs()
+    later = replace(
+        inputs,
+        readiness_evidence=replace(
+            inputs.readiness_evidence,
+            audit_finished_at="2026-08-27T09:00:00Z",
+        ),
+    )
+
+    assert decision_input_sha256(later) == decision_input_sha256(inputs)
+
+
 def test_package_integrity_status_is_strictly_validated() -> None:
     with pytest.raises(ValueError, match="content_integrity_status"):
         decision_input_sha256(replace(_inputs(), content_integrity_status="verified"))
@@ -490,6 +517,26 @@ def test_foreign_parse_artifact_content_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="package attachment content"):
         decision_input_sha256(replace(inputs, used_parse_artifacts=(foreign,)))
+
+
+def test_file_sha_cannot_substitute_for_parse_content_object_identity() -> None:
+    inputs = _inputs()
+    attachment = replace(
+        inputs.attachments[0],
+        sha256=HASH_A,
+        content_sha256=HASH_B,
+        parent_attachment_key=None,
+    )
+    artifact = replace(inputs.used_parse_artifacts[0], content_sha256=HASH_A)
+
+    with pytest.raises(ValueError, match="package attachment content"):
+        decision_input_sha256(
+            replace(
+                inputs,
+                attachments=(attachment,),
+                used_parse_artifacts=(artifact,),
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -528,6 +575,82 @@ def test_inconsistent_container_topology_is_rejected(changed) -> None:
             replace(
                 inputs,
                 attachments=(changed(inputs.attachments[0]), *inputs.attachments[1:]),
+            )
+        )
+
+
+def test_empty_parent_container_is_valid_when_declared_by_child_path() -> None:
+    inputs = _inputs()
+    child = replace(inputs.attachments[0], parent_attachment_key=None)
+
+    digest = decision_input_sha256(
+        replace(inputs, attachments=(child,), used_parse_artifacts=inputs.used_parse_artifacts)
+    )
+
+    assert len(digest) == 64
+
+
+def test_same_container_key_cannot_declare_two_parent_paths() -> None:
+    inputs = _inputs()
+    first = replace(inputs.attachments[0], parent_attachment_key=None)
+    second = replace(
+        inputs.attachments[1],
+        source_container_key=first.source_container_key,
+        parent_container_key="root-2",
+        container_path=("root-2", first.source_container_key),
+        depth=2,
+    )
+
+    with pytest.raises(ValueError, match="container topology"):
+        decision_input_sha256(
+            replace(inputs, attachments=(first, second), used_parse_artifacts=())
+        )
+
+
+def test_readiness_adapter_is_lossless_and_inconsistent_inputs_are_rejected() -> None:
+    assessment = IntegrityAssessment(
+        content_integrity_status="missing",
+        publishable=False,
+        reason_codes=("DEPTH_LIMIT_REACHED",),
+        evidence=ReadinessEvidence(
+            manifest_processing_status="depth_limit_reached",
+            manifest_no_attachment_confirmed=False,
+            audit_status="depth_limit_reached",
+            audit_finished_at=datetime(2026, 8, 26, 9, tzinfo=timezone.utc),
+            audit_recognized_attachments=1,
+            audit_database_attachments=1,
+            audit_downloaded_attachments=1,
+            audit_online_inventory_sha256=HASH_A,
+            audit_local_inventory_sha256=HASH_A,
+            audit_online_content_sha256=HASH_B,
+            audit_local_content_sha256=HASH_B,
+            audit_online_evidence_sha256=HASH_C,
+            audit_local_evidence_sha256=HASH_C,
+            audit_depth_limit_reached=True,
+        ),
+    )
+
+    adapted = readiness_evidence_from_assessment(assessment)
+
+    assert adapted.audit_depth_limit_reached is True
+    assert adapted.reason_codes == assessment.reason_codes
+    with pytest.raises(ValueError, match="readiness evidence"):
+        decision_input_sha256(
+            replace(
+                _inputs(),
+                manifest_status="depth_limit_reached",
+                content_integrity_status="ok",
+                readiness_evidence=adapted,
+            )
+        )
+
+
+def test_manifest_status_must_match_readiness_evidence() -> None:
+    with pytest.raises(ValueError, match="manifest status"):
+        decision_input_sha256(
+            replace(
+                _inputs(),
+                manifest_status="download_failed",
             )
         )
 

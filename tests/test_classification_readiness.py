@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
+import unicodedata
 
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
-from oa_knowledge.classification.readiness import ArchiveReadinessService
+from oa_knowledge.classification.readiness import (
+    ArchiveReadinessService,
+    _normalized_json_sha256,
+)
 from oa_knowledge.db.models import (
     ArchivedFile,
     Base,
@@ -102,9 +107,14 @@ def _audit(
     depth_limit_reached: bool = False,
     finished_at: datetime = NOW + timedelta(minutes=1),
     recognized_attachments: int | None = 1,
+    database_attachments: int = 1,
     downloaded_attachments: int = 1,
-    online_evidence: tuple[tuple[str, str, int | None, str | None], ...] = (),
-    local_evidence: tuple[tuple[str, str, int | None, str | None], ...] = (),
+    online_evidence: tuple[tuple[str, str, int | None, str | None], ...] = (
+        ("direct_attachment", "attachment-synthetic-1", 12, FILE_SHA),
+    ),
+    local_evidence: tuple[tuple[str, str, int | None, str | None], ...] = (
+        ("direct_attachment", "attachment-synthetic-1", 12, FILE_SHA),
+    ),
 ) -> None:
     run = OnlineAuditRun(status="completed", total_items=1, finished_at=finished_at)
     session.add(run)
@@ -116,6 +126,7 @@ def _audit(
             title="Synthetic archive item",
             status=status,
             recognized_attachments=recognized_attachments,
+            database_attachments=database_attachments,
             downloaded_attachments=downloaded_attachments,
             online_evidence_json=json.dumps(
                 [
@@ -284,6 +295,57 @@ def test_zero_attachment_is_blocked_by_contradictory_latest_audit_counts(session
 
     assert result.content_integrity_status == "missing"
     assert "ZERO_ATTACHMENT_AUDIT_CONFLICT" in result.reason_codes
+
+
+def test_matched_audit_with_contradictory_inventory_is_not_publishable(
+    session: Session,
+) -> None:
+    _package(session)
+    _audit(
+        session,
+        status="matched",
+        recognized_attachments=2,
+        downloaded_attachments=1,
+        online_evidence=(
+            ("direct_attachment", "attachment-synthetic-1", 12, FILE_SHA),
+            ("direct_attachment", "attachment-synthetic-2", 8, "b" * 64),
+        ),
+        local_evidence=(
+            ("direct_attachment", "attachment-synthetic-1", 12, FILE_SHA),
+        ),
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "missing"
+    assert result.publishable is False
+    assert "AUDIT_INVENTORY_MISMATCH" in result.reason_codes
+
+
+def test_audit_evidence_hash_is_stable_across_order_and_unicode_form() -> None:
+    nfc = "caf\u00e9"
+    nfd = unicodedata.normalize("NFD", nfc)
+    rows = [
+        {"role": "direct_attachment", "key": nfc, "size": 1, "sha256": FILE_SHA},
+        {"role": "official_body", "key": "body", "size": 2, "sha256": "b" * 64},
+    ]
+    reordered = [
+        {"sha256": "b" * 64, "size": 2, "key": "body", "role": "official_body"},
+        {"sha256": FILE_SHA.upper(), "size": 1, "key": nfd, "role": "direct_attachment"},
+    ]
+
+    assert _normalized_json_sha256(json.dumps(rows)) == _normalized_json_sha256(
+        json.dumps(reordered)
+    )
+
+
+def test_conflicting_duplicate_audit_evidence_fails_validation() -> None:
+    rows = [
+        {"role": "direct_attachment", "key": "same", "size": 1, "sha256": FILE_SHA},
+        {"role": "direct_attachment", "key": "same", "size": 2, "sha256": FILE_SHA},
+    ]
+
+    assert _normalized_json_sha256(json.dumps(rows)) == (None, None)
 
 
 @pytest.mark.parametrize("source", ["manifest", "audit"])
@@ -507,6 +569,8 @@ def test_assess_many_handles_full_historical_target_with_bounded_selects(
         for key in keys
     )
     session.flush()
+    dbapi_connection = session.connection().connection.driver_connection
+    previous_limit = dbapi_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
     selects: list[str] = []
 
     def record_select(_connection, _cursor, statement, _parameters, _context, _many) -> None:
@@ -518,8 +582,9 @@ def test_assess_many_handles_full_historical_target_with_bounded_selects(
         results = ArchiveReadinessService().assess_many(session, keys)
     finally:
         event.remove(session.bind, "before_cursor_execute", record_select)
+        dbapi_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
 
     assert len(results) == 6_144
     assert all(result.content_integrity_status == "no_attachment_confirmed" for result in results.values())
-    assert len(selects) <= 5
-    assert sum("online_audit_items" in statement for statement in selects) == 1
+    assert len(selects) <= 60
+    assert 1 < sum("online_audit_items" in statement for statement in selects) <= 13
