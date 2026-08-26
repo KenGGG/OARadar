@@ -1,0 +1,10 @@
+# Synthetic examples only. These declarations are validated here and interpreted downstream.
+templates:
+  - pattern: '^Synthetic internal approval:'
+    content_origin: internal
+    flow_type: approval
+    business_category: 08_synthetic_administration
+  - pattern: '^Synthetic external circulation:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Records Authority

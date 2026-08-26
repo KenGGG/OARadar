@@ -1,0 +1,4 @@
+# Each synthetic alias resolves to exactly one synthetic canonical issuer.
+aliases:
+  SRA: Synthetic Records Authority
+  Synthetic Records Authority: Synthetic Records Authority

@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+import yaml
+from pydantic import ValidationError
+
+from oa_knowledge.classification.private_config import (
+    PrivateConfigError,
+    load_private_classification_config,
+)
+from oa_knowledge.config import load_settings
+
+
+REQUIRED_FILES = {
+    "initiator_profiles.yaml": """
+initiators:
+  synth.person.internal:
+    role: internal
+    aliases: [Synthetic Internal Person]
+  synth.person.external:
+    role: external
+    aliases: [Synthetic External Person]
+  synth.person.mixed:
+    role: mixed
+    aliases: [Synthetic Mixed Person]
+  synth.person.system:
+    role: system
+    aliases: [Synthetic Workflow Account]
+  synth.person.unknown:
+    role: unknown
+    aliases: [Synthetic Unresolved Person]
+""",
+    "document_number_issuers.yaml": """
+rules:
+  - pattern: '^SYN-AUTH-[0-9]{4}-[0-9]+$'
+    canonical_issuer: Synthetic Records Authority
+    document_type: notice
+""",
+    "issuer_aliases.yaml": """
+aliases:
+  SRA: Synthetic Records Authority
+  Synthetic Records Authority: Synthetic Records Authority
+""",
+    "title_templates.yaml": """
+templates:
+  - pattern: '^Synthetic internal approval:'
+    content_origin: internal
+    flow_type: approval
+    business_category: 08_synthetic_administration
+  - pattern: '^Synthetic external circulation:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Records Authority
+""",
+}
+
+
+def _write_private_config(
+    root: Path,
+    *,
+    replacements: dict[str, str] | None = None,
+    modes: dict[str, int] | None = None,
+) -> Path:
+    root.mkdir()
+    contents = REQUIRED_FILES | (replacements or {})
+    for filename, text in contents.items():
+        path = root / filename
+        path.write_text(text.lstrip(), encoding="utf-8")
+        path.chmod((modes or {}).get(filename, 0o600))
+    return root
+
+
+def test_loads_all_four_strict_schemas_and_preserves_unknown_role(tmp_path: Path) -> None:
+    root = _write_private_config(tmp_path / "classification")
+
+    loaded = load_private_classification_config(root)
+
+    assert loaded.config.initiators["synth.person.unknown"].role == "unknown"
+    assert set(loaded.config.initiators) == {
+        "synth.person.internal",
+        "synth.person.external",
+        "synth.person.mixed",
+        "synth.person.system",
+        "synth.person.unknown",
+    }
+    assert loaded.config.document_number_issuers[0].canonical_issuer == "Synthetic Records Authority"
+    assert loaded.config.issuer_aliases["SRA"] == "Synthetic Records Authority"
+    assert loaded.config.title_templates[0].content_origin == "internal"
+    assert len(loaded.config_sha256) == 64
+    assert set(loaded.config_sha256) <= set("0123456789abcdef")
+
+
+def test_hash_is_deterministic_across_mapping_order_and_root(tmp_path: Path) -> None:
+    first = _write_private_config(tmp_path / "first")
+    second = _write_private_config(
+        tmp_path / "second",
+        replacements={
+            "issuer_aliases.yaml": """
+aliases:
+  Synthetic Records Authority: Synthetic Records Authority
+  SRA: Synthetic Records Authority
+""",
+        },
+    )
+
+    first_loaded = load_private_classification_config(first)
+    second_loaded = load_private_classification_config(second)
+
+    assert first_loaded.config == second_loaded.config
+    assert first_loaded.config_sha256 == second_loaded.config_sha256
+
+
+@pytest.mark.parametrize(
+    ("filename", "replacement"),
+    [
+        (
+            "initiator_profiles.yaml",
+            "initiators:\n  synth.person.internal:\n    role: internal\n    unexpected: forbidden\n",
+        ),
+        (
+            "document_number_issuers.yaml",
+            "rules:\n  - pattern: '^SYN-'\n    canonical_issuer: Synthetic Records Authority\n    unexpected: forbidden\n",
+        ),
+        (
+            "title_templates.yaml",
+            "templates:\n  - pattern: '^Synthetic'\n    content_origin: internal\n    unexpected: forbidden\n",
+        ),
+        (
+            "issuer_aliases.yaml",
+            "aliases:\n  SRA: Synthetic Records Authority\nunexpected: forbidden\n",
+        ),
+    ],
+)
+def test_rejects_unknown_fields_in_each_file_schema(
+    tmp_path: Path, filename: str, replacement: str
+) -> None:
+    root = _write_private_config(tmp_path / "classification", replacements={filename: replacement})
+
+    with pytest.raises(PrivateConfigError, match=filename):
+        load_private_classification_config(root)
+
+
+def test_requires_all_four_files(tmp_path: Path) -> None:
+    root = _write_private_config(tmp_path / "classification")
+    (root / "title_templates.yaml").unlink()
+
+    with pytest.raises(PrivateConfigError, match="title_templates.yaml"):
+        load_private_classification_config(root)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_rejects_permissions_broader_than_owner_read_write(tmp_path: Path) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        modes={"issuer_aliases.yaml": 0o640},
+    )
+
+    with pytest.raises(PrivateConfigError, match=r"issuer_aliases.yaml.*0600"):
+        load_private_classification_config(root)
+
+
+def test_rejects_symlink_that_escapes_the_private_root(tmp_path: Path) -> None:
+    root = _write_private_config(tmp_path / "classification")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(REQUIRED_FILES["issuer_aliases.yaml"].lstrip(), encoding="utf-8")
+    outside.chmod(0o600)
+    (root / "issuer_aliases.yaml").unlink()
+    (root / "issuer_aliases.yaml").symlink_to(outside)
+
+    with pytest.raises(PrivateConfigError, match=r"issuer_aliases.yaml.*symlink"):
+        load_private_classification_config(root)
+
+
+def test_rejects_non_regular_required_file(tmp_path: Path) -> None:
+    root = _write_private_config(tmp_path / "classification")
+    (root / "issuer_aliases.yaml").unlink()
+    (root / "issuer_aliases.yaml").mkdir()
+
+    with pytest.raises(PrivateConfigError, match=r"issuer_aliases.yaml.*regular"):
+        load_private_classification_config(root)
+
+
+def test_rejects_duplicate_yaml_alias_key_instead_of_silently_overwriting(tmp_path: Path) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={
+            "issuer_aliases.yaml": """
+aliases:
+  SRA: Synthetic Records Authority
+  SRA: Synthetic Alternate Authority
+""",
+        },
+    )
+
+    with pytest.raises(PrivateConfigError, match=r"issuer_aliases.yaml.*duplicate"):
+        load_private_classification_config(root)
+
+
+def test_rejects_normalized_alias_conflict_between_canonical_issuers(tmp_path: Path) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={
+            "issuer_aliases.yaml": """
+aliases:
+  SRA: Synthetic Records Authority
+  ' SRA ': Synthetic Alternate Authority
+""",
+        },
+    )
+
+    with pytest.raises(PrivateConfigError, match="issuer_aliases.yaml"):
+        load_private_classification_config(root)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "aliases: [Synthetic Unresolved Person]",
+        "role: undecided\n    aliases: [Synthetic Unresolved Person]",
+    ],
+)
+def test_rejects_missing_or_invalid_initiator_role(tmp_path: Path, profile: str) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={
+            "initiator_profiles.yaml": (
+                "initiators:\n  synth.person.unknown:\n    " + profile + "\n"
+            ),
+        },
+    )
+
+    with pytest.raises(PrivateConfigError, match=r"initiator_profiles.yaml.*role"):
+        load_private_classification_config(root)
+
+
+def test_classification_private_directory_is_the_only_settings_entry(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "classification"
+    monkeypatch.setenv("OA_CLASSIFICATION_PRIVATE_DIR", str(root))
+    monkeypatch.setenv("OA_CLASSIFICATION_INITIATOR_NAME", "must-not-be-loaded")
+
+    settings = load_settings()
+
+    assert settings.classification_private_dir == root.resolve()
+    assert "must-not-be-loaded" not in settings.model_dump_json()
+
+
+def test_public_examples_are_synthetic_and_cover_all_initiator_roles() -> None:
+    examples_root = Path(__file__).parents[1] / "examples" / "classification"
+    initiators = yaml.safe_load(
+        (examples_root / "initiator_profiles.example.yaml").read_text(encoding="utf-8")
+    )["initiators"]
+
+    assert {profile["role"] for profile in initiators.values()} == {
+        "internal",
+        "external",
+        "mixed",
+        "system",
+        "unknown",
+    }
+    assert all(identifier.startswith("synth.") for identifier in initiators)
+
+
+def test_model_schemas_are_strict_even_when_used_directly() -> None:
+    from oa_knowledge.classification.schemas import InitiatorProfile
+
+    with pytest.raises(ValidationError):
+        InitiatorProfile.model_validate({"role": "internal", "unexpected": "forbidden"})

@@ -1,0 +1,5 @@
+# Synthetic examples only. Regular expressions are evaluated by downstream metadata rules.
+rules:
+  - pattern: '^SYN-AUTH-[0-9]{4}-[0-9]+$'
+    canonical_issuer: Synthetic Records Authority
+    document_type: notice

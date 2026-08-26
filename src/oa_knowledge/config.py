@@ -343,6 +343,7 @@ class WebConfig(StrictModel):
 
 
 class Settings(StrictModel):
+    classification_private_dir: Path | None = None
     app: AppConfig = AppConfig()
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     browser: BrowserConfig = BrowserConfig()
@@ -360,6 +361,16 @@ class Settings(StrictModel):
     online_audit: OnlineAuditConfig = OnlineAuditConfig()
     pending_cleanup: PendingCleanupConfig = PendingCleanupConfig()
     web: WebConfig = WebConfig()
+
+    @field_validator("classification_private_dir")
+    @classmethod
+    def absolute_classification_private_dir(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        expanded = value.expanduser()
+        if not expanded.is_absolute():
+            raise ValueError("classification_private_dir must be an absolute local path")
+        return expanded.resolve()
 
     @model_validator(mode="after")
     def local_only(self) -> "Settings":
@@ -467,4 +478,7 @@ def load_settings(path: Path | None = None) -> Settings:
     env_web_require_auth = os.getenv("OA_WEB__REQUIRE_AUTH")
     if env_web_require_auth:
         raw.setdefault("web", {})["require_auth"] = env_web_require_auth.strip().lower() in {"1", "true", "yes", "on"}
+    env_classification_private_dir = os.getenv("OA_CLASSIFICATION_PRIVATE_DIR")
+    if env_classification_private_dir:
+        raw["classification_private_dir"] = env_classification_private_dir
     return Settings.model_validate(raw)
