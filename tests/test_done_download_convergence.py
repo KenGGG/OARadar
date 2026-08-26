@@ -90,6 +90,45 @@ def test_manifest_retry_snapshot_requires_all_targets_before_completed(config_fi
     assert snapshot.pending_keys == ("done:later",)
 
 
+def test_no_attachment_recheck_requires_a_fresh_attempt(config_file: Path) -> None:
+    """An old no-attachment result is not success for a job created to recheck it."""
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    started = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add_all([
+            OAManifestItem(
+                oa_item_key="done:stale-empty", title="合成待复核", list_page=1,
+                processing_status="no_attachment", last_retry_at=started - timedelta(seconds=1),
+            ),
+            OAManifestItem(
+                oa_item_key="done:fresh-empty", title="合成已复核", list_page=1,
+                processing_status="no_attachment", last_retry_at=started + timedelta(seconds=1),
+            ),
+        ])
+        job = OperationJob(
+            job_key="synthetic-empty-recheck", job_type="full_manifest_retry", status="running",
+            idempotency_key="synthetic-empty-recheck", progress_total=2, started_at=started,
+            parameters_json=json.dumps({
+                "oa_item_keys": ["done:stale-empty", "done:fresh-empty"],
+                "source_status": "no_attachment",
+            }),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        snapshot = worker._manifest_retry_snapshot(job_id)
+    finally:
+        worker.close()
+
+    assert snapshot.success == 1
+    assert snapshot.pending_keys == ("done:stale-empty",)
+
+
 def test_systemic_browser_closed_detection_does_not_treat_normal_download_errors_as_global() -> None:
     """Only a closed Playwright target stops the whole download chunk."""
     assert is_systemic_browser_closed(RuntimeError("Target page, context or browser has been closed"))

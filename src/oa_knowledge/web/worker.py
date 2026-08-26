@@ -123,7 +123,9 @@ class OperationWorker:
             job = session.get(OperationJob, job_id)
             if job is None:
                 raise LookupError(f"manifest retry job {job_id} is missing")
-            keys = tuple(json.loads(job.parameters_json or "{}").get("oa_item_keys") or ())
+            parameters = json.loads(job.parameters_json or "{}")
+            keys = tuple(parameters.get("oa_item_keys") or ())
+            source_status = parameters.get("source_status")
             started_at = job.started_at
             rows = {
                 row.oa_item_key: row
@@ -140,10 +142,17 @@ class OperationWorker:
             if row is None:
                 failed += 1
                 continue
+            attempted = bool(started_at and row.last_retry_at and row.last_retry_at >= started_at)
             if row.processing_status in terminal:
+                if (
+                    row.processing_status == "no_attachment"
+                    and source_status == "no_attachment"
+                    and not attempted
+                ):
+                    pending.append(key)
+                    continue
                 success += 1
                 continue
-            attempted = bool(started_at and row.last_retry_at and row.last_retry_at >= started_at)
             if attempted and row.processing_status in failed_statuses:
                 failed += 1
             else:
