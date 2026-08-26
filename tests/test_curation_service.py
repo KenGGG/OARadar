@@ -49,14 +49,18 @@ class InternalClient:
 
 
 def setup_source(tmp_path: Path):
-    settings = Settings(app={"data_root": tmp_path}, curation={"enabled": True}, llm={"enabled": True})
+    settings = Settings(
+        app={"data_root": tmp_path / "data"},
+        runtime={"state_root": tmp_path / "state", "cache_root": tmp_path / "cache"},
+        curation={"enabled": True}, llm={"enabled": True},
+    )
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
     text = "示例集团文件\n示例发〔2026〕1号\n关于合成测试的通知"
-    path = tmp_path / "parse/synthetic.md"
+    path = settings.parse_work_root / "synthetic" / "synthetic.md"
     path.parent.mkdir(parents=True)
     path.write_text(text, encoding="utf-8")
-    original = tmp_path / "archive/raw/oa/done/synthetic/source.docx"
+    original = settings.data_root / "originals/2026/08/2026-08-15_合成测试通知/source.docx"
     original.parent.mkdir(parents=True)
     original.write_bytes(b"source")
     with Session(engine) as session:
@@ -71,20 +75,20 @@ def setup_source(tmp_path: Path):
             oa_item_id=item.id, original_name="示例发〔2026〕1号.md", attachment_key="synthetic",
             file_role="direct_attachment", source_container_key="root", depth=1,
             content_object_id=content.id, sha256=content.sha256, download_status="verified",
-            local_relpath="archive/raw/oa/done/synthetic/source.docx", size_bytes=6,
+            local_relpath="originals/2026/08/2026-08-15_合成测试通知/source.docx", size_bytes=6,
         )
         session.add(source_file); session.flush()
         job = ParseJob(file_id=source_file.id, engine="synthetic", engine_version="1", config_hash="a" * 64, status="completed")
         session.add(job); session.flush()
         artifact = ParseArtifact(
             parse_job_id=job.id, content_object_id=content.id, engine="synthetic", engine_version="1",
-            output_relpath="synthetic.md", source_sha256=content.sha256, product_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            output_relpath="work/synthetic/synthetic.md", source_sha256=content.sha256, product_sha256=hashlib.sha256(text.encode()).hexdigest(),
             config_hash="a" * 64, lifecycle_status="valid",
         )
         session.add(artifact); session.flush(); content.active_parse_artifact_id = artifact.id
         publish_active_artifact(session, settings, source_file.id)
         session.commit()
-    return settings, engine, path
+    return settings, engine, original
 
 
 def test_plan_is_read_only_and_run_is_incremental(monkeypatch, tmp_path: Path) -> None:
@@ -106,7 +110,7 @@ def test_plan_is_read_only_and_run_is_incremental(monkeypatch, tmp_path: Path) -
     assert first.completed == 1 and first.failed == 0
     assert second.skipped == 1
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == original_hash
-    curated_body = next((tmp_path / "workspace/curated/oa").rglob("正文.md")).read_text(encoding="utf-8")
+    curated_body = next((settings.workspace_root / "workspace/curated/oa").rglob("正文.md")).read_text(encoding="utf-8")
     assert "示例集团文件" in curated_body
     assert "转换说明" not in curated_body
     assert "转换引擎" not in curated_body
@@ -171,12 +175,15 @@ def test_exact_content_is_globally_deduplicated_across_oa_packages(monkeypatch, 
             oa_item_id=second.id, original_name="相同内容.md", attachment_key="same",
             file_role="direct_attachment", source_container_key="root", depth=1,
             content_object_id=first_file.content_object_id, sha256=first_file.sha256, download_status="verified",
-            local_relpath="archive/raw/oa/done/synthetic-2/source.docx", size_bytes=6,
+            local_relpath="originals/2026/08/2026-08-15_事项乙/source.docx", size_bytes=6,
         )
         session.add(second_file); session.flush()
-        second_original = tmp_path / second_file.local_relpath
+        second_original = settings.data_root / second_file.local_relpath
         second_original.parent.mkdir(parents=True)
         second_original.write_bytes(b"source")
+        artifact_path = settings.cache_root / "work/synthetic/synthetic.md"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("示例集团文件\n示例发〔2026〕1号\n关于合成测试的通知", encoding="utf-8")
         publish_active_artifact(session, settings, second_file.id)
         first = session.get(OAItem, 1); assert first is not None; first.title = "事项甲"
         session.commit()
@@ -191,4 +198,4 @@ def test_exact_content_is_globally_deduplicated_across_oa_packages(monkeypatch, 
     with Session(engine) as session:
         assert session.query(KnowledgeDocument).count() == 1
         assert session.query(SourceReference).count() == 2
-    assert len(list((tmp_path / "workspace/curated/oa").rglob("_manifest.json"))) == 1
+    assert len(list((settings.workspace_root / "workspace/curated/oa").rglob("_manifest.json"))) == 1

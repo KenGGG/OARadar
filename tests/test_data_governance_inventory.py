@@ -24,37 +24,27 @@ def _write(data_root: Path, relpath: str, content: bytes = b"synthetic") -> Path
     return path
 
 
-def test_cleanup_plan_selects_only_rebuildable_unprotected_files(tmp_path: Path) -> None:
+def test_cleanup_plan_never_selects_two_root_application_data(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     settings = Settings(app={"data_root": data_root})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
 
-    candidate_paths = {
-        "runtime/browser-profile/Default/Cache/cache.bin",
-        "runtime/browser-profile/Default/Code Cache/js/code.bin",
-        "runtime/reports/status.json",
-        "parse/rebuildable.md",
-    }
     protected_paths = {
-        "raw/done/2026/original.pdf",
-        "runtime/browser-profile/Default/Cookies",
-        "runtime/browser-profile/Default/Local Storage/session.bin",
-        "runtime/browser-profile/Default/Sessions/tab.bin",
-        "parse/active-input.md",
-        "parse/review-required.md",
+        "originals/2026/08/synthetic/source.pdf",
+        "markdown/2026/08/synthetic/source.pdf.md",
     }
-    for relpath in candidate_paths | protected_paths:
+    for relpath in protected_paths:
         _write(data_root, relpath)
 
     with Session(engine) as session:
         session.add(PipelineTask(
             queue_name="done", priority=1, logical_item_key="synthetic", stage="parse",
             status="running", idempotency_key="active-task",
-            payload_json=json.dumps({"source_relpath": "parse/active-input.md"}),
+            payload_json=json.dumps({"source_relpath": "originals/2026/08/synthetic/source.pdf"}),
         ))
         session.add(ReviewEntry(
-            kind="hash_mismatch", details_json=json.dumps({"relative_path": "parse/review-required.md"}),
+            kind="hash_mismatch", details_json=json.dumps({"relative_path": "markdown/2026/08/synthetic/source.pdf.md"}),
             status="pending",
         ))
         session.commit()
@@ -70,11 +60,11 @@ def test_cleanup_plan_selects_only_rebuildable_unprotected_files(tmp_path: Path)
             select(CleanupItem).where(CleanupItem.cleanup_run_id == summary.run_id)
         ).all()
     planned = {row.relative_path for row in rows}
-    assert planned == candidate_paths
-    assert summary.candidate_count == len(candidate_paths)
-    assert summary.candidate_bytes == sum((data_root / path).stat().st_size for path in candidate_paths)
+    assert planned == set()
+    assert summary.candidate_count == 0
+    assert summary.candidate_bytes == 0
     assert set(summary.categories) == {"browser_cache", "runtime_reports", "rebuildable_projection"}
-    assert "original.pdf" not in repr(summary)
+    assert "source.pdf" not in repr(summary)
 
 
 def test_sent_pending_orphans_excludes_database_references_and_requires_cleaned_ledger(

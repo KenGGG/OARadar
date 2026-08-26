@@ -203,7 +203,7 @@ def test_curate_plan_is_read_only_and_commands_are_registered(config_file: Path)
 
 def test_convert_synthetic_text_and_unsupported_file(config_file: Path) -> None:
     assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
-    raw = config_file.parent / "data/archive/raw/oa/done/2026/07/OA-SYNTHETIC"
+    raw = config_file.parent / "data/originals/2026/07/OA-SYNTHETIC"
     raw.mkdir(parents=True)
     (raw / "body.html").write_text("<h1>合成正文</h1>", encoding="utf-8")
     (raw / "example.bin").write_bytes(b"synthetic")
@@ -211,11 +211,9 @@ def test_convert_synthetic_text_and_unsupported_file(config_file: Path) -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["success"] == 1 and payload["unsupported"] == 1
-    output = config_file.parent / "data/workspace/raw/sources/oa/done/2026/07/OA-SYNTHETIC"
+    output = config_file.parent / "data/markdown/2026/07/OA-SYNTHETIC"
     assert (output / "body.html.md").is_file()
     assert "UNSUPPORTED_FILE_TYPE" in (output / "example.bin.md").read_text(encoding="utf-8")
-    wiki = config_file.parent / "data/workspace/wiki"
-    assert list(wiki.iterdir()) == []
     again = runner.invoke(app, ["convert", "--config", str(config_file)])
     assert json.loads(again.output)["skipped"] == 2
 
@@ -372,7 +370,7 @@ def test_pending_identity_inspection_accepts_complete_pending_count(config_file:
 
 
 def test_audit_reports_corrupt_database(config_file: Path) -> None:
-    database = config_file.parent / "data" / "state" / "oa.db"
+    database = load_settings(config_file).database_path
     database.parent.mkdir(parents=True)
     database.write_bytes(b"not sqlite")
     result = runner.invoke(app, ["audit", "--config", str(config_file)])
@@ -439,7 +437,7 @@ def test_audit_detects_batch_manifest_mismatch(config_file: Path) -> None:
     runner.invoke(app, ["init", "--config", str(config_file)])
     planned = runner.invoke(app, ["batch", "plan", "--from", "2026-05-01", "--to", "2026-05-31", "--config", str(config_file)])
     assert planned.exit_code == 0
-    database = config_file.parent / "data" / "state" / "oa.db"
+    database = load_settings(config_file).database_path
     import sqlite3
     with sqlite3.connect(database) as connection:
         connection.execute("UPDATE collection_batches SET discovered_count=1")

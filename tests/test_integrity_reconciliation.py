@@ -70,7 +70,7 @@ def test_historical_manifest_path_maps_only_with_matching_byte_evidence() -> Non
         attachment_key="same-key",
         file_role="official_body",
         source_container_key="root",
-        local_relpath="archive/raw/oa/done/2026/08/current/source.bin",
+        local_relpath="originals/2026/08/current/source.bin",
         sha256="a" * 64,
         download_status="verified",
     )
@@ -80,7 +80,7 @@ def test_historical_manifest_path_maps_only_with_matching_byte_evidence() -> Non
         file_role="official_body",
         sha256="a" * 64,
         database_files=[current],
-    ) == "archive/raw/oa/done/2026/08/current/source.bin"
+    ) == "originals/2026/08/current/source.bin"
     assert normalize_historical_manifest_path(
         "raw/done/legacy/source.bin",
         attachment_key="same-key",
@@ -95,7 +95,7 @@ def test_integrity_summary_contains_reasons_but_not_confidential_paths(tmp_path:
     settings.data_root.mkdir(parents=True)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    relative_path = "raw/done/synthetic/source.bin"
+    relative_path = "originals/2026/08/synthetic/source.bin"
     source = settings.data_root / relative_path
     source.parent.mkdir(parents=True)
     source.write_bytes(b"synthetic-current-content")
@@ -138,12 +138,12 @@ def test_integrity_audit_accepts_byte_proven_legacy_manifest_after_move(
     settings.data_root.mkdir(parents=True)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    current_rel = "archive/raw/oa/done/2026/08/current/source.bin"
+    current_rel = "originals/2026/08/current/source.bin"
     source = settings.data_root / current_rel
     source.parent.mkdir(parents=True)
     source.write_bytes(b"same immutable bytes")
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
-    manifest_rel = "archive/raw/oa/done/2026/08/current/manifest.json"
+    manifest_rel = "originals/2026/08/current/manifest.json"
     (settings.data_root / manifest_rel).write_text(json.dumps({
         "oa_item_key": "done:manifest-moved",
         "workitem_id_text": "manifest-moved",
@@ -166,7 +166,7 @@ def test_integrity_audit_accepts_byte_proven_legacy_manifest_after_move(
     with Session(engine) as session:
         item = OAItem(
             oa_item_key="done:manifest-moved", source_channel="done",
-            title="合成事项", archive_relpath="archive/raw/oa/done/2026/08/current",
+            title="合成事项", archive_relpath="originals/2026/08/current",
         )
         batch = CollectionBatch(
             batch_key="synthetic-manifest", source_channel="done", planned_limit=1,

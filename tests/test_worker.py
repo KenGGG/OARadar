@@ -977,7 +977,7 @@ def test_done_parse_advances_to_source_publish_before_curation(config_file: Path
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.pdf", attachment_key="source-stage",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/source.pdf", download_status="verified",
+            local_relpath="originals/unknown/source.pdf", download_status="verified",
         )
         session.add(source); session.flush()
         session.add(ParseJob(
@@ -1010,7 +1010,7 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.pdf", attachment_key="publish",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/source.pdf", download_status="verified",
+            local_relpath="originals/unknown/source.pdf", download_status="verified",
         )
         session.add(source); session.flush()
         content = ContentObject(sha256="a" * 64, size_bytes=1)
@@ -1029,7 +1029,7 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
         )
         session.add(artifact); session.flush()
         content.active_parse_artifact_id = artifact.id
-        session.commit(); source_id = source.id
+        session.commit(); source_id = source.id; parse_job_id = job.id
     task_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-task")
     task = queue.claim("worker-test")
     called: list[int] = []
@@ -1044,8 +1044,17 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
         worker.close()
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
-        assert called == [source_id]
+        assert called == []
         assert row.stage == "classify" and row.status == "queued"
+
+    source_path = settings.data_root / "originals/unknown/source.pdf"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"%PDF synthetic")
+    with Session(engine) as session:
+        artifact = session.scalar(select(ParseArtifact).where(ParseArtifact.parse_job_id == parse_job_id))
+        assert artifact is not None
+        artifact.lifecycle_status = "superseded"
+        session.commit()
 
     missing_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-missing")
     missing = queue.claim("worker-test")
@@ -1071,7 +1080,7 @@ def test_source_publish_records_unsupported_source_in_item_index_without_review(
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.wps"
+    source_path = settings.data_root / "originals/unknown/synthetic/source.wps"
     source_path.parent.mkdir(parents=True)
     source_path.write_bytes(b"synthetic unsupported source")
     with Session(engine) as session:
@@ -1085,7 +1094,7 @@ def test_source_publish_records_unsupported_source_in_item_index_without_review(
             file_role="direct_attachment",
             source_container_key="root",
             depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/source.wps",
+            local_relpath="originals/unknown/synthetic/source.wps",
             download_status="verified",
         ))
         session.commit()
@@ -1112,7 +1121,7 @@ def test_source_publish_records_parser_skipped_source_without_review(config_file
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.doc"
+    source_path = settings.data_root / "originals/unknown/synthetic/source.doc"
     source_path.parent.mkdir(parents=True)
     source_path.write_bytes(b"synthetic legacy document")
     with Session(engine) as session:
@@ -1122,7 +1131,7 @@ def test_source_publish_records_parser_skipped_source_without_review(config_file
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.doc", attachment_key="skipped",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/source.doc",
+            local_relpath="originals/unknown/synthetic/source.doc",
             download_status="verified",
         )
         session.add(source)
@@ -1158,7 +1167,7 @@ def test_source_publish_fails_rejected_quality_artifact_without_review(config_fi
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.docx"
+    source_path = settings.data_root / "originals/unknown/synthetic/source.docx"
     source_path.parent.mkdir(parents=True)
     source_path.write_bytes(b"synthetic low-quality document")
     digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -1172,7 +1181,7 @@ def test_source_publish_fails_rejected_quality_artifact_without_review(config_fi
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.docx", attachment_key="rejected",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/source.docx",
+            local_relpath="originals/unknown/synthetic/source.docx",
             download_status="verified", sha256=digest, content_object_id=content.id,
         )
         session.add(source)
@@ -1219,7 +1228,7 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    root = settings.data_root / "archive/raw/oa/done/synthetic"
+    root = settings.data_root / "originals/unknown/synthetic"
     root.mkdir(parents=True)
     (root / "first.docx").write_bytes(b"synthetic eligible source")
     (root / "second.wps").write_bytes(b"synthetic unsupported source")
@@ -1230,12 +1239,12 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
         first = ArchivedFile(
             oa_item_id=item.id, original_name="first.docx", attachment_key="first",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/first.docx", download_status="verified",
+            local_relpath="originals/unknown/synthetic/first.docx", download_status="verified",
         )
         second = ArchivedFile(
             oa_item_id=item.id, original_name="second.wps", attachment_key="second",
             file_role="official_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/second.wps", download_status="verified",
+            local_relpath="originals/unknown/synthetic/second.wps", download_status="verified",
         )
         session.add_all([first, second]); session.flush()
         content = ContentObject(sha256=hashlib.sha256(b"synthetic eligible source").hexdigest(), size_bytes=25)
@@ -1277,7 +1286,7 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
         worker.close()
 
     with Session(engine) as session:
-        assert calls == [first_id]
+        assert calls == []
         row = session.get(PipelineTask, task_id)
         assert row.status == "queued"
         assert row.stage == "classify"

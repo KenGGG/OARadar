@@ -93,11 +93,11 @@ def test_completed_audit_allows_only_safe_canonical_history(config_file: Path) -
             ),
             OAItem(
                 oa_item_key="done:canonical", source_channel="done", title="canonical",
-                archive_relpath="archive/raw/oa/done/unknown/canonical",
+                archive_relpath="originals/unknown/unknown_canonical",
             ),
             OAItem(
                 oa_item_key="done:unsafe-canonical", source_channel="done", title="unsafe",
-                archive_relpath="archive/raw/oa/done/unknown/unsafe",
+                archive_relpath="originals/unknown/unknown_unsafe",
             ),
         ))
         audit = OnlineAuditRun(status="completed", total_items=3, completed_items=3)
@@ -142,7 +142,7 @@ def test_newer_running_audit_blocks_history_despite_older_safe_evidence(config_f
     with Session(queue.engine) as session:
         session.add(OAItem(
             oa_item_key="done:stale-evidence", source_channel="done", title="stale",
-            archive_relpath="archive/raw/oa/done/unknown/stale",
+            archive_relpath="originals/unknown/unknown_stale",
         ))
         completed = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
         session.add(completed); session.flush()
@@ -168,11 +168,11 @@ def test_finalize_ineligible_historical_tasks_parks_only_review_rows(config_file
         session.add_all((
             OAItem(
                 oa_item_key="done:safe", source_channel="done", title="safe",
-                archive_relpath="archive/raw/oa/done/unknown/safe",
+                archive_relpath="originals/unknown/unknown_safe",
             ),
             OAItem(
                 oa_item_key="done:unsafe", source_channel="done", title="unsafe",
-                archive_relpath="archive/raw/oa/done/unknown/unsafe",
+                archive_relpath="originals/unknown/unknown_unsafe",
             ),
             OAItem(
                 oa_item_key="done:migration-failed", source_channel="done", title="migration-failed",
@@ -230,7 +230,7 @@ def test_new_safe_audit_releases_previously_review_gated_history(config_file: Pa
     with Session(queue.engine) as session:
         session.add(OAItem(
             oa_item_key="done:resolved", source_channel="done", title="resolved",
-            archive_relpath="archive/raw/oa/done/unknown/resolved",
+            archive_relpath="originals/unknown/unknown_resolved",
         ))
         audit = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
         session.add(audit); session.flush()
@@ -431,7 +431,7 @@ def test_bootstrap_resumes_fully_parsed_done_at_source_publish(config_file: Path
         )
         item = OAItem(
             oa_item_key="done:parsed", source_channel="done", title="已解析历史事项",
-            archive_relpath="archive/raw/oa/done/synthetic",
+            archive_relpath="originals/unknown/unknown_synthetic",
         )
         session.add_all([manifest, item]); session.flush()
         content = ContentObject(sha256=hashlib.sha256(b"source").hexdigest(), size_bytes=6)
@@ -439,7 +439,7 @@ def test_bootstrap_resumes_fully_parsed_done_at_source_publish(config_file: Path
         source = ArchivedFile(
             oa_item_id=item.id, attachment_key="source", file_role="direct_attachment",
             source_container_key="root", original_name="source.docx",
-            local_relpath="archive/raw/oa/done/synthetic/source.docx",
+            local_relpath="originals/unknown/unknown_synthetic/source.docx",
             download_status="verified", sha256=content.sha256, content_object_id=content.id,
         )
         session.add(source); session.flush()
