@@ -450,6 +450,129 @@ aliases:
 
 
 @pytest.mark.parametrize(
+    "replacements",
+    [
+        {
+            "issuer_aliases.yaml": """
+aliases:
+  SAA: Synthetic Authority A
+""",
+            "document_number_issuers.yaml": """
+rules:
+  - pattern: '^SYN-ALIAS-DOC-[0-9]+$'
+    canonical_issuer: SYNTHETIC AUTHORITY A
+""",
+        },
+        {
+            "document_number_issuers.yaml": """
+rules:
+  - pattern: '^SYN-DOC-TITLE-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+""",
+            "title_templates.yaml": """
+templates:
+  - pattern: '^Synthetic doc title conflict:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: SYNTHETIC AUTHORITY A
+""",
+        },
+        {
+            "document_number_issuers.yaml": """
+rules:
+  - pattern: '^SYN-DOC-ONE-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+  - pattern: '^SYN-DOC-TWO-[0-9]+$'
+    canonical_issuer: SYNTHETIC AUTHORITY A
+""",
+        },
+        {
+            "title_templates.yaml": """
+templates:
+  - pattern: '^Synthetic title one:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Authority A
+  - pattern: '^Synthetic title two:'
+    content_origin: external
+    flow_type: distribution
+    canonical_issuer: SYNTHETIC AUTHORITY A
+""",
+        },
+        {
+            "issuer_aliases.yaml": """
+aliases:
+  SAA: Synthetic Authority A
+""",
+            "title_templates.yaml": """
+templates:
+  - pattern: '^Synthetic alias title conflict:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: SYNTHETIC AUTHORITY A
+""",
+        },
+    ],
+    ids=[
+        "alias-vs-document",
+        "document-vs-title",
+        "document-vs-document",
+        "title-vs-title",
+        "alias-vs-title",
+    ],
+)
+def test_rejects_cross_source_case_drift_for_one_canonical_identity(
+    tmp_path: Path, replacements: dict[str, str]
+) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements=replacements,
+    )
+
+    with pytest.raises(PrivateConfigError, match="conflicting aliases"):
+        load_private_classification_config(root)
+
+
+def test_accepts_one_exact_canonical_spelling_reused_by_all_sources(tmp_path: Path) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={
+            "issuer_aliases.yaml": """
+aliases:
+  SAA: Synthetic Authority A
+""",
+            "document_number_issuers.yaml": """
+rules:
+  - pattern: '^SYN-EXACT-ONE-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+  - pattern: '^SYN-EXACT-TWO-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+""",
+            "title_templates.yaml": """
+templates:
+  - pattern: '^Synthetic exact one:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Authority A
+  - pattern: '^Synthetic exact two:'
+    content_origin: external
+    flow_type: distribution
+    canonical_issuer: Synthetic Authority A
+""",
+        },
+    )
+
+    loaded = load_private_classification_config(root)
+
+    assert {
+        rule.canonical_issuer for rule in loaded.config.document_number_issuers
+    } == {"Synthetic Authority A"}
+    assert {
+        template.canonical_issuer for template in loaded.config.title_templates
+    } == {"Synthetic Authority A"}
+
+
+@pytest.mark.parametrize(
     ("filename", "rules"),
     [
         (
