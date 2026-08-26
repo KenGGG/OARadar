@@ -211,6 +211,71 @@ def test_0038_preserves_legacy_parse_duplicates_with_deterministic_profiles(
     ]
 
 
+def test_0038_prefers_active_legacy_parse_artifact_as_canonical(tmp_path: Path) -> None:
+    database_path = tmp_path / "active-legacy-duplicate.db"
+    upgrade_database(database_path)
+    command.downgrade(_alembic_config(database_path), "0037_no_attachment_evidence")
+
+    with sqlite3.connect(database_path) as connection:
+        artifact_ids = _insert_legacy_parse_artifacts(
+            connection,
+            count=2,
+            content_sha256="f" * 64,
+            config_hash="1" * 64,
+        )
+        connection.execute(
+            "UPDATE content_objects SET active_parse_artifact_id = ? WHERE sha256 = ?",
+            (artifact_ids[1], "f" * 64),
+        )
+
+    command.upgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
+
+    with sqlite3.connect(database_path) as connection:
+        profiles = connection.execute(
+            "SELECT id, profile_version FROM parse_artifacts ORDER BY id"
+        ).fetchall()
+    assert profiles == [
+        (artifact_ids[0], f"legacy-duplicate-{artifact_ids[0]}"),
+        (artifact_ids[1], "legacy"),
+    ]
+
+
+def test_0038_recovers_when_profile_column_exists_without_reuse_index(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "interrupted-profile-backfill.db"
+    upgrade_database(database_path)
+    command.downgrade(_alembic_config(database_path), "0037_no_attachment_evidence")
+
+    with sqlite3.connect(database_path) as connection:
+        artifact_ids = _insert_legacy_parse_artifacts(
+            connection,
+            count=2,
+            content_sha256="2" * 64,
+            config_hash="3" * 64,
+        )
+        connection.execute(
+            """
+            ALTER TABLE parse_artifacts
+            ADD COLUMN profile_version VARCHAR(80) NOT NULL DEFAULT 'legacy'
+            """
+        )
+
+    command.upgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
+
+    engine = create_db_engine(database_path)
+    indexes = {index["name"] for index in inspect(engine).get_indexes("parse_artifacts")}
+    assert "uq_parse_artifact_reuse_identity" in indexes
+    with sqlite3.connect(database_path) as connection:
+        profiles = connection.execute(
+            "SELECT id, profile_version FROM parse_artifacts ORDER BY id"
+        ).fetchall()
+    assert profiles == [
+        (artifact_ids[0], "legacy"),
+        (artifact_ids[1], f"legacy-duplicate-{artifact_ids[1]}"),
+    ]
+
+
 def test_parse_artifact_model_declares_versioned_reuse_identity() -> None:
     indexes = {index.name: index for index in models.ParseArtifact.__table__.indexes}
     reuse_index = indexes["uq_parse_artifact_reuse_identity"]

@@ -41,6 +41,57 @@ def _parse_indexes() -> set[str]:
     }
 
 
+def _normalize_legacy_parse_profiles() -> None:
+    """Make the legacy cache key unique without discarding historical rows.
+
+    Prefer the ContentObject's valid active pointer for each legacy identity;
+    otherwise keep the oldest artifact canonical. The statement is idempotent
+    so a retry after SQLite commits the column-add DDL can safely resume.
+    """
+    op.execute(sa.text(
+        """
+        UPDATE parse_artifacts
+        SET profile_version = CASE
+            WHEN id = COALESCE(
+                (
+                    SELECT active.id
+                    FROM content_objects AS content
+                    JOIN parse_artifacts AS active
+                      ON active.id = content.active_parse_artifact_id
+                    WHERE content.id = parse_artifacts.content_object_id
+                      AND active.content_object_id = parse_artifacts.content_object_id
+                      AND active.engine = parse_artifacts.engine
+                      AND active.engine_version = parse_artifacts.engine_version
+                      AND active.config_hash = parse_artifacts.config_hash
+                      AND (
+                          active.profile_version = 'legacy'
+                          OR active.profile_version LIKE 'legacy-duplicate-%'
+                      )
+                ),
+                (
+                    SELECT MIN(candidate.id)
+                    FROM parse_artifacts AS candidate
+                    WHERE candidate.content_object_id = parse_artifacts.content_object_id
+                      AND candidate.engine = parse_artifacts.engine
+                      AND candidate.engine_version = parse_artifacts.engine_version
+                      AND candidate.config_hash = parse_artifacts.config_hash
+                      AND (
+                          candidate.profile_version = 'legacy'
+                          OR candidate.profile_version LIKE 'legacy-duplicate-%'
+                      )
+                )
+            ) THEN 'legacy'
+            ELSE 'legacy-duplicate-' || id
+        END
+        WHERE content_object_id IS NOT NULL
+          AND (
+              profile_version = 'legacy'
+              OR profile_version LIKE 'legacy-duplicate-%'
+          )
+        """
+    ))
+
+
 def upgrade() -> None:
     if "profile_version" not in _parse_columns():
         with op.batch_alter_table("parse_artifacts") as batch:
@@ -50,20 +101,8 @@ def upgrade() -> None:
                 nullable=False,
                 server_default="legacy",
             ))
-        op.execute(sa.text(
-            """
-            UPDATE parse_artifacts
-            SET profile_version = 'legacy-duplicate-' || id
-            WHERE content_object_id IS NOT NULL
-              AND id NOT IN (
-                  SELECT MIN(id)
-                  FROM parse_artifacts
-                  WHERE content_object_id IS NOT NULL
-                  GROUP BY content_object_id, engine, engine_version, config_hash
-              )
-            """
-        ))
     if "uq_parse_artifact_reuse_identity" not in _parse_indexes():
+        _normalize_legacy_parse_profiles()
         op.create_index(
             "uq_parse_artifact_reuse_identity",
             "parse_artifacts",
