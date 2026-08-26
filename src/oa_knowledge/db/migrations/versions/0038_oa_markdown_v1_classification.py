@@ -50,6 +50,19 @@ def upgrade() -> None:
                 nullable=False,
                 server_default="legacy",
             ))
+        op.execute(sa.text(
+            """
+            UPDATE parse_artifacts
+            SET profile_version = 'legacy-duplicate-' || id
+            WHERE content_object_id IS NOT NULL
+              AND id NOT IN (
+                  SELECT MIN(id)
+                  FROM parse_artifacts
+                  WHERE content_object_id IS NOT NULL
+                  GROUP BY content_object_id, engine, engine_version, config_hash
+              )
+            """
+        ))
     if "uq_parse_artifact_reuse_identity" not in _parse_indexes():
         op.create_index(
             "uq_parse_artifact_reuse_identity",
@@ -142,13 +155,36 @@ def upgrade() -> None:
             sa.Column("supersedes_decision_id", sa.Integer(), sa.ForeignKey("classification_decisions.id", ondelete="SET NULL")),
             sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
             sa.UniqueConstraint("oa_item_key", "version", name="uq_classification_decision_version"),
+            sa.CheckConstraint("version >= 1", name="ck_classification_decision_version"),
             sa.CheckConstraint(f"classification_status IN ({CLASSIFICATION_STATUSES})", name="ck_classification_decision_status"),
             sa.CheckConstraint(f"content_integrity_status IN ({INTEGRITY_STATUSES})", name="ck_classification_integrity_status"),
             sa.CheckConstraint("content_origin IS NULL OR content_origin IN ('internal', 'external')", name="ck_classification_content_origin"),
             sa.CheckConstraint("decision_source IN ('metadata_rule', 'content_rule', 'local_qwen', 'manual')", name="ck_classification_decision_source"),
             sa.CheckConstraint("initiator_type IN ('internal', 'external', 'mixed', 'system', 'unknown')", name="ck_classification_initiator_type"),
             sa.CheckConstraint("classification_confidence >= 0 AND classification_confidence <= 1", name="ck_classification_confidence"),
-            sa.CheckConstraint("content_origin <> 'external' OR business_category IS NULL", name="ck_classification_external_category_empty"),
+            sa.CheckConstraint(
+                "business_category IS NULL OR "
+                "(content_origin IS NOT NULL AND content_origin = 'internal')",
+                name="ck_classification_category_requires_internal",
+            ),
+            sa.CheckConstraint(
+                "content_origin <> 'external' OR "
+                "(canonical_issuer IS NOT NULL AND trim(canonical_issuer) <> '')",
+                name="ck_classification_external_issuer_required",
+            ),
+            sa.CheckConstraint(
+                "canonical_issuer IS NULL OR content_origin = 'external'",
+                name="ck_classification_issuer_requires_external",
+            ),
+            sa.CheckConstraint(
+                "manual_locked = 0 OR "
+                "(decision_source = 'manual' AND actor IS NOT NULL AND trim(actor) <> '')",
+                name="ck_classification_manual_lock_provenance",
+            ),
+            sa.CheckConstraint(
+                "decision_source <> 'manual' OR (actor IS NOT NULL AND trim(actor) <> '')",
+                name="ck_classification_manual_actor_required",
+            ),
             sa.CheckConstraint(
                 "classification_status <> 'classified' OR "
                 f"(content_origin = 'internal' AND business_category IN ({BUSINESS_CATEGORIES})) OR "
@@ -189,6 +225,7 @@ def upgrade() -> None:
             sa.Column("parse_artifact_id", sa.Integer(), sa.ForeignKey("parse_artifacts.id", ondelete="SET NULL")),
             sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
             sa.UniqueConstraint("classification_decision_id", "sequence", name="uq_classification_evidence_sequence"),
+            sa.CheckConstraint("sequence >= 1", name="ck_classification_evidence_sequence"),
             sa.CheckConstraint("evidence_scope IN ('package', 'attachment')", name="ck_classification_evidence_scope"),
             sa.CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_classification_evidence_confidence"),
         )

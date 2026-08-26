@@ -313,6 +313,17 @@ class ExclusionPolicyRevision(Base):
 
 class ParseArtifact(Base):
     __tablename__ = "parse_artifacts"
+    __table_args__ = (
+        Index(
+            "uq_parse_artifact_reuse_identity",
+            "content_object_id",
+            "engine",
+            "engine_version",
+            "profile_version",
+            "config_hash",
+            unique=True,
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     parse_job_id: Mapped[int] = mapped_column(ForeignKey("parse_jobs.id", ondelete="CASCADE"), nullable=False)
     content_object_id: Mapped[int | None] = mapped_column(ForeignKey("content_objects.id", ondelete="CASCADE"))
@@ -394,6 +405,7 @@ class ClassificationDecision(Base):
     __tablename__ = "classification_decisions"
     __table_args__ = (
         UniqueConstraint("oa_item_key", "version", name="uq_classification_decision_version"),
+        CheckConstraint("version >= 1", name="ck_classification_decision_version"),
         CheckConstraint("classification_status IN ('classified', 'needs_review', 'excluded')", name="ck_classification_decision_status"),
         CheckConstraint(
             "content_integrity_status IN ('ok', 'no_attachment_confirmed', 'missing', 'size_mismatch', 'sha256_mismatch', 'download_failed', 'not_checked')",
@@ -403,7 +415,29 @@ class ClassificationDecision(Base):
         CheckConstraint("decision_source IN ('metadata_rule', 'content_rule', 'local_qwen', 'manual')", name="ck_classification_decision_source"),
         CheckConstraint("initiator_type IN ('internal', 'external', 'mixed', 'system', 'unknown')", name="ck_classification_initiator_type"),
         CheckConstraint("classification_confidence >= 0 AND classification_confidence <= 1", name="ck_classification_confidence"),
-        CheckConstraint("content_origin <> 'external' OR business_category IS NULL", name="ck_classification_external_category_empty"),
+        CheckConstraint(
+            "business_category IS NULL OR "
+            "(content_origin IS NOT NULL AND content_origin = 'internal')",
+            name="ck_classification_category_requires_internal",
+        ),
+        CheckConstraint(
+            "content_origin <> 'external' OR "
+            "(canonical_issuer IS NOT NULL AND trim(canonical_issuer) <> '')",
+            name="ck_classification_external_issuer_required",
+        ),
+        CheckConstraint(
+            "canonical_issuer IS NULL OR content_origin = 'external'",
+            name="ck_classification_issuer_requires_external",
+        ),
+        CheckConstraint(
+            "manual_locked = 0 OR "
+            "(decision_source = 'manual' AND actor IS NOT NULL AND trim(actor) <> '')",
+            name="ck_classification_manual_lock_provenance",
+        ),
+        CheckConstraint(
+            "decision_source <> 'manual' OR (actor IS NOT NULL AND trim(actor) <> '')",
+            name="ck_classification_manual_actor_required",
+        ),
         CheckConstraint(
             "classification_status <> 'classified' OR "
             "(content_origin = 'internal' AND business_category IN "
@@ -461,6 +495,7 @@ class ClassificationEvidence(Base):
     __tablename__ = "classification_evidence"
     __table_args__ = (
         UniqueConstraint("classification_decision_id", "sequence", name="uq_classification_evidence_sequence"),
+        CheckConstraint("sequence >= 1", name="ck_classification_evidence_sequence"),
         CheckConstraint("evidence_scope IN ('package', 'attachment')", name="ck_classification_evidence_scope"),
         CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_classification_evidence_confidence"),
     )

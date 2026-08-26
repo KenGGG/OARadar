@@ -34,9 +34,120 @@ def _alembic_config(database_path: Path) -> Config:
     return config
 
 
+def _parse_schema_snapshot(database_path: Path) -> dict[str, object]:
+    with sqlite3.connect(database_path) as connection:
+        indexes = connection.execute("PRAGMA index_list(parse_artifacts)").fetchall()
+        return {
+            "columns": connection.execute("PRAGMA table_info(parse_artifacts)").fetchall(),
+            "foreign_keys": sorted(
+                (row[2], row[3], row[4], row[5], row[6], row[7])
+                for row in connection.execute(
+                    "PRAGMA foreign_key_list(parse_artifacts)"
+                ).fetchall()
+            ),
+            "indexes": sorted(
+                (
+                    row[1],
+                    row[2],
+                    tuple(
+                        column[2]
+                        for column in connection.execute(
+                            f'PRAGMA index_info("{row[1]}")'
+                        ).fetchall()
+                    ),
+                )
+                for row in indexes
+            ),
+        }
+
+
+def _insert_legacy_parse_artifacts(
+    connection: sqlite3.Connection,
+    *,
+    count: int,
+    content_sha256: str,
+    config_hash: str,
+) -> list[int]:
+    item_id = connection.execute(
+        """
+        INSERT INTO oa_items (
+            oa_item_key, source_channel, title, pipeline_status,
+            first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        (f"done:{content_sha256[:8]}", "done", "Synthetic parse item", "archived"),
+    ).lastrowid
+    content_object_id = connection.execute(
+        "INSERT INTO content_objects (sha256, created_at) VALUES (?, CURRENT_TIMESTAMP)",
+        (content_sha256,),
+    ).lastrowid
+    artifact_ids: list[int] = []
+    for offset in range(count):
+        file_id = connection.execute(
+            """
+            INSERT INTO files (
+                oa_item_id, original_name, attachment_key, file_role,
+                source_container_key, depth, download_status, download_attempts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id,
+                f"synthetic-{offset}.pdf",
+                f"attachment-{offset}",
+                "attachment",
+                "root",
+                1,
+                "verified",
+                0,
+            ),
+        ).lastrowid
+        parse_job_id = connection.execute(
+            """
+            INSERT INTO parse_jobs (
+                file_id, engine, engine_version, config_hash, status, attempts
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (file_id, "synthetic", "1", config_hash, "completed", 1),
+        ).lastrowid
+        artifact_id = connection.execute(
+            """
+            INSERT INTO parse_artifacts (
+                parse_job_id, content_object_id, engine, engine_version,
+                output_relpath, source_sha256, config_hash, page_map_json,
+                lifecycle_status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                parse_job_id,
+                content_object_id,
+                "synthetic",
+                "1",
+                f"markdown/cache/artifact-{offset}.md",
+                content_sha256,
+                config_hash,
+                "{}",
+                "valid",
+            ),
+        ).lastrowid
+        artifact_ids.append(artifact_id)
+    return artifact_ids
+
+
 def test_0038_upgrade_and_downgrade_are_exact(tmp_path: Path) -> None:
     database_path = tmp_path / "classification.db"
     upgrade_database(database_path)
+    command.downgrade(_alembic_config(database_path), "0037_no_attachment_evidence")
+    before = _parse_schema_snapshot(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        _insert_legacy_parse_artifacts(
+            connection,
+            count=1,
+            content_sha256="a" * 64,
+            config_hash="c" * 64,
+        )
+
+    command.upgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
 
     engine = create_db_engine(database_path)
     inspector = inspect(engine)
@@ -69,6 +180,48 @@ def test_0038_upgrade_and_downgrade_are_exact(tmp_path: Path) -> None:
     assert "uq_parse_artifact_reuse_identity" not in {
         index["name"] for index in downgraded_inspector.get_indexes("parse_artifacts")
     }
+    downgraded.dispose()
+    assert _parse_schema_snapshot(database_path) == before
+
+
+def test_0038_preserves_legacy_parse_duplicates_with_deterministic_profiles(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-duplicates.db"
+    upgrade_database(database_path)
+    command.downgrade(_alembic_config(database_path), "0037_no_attachment_evidence")
+
+    with sqlite3.connect(database_path) as connection:
+        artifact_ids = _insert_legacy_parse_artifacts(
+            connection,
+            count=2,
+            content_sha256="d" * 64,
+            config_hash="e" * 64,
+        )
+
+    command.upgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
+
+    with sqlite3.connect(database_path) as connection:
+        profiles = connection.execute(
+            "SELECT id, profile_version FROM parse_artifacts ORDER BY id"
+        ).fetchall()
+    assert profiles == [
+        (artifact_ids[0], "legacy"),
+        (artifact_ids[1], f"legacy-duplicate-{artifact_ids[1]}"),
+    ]
+
+
+def test_parse_artifact_model_declares_versioned_reuse_identity() -> None:
+    indexes = {index.name: index for index in models.ParseArtifact.__table__.indexes}
+    reuse_index = indexes["uq_parse_artifact_reuse_identity"]
+    assert reuse_index.unique is True
+    assert [column.name for column in reuse_index.columns] == [
+        "content_object_id",
+        "engine",
+        "engine_version",
+        "profile_version",
+        "config_hash",
+    ]
 
 
 def test_classification_models_preserve_text_keys_and_current_decision(tmp_path: Path) -> None:
@@ -250,3 +403,137 @@ def test_classification_constraints_keep_status_axes_and_package_fields_separate
         session.commit()
         assert excluded.classification_status == "excluded"
         assert excluded.content_integrity_status == "not_checked"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_constraint"),
+    [
+        (
+            {"content_origin": None, "business_category": "99_其他内部"},
+            "business_category",
+        ),
+        (
+            {"content_origin": "external", "canonical_issuer": None},
+            "canonical_issuer",
+        ),
+        (
+            {
+                "classification_status": "classified",
+                "content_origin": "internal",
+                "business_category": "99_其他内部",
+                "canonical_issuer": "Synthetic Authority",
+            },
+            "canonical_issuer",
+        ),
+        (
+            {"decision_source": "metadata_rule", "manual_locked": True, "actor": None},
+            "manual_locked",
+        ),
+        (
+            {"decision_source": "manual", "manual_locked": False, "actor": None},
+            "actor",
+        ),
+        ({"version": 0}, "version"),
+    ],
+)
+def test_classification_decision_rejects_invalid_routing_and_provenance(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    expected_constraint: str,
+) -> None:
+    database_path = tmp_path / f"invalid-{expected_constraint}.db"
+    upgrade_database(database_path)
+    engine = create_db_engine(database_path)
+    with Session(engine) as session:
+        run = models.ClassificationRun(
+            run_id="invalid",
+            run_kind="incremental",
+            status="running",
+            input_signature="1" * 64,
+            manifest_sha256="2" * 64,
+            exclusion_policy_sha256="3" * 64,
+            rule_version="rules-v1",
+            schema_version="schema-v1",
+            prompt_version="prompt-v1",
+            model_name="synthetic-local",
+            private_config_sha256="4" * 64,
+        )
+        session.add(run)
+        session.flush()
+        values: dict[str, object] = {
+            "classification_run_id": run.id,
+            "oa_item_key": "done:invalid",
+            "version": 1,
+            "is_current": True,
+            "decision_input_sha256": "5" * 64,
+            "decision_source": "metadata_rule",
+            "classification_status": "needs_review",
+            "content_integrity_status": "not_checked",
+            "content_origin": None,
+            "initiator_type": "unknown",
+            "transfer_chain_json": "[]",
+            "business_category": None,
+            "canonical_issuer": None,
+            "normalized_title": "Synthetic invalid decision",
+            "classification_confidence": 0.5,
+            "classification_reason_json": "{}",
+            "rule_version": "rules-v1",
+            "private_config_sha256": "4" * 64,
+            "manual_locked": False,
+            "actor": None,
+        }
+        values.update(overrides)
+        session.add(models.ClassificationDecision(**values))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_classification_evidence_sequence_must_be_positive(tmp_path: Path) -> None:
+    database_path = tmp_path / "invalid-evidence-sequence.db"
+    upgrade_database(database_path)
+    engine = create_db_engine(database_path)
+    with Session(engine) as session:
+        run = models.ClassificationRun(
+            run_id="evidence",
+            run_kind="incremental",
+            status="running",
+            input_signature="1" * 64,
+            manifest_sha256="2" * 64,
+            exclusion_policy_sha256="3" * 64,
+            rule_version="rules-v1",
+            schema_version="schema-v1",
+            prompt_version="prompt-v1",
+            model_name="synthetic-local",
+            private_config_sha256="4" * 64,
+        )
+        session.add(run)
+        session.flush()
+        decision = models.ClassificationDecision(
+            classification_run_id=run.id,
+            oa_item_key="done:evidence",
+            version=1,
+            is_current=True,
+            decision_input_sha256="5" * 64,
+            decision_source="metadata_rule",
+            classification_status="needs_review",
+            content_integrity_status="not_checked",
+            initiator_type="unknown",
+            transfer_chain_json="[]",
+            normalized_title="Synthetic evidence",
+            classification_confidence=0.5,
+            classification_reason_json="{}",
+            rule_version="rules-v1",
+            private_config_sha256="4" * 64,
+        )
+        session.add(decision)
+        session.flush()
+        session.add(models.ClassificationEvidence(
+            classification_decision_id=decision.id,
+            sequence=0,
+            evidence_type="synthetic",
+            evidence_scope="package",
+            value_json="{}",
+            confidence=0.5,
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
