@@ -15,6 +15,7 @@ from typing import Any
 
 
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _INTEGRITY_STATUSES = frozenset(
     {
         "ok",
@@ -26,27 +27,57 @@ _INTEGRITY_STATUSES = frozenset(
         "not_checked",
     }
 )
-_TEXT_ID_KEYS = frozenset(
-    {
-        "oa_item_key",
-        "attachment_key",
-        "source_container_key",
-        "parent_attachment_key",
-        "from",
-        "to",
-        "initiator",
-        "relay_from",
-        "person_id",
-        "identifier",
-    }
+_TRANSFER_TEXT_ID_KEYS = frozenset(
+    {"from", "to", "person_id", "identifier", "relay_from"}
 )
+
+
+@dataclass(frozen=True)
+class NormalizedOAMetadata:
+    normalized_title: str
+    initiator: str | int | None = None
+    document_number: str | None = None
+    completed_at: datetime | str | None = None
+    oa_id_text: str | int | None = None
+    workitem_id_text: str | int | None = None
+    process_id_text: str | int | None = None
+    affair_id_text: str | int | None = None
+    summary_id_text: str | int | None = None
+    initiated_at: datetime | str | None = None
+    received_at: datetime | str | None = None
+    sender: str | None = None
+    department: str | None = None
+    flow_type: str | None = None
+
+
+@dataclass(frozen=True)
+class ReadinessEvidenceInput:
+    manifest_processing_status: str | None
+    manifest_no_attachment_confirmed: bool
+    audit_status: str | None = None
+    audit_finished_at: datetime | str | None = None
+    audit_recognized_attachments: int | None = None
+    audit_database_attachments: int | None = None
+    audit_downloaded_attachments: int | None = None
+    audit_online_inventory_sha256: str | None = None
+    audit_local_inventory_sha256: str | None = None
+    audit_online_content_sha256: str | None = None
+    audit_local_content_sha256: str | None = None
+    audit_online_evidence_sha256: str | None = None
+    audit_local_evidence_sha256: str | None = None
+    audit_depth_limit_reached: bool = False
+    reason_codes: Sequence[str] = ()
 
 
 @dataclass(frozen=True)
 class AttachmentInput:
     attachment_key: str | int
     file_role: str
+    original_filename: str
+    display_filename: str
     source_container_key: str | int
+    parent_container_key: str | int | None
+    container_path: Sequence[str | int]
     local_relpath: str | Path | None
     size_bytes: int | None
     expected_size: int | None
@@ -70,10 +101,12 @@ class ParseArtifactIdentity:
 @dataclass(frozen=True)
 class DecisionInputs:
     oa_item_key: str | int
-    normalized_metadata: Mapping[str, Any]
+    normalized_metadata: NormalizedOAMetadata
     manifest_status: str
     excluded: bool
     exclusion_matches: Sequence[str | int]
+    content_integrity_status: str
+    readiness_evidence: ReadinessEvidenceInput
     attachments: Sequence[AttachmentInput]
     transfer_evidence: Sequence[Mapping[str, Any]]
     used_parse_artifacts: Sequence[ParseArtifactIdentity]
@@ -93,13 +126,21 @@ def _text(value: object, *, field: str) -> str:
     return normalized
 
 
+def _optional_text_id(value: object, *, field: str) -> str | None:
+    return None if value is None else _text(value, field=field)
+
+
 def _plain_text(value: object, *, field: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field} must be text")
-    normalized = unicodedata.normalize("NFC", value)
-    if not normalized.strip():
+    normalized = unicodedata.normalize("NFC", value).strip()
+    if not normalized:
         raise ValueError(f"{field} must not be empty")
     return normalized
+
+
+def _optional_plain_text(value: object, *, field: str) -> str | None:
+    return None if value is None else _plain_text(value, field=field)
 
 
 def _hash(value: object, *, field: str, optional: bool = False) -> str | None:
@@ -123,9 +164,7 @@ def _integer(
 
 
 def _optional_integer(value: object, *, field: str) -> int | None:
-    if value is None:
-        return None
-    return _integer(value, field=field)
+    return None if value is None else _integer(value, field=field)
 
 
 def _timestamp(value: datetime | str, *, field: str) -> str:
@@ -141,19 +180,30 @@ def _timestamp(value: datetime | str, *, field: str) -> str:
         raise TypeError(f"{field} must be a timestamp")
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    value = value.astimezone(timezone.utc)
-    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _optional_timestamp(value: datetime | str | None, *, field: str) -> str | None:
+    return None if value is None else _timestamp(value, field=field)
 
 
 def _relative_path(value: str | Path | None, *, field: str) -> str | None:
     if value is None:
         return None
-    raw = str(value)
-    if not raw or "\x00" in raw or "\\" in raw:
+    raw = unicodedata.normalize("NFC", str(value))
+    if (
+        not raw
+        or "\x00" in raw
+        or "\\" in raw
+        or raw.startswith("//")
+        or _WINDOWS_DRIVE_RE.match(raw)
+    ):
         raise ValueError(f"{field} must be a non-empty POSIX relative path")
     path = PurePosixPath(raw)
     if path.is_absolute() or ".." in path.parts:
-        raise ValueError(f"{field} must not be absolute or traverse parents")
+        raise ValueError(f"{field} must be a relative path without parent traversal")
     normalized = path.as_posix()
     if normalized in {"", "."}:
         raise ValueError(f"{field} must identify a file")
@@ -183,7 +233,7 @@ def _json_safe(value: object, *, field: str) -> Any:
             normalized_key = unicodedata.normalize("NFC", key)
             if normalized_key in normalized:
                 raise ValueError(f"{field} contains duplicate normalized mapping keys")
-            if normalized_key in _TEXT_ID_KEYS and child is not None:
+            if normalized_key in _TRANSFER_TEXT_ID_KEYS and child is not None:
                 normalized[normalized_key] = _text(
                     child, field=f"{field}.{normalized_key}"
                 )
@@ -214,6 +264,121 @@ def _canonical_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _metadata_row(metadata: NormalizedOAMetadata) -> dict[str, Any]:
+    if not isinstance(metadata, NormalizedOAMetadata):
+        raise TypeError("normalized_metadata must be a NormalizedOAMetadata value")
+    return {
+        "normalized_title": _plain_text(
+            metadata.normalized_title, field="normalized_metadata.normalized_title"
+        ),
+        "initiator": _optional_text_id(
+            metadata.initiator, field="normalized_metadata.initiator"
+        ),
+        "document_number": _optional_plain_text(
+            metadata.document_number, field="normalized_metadata.document_number"
+        ),
+        "completed_at": _optional_timestamp(
+            metadata.completed_at, field="normalized_metadata.completed_at"
+        ),
+        "initiated_at": _optional_timestamp(
+            metadata.initiated_at, field="normalized_metadata.initiated_at"
+        ),
+        "received_at": _optional_timestamp(
+            metadata.received_at, field="normalized_metadata.received_at"
+        ),
+        "oa_id_text": _optional_text_id(
+            metadata.oa_id_text, field="normalized_metadata.oa_id_text"
+        ),
+        "workitem_id_text": _optional_text_id(
+            metadata.workitem_id_text, field="normalized_metadata.workitem_id_text"
+        ),
+        "process_id_text": _optional_text_id(
+            metadata.process_id_text, field="normalized_metadata.process_id_text"
+        ),
+        "affair_id_text": _optional_text_id(
+            metadata.affair_id_text, field="normalized_metadata.affair_id_text"
+        ),
+        "summary_id_text": _optional_text_id(
+            metadata.summary_id_text, field="normalized_metadata.summary_id_text"
+        ),
+        "sender": _optional_plain_text(metadata.sender, field="normalized_metadata.sender"),
+        "department": _optional_plain_text(
+            metadata.department, field="normalized_metadata.department"
+        ),
+        "flow_type": _optional_plain_text(
+            metadata.flow_type, field="normalized_metadata.flow_type"
+        ),
+    }
+
+
+def _readiness_row(evidence: ReadinessEvidenceInput) -> dict[str, Any]:
+    if not isinstance(evidence, ReadinessEvidenceInput):
+        raise TypeError("readiness_evidence must be a ReadinessEvidenceInput value")
+    if not isinstance(evidence.manifest_no_attachment_confirmed, bool):
+        raise TypeError("manifest_no_attachment_confirmed must be a boolean")
+    if not isinstance(evidence.audit_depth_limit_reached, bool):
+        raise TypeError("audit_depth_limit_reached must be a boolean")
+    return {
+        "manifest_processing_status": _optional_plain_text(
+            evidence.manifest_processing_status,
+            field="readiness_evidence.manifest_processing_status",
+        ),
+        "manifest_no_attachment_confirmed": evidence.manifest_no_attachment_confirmed,
+        "audit_status": _optional_plain_text(
+            evidence.audit_status, field="readiness_evidence.audit_status"
+        ),
+        "audit_finished_at": _optional_timestamp(
+            evidence.audit_finished_at, field="readiness_evidence.audit_finished_at"
+        ),
+        "audit_recognized_attachments": _optional_integer(
+            evidence.audit_recognized_attachments,
+            field="readiness_evidence.audit_recognized_attachments",
+        ),
+        "audit_database_attachments": _optional_integer(
+            evidence.audit_database_attachments,
+            field="readiness_evidence.audit_database_attachments",
+        ),
+        "audit_downloaded_attachments": _optional_integer(
+            evidence.audit_downloaded_attachments,
+            field="readiness_evidence.audit_downloaded_attachments",
+        ),
+        "audit_online_inventory_sha256": _hash(
+            evidence.audit_online_inventory_sha256,
+            field="readiness_evidence.audit_online_inventory_sha256",
+            optional=True,
+        ),
+        "audit_local_inventory_sha256": _hash(
+            evidence.audit_local_inventory_sha256,
+            field="readiness_evidence.audit_local_inventory_sha256",
+            optional=True,
+        ),
+        "audit_online_content_sha256": _hash(
+            evidence.audit_online_content_sha256,
+            field="readiness_evidence.audit_online_content_sha256",
+            optional=True,
+        ),
+        "audit_local_content_sha256": _hash(
+            evidence.audit_local_content_sha256,
+            field="readiness_evidence.audit_local_content_sha256",
+            optional=True,
+        ),
+        "audit_online_evidence_sha256": _hash(
+            evidence.audit_online_evidence_sha256,
+            field="readiness_evidence.audit_online_evidence_sha256",
+            optional=True,
+        ),
+        "audit_local_evidence_sha256": _hash(
+            evidence.audit_local_evidence_sha256,
+            field="readiness_evidence.audit_local_evidence_sha256",
+            optional=True,
+        ),
+        "audit_depth_limit_reached": evidence.audit_depth_limit_reached,
+        "reason_codes": sorted(
+            {_plain_text(reason, field="readiness_evidence.reason_code") for reason in evidence.reason_codes}
+        ),
+    }
+
+
 def _attachment_rows(inputs: Sequence[AttachmentInput]) -> list[dict[str, Any]]:
     by_identity: dict[tuple[str, str], dict[str, Any]] = {}
     for attachment in inputs:
@@ -222,16 +387,30 @@ def _attachment_rows(inputs: Sequence[AttachmentInput]) -> list[dict[str, Any]]:
         status = _plain_text(attachment.integrity_status, field="integrity_status")
         if status not in _INTEGRITY_STATUSES:
             raise ValueError("integrity_status is not a supported content integrity state")
+        container_path = tuple(
+            _text(value, field="attachment.container_path")
+            for value in attachment.container_path
+        )
+        if not container_path:
+            raise ValueError("container topology must contain its source container")
         row = {
             "attachment_key": _text(attachment.attachment_key, field="attachment_key"),
             "file_role": _plain_text(attachment.file_role, field="file_role"),
+            "original_filename": _plain_text(
+                attachment.original_filename, field="original filename"
+            ),
+            "display_filename": _plain_text(
+                attachment.display_filename, field="display filename"
+            ),
             "source_container_key": _text(
                 attachment.source_container_key, field="source_container_key"
             ),
-            "parent_attachment_key": (
-                _text(attachment.parent_attachment_key, field="parent_attachment_key")
-                if attachment.parent_attachment_key is not None
-                else None
+            "parent_container_key": _optional_text_id(
+                attachment.parent_container_key, field="parent_container_key"
+            ),
+            "container_path": container_path,
+            "parent_attachment_key": _optional_text_id(
+                attachment.parent_attachment_key, field="parent_attachment_key"
             ),
             "local_relpath": _relative_path(
                 attachment.local_relpath, field="attachment.local_relpath"
@@ -242,37 +421,83 @@ def _attachment_rows(inputs: Sequence[AttachmentInput]) -> list[dict[str, Any]]:
             ),
             "sha256": _hash(attachment.sha256, field="attachment.sha256", optional=True),
             "content_sha256": _hash(
-                attachment.content_sha256, field="attachment.content_sha256", optional=True
+                attachment.content_sha256,
+                field="attachment.content_sha256",
+                optional=True,
             ),
             "integrity_status": status,
-            "depth": _integer(
-                attachment.depth, field="depth", minimum=1, maximum=10
-            ),
+            "depth": _integer(attachment.depth, field="depth", minimum=1, maximum=10),
         }
         identity = (row["attachment_key"], row["file_role"])
         previous = by_identity.get(identity)
         if previous is not None and previous != row:
             raise ValueError("duplicate attachment identity has conflicting evidence")
         by_identity[identity] = row
-    return [by_identity[identity] for identity in sorted(by_identity)]
+
+    rows = [by_identity[identity] for identity in sorted(by_identity)]
+    keys = [row["attachment_key"] for row in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError("attachment parent topology has ambiguous attachment keys")
+    key_set = set(keys)
+    container_keys = {row["source_container_key"] for row in rows}
+    parent_by_key: dict[str, str | None] = {}
+    for row in rows:
+        path = row["container_path"]
+        if (
+            path[-1] != row["source_container_key"]
+            or len(path) != row["depth"]
+            or len(path) != len(set(path))
+        ):
+            raise ValueError("container topology is inconsistent")
+        expected_parent = path[-2] if len(path) > 1 else None
+        if row["parent_container_key"] != expected_parent:
+            raise ValueError("container topology has an inconsistent parent")
+        if expected_parent is not None and expected_parent not in container_keys:
+            raise ValueError("container topology references an outside container")
+
+        key = row["attachment_key"]
+        parent = row["parent_attachment_key"]
+        if parent is not None and (parent not in key_set or parent == key):
+            raise ValueError("attachment parent topology is invalid")
+        parent_by_key[key] = parent
+
+    for key in parent_by_key:
+        seen: set[str] = set()
+        current: str | None = key
+        while current is not None:
+            if current in seen:
+                raise ValueError("attachment parent topology contains a cycle")
+            seen.add(current)
+            current = parent_by_key[current]
+    return rows
 
 
-def _parse_rows(inputs: Sequence[ParseArtifactIdentity]) -> list[dict[str, Any]]:
-    by_identity: dict[tuple[str, str, str, str, str], tuple[dict[str, Any], str | None]] = {}
+def _parse_rows(
+    inputs: Sequence[ParseArtifactIdentity], *, package_content_hashes: set[str]
+) -> list[dict[str, Any]]:
+    by_identity: dict[
+        tuple[str, str, str, str, str], tuple[dict[str, Any], str | None]
+    ] = {}
     for artifact in inputs:
         if not isinstance(artifact, ParseArtifactIdentity):
             raise TypeError("used_parse_artifacts must contain ParseArtifactIdentity values")
+        content_hash = _hash(
+            artifact.content_sha256, field="parse_artifact.content_sha256"
+        )
+        if content_hash not in package_content_hashes:
+            raise ValueError("parse artifact must reference package attachment content")
         row = {
-            "content_sha256": _hash(
-                artifact.content_sha256, field="parse_artifact.content_sha256"
-            ),
+            "content_sha256": content_hash,
             "parser_name": _plain_text(artifact.parser_name, field="parser_name"),
-            "parser_version": _plain_text(artifact.parser_version, field="parser_version"),
+            "parser_version": _plain_text(
+                artifact.parser_version, field="parser_version"
+            ),
             "parse_profile_version": _plain_text(
                 artifact.parse_profile_version, field="parse_profile_version"
             ),
             "parse_config_sha256": _hash(
-                artifact.parse_config_sha256, field="parse_artifact.parse_config_sha256"
+                artifact.parse_config_sha256,
+                field="parse_artifact.parse_config_sha256",
             ),
         }
         source_path = _relative_path(
@@ -301,7 +526,9 @@ def _relationship_rows(inputs: Sequence[Mapping[str, Any]]) -> list[Any]:
             identity = ("value", _canonical_bytes(normalized))
         previous = by_identity.get(identity)
         if previous is not None and previous != normalized:
-            raise ValueError("duplicate transfer relationship identity has conflicting evidence")
+            raise ValueError(
+                "duplicate transfer relationship identity has conflicting evidence"
+            )
         by_identity[identity] = normalized
     return sorted(by_identity.values(), key=_canonical_bytes)
 
@@ -310,10 +537,13 @@ def decision_input_sha256(inputs: DecisionInputs) -> str:
     """Hash exactly one OA package's normalized effective decision inputs."""
     if not isinstance(inputs, DecisionInputs):
         raise TypeError("inputs must be a DecisionInputs value")
-    if not isinstance(inputs.normalized_metadata, Mapping):
-        raise TypeError("normalized_metadata must be a mapping")
     if not isinstance(inputs.excluded, bool):
         raise TypeError("excluded must be a boolean")
+    integrity_status = _plain_text(
+        inputs.content_integrity_status, field="content_integrity_status"
+    )
+    if integrity_status not in _INTEGRITY_STATUSES:
+        raise ValueError("content_integrity_status is not supported")
     if inputs.manual_decision_version is not None:
         _integer(
             inputs.manual_decision_version,
@@ -321,19 +551,29 @@ def decision_input_sha256(inputs: DecisionInputs) -> str:
             minimum=1,
         )
 
+    attachment_rows = _attachment_rows(inputs.attachments)
+    package_content_hashes = {
+        value
+        for row in attachment_rows
+        for value in (row["content_sha256"], row["sha256"])
+        if value is not None
+    }
     payload = {
         "oa_item_key": _text(inputs.oa_item_key, field="oa_item_key"),
-        "normalized_metadata": _json_safe(
-            inputs.normalized_metadata, field="normalized_metadata"
-        ),
+        "normalized_metadata": _metadata_row(inputs.normalized_metadata),
         "manifest_status": _plain_text(inputs.manifest_status, field="manifest_status"),
         "excluded": inputs.excluded,
         "exclusion_matches": sorted(
             {_text(value, field="exclusion_match") for value in inputs.exclusion_matches}
         ),
-        "attachments": _attachment_rows(inputs.attachments),
+        "content_integrity_status": integrity_status,
+        "readiness_evidence": _readiness_row(inputs.readiness_evidence),
+        "attachments": attachment_rows,
         "transfer_evidence": _relationship_rows(inputs.transfer_evidence),
-        "used_parse_artifacts": _parse_rows(inputs.used_parse_artifacts),
+        "used_parse_artifacts": _parse_rows(
+            inputs.used_parse_artifacts,
+            package_content_hashes=package_content_hashes,
+        ),
         "manual_decision_version": inputs.manual_decision_version,
         "rule_version": _plain_text(inputs.rule_version, field="rule_version"),
         "schema_version": _plain_text(inputs.schema_version, field="schema_version"),

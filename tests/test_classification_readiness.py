@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -16,6 +17,7 @@ from oa_knowledge.db.models import (
     OnlineAuditItem,
     OnlineAuditRun,
 )
+from oa_knowledge.source_roles import AUDIT_ATTACHMENT_ROLES
 
 
 NOW = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
@@ -49,6 +51,7 @@ def _package(
     content_sha256: str | None = FILE_SHA,
     local_relpath: str | None = "originals/done/synthetic/source.pdf",
     verified_at: datetime | None = NOW,
+    file_role: str = "direct_attachment",
 ) -> tuple[OAItem, OAManifestItem, ArchivedFile | None]:
     item = OAItem(
         oa_item_key=key,
@@ -81,7 +84,7 @@ def _package(
         sha256=sha256,
         content_object_id=content.id if content else None,
         attachment_key="attachment-synthetic-1",
-        file_role="direct_attachment",
+        file_role=file_role,
         source_container_key="root",
         download_status=file_status,
         verified_at=verified_at,
@@ -98,6 +101,10 @@ def _audit(
     status: str,
     depth_limit_reached: bool = False,
     finished_at: datetime = NOW + timedelta(minutes=1),
+    recognized_attachments: int | None = 1,
+    downloaded_attachments: int = 1,
+    online_evidence: tuple[tuple[str, str, int | None, str | None], ...] = (),
+    local_evidence: tuple[tuple[str, str, int | None, str | None], ...] = (),
 ) -> None:
     run = OnlineAuditRun(status="completed", total_items=1, finished_at=finished_at)
     session.add(run)
@@ -108,6 +115,20 @@ def _audit(
             oa_item_key=key,
             title="Synthetic archive item",
             status=status,
+            recognized_attachments=recognized_attachments,
+            downloaded_attachments=downloaded_attachments,
+            online_evidence_json=json.dumps(
+                [
+                    {"role": role, "key": key, "size": size, "sha256": sha256}
+                    for role, key, size, sha256 in online_evidence
+                ]
+            ),
+            local_evidence_json=json.dumps(
+                [
+                    {"role": role, "key": key, "size": size, "sha256": sha256}
+                    for role, key, size, sha256 in local_evidence
+                ]
+            ),
             depth_limit_reached=depth_limit_reached,
             finished_at=finished_at,
         )
@@ -169,6 +190,31 @@ def test_explicit_zero_attachment_evidence_does_not_require_a_file_row(session: 
     assert result.reason_codes == ("NO_ATTACHMENT_CONFIRMED",)
 
 
+def test_non_attachment_evidence_cannot_manufacture_attachment_readiness(session: Session) -> None:
+    assert "metadata_snapshot" not in AUDIT_ATTACHMENT_ROLES
+    _package(session, file_role="metadata_snapshot")
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "not_checked"
+    assert result.publishable is False
+
+
+def test_non_attachment_evidence_does_not_conflict_with_confirmed_zero_attachments(
+    session: Session,
+) -> None:
+    _package(
+        session,
+        manifest_status="no_attachment",
+        no_attachment_confirmed=True,
+        file_role="workflow_snapshot",
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "no_attachment_confirmed"
+
+
 @pytest.mark.parametrize(
     ("manifest_status", "audit_status", "expected"),
     [
@@ -196,6 +242,48 @@ def test_no_attachment_evidence_cannot_override_conflicting_current_evidence(
 
     assert result.content_integrity_status == expected
     assert result.publishable is False
+
+
+@pytest.mark.parametrize(
+    ("manifest_status", "confirmed"),
+    [("downloaded", True), ("no_attachment", False)],
+)
+def test_zero_attachment_requires_matching_manifest_status_and_flag(
+    session: Session, manifest_status: str, confirmed: bool
+) -> None:
+    _package(
+        session,
+        manifest_status=manifest_status,
+        no_attachment_confirmed=confirmed,
+        file_status=None,
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "not_checked"
+    assert "ZERO_ATTACHMENT_EVIDENCE_INCOMPLETE" in result.reason_codes
+
+
+def test_zero_attachment_is_blocked_by_contradictory_latest_audit_counts(session: Session) -> None:
+    _package(
+        session,
+        manifest_status="no_attachment",
+        no_attachment_confirmed=True,
+        file_status=None,
+    )
+    _audit(
+        session,
+        status="matched",
+        recognized_attachments=1,
+        downloaded_attachments=1,
+        online_evidence=(("direct_attachment", "foreign", 10, FILE_SHA),),
+        local_evidence=(("direct_attachment", "foreign", 10, FILE_SHA),),
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "missing"
+    assert "ZERO_ATTACHMENT_AUDIT_CONFLICT" in result.reason_codes
 
 
 @pytest.mark.parametrize("source", ["manifest", "audit"])
@@ -232,10 +320,26 @@ def test_newest_current_audit_evidence_wins_regardless_of_insert_order(session: 
     assert result.content_integrity_status == "sha256_mismatch"
 
 
-def test_file_verification_newer_than_audit_makes_old_audit_non_current(session: Session) -> None:
-    """Chronologically newer durable verification supersedes a stale non-depth mismatch."""
+@pytest.mark.parametrize(
+    ("audit_status", "expected"),
+    [("missing_download", "missing"), ("content_mismatch", "sha256_mismatch")],
+)
+def test_file_verification_cannot_clear_latest_package_audit_failure(
+    session: Session, audit_status: str, expected: str
+) -> None:
+    """One later file timestamp cannot prove a package discrepancy was repaired."""
     _package(session, verified_at=NOW + timedelta(minutes=2))
-    _audit(session, status="content_mismatch", finished_at=NOW + timedelta(minutes=1))
+    _audit(session, status=audit_status, finished_at=NOW + timedelta(minutes=1))
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == expected
+
+
+def test_later_successful_package_audit_clears_prior_inventory_failure(session: Session) -> None:
+    _package(session)
+    _audit(session, status="missing_download", finished_at=NOW + timedelta(minutes=1))
+    _audit(session, status="matched", finished_at=NOW + timedelta(minutes=2))
 
     result = ArchiveReadinessService().assess(session, "done:synthetic-1")
 
@@ -297,12 +401,40 @@ def test_failure_precedence_is_deterministic_when_multiple_failures_exist(sessio
     assert result.content_integrity_status == "missing"
     assert result.reason_codes == (
         "DEPTH_LIMIT_REACHED",
-        "ARCHIVE_FILE_MISSING",
         "DOWNLOAD_FAILED",
         "SIZE_MISMATCH",
         "SHA256_MISMATCH",
         "NOT_CHECKED",
     )
+
+
+@pytest.mark.parametrize(
+    "failure_status",
+    [
+        "failed",
+        "error",
+        "rejected_zero_byte",
+        "rejected_error_page",
+        "rejected_type_mismatch",
+        "download_failed",
+    ],
+)
+def test_known_transfer_failures_map_to_download_failed_without_false_missing(
+    session: Session, failure_status: str
+) -> None:
+    _package(
+        session,
+        manifest_status="download_failed",
+        file_status=failure_status,
+        local_relpath=None,
+        verified_at=None,
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "download_failed"
+    assert "DOWNLOAD_FAILED" in result.reason_codes
+    assert "ARCHIVE_FILE_MISSING" not in result.reason_codes
 
 
 def test_content_object_size_is_durable_size_mismatch_evidence(session: Session) -> None:
@@ -349,3 +481,45 @@ def test_missing_manifest_or_item_is_missing_without_mutation(session: Session) 
     assert result.reason_codes == ("MANIFEST_MISSING", "ARCHIVED_ITEM_MISSING")
     assert not session.new
     assert not session.dirty
+
+
+def test_assess_many_handles_full_historical_target_with_bounded_selects(
+    session: Session,
+) -> None:
+    keys = [f"done:bulk-{index}" for index in range(6_144)]
+    session.add_all(
+        OAItem(
+            oa_item_key=key,
+            source_channel="done",
+            title="Synthetic bulk item",
+            pipeline_status="files_verified",
+        )
+        for key in keys
+    )
+    session.add_all(
+        OAManifestItem(
+            oa_item_key=key,
+            title="Synthetic bulk item",
+            list_page=1,
+            processing_status="no_attachment",
+            no_attachment_confirmed=True,
+        )
+        for key in keys
+    )
+    session.flush()
+    selects: list[str] = []
+
+    def record_select(_connection, _cursor, statement, _parameters, _context, _many) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    event.listen(session.bind, "before_cursor_execute", record_select)
+    try:
+        results = ArchiveReadinessService().assess_many(session, keys)
+    finally:
+        event.remove(session.bind, "before_cursor_execute", record_select)
+
+    assert len(results) == 6_144
+    assert all(result.content_integrity_status == "no_attachment_confirmed" for result in results.values())
+    assert len(selects) <= 5
+    assert sum("online_audit_items" in statement for statement in selects) == 1
