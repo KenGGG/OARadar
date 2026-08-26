@@ -110,7 +110,8 @@ def test_plan_is_read_only_and_run_is_incremental(monkeypatch, tmp_path: Path) -
     assert first.completed == 1 and first.failed == 0
     assert second.skipped == 1
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == original_hash
-    curated_body = next((settings.workspace_root / "workspace/curated/oa").rglob("正文.md")).read_text(encoding="utf-8")
+    assert {path.name for path in settings.data_root.iterdir()} == {"originals", "markdown"}
+    curated_body = next((settings.markdown_root / "curated/oa").rglob("正文.md")).read_text(encoding="utf-8")
     assert "示例集团文件" in curated_body
     assert "转换说明" not in curated_body
     assert "转换引擎" not in curated_body
@@ -198,4 +199,4 @@ def test_exact_content_is_globally_deduplicated_across_oa_packages(monkeypatch, 
     with Session(engine) as session:
         assert session.query(KnowledgeDocument).count() == 1
         assert session.query(SourceReference).count() == 2
-    assert len(list((settings.workspace_root / "workspace/curated/oa").rglob("_manifest.json"))) == 1
+    assert len(list((settings.markdown_root / "curated/oa").rglob("_manifest.json"))) == 1

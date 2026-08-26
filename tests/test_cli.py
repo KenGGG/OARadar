@@ -214,6 +214,7 @@ def test_convert_synthetic_text_and_unsupported_file(config_file: Path) -> None:
     output = config_file.parent / "data/markdown/2026/07/OA-SYNTHETIC"
     assert (output / "body.html.md").is_file()
     assert "UNSUPPORTED_FILE_TYPE" in (output / "example.bin.md").read_text(encoding="utf-8")
+    assert not (config_file.parent / "data/wiki").exists()
     again = runner.invoke(app, ["convert", "--config", str(config_file)])
     assert json.loads(again.output)["skipped"] == 2
 

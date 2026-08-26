@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,7 +13,7 @@ from oa_knowledge.config import Settings
 from oa_knowledge.data_governance.service import build_cleanup_plan
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import CleanupItem, ItemOccurrence, LogicalItem, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import CleanupItem, ItemOccurrence, LogicalItem
 
 
 def _write(data_root: Path, relpath: str, content: bytes = b"synthetic") -> Path:
@@ -24,30 +23,26 @@ def _write(data_root: Path, relpath: str, content: bytes = b"synthetic") -> Path
     return path
 
 
-def test_cleanup_plan_never_selects_two_root_application_data(tmp_path: Path) -> None:
+def test_cleanup_plan_rejects_legacy_runtime_and_projection_trees_under_data_root(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     settings = Settings(app={"data_root": data_root})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
 
-    protected_paths = {
+    allowed_paths = {
         "originals/2026/08/synthetic/source.pdf",
         "markdown/2026/08/synthetic/source.pdf.md",
     }
-    for relpath in protected_paths:
+    prohibited_candidate_paths = {
+        "browser-profile/Default/Cache/cache.bin",
+        "browser-profile/Default/Code Cache/js/code.bin",
+        "runtime/reports/status.json",
+        "parse/rebuildable.md",
+        "vault/rebuildable.md",
+        "workspace/rebuildable.md",
+    }
+    for relpath in allowed_paths | prohibited_candidate_paths:
         _write(data_root, relpath)
-
-    with Session(engine) as session:
-        session.add(PipelineTask(
-            queue_name="done", priority=1, logical_item_key="synthetic", stage="parse",
-            status="running", idempotency_key="active-task",
-            payload_json=json.dumps({"source_relpath": "originals/2026/08/synthetic/source.pdf"}),
-        ))
-        session.add(ReviewEntry(
-            kind="hash_mismatch", details_json=json.dumps({"relative_path": "markdown/2026/08/synthetic/source.pdf.md"}),
-            status="pending",
-        ))
-        session.commit()
 
     summary = build_cleanup_plan(
         settings,
@@ -60,6 +55,8 @@ def test_cleanup_plan_never_selects_two_root_application_data(tmp_path: Path) ->
             select(CleanupItem).where(CleanupItem.cleanup_run_id == summary.run_id)
         ).all()
     planned = {row.relative_path for row in rows}
+    # The two-root contract permits only originals/ and markdown/ below data_root.
+    # Runtime/cache and derived-work trees must be outside data_root, never cleanup candidates.
     assert planned == set()
     assert summary.candidate_count == 0
     assert summary.candidate_bytes == 0
