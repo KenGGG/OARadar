@@ -84,3 +84,15 @@ def test_markdown_tail_from_archive_path(rel: PurePosixPath, expected: PurePosix
 def test_markdown_tail_rejects_unknown_prefix() -> None:
     with pytest.raises(ValueError):
         markdown_tail_from_archive_path(PurePosixPath("data/other/x"))
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        PurePosixPath("originals/../escape"),
+        PurePosixPath("/raw/done/2022/04/x"),
+    ],
+)
+def test_markdown_tail_rejects_absolute_or_traversal_path(rel: PurePosixPath) -> None:
+    with pytest.raises(ValueError, match="safe relative"):
+        markdown_tail_from_archive_path(rel)

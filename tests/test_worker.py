@@ -780,7 +780,7 @@ def test_worker_consumes_production_queue_when_operation_queue_is_empty(config_f
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    ProductionQueue(engine).enqueue("historical_done_backfill", "done-1", "attachment_inventory", "production-1")
+    ProductionQueue(engine).enqueue("realtime_done", "done-1", "attachment_inventory", "production-1")
     worker = OperationWorker(settings, config_path=config_file)
     handled = []
     monkeypatch.setattr(worker, "_execute_pipeline_task", lambda task: handled.append(task.id))
@@ -988,7 +988,7 @@ def test_done_parse_advances_to_source_publish_before_curation(config_file: Path
         ))
         session.commit()
         source_id = source.id
-    task_id = queue.enqueue("historical_done_backfill", "done:source-stage", "parse", "source-stage-task")
+    task_id = queue.enqueue("realtime_done", "done:source-stage", "parse", "source-stage-task")
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file); worker.owner = "worker-test"
     try:
@@ -1007,7 +1007,12 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
     engine = create_db_engine(settings.database_path)
     queue = ProductionQueue(engine)
     with Session(engine) as session:
-        item = OAItem(oa_item_key="done:publish", source_channel="done", title="Synthetic")
+        item = OAItem(
+            oa_item_key="done:publish",
+            source_channel="done",
+            title="Synthetic",
+            archive_relpath="originals/unknown/unknown_publish",
+        )
         session.add(item); session.flush()
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.pdf", attachment_key="publish",
@@ -1031,6 +1036,16 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
         )
         session.add(artifact); session.flush()
         content.active_parse_artifact_id = artifact.id
+        audit = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id,
+            oa_item_key=item.oa_item_key,
+            title=item.title,
+            status="matched",
+            comparison_reason="exact_match",
+            depth_limit_reached=False,
+        ))
         session.commit(); source_id = source.id; parse_job_id = job.id
     task_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-task")
     task = queue.claim("worker-test")
@@ -1102,7 +1117,7 @@ def test_source_publish_records_unsupported_source_in_item_index_without_review(
         session.commit()
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:unsupported", "source_publish", "unsupported-source",
+        "realtime_done", "done:unsupported", "source_publish", "unsupported-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)
@@ -1146,7 +1161,7 @@ def test_source_publish_records_parser_skipped_source_without_review(config_file
         source_id = source.id
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:skipped", "source_publish", "skipped-source",
+        "realtime_done", "done:skipped", "source_publish", "skipped-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)
@@ -1205,7 +1220,7 @@ def test_source_publish_fails_rejected_quality_artifact_without_review(config_fi
         source_id = source.id
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:rejected", "source_publish", "rejected-source",
+        "realtime_done", "done:rejected", "source_publish", "rejected-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)
@@ -1277,7 +1292,7 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
     monkeypatch.setattr("oa_knowledge.source_markdown.service.publish_active_artifact", publish)
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:preflight", "source_publish", "preflight-source",
+        "realtime_done", "done:preflight", "source_publish", "preflight-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)

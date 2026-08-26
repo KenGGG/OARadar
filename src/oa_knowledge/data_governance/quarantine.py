@@ -19,6 +19,11 @@ from oa_knowledge.storage_paths import resolve_data_path
 
 
 QUARANTINE_RETENTION = timedelta(days=7)
+ROOT_QUALIFIED_CATEGORIES = frozenset({
+    "browser_cache",
+    "runtime_reports",
+    "rebuildable_projection",
+})
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,15 @@ class CleanupExecutionSummary:
     skipped_count: int
     failed_count: int
     processed_bytes: int
+
+
+def _require_root_qualified_ledger(items: list[CleanupItem]) -> None:
+    disabled = sorted({item.category for item in items} & ROOT_QUALIFIED_CATEGORIES)
+    if disabled:
+        raise ValueError(
+            "root-qualified cleanup ledger is required for categories: "
+            + ",".join(disabled)
+        )
 
 
 def _source_prefixes(settings: Settings, category: str) -> tuple[str, ...]:
@@ -78,13 +92,14 @@ def quarantine_run(settings: Settings, engine: Engine, run_id: int) -> CleanupEx
         run = session.get(CleanupRun, run_id)
         if run is None or run.status not in {"planned", "quarantined"}:
             raise ValueError("cleanup run is not ready for quarantine")
-        run.status = "quarantining"
         items = session.scalars(
             select(CleanupItem).where(
                 CleanupItem.cleanup_run_id == run_id,
                 CleanupItem.status == "planned",
             ).order_by(CleanupItem.id)
         ).all()
+        _require_root_qualified_ledger(items)
+        run.status = "quarantining"
         for item in items:
             source = resolve_data_path(
                 settings.data_root, item.relative_path,
@@ -131,11 +146,12 @@ def restore_run(settings: Settings, engine: Engine, run_id: int) -> CleanupExecu
         run = session.get(CleanupRun, run_id)
         if run is None or run.status not in {"quarantined", "restored"}:
             raise ValueError("cleanup run is not ready for restore")
-        run.status = "restoring"
         items = session.scalars(select(CleanupItem).where(
             CleanupItem.cleanup_run_id == run_id,
             CleanupItem.status == "quarantined",
         ).order_by(CleanupItem.id)).all()
+        _require_root_qualified_ledger(items)
+        run.status = "restoring"
         for item in items:
             source = resolve_data_path(
                 settings.data_root, item.quarantine_relpath or "",
@@ -185,11 +201,12 @@ def purge_run(
             finished_at = finished_at.replace(tzinfo=timezone.utc)
         if datetime.now(timezone.utc) - finished_at < QUARANTINE_RETENTION:
             raise ValueError("quarantine retention period has not elapsed")
-        run.status = "purging"
         items = session.scalars(select(CleanupItem).where(
             CleanupItem.cleanup_run_id == run_id,
             CleanupItem.status == "quarantined",
         ).order_by(CleanupItem.id)).all()
+        _require_root_qualified_ledger(items)
+        run.status = "purging"
         for item in items:
             path = resolve_data_path(
                 settings.data_root, item.quarantine_relpath or "",

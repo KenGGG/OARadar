@@ -118,6 +118,8 @@ def markdown_tail_from_archive_path(rel: PurePosixPath) -> PurePosixPath:
     Current archives map relative to ``originals/``. Legacy archives preserve
     their historical ``done/...`` or ``pending/...`` Markdown tail.
     """
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError("archive path must be a safe relative path")
     parts = rel.parts
     if is_current_archive_path(rel):
         return PurePosixPath(*parts[len(ARCHIVE_PREFIX.parts):])

@@ -430,11 +430,9 @@ class ProductionQueue:
                 conditions.append(PipelineTask.queue_name.in_(queue_names))
             if self.historical_paused(session):
                 conditions.append(PipelineTask.queue_name != "historical_done_backfill")
-            # Once online auditing exists, only the newest run may authorize
-            # history. An older completed run becomes stale as soon as a newer
-            # run is queued/running/reopened. Synthetic/first-deploy databases
-            # without any audit retain the old behavior.
-            has_any_audit = exists(select(OnlineAuditRun.id))
+            # Only the newest completed online audit may authorize history. An
+            # older completed run becomes stale as soon as a newer run is
+            # queued/running/reopened, and first deploy remains fail-closed.
             canonical_done_keys = select(OAItem.oa_item_key).where(
                 OAItem.source_channel == "done",
                 OAItem.archive_relpath.like("originals/%"),
@@ -452,7 +450,6 @@ class ProductionQueue:
             )
             conditions.append(or_(
                 PipelineTask.queue_name != "historical_done_backfill",
-                ~has_any_audit,
                 and_(
                     latest_audit_completed,
                     PipelineTask.logical_item_key.in_(canonical_done_keys),
