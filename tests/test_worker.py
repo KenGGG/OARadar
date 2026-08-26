@@ -564,7 +564,7 @@ def test_worker_migrates_only_online_verified_legacy_archives(config_file: Path)
         job = session.scalar(select(OperationJob).where(
             OperationJob.job_type == "verified_archive_migration",
         ))
-        assert safe.archive_relpath.startswith("originals/done/")
+        assert safe.archive_relpath == "originals/unknown/unknown_safe"
         assert review.archive_relpath == review_rel
         assert job.status == "completed"
         parameters = json.loads(job.parameters_json)
@@ -663,6 +663,8 @@ def test_worker_claims_one_job_and_records_unsupported_type(config_file: Path) -
 
 def test_backfill_campaign_quarantines_failed_item_and_continues(config_file: Path, monkeypatch) -> None:
     settings = load_settings(config_file)
+    (settings.data_root / "originals").mkdir(parents=True)
+    (settings.data_root / "markdown").mkdir()
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
     with Session(engine) as session:

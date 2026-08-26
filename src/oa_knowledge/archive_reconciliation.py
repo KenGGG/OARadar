@@ -16,6 +16,7 @@ from oa_knowledge.archive_paths import (
     is_current_archive_path,
     is_legacy_archive_path,
     markdown_tail_from_archive_path,
+    pending_archive_directory,
     replace_archive_prefix,
 )
 from oa_knowledge.config import Settings
@@ -177,24 +178,26 @@ def reconciliation_counts(session: Session) -> dict[str, int]:
 
 
 def _new_archive_relpath(item: OAItem) -> Path:
-    """Compute the unified ``archive/raw/oa/...`` path for a legacy item.
+    """Compute the canonical ``originals/...`` path for a legacy item.
 
     Called only for items under the legacy ``raw/done`` or ``raw/pending``
     prefix (the migrator guards against other prefixes). Done items get the
-    date-calibrated directory; pending items keep their logical/snapshot
-    identity under the unified prefix.
+    date-calibrated directory; pending items keep their logical/snapshot identity.
     """
     rel = Path(item.archive_relpath)
     parts = rel.parts
     if parts[1] == "done":
         return Path(done_archive_directory(item.title, item.workitem_id_text or str(item.id), item.initiated_at))
-    # pending: raw/pending/<logical_id>/<snapshot_id> -> archive/raw/oa/pending/<logical_id>/<snapshot_id>
+    # pending: raw/pending/<logical_id>/<snapshot_id> -> originals/pending/<logical_id>/<snapshot_id>
     segment_index = parts.index("pending")
-    return Path("archive/raw/oa", "pending", *parts[segment_index + 1:])
+    pending_parts = parts[segment_index + 1:]
+    if len(pending_parts) != 2:
+        raise ValueError("unexpected legacy pending path")
+    return Path(pending_archive_directory(*pending_parts))
 
 
 def _migrate_one_item(session: Session, settings: Settings, item: OAItem) -> str:
-    """Move one archive directory from ``raw/`` to ``archive/raw/oa/`` and rewrite DB paths.
+    """Move one archive directory from ``raw/`` to ``originals/`` and rewrite DB paths.
 
     Returns ``"already_correct"`` when the item is already under the unified
     prefix, or ``"migrated"`` on success. Raises on collision or missing source;
@@ -258,7 +261,7 @@ def migrate_archive_item_by_id(session: Session, settings: Settings, item_id: in
 
 
 def migrate_archive_paths(session: Session, settings: Settings, *, dry_run: bool = False) -> dict[str, int]:
-    """Unify legacy ``raw/done`` and ``raw/pending`` archives under ``archive/raw/oa``.
+    """Unify legacy ``raw/done`` and ``raw/pending`` archives under ``originals``.
 
     Idempotent and item-by-item safe. With ``dry_run=True`` no files or rows are
     touched; the returned counts describe what *would* change. The caller is

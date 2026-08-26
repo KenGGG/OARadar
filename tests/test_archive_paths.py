@@ -72,6 +72,7 @@ def test_replace_archive_prefix() -> None:
 @pytest.mark.parametrize(
     "rel,expected",
     [
+        (PurePosixPath("originals/2022/04/2022-04-22_x/y.pdf"), PurePosixPath("2022/04/2022-04-22_x/y.pdf")),
         (PurePosixPath("archive/raw/oa/done/2022/04/x/y.pdf"), PurePosixPath("done/2022/04/x/y.pdf")),
         (PurePosixPath("raw/pending/7/99/body.html"), PurePosixPath("pending/7/99/body.html")),
     ],

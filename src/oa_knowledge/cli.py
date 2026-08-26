@@ -934,8 +934,10 @@ def verified_attachment_resolver(engine, data_root: Path):
 def init_command(config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False)) -> None:
     settings = settings_option(config)
     secure_dir(settings.data_root)
-    for relative in ("state", "archive/raw/oa/pending", "archive/raw/oa/done", "parse/artifacts", "parse/staging", "parse/failed", "runtime", "logs", "backups", "workspace/raw/sources/oa/pending", "workspace/raw/sources/oa/done", "workspace/wiki"):
+    for relative in ("originals", "markdown"):
         secure_dir(settings.data_root / relative)
+    for root in (settings.state_root, settings.cache_root, settings.runtime_root):
+        secure_dir(root)
     upgrade_database(settings.database_path)
     os.chmod(settings.database_path, 0o600)
     typer.echo(f"initialized: {settings.data_root}")

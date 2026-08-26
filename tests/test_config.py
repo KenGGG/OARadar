@@ -22,8 +22,11 @@ def test_defaults_are_local_and_depth_ten() -> None:
     assert settings.database_path == settings.state_root / "oa.db"
     assert settings.browser_profile_path == settings.cache_root / "browser-profile"
     assert settings.browser.credential_profile_path is None
+    assert settings.workspace_root == settings.markdown_root
     assert settings.markdown_root == settings.data_root / "markdown"
     assert settings.markdown_root != settings.archive_root
+    assert settings.runtime_root.is_relative_to(settings.state_root)
+    assert not settings.runtime_root.is_relative_to(settings.data_root)
 
 
 def test_browser_credential_profile_must_be_absolute(tmp_path: Path) -> None:

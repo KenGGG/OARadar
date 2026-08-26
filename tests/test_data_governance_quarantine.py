@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 
 import pytest
@@ -21,10 +22,20 @@ def _prepared_plan(tmp_path: Path):
     settings = Settings(app={"data_root": tmp_path / "data"})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    source = settings.data_root / "runtime/reports/synthetic.json"
+    backup_root = settings.data_root / "runtime/backups"
+    source = backup_root / "synthetic.json"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"synthetic-report")
-    plan = build_cleanup_plan(settings, engine, categories={"runtime_reports"})
+    modified = datetime(2026, 8, 20, 12, tzinfo=timezone.utc)
+    for hours, name in enumerate(("newest.db", "second.db", "weekly.db")):
+        backup = backup_root / name
+        backup.write_bytes(name.encode())
+        timestamp = (modified - timedelta(hours=hours)).timestamp()
+        os.utime(backup, (timestamp, timestamp))
+    source_timestamp = (modified - timedelta(hours=3)).timestamp()
+    os.utime(source, (source_timestamp, source_timestamp))
+    plan = build_cleanup_plan(settings, engine, categories={"expired_backups"})
+    assert plan.candidate_count == 1
     return settings, engine, source, plan
 
 
@@ -64,7 +75,7 @@ def test_quarantine_skips_file_changed_after_preflight(tmp_path: Path) -> None:
 
 def test_quarantine_refuses_target_conflict(tmp_path: Path) -> None:
     settings, engine, source, plan = _prepared_plan(tmp_path)
-    conflict = settings.data_root / f"quarantine/{plan.run_id}/runtime/reports/synthetic.json"
+    conflict = settings.data_root / f"quarantine/{plan.run_id}" / source.relative_to(settings.data_root)
     conflict.parent.mkdir(parents=True)
     conflict.write_bytes(b"do-not-overwrite")
 

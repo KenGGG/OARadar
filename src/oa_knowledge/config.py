@@ -413,7 +413,7 @@ class Settings(StrictModel):
 
     @property
     def workspace_root(self) -> Path:
-        return self.data_root
+        return self.markdown_root
 
     @property
     def markdown_root(self) -> Path:

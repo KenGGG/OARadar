@@ -100,7 +100,7 @@ def _persist_document(session: Session, run: CuratedRun, package: OAPackage, doc
     knowledge = session.scalar(select(KnowledgeDocument).where(KnowledgeDocument.knowledge_key == canonical))
     previous_path = (
         knowledge.vault_relpath
-        if knowledge is not None and knowledge.vault_relpath and knowledge.vault_relpath.startswith("workspace/curated/oa/")
+        if knowledge is not None and knowledge.vault_relpath and knowledge.vault_relpath.startswith("curated/oa/")
         else None
     )
     primary = next((source for edge, source in zip(document.sources, selected) if edge.role == "body"), selected[0])
@@ -283,7 +283,7 @@ def run_curation(
                     if existing_path:
                         continue
                     published = publish_document(
-                        settings.data_root, document, source_map, canonical_id=canonical,
+                        settings.markdown_root, document, source_map, canonical_id=canonical,
                         decision_version=run.id, fallback_date=package.completed_at or "",
                     )
                     row = session.get(CuratedDecision, row_id)
@@ -294,7 +294,7 @@ def run_curation(
                     if knowledge is not None:
                         knowledge.vault_relpath = published.relpath
                     if previous_path and previous_path != published.relpath:
-                        remove_managed_publication(settings.data_root, previous_path, canonical_id=canonical)
+                        remove_managed_publication(settings.markdown_root, previous_path, canonical_id=canonical)
                 run.status = "completed"
                 run.finished_at = datetime.now(timezone.utc)
                 session.commit()
@@ -335,6 +335,6 @@ def validate_curation(settings: Settings, engine) -> dict:
             if not row.output_relpath:
                 issues.append({"decision_id": row.id, "code": "missing_output_path"})
                 continue
-            for code in validate_publication(settings.data_root, row.output_relpath):
+            for code in validate_publication(settings.markdown_root, row.output_relpath):
                 issues.append({"decision_id": row.id, "code": code})
     return {"ok": not issues, "published": len(rows), "issues": issues}

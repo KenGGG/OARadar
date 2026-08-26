@@ -44,6 +44,7 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     database_path = load_settings(config_file).database_path
     assert oct(data_root.stat().st_mode & 0o777) == "0o700"
     assert oct(database_path.stat().st_mode & 0o777) == "0o600"
+    assert {path.name for path in data_root.iterdir()} == {"originals", "markdown"}
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
     assert json.loads(status.output)["schema"] == "0037_no_attachment_evidence"
