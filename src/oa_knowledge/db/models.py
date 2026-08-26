@@ -318,6 +318,7 @@ class ParseArtifact(Base):
     content_object_id: Mapped[int | None] = mapped_column(ForeignKey("content_objects.id", ondelete="CASCADE"))
     engine: Mapped[str] = mapped_column(String(20), nullable=False)
     engine_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    profile_version: Mapped[str] = mapped_column(String(80), nullable=False, default="legacy")
     output_relpath: Mapped[str] = mapped_column(Text, nullable=False)
     source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     product_sha256: Mapped[str | None] = mapped_column(String(64))
@@ -336,6 +337,142 @@ class ContentObject(Base):
     size_bytes: Mapped[int | None] = mapped_column(Integer)
     detected_type: Mapped[str | None] = mapped_column(String(40))
     active_parse_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("parse_artifacts.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ClassificationRun(Base):
+    __tablename__ = "classification_runs"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_classification_run_id"),
+        CheckConstraint("run_kind IN ('full', 'incremental')", name="ck_classification_run_kind"),
+        CheckConstraint("status IN ('created', 'running', 'completed', 'failed')", name="ck_classification_run_status"),
+        CheckConstraint("target_count >= 0 AND excluded_count >= 0", name="ck_classification_run_counts"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    run_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="created")
+    input_signature: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    exclusion_policy_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    rule_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    private_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    excluded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ClassificationRunItem(Base):
+    __tablename__ = "classification_run_items"
+    __table_args__ = (
+        UniqueConstraint("classification_run_id", "oa_item_key", name="uq_classification_run_item"),
+        CheckConstraint(
+            "stage IN ('queued', 'metadata', 'parse', 'content', 'qwen', 'decided', 'failed')",
+            name="ck_classification_run_item_stage",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_classification_run_item_attempts"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    classification_run_id: Mapped[int] = mapped_column(ForeignKey("classification_runs.id", ondelete="CASCADE"), nullable=False)
+    oa_item_key: Mapped[str] = mapped_column(Text, nullable=False)
+    inclusion_reason: Mapped[str] = mapped_column(String(40), nullable=False)
+    stage: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ClassificationDecision(Base):
+    __tablename__ = "classification_decisions"
+    __table_args__ = (
+        UniqueConstraint("oa_item_key", "version", name="uq_classification_decision_version"),
+        CheckConstraint("classification_status IN ('classified', 'needs_review', 'excluded')", name="ck_classification_decision_status"),
+        CheckConstraint(
+            "content_integrity_status IN ('ok', 'no_attachment_confirmed', 'missing', 'size_mismatch', 'sha256_mismatch', 'download_failed', 'not_checked')",
+            name="ck_classification_integrity_status",
+        ),
+        CheckConstraint("content_origin IS NULL OR content_origin IN ('internal', 'external')", name="ck_classification_content_origin"),
+        CheckConstraint("decision_source IN ('metadata_rule', 'content_rule', 'local_qwen', 'manual')", name="ck_classification_decision_source"),
+        CheckConstraint("initiator_type IN ('internal', 'external', 'mixed', 'system', 'unknown')", name="ck_classification_initiator_type"),
+        CheckConstraint("classification_confidence >= 0 AND classification_confidence <= 1", name="ck_classification_confidence"),
+        CheckConstraint("content_origin <> 'external' OR business_category IS NULL", name="ck_classification_external_category_empty"),
+        CheckConstraint(
+            "classification_status <> 'classified' OR "
+            "(content_origin = 'internal' AND business_category IN "
+            "('01_公司治理与决策', '02_业务项目与投放租后', '03_风险合规审计法务', '04_财务资金与融资', "
+            "'05_经营计划与绩效考核', '06_人力资源', '07_党建纪检与工会', '08_行政采购与信息化', "
+            "'09_对外报送与监管反馈', '99_其他内部')) OR "
+            "(content_origin = 'external' AND canonical_issuer IS NOT NULL AND trim(canonical_issuer) <> '')",
+            name="ck_classification_publish_fields",
+        ),
+        CheckConstraint(
+            "classification_status <> 'excluded' OR "
+            "(content_origin IS NULL AND business_category IS NULL AND canonical_issuer IS NULL)",
+            name="ck_classification_excluded_fields",
+        ),
+        Index(
+            "uq_classification_current_decision",
+            "oa_item_key",
+            unique=True,
+            sqlite_where=text("is_current = 1"),
+        ),
+        Index("ix_classification_decision_run_status", "classification_run_id", "classification_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    classification_run_id: Mapped[int] = mapped_column(ForeignKey("classification_runs.id", ondelete="CASCADE"), nullable=False)
+    oa_item_key: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    decision_input_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision_source: Mapped[str] = mapped_column(String(20), nullable=False)
+    classification_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    content_integrity_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    content_origin: Mapped[str | None] = mapped_column(String(20))
+    flow_type: Mapped[str | None] = mapped_column(String(40))
+    initiator: Mapped[str | None] = mapped_column(Text)
+    initiator_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    relay_from: Mapped[str | None] = mapped_column(Text)
+    transfer_chain_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    issuer: Mapped[str | None] = mapped_column(Text)
+    canonical_issuer: Mapped[str | None] = mapped_column(Text)
+    business_category: Mapped[str | None] = mapped_column(String(80))
+    document_number: Mapped[str | None] = mapped_column(Text)
+    document_type: Mapped[str | None] = mapped_column(String(80))
+    normalized_title: Mapped[str] = mapped_column(Text, nullable=False)
+    classification_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    classification_reason_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    rule_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    private_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    manual_locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    actor: Mapped[str | None] = mapped_column(String(120))
+    supersedes_decision_id: Mapped[int | None] = mapped_column(ForeignKey("classification_decisions.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ClassificationEvidence(Base):
+    __tablename__ = "classification_evidence"
+    __table_args__ = (
+        UniqueConstraint("classification_decision_id", "sequence", name="uq_classification_evidence_sequence"),
+        CheckConstraint("evidence_scope IN ('package', 'attachment')", name="ck_classification_evidence_scope"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_classification_evidence_confidence"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    classification_decision_id: Mapped[int] = mapped_column(ForeignKey("classification_decisions.id", ondelete="CASCADE"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    evidence_scope: Mapped[str] = mapped_column(String(20), nullable=False)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    source_file_id: Mapped[int | None] = mapped_column(ForeignKey("files.id", ondelete="SET NULL"))
+    parse_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("parse_artifacts.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
