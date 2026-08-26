@@ -341,6 +341,115 @@ def test_rejects_non_terminal_canonical_issuer_aliases(
 
 
 @pytest.mark.parametrize(
+    "aliases",
+    [
+        """
+aliases:
+  SAA: Synthetic Authority A
+  Synthetic Authority A: SYNTHETIC AUTHORITY A
+""",
+        """
+aliases:
+  SAA: Synthetic Authority A
+  SAA Upper: SYNTHETIC AUTHORITY A
+""",
+    ],
+    ids=["case-drifting-pseudo-self-map", "non-unique-canonical-output"],
+)
+def test_rejects_case_drift_between_canonical_output_strings(
+    tmp_path: Path, aliases: str
+) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={"issuer_aliases.yaml": aliases},
+    )
+
+    with pytest.raises(PrivateConfigError, match="issuer_aliases.yaml"):
+        load_private_classification_config(root)
+
+
+@pytest.mark.parametrize(
+    ("filename", "rule_config"),
+    [
+        (
+            "document_number_issuers.yaml",
+            """
+rules:
+  - pattern: '^SYN-REDIRECT-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+""",
+        ),
+        (
+            "title_templates.yaml",
+            """
+templates:
+  - pattern: '^Synthetic redirected circulation:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Authority A
+""",
+        ),
+    ],
+    ids=["document-number-rule", "title-template"],
+)
+def test_rejects_rule_canonical_issuer_that_aliases_to_another_output(
+    tmp_path: Path, filename: str, rule_config: str
+) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={
+            filename: rule_config,
+            "issuer_aliases.yaml": """
+aliases:
+  Synthetic Authority A: Synthetic Authority B
+  Synthetic Authority B: Synthetic Authority B
+""",
+        },
+    )
+
+    with pytest.raises(PrivateConfigError, match="conflicting aliases"):
+        load_private_classification_config(root)
+
+
+def test_accepts_exact_canonical_output_from_case_insensitive_alias_key_across_rules(
+    tmp_path: Path,
+) -> None:
+    root = _write_private_config(
+        tmp_path / "classification",
+        replacements={
+            "document_number_issuers.yaml": """
+rules:
+  - pattern: '^SYN-EXACT-[0-9]+$'
+    canonical_issuer: Synthetic Authority A
+""",
+            "title_templates.yaml": """
+templates:
+  - pattern: '^Synthetic exact circulation:'
+    content_origin: external
+    flow_type: circulation
+    canonical_issuer: Synthetic Authority A
+""",
+            "issuer_aliases.yaml": """
+aliases:
+  SAA: Synthetic Authority A
+  synthetic authority a: Synthetic Authority A
+""",
+        },
+    )
+
+    loaded = load_private_classification_config(root)
+
+    assert loaded.config.issuer_aliases == {
+        "SAA": "Synthetic Authority A",
+        "synthetic authority a": "Synthetic Authority A",
+    }
+    assert loaded.config.document_number_issuers[0].canonical_issuer == (
+        "Synthetic Authority A"
+    )
+    assert loaded.config.title_templates[0].canonical_issuer == "Synthetic Authority A"
+
+
+@pytest.mark.parametrize(
     ("filename", "rules"),
     [
         (

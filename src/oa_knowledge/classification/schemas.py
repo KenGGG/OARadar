@@ -39,10 +39,28 @@ def _normalize_alias_mapping(value: object) -> object:
 
 def _validate_terminal_aliases(aliases: dict[str, str]) -> None:
     targets_by_alias = {alias.casefold(): canonical for alias, canonical in aliases.items()}
+    canonical_spelling: dict[str, str] = {}
     for canonical in aliases.values():
-        next_target = targets_by_alias.get(canonical.casefold())
-        if next_target is not None and next_target.casefold() != canonical.casefold():
+        canonical_key = canonical.casefold()
+        prior_spelling = canonical_spelling.get(canonical_key)
+        if prior_spelling is not None and prior_spelling != canonical:
+            raise ValueError("each canonical issuer must have one exact output string")
+        canonical_spelling[canonical_key] = canonical
+        next_target = targets_by_alias.get(canonical_key)
+        if next_target is not None and next_target != canonical:
             raise ValueError("canonical issuer aliases must resolve directly to terminal targets")
+
+
+def _validate_declared_canonical_issuers(
+    aliases: dict[str, str], canonical_issuers: Sequence[str]
+) -> None:
+    targets_by_alias = {alias.casefold(): canonical for alias, canonical in aliases.items()}
+    for canonical in canonical_issuers:
+        alias_target = targets_by_alias.get(canonical.casefold())
+        if alias_target is not None and alias_target != canonical:
+            raise ValueError(
+                "rule canonical issuers must be absent from aliases or exact self-maps"
+            )
 
 
 def _validate_unique_rule_patterns(rules: Sequence[_PatternRule]) -> None:
@@ -188,6 +206,17 @@ class PrivateClassificationConfig(StrictClassificationModel):
         self,
     ) -> "PrivateClassificationConfig":
         _validate_terminal_aliases(self.issuer_aliases)
+        _validate_declared_canonical_issuers(
+            self.issuer_aliases,
+            [
+                *(rule.canonical_issuer for rule in self.document_number_issuers),
+                *(
+                    template.canonical_issuer
+                    for template in self.title_templates
+                    if template.canonical_issuer is not None
+                ),
+            ],
+        )
         _validate_unique_rule_patterns(self.document_number_issuers)
         _validate_unique_rule_patterns(self.title_templates)
         return self
