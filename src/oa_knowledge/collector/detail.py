@@ -47,6 +47,7 @@ class RelatedContainerCapture:
     snapshots: tuple[PageSnapshot, ...]
     attachments: tuple[DirectAttachment, ...]
     has_unvisited_children: bool = False
+    attachment_inventory_confirmed_empty: bool = False
 
 
 @dataclass(frozen=True)
@@ -179,12 +180,25 @@ class CollaborationDetailAdapter:
                 raise AuthRequiredError(f"OA session redirected to {path}")
             body = self._snapshots(detail, "body")
             default_role = "official_attachment" if "/govdoc/govdoc.do" in path else "direct_attachment"
-            attachments = self._download_files(detail, default_role, capture_deadline, download_timeout_seconds)
-            no_attachment_confirmed = self._last_attachment_inventory_confirmed_empty
+            attachments: tuple[DirectAttachment, ...] = ()
+            root_inventory_confirmed_empty = False
+            defer_root_inventory = path in {
+                "/seeyon/collaboration/collaboration.do",
+                "/seeyon/govdoc/govdoc.do",
+            }
+            if not defer_root_inventory:
+                attachments = self._download_files(
+                    detail, default_role, capture_deadline, download_timeout_seconds,
+                )
+                root_inventory_confirmed_empty = self._last_attachment_inventory_confirmed_empty
             if "/collaboration/collaboration.do" in path:
                 family = "collaboration"
                 root_key = f"collaboration:{workitem_id_text}"
                 related = self._crawl_associated(detail, root_key, 1, max_depth, set(), capture_deadline, download_timeout_seconds)
+                attachments = self._download_files(
+                    detail, default_role, capture_deadline, download_timeout_seconds,
+                )
+                root_inventory_confirmed_empty = self._last_attachment_inventory_confirmed_empty
                 workflow = self._optional_workflow(detail, 1500)
             elif "/mdf-node/meta/voucher/" in path:
                 family = "expense_voucher"
@@ -204,6 +218,10 @@ class CollaborationDetailAdapter:
                 family = "govdoc"
                 root_key = f"govdoc:{workitem_id_text}"
                 related = self._crawl_associated(detail, root_key, 1, max_depth, set(), capture_deadline, download_timeout_seconds)
+                attachments = self._download_files(
+                    detail, default_role, capture_deadline, download_timeout_seconds,
+                )
+                root_inventory_confirmed_empty = self._last_attachment_inventory_confirmed_empty
                 flow = detail.get_by_text("流程", exact=True)
                 if flow.count():
                     flow.first.click(force=True)
@@ -219,7 +237,15 @@ class CollaborationDetailAdapter:
                 workflow = ()
             else:
                 raise ValueError(f"unsupported detail page family: {path}")
-            if family in {"collaboration", "govdoc", "meeting"} and not attachments and not no_attachment_confirmed:
+            no_attachment_confirmed = self._can_confirm_no_attachment(
+                root_confirmed_empty=root_inventory_confirmed_empty,
+                related=tuple(related),
+                capture_issues=tuple(self._capture_issues),
+            )
+            has_any_attachment = bool(attachments) or any(
+                container.attachments for container in related
+            )
+            if family in {"collaboration", "govdoc", "meeting"} and not has_any_attachment and not no_attachment_confirmed:
                 reason = "OA detail page is blank" if not body else "OA attachment inventory is unavailable"
                 raise LookupError(reason)
             return DetailCapture(
@@ -361,17 +387,19 @@ class CollaborationDetailAdapter:
                 continue
             try:
                 child.wait_for_load_state("domcontentloaded")
-                self._wait_dynamic_content(child, max_wait_ms=1800)
+                self._wait_dynamic_content(child, max_wait_ms=5000)
                 family = "govdoc" if "/govdoc/" in child.url else "associated_document"
                 container_key = f"{family}:{key}"
                 snapshots = self._snapshots(child, f"container-{parent_depth + 1}")
                 attachments = self._download_files(child, "official_attachment", deadline, download_timeout_seconds)
+                inventory_confirmed_empty = self._last_attachment_inventory_confirmed_empty
                 child_depth = parent_depth + 1
                 has_unvisited = child_depth == max_depth and bool(self._associated_documents(child))
                 captures.append(RelatedContainerCapture(
                     container_key=container_key, parent_container_key=parent_key,
                     page_family=family, depth=child_depth, source_url=child.url,
                     snapshots=snapshots, attachments=attachments, has_unvisited_children=has_unvisited,
+                    attachment_inventory_confirmed_empty=inventory_confirmed_empty,
                 ))
                 if child_depth < max_depth:
                     captures.extend(self._crawl_associated(child, container_key, child_depth, max_depth, visited, deadline, download_timeout_seconds))
@@ -381,14 +409,33 @@ class CollaborationDetailAdapter:
 
     @staticmethod
     def _wait_context_page(source: Page, before: set[Page]) -> Page:
-        # OA popups normally appear immediately. Broken associations are isolated
-        # as review issues, so four seconds is enough without delaying the item.
-        for _ in range(40):
-            pages = [page for page in source.context.pages if page not in before]
+        # Poll the actual popup condition. Some govdoc links initialize OA-side
+        # JavaScript before opening, so retain a bounded 12-second ceiling.
+        for _ in range(120):
+            pages = [
+                page for page in source.context.pages
+                if page not in before and getattr(page, "url", "about:blank") != "about:blank"
+            ]
             if pages:
                 return pages[-1]
             source.wait_for_timeout(100)
         raise RuntimeError("associated document did not open")
+
+    @staticmethod
+    def _can_confirm_no_attachment(
+        *, root_confirmed_empty: bool,
+        related: tuple[RelatedContainerCapture, ...],
+        capture_issues: tuple[dict[str, object], ...],
+    ) -> bool:
+        """Require complete empty evidence across the whole reachable tree."""
+        if not root_confirmed_empty or capture_issues:
+            return False
+        return all(
+            not container.attachments
+            and container.attachment_inventory_confirmed_empty
+            and not container.has_unvisited_children
+            for container in related
+        )
 
     @staticmethod
     def _is_recipient_collaboration_link(href: str, context_text: str) -> bool:
@@ -980,19 +1027,36 @@ class CollaborationDetailAdapter:
         while elapsed < max_wait_ms:
             page.wait_for_timeout(100)
             elapsed += 100
-            signature: list[tuple[str, int, int, int, int, int]] = []
+            signature: list[tuple[str, int, int, int, int, int, int]] = []
             for frame in page.frames:
                 try:
                     attachment_count = frame.locator("a[_temp*='fileDownload.do?method=download']").count()
                     association_count = frame.locator("[comptype='assdoc'][attsdata]").count()
                     cap4_batch_count = frame.locator("a.cap4-attach-downall[href*='batchDownload/']").count()
                     cap4_file_count = frame.locator(".cap4-attach__att").count()
+                    panel_opener_count = frame.locator("[title='查看附件列表']").count()
                     child_count = frame.evaluate("() => document.body?.childElementCount || 0")
-                    signature.append((frame.url, attachment_count, association_count, cap4_batch_count, cap4_file_count, int(child_count)))
+                    signature.append((
+                        frame.url, attachment_count, association_count,
+                        cap4_batch_count, cap4_file_count, panel_opener_count,
+                        int(child_count),
+                    ))
                 except Exception:
                     continue
             current = tuple(signature)
             stable = stable + 1 if current == previous else 0
             previous = current
-            if elapsed >= min_wait_ms and stable >= 2:
+            inventory_dom_ready = len(signature) > 1 or any(
+                attachment_count
+                or association_count
+                or cap4_batch_count
+                or cap4_file_count
+                or panel_opener_count
+                for (
+                    _url, attachment_count, association_count,
+                    cap4_batch_count, cap4_file_count, panel_opener_count,
+                    _child_count,
+                ) in signature
+            )
+            if elapsed >= min_wait_ms and stable >= 2 and inventory_dom_ready:
                 return
