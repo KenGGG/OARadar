@@ -12,6 +12,8 @@ export type SimpleDoneState =
   | "attention"
   | "excluded"
 
+export type SimpleDoneFilter = SimpleDoneState | "no_attachment"
+
 export type AttentionSeverity = "error" | "warning"
 
 export type AttentionJump = "done" | "settings"
@@ -94,6 +96,7 @@ export interface SimpleDoneItem {
   archive_relpath: string | null
   file_count: number | null
   attachment_names: string[]
+  attachment_review_label: string | null
   simple_status: SimpleDoneState
   simple_status_label: string
   attention_reason: string | null

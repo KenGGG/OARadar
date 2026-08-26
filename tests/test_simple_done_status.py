@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import csv
+import io
 from pathlib import Path
 
 import pytest
@@ -224,3 +226,72 @@ def test_done_archives_rejects_unknown_simple_status(config_file: Path) -> None:
     client = _client(config_file)
     resp = client.get("/api/done-archives?simple_status=bogus")
     assert resp.status_code == 422
+
+
+def test_done_archives_filters_confirmed_no_attachment_for_manual_review(config_file: Path) -> None:
+    """Removing the dedicated review filter would mix zero attachments with other rows."""
+    client = _client(config_file)
+    engine = create_db_engine(load_settings(config_file).database_path)
+    with Session(engine) as session:
+        _seed_fact(session, "oa:none", {"manifest": "no_attachment"})
+        _seed_fact(session, "oa:pending", {"manifest": "discovered"})
+        _seed_fact(session, "oa:excluded", {"manifest": "skipped"})
+
+    payload = client.get(
+        "/api/done-archives?page=1&page_size=50&attachment_review=no_attachment"
+    ).json()
+
+    assert payload["total"] == 1
+    assert payload["items"][0]["item_id"] is None
+    assert payload["items"][0]["pipeline_status"] == "no_attachment"
+    assert payload["items"][0]["file_count"] == 0
+    assert payload["items"][0]["attachment_review_label"] == "0（待人工复核）"
+
+
+def test_done_archives_marks_no_attachment_for_review_even_before_filtering(config_file: Path) -> None:
+    """The review cue must remain visible in the unfiltered Done list."""
+    client = _client(config_file)
+    engine = create_db_engine(load_settings(config_file).database_path)
+    with Session(engine) as session:
+        _seed_fact(session, "oa:none-unfiltered", {"manifest": "no_attachment"})
+
+    item = client.get("/api/done-archives?page=1&page_size=50").json()["items"][0]
+
+    assert item["file_count"] == 0
+    assert item["attachment_review_label"] == "0（待人工复核）"
+
+
+def test_done_archives_csv_exports_all_filtered_rows_not_only_first_page(config_file: Path) -> None:
+    """CSV export must honor active filters while ignoring UI pagination."""
+    client = _client(config_file)
+    engine = create_db_engine(load_settings(config_file).database_path)
+    with Session(engine) as session:
+        for index in range(55):
+            _seed_fact(session, f"oa:none-{index}", {"manifest": "no_attachment"})
+        _seed_fact(session, "oa:other", {"manifest": "discovered"})
+
+    response = client.get("/api/done-archives/export.csv?attachment_review=no_attachment")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "attachment;" in response.headers["content-disposition"]
+    assert response.content.startswith(b"\xef\xbb\xbf")
+    rows = list(csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"))))
+    assert len(rows) == 55
+    assert set(row["附件数量"] for row in rows) == {"0"}
+    assert set(row["状态"] for row in rows) == {"确认无附件"}
+
+
+def test_done_archives_csv_without_filters_exports_every_row(config_file: Path) -> None:
+    """An unfiltered export is the full Done list, not the current page."""
+    client = _client(config_file)
+    engine = create_db_engine(load_settings(config_file).database_path)
+    with Session(engine) as session:
+        _seed_fact(session, "oa:all-one", {"manifest": "no_attachment"})
+        _seed_fact(session, "oa:all-two", {"manifest": "discovered"})
+
+    response = client.get("/api/done-archives/export.csv")
+    rows = list(csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"))))
+
+    assert len(rows) == 2
+    assert {row["标题"] for row in rows} == {"oa:all-one 标题", "oa:all-two 标题"}

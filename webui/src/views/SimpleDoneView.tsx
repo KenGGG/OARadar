@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react"
-import { ChevronRight, CircleAlert, Search, X } from "lucide-react"
-import type { SimpleDoneItem, SimpleDoneState, SimpleDonePage } from "../types/simple-status"
+import { ChevronRight, CircleAlert, Download, Search, X } from "lucide-react"
+import type { SimpleDoneFilter, SimpleDoneItem, SimpleDoneState, SimpleDonePage } from "../types/simple-status"
 import { time } from "../App"
 
 type Tone = "good" | "warn" | "bad" | "neutral"
 
-const DONE_FILTERS: { key: SimpleDoneState | ""; label: string }[] = [
+const DONE_FILTERS: { key: SimpleDoneFilter | ""; label: string }[] = [
   { key: "", label: "全部" },
+  { key: "no_attachment", label: "确认无附件（待人工复核）" },
   { key: "waiting_download", label: "等待下载" },
   { key: "waiting_markdown", label: "等待 MD 化" },
   { key: "waiting_classification", label: "等待归类" },
@@ -60,7 +61,7 @@ function SimpleDoneDrawer({ item, close }: {
           <div className="info"><span>原件</span><strong>{facts.original}</strong></div>
           <div className="info"><span>Markdown</span><strong>{facts.markdown}</strong></div>
           <div className="info"><span>归类发布</span><strong>{facts.publish}</strong></div>
-          <div className="info"><span>附件数量</span><strong>{item.file_count == null ? "尚未取得" : String(item.file_count)}</strong></div>
+          <div className="info"><span>附件数量</span><strong>{item.attachment_review_label || (item.file_count == null ? "尚未取得" : String(item.file_count))}</strong></div>
           <div className="info"><span>发起人</span><strong>{item.sender || "-"}</strong></div>
           <div className="info"><span>发起时间</span><strong>{time(item.initiated_at)}</strong></div>
           <div className="info"><span>最近成功同步</span><strong>{time(item.updated_at)}</strong></div>
@@ -69,6 +70,9 @@ function SimpleDoneDrawer({ item, close }: {
         {item.attachment_names.length ? <div className="attachment-name-list">
           {item.attachment_names.map(name => <div key={name}>{name}</div>)}
         </div> : <p className="settings-help">暂无附件。</p>}
+        {item.pipeline_status === "no_attachment" && (
+          <div className="settings-message no-attachment-review"><CircleAlert size={16}/>系统扫描未发现附件，请人工到 OA 复核。</div>
+        )}
         {isAttention && item.attention_reason && (
           <div className="settings-message" role="alert"><CircleAlert size={16}/>{item.attention_reason}</div>
         )}
@@ -92,8 +96,8 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
   setPage: (p: number) => void
   query: string
   setQuery: (v: string) => void
-  filter: SimpleDoneState | ""
-  setFilter: (v: SimpleDoneState | "") => void
+  filter: SimpleDoneFilter | ""
+  setFilter: (v: SimpleDoneFilter | "") => void
 }) {
   const pages = Math.max(1, Math.ceil(total / 50))
   const [selected, setSelected] = useState<SimpleDoneItem | null>(null)
@@ -112,16 +116,27 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
     goToPage(Number.isFinite(requested) ? requested : page)
   }
 
+  const exportCsv = () => {
+    const params = new URLSearchParams()
+    if (query) params.set("query", query)
+    if (filter === "no_attachment") params.set("attachment_review", filter)
+    else if (filter) params.set("simple_status", filter)
+    const suffix = params.size ? `?${params.toString()}` : ""
+    window.location.assign(`/api/done-archives/export.csv${suffix}`)
+  }
+
   return <section className="done-page">
     <div className="metrics compact-metrics">
       <div className="metric"><span>已办总数</span><strong>{metrics.oa_done_total.toLocaleString()}</strong></div>
       <div className="metric"><span>成功下载</span><strong>{metrics.downloaded_items.toLocaleString()}</strong></div>
       <div className="metric"><span>已验证附件</span><strong>{metrics.verified_attachments.toLocaleString()}</strong></div>
     </div>
-    <div className="section-toolbar"><div><h2>已办资料</h2><p>原件、Markdown 与归类发布的当前完成情况。</p></div></div>
+    <div className="section-toolbar"><div><h2>已办资料</h2><p>原件、Markdown 与归类发布的当前完成情况。</p></div>
+      <button className="export-button" onClick={exportCsv}><Download size={16}/>导出 CSV</button>
+    </div>
     <div className="filter-row">
       <label className="search"><Search size={17}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索事项标题"/></label>
-      <select value={filter} onChange={e => setFilter(e.target.value as SimpleDoneState | "")}>
+      <select value={filter} onChange={e => setFilter(e.target.value as SimpleDoneFilter | "")}>
         {DONE_FILTERS.map(f => <option key={f.key} value={f.key}>{f.label}</option>)}
       </select>
     </div>
@@ -139,8 +154,8 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
           <td className="title-cell"><strong>{row.title}</strong></td>
           <td>{row.sender || "-"}</td>
           <td className="nowrap">{time(row.initiated_at)}</td>
-          <td>{row.file_count == null ? "-" : row.file_count}</td>
-          <td><span className={`status status-${statusTone(row.simple_status)}`}>{row.simple_status_label}</span></td>
+          <td className={row.pipeline_status === "no_attachment" ? "review-zero" : ""}>{row.attachment_review_label || (row.file_count == null ? "-" : row.file_count)}</td>
+          <td><span className={`status status-${row.pipeline_status === "no_attachment" ? "warn" : statusTone(row.simple_status)}`}>{row.pipeline_status === "no_attachment" ? "确认无附件" : row.simple_status_label}</span></td>
           <td className="nowrap">{time(row.updated_at)}</td>
           <td><ChevronRight size={17}/></td>
         </tr>

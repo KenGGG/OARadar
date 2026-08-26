@@ -8,6 +8,8 @@ the frontend never has to display raw English codes (§11).
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -534,25 +536,29 @@ def done_archives_list(
     query: str | None = None, archive_status: str | None = None,
     markdown_status: str | None = None, handoff_status: str | None = None,
     simple_status: str | None = None,
+    attachment_review: str | None = None,
 ) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
-            if simple_status is not None:
+            if simple_status is not None or attachment_review is not None:
                 # 服务端按简化状态筛选：先算出候选 manifest id 集合，再正确分页
                 # 与计数，避免“先分页后过滤”导致 total / 页数错误（plan Task 2）。
                 status_map = _done_simple_status_map(session)
                 candidate_ids = [mid for mid, (state, _label, _reason) in status_map.items() if state == simple_status]
                 stmt = select(OAManifestItem)
+                if attachment_review == "no_attachment":
+                    stmt = stmt.where(OAManifestItem.processing_status == "no_attachment")
                 if query:
                     pattern = f"%{query.strip()}%"
                     stmt = stmt.where(
                         OAManifestItem.title.ilike(pattern) | OAManifestItem.sender.ilike(pattern)
                     )
-                if candidate_ids:
-                    stmt = stmt.where(OAManifestItem.id.in_(candidate_ids))
-                else:
-                    stmt = stmt.where(False)
+                if simple_status is not None:
+                    if candidate_ids:
+                        stmt = stmt.where(OAManifestItem.id.in_(candidate_ids))
+                    else:
+                        stmt = stmt.where(False)
                 total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
                 rows = session.scalars(
                     stmt.order_by(OAManifestItem.list_page, OAManifestItem.list_ordinal, OAManifestItem.id)
@@ -562,7 +568,10 @@ def done_archives_list(
                 for row in rows:
                     archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == row.oa_item_key))
                     archive_relpath = row.archive_relpath or (archived.archive_relpath if archived else None)
-                    file_count = count_original_files(settings.data_root, archive_relpath) if archive_relpath else None
+                    file_count = (
+                        0 if row.processing_status == "no_attachment"
+                        else count_original_files(settings.data_root, archive_relpath) if archive_relpath else None
+                    )
                     simple = _enrich_done_item(session, settings, row, archived, None, None)
                     if simple is None:
                         continue
@@ -576,6 +585,9 @@ def done_archives_list(
                         "pipeline_status": row.processing_status,
                         "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
                         "file_count": file_count,
+                        "attachment_review_label": (
+                            "0（待人工复核）" if row.processing_status == "no_attachment" else None
+                        ),
                         "attachment_names": original_file_names(settings.data_root, archive_relpath),
                         "simple_status": simple["state"],
                         "simple_status_label": simple["label"],
@@ -613,6 +625,10 @@ def done_archives_list(
                     continue
                 enriched.append({
                     **it,
+                    "file_count": 0 if manifest and manifest.processing_status == "no_attachment" else it.get("file_count"),
+                    "attachment_review_label": (
+                        "0（待人工复核）" if manifest and manifest.processing_status == "no_attachment" else None
+                    ),
                     "archive_status_label": archive_status_label,
                     "markdown": md,
                     "handoff": handoff,
@@ -625,6 +641,67 @@ def done_archives_list(
                 })
             base["items"] = enriched
             return base
+    finally:
+        engine.dispose()
+
+
+def _csv_safe(value: object | None) -> str:
+    """Neutralize spreadsheet formulas while retaining the visible OA text."""
+    text = "" if value is None else str(value)
+    return f"'{text}" if text.startswith(("=", "+", "-", "@")) else text
+
+
+def export_done_archives_csv(
+    settings: Settings, *, query: str | None = None,
+    simple_status: str | None = None, attachment_review: str | None = None,
+) -> bytes:
+    """Export every Done row matching the current user-visible filters."""
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            status_map = _done_simple_status_map(session)
+            stmt = select(OAManifestItem, OAItem).outerjoin(
+                OAItem, OAItem.oa_item_key == OAManifestItem.oa_item_key,
+            )
+            if query:
+                pattern = f"%{query.strip()}%"
+                stmt = stmt.where(
+                    OAManifestItem.title.ilike(pattern) | OAManifestItem.sender.ilike(pattern)
+                )
+            if attachment_review == "no_attachment":
+                stmt = stmt.where(OAManifestItem.processing_status == "no_attachment")
+            if simple_status is not None:
+                candidate_ids = [
+                    manifest_id for manifest_id, (state, _label, _reason) in status_map.items()
+                    if state == simple_status
+                ]
+                stmt = stmt.where(OAManifestItem.id.in_(candidate_ids)) if candidate_ids else stmt.where(False)
+            rows = session.execute(stmt.order_by(
+                OAManifestItem.list_page, OAManifestItem.list_ordinal, OAManifestItem.id,
+            )).all()
+
+            output = io.StringIO(newline="")
+            writer = csv.writer(output)
+            writer.writerow(("事项 ID", "标题", "发起人", "发起时间", "完成时间", "附件数量", "状态", "最近同步时间"))
+            for manifest, item in rows:
+                archive_relpath = manifest.archive_relpath or (item.archive_relpath if item else None)
+                file_count = (
+                    0 if manifest.processing_status == "no_attachment"
+                    else count_original_files(settings.data_root, archive_relpath) if archive_relpath else ""
+                )
+                _state, simple_label, _reason = status_map[manifest.id]
+                visible_status = "确认无附件" if manifest.processing_status == "no_attachment" else simple_label
+                writer.writerow(tuple(_csv_safe(value) for value in (
+                    manifest.workitem_id_text,
+                    manifest.title,
+                    manifest.sender,
+                    manifest.initiated_at.isoformat() if manifest.initiated_at else None,
+                    manifest.completed_at.isoformat() if manifest.completed_at else None,
+                    file_count,
+                    visible_status,
+                    manifest.last_synced_at.isoformat() if manifest.last_synced_at else None,
+                )))
+            return ("\ufeff" + output.getvalue()).encode("utf-8")
     finally:
         engine.dispose()
 

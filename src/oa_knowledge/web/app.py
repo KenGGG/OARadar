@@ -5,7 +5,7 @@ import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
@@ -17,6 +17,7 @@ from oa_knowledge.web.console_views import (
     cleanup_eligible_pending,
     cleanup_pending,
     done_archives_list,
+    export_done_archives_csv,
     markdown_outputs_list,
     pending_notification_detail,
     pending_notifications_list,
@@ -418,13 +419,36 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
         markdown_status: str | None = Query(None),
         handoff_status: str | None = Query(None),
         simple_status: str | None = Query(None),
+        attachment_review: str | None = Query(None),
     ) -> dict:
         if simple_status is not None and simple_status not in _ALLOWED_SIMPLE_STATES:
             raise HTTPException(status_code=422, detail=f"unsupported simple_status: {simple_status}")
+        if attachment_review is not None and attachment_review != "no_attachment":
+            raise HTTPException(status_code=422, detail=f"unsupported attachment_review: {attachment_review}")
         return done_archives_list(
             settings, page=page, page_size=page_size, query=query,
             archive_status=archive_status, markdown_status=markdown_status, handoff_status=handoff_status,
             simple_status=simple_status,
+            attachment_review=attachment_review,
+        )
+
+    @app.get("/api/done-archives/export.csv")
+    def get_done_archives_csv(
+        query: str | None = Query(None),
+        simple_status: str | None = Query(None),
+        attachment_review: str | None = Query(None),
+    ) -> Response:
+        if simple_status is not None and simple_status not in _ALLOWED_SIMPLE_STATES:
+            raise HTTPException(status_code=422, detail=f"unsupported simple_status: {simple_status}")
+        if attachment_review is not None and attachment_review != "no_attachment":
+            raise HTTPException(status_code=422, detail=f"unsupported attachment_review: {attachment_review}")
+        content = export_done_archives_csv(
+            settings, query=query, simple_status=simple_status, attachment_review=attachment_review,
+        )
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="oaradar-done-archives.csv"'},
         )
 
     @app.get("/api/markdown-outputs")

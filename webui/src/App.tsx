@@ -3,7 +3,7 @@ import {
   Bell, BookOpen, CircleAlert, FileText, LayoutDashboard, Menu, RefreshCw, Settings as SettingsIcon, ShieldCheck, X,
 } from "lucide-react"
 import { Progress } from "./components/ui/progress"
-import type { SimpleDoneItem, SimpleDonePage, SimpleDoneState, SimpleStatusResponse } from "./types/simple-status"
+import type { SimpleDoneFilter, SimpleDoneItem, SimpleDonePage, SimpleStatusResponse } from "./types/simple-status"
 import { SimpleOverviewView } from "./views/SimpleOverviewView"
 import { SimpleDoneView } from "./views/SimpleDoneView"
 import { SimpleSettingsView } from "./views/SimpleSettingsView"
@@ -248,7 +248,7 @@ export function App() {
   const [doneMetrics, setDoneMetrics] = useState<SimpleDonePage["metrics"]>({ oa_done_total: 0, downloaded_items: 0, verified_attachments: 0 })
   const [donePage, setDonePage] = useState(1)
   const [doneQuery, setDoneQuery] = useState("")
-  const [doneFilter, setDoneFilter] = useState<SimpleDoneState | "">("")
+  const [doneFilter, setDoneFilter] = useState<SimpleDoneFilter | "">("")
   const [settings, setSettings] = useState<SettingsData | null>(null)
   const [pending, setPending] = useState<PendingRow[]>([])
   const [markdown, setMarkdown] = useState<MarkdownItem[]>([])
@@ -266,7 +266,8 @@ export function App() {
       else if (view === "done") {
         const params = new URLSearchParams({ page: String(donePage), page_size: "50" })
         if (doneQuery) params.set("query", doneQuery)
-        if (doneFilter) params.set("simple_status", doneFilter)
+        if (doneFilter === "no_attachment") params.set("attachment_review", doneFilter)
+        else if (doneFilter) params.set("simple_status", doneFilter)
         const result = await api<SimpleDonePage>(`/api/done-archives?${params.toString()}`)
         setDone(result.items); setDoneTotal(result.total); setDoneMetrics(result.metrics)
       } else if (view === "markdown") {
