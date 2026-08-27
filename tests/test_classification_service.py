@@ -218,6 +218,46 @@ def test_scoped_run_rejects_unknown_duplicate_or_excluded_target_keys(
             )
 
 
+def test_document_number_embedded_in_title_uses_existing_issuer_rule(
+    factory: sessionmaker[Session], config: PrivateClassificationConfig
+) -> None:
+    key = "done:title-document-number"
+    with factory.begin() as session:
+        session.add_all(
+            [
+                OAManifestItem(
+                    oa_item_key=key,
+                    title="SYN-AUTH-88",
+                    sender="synth.internal",
+                    list_page=1,
+                    list_ordinal=1,
+                    processing_status="downloaded",
+                ),
+                OAItem(
+                    oa_item_key=key,
+                    source_channel="done",
+                    title="SYN-AUTH-88",
+                    sender="synth.internal",
+                    document_number=None,
+                    pipeline_status="files_verified",
+                ),
+            ]
+        )
+    service = ClassificationService(factory, config)
+    ref = service.create_run(
+        replace(_request("synthetic-title-number"), target_keys=(key,))
+    )
+
+    service.process_next(ref.run_id, limit=10)
+
+    with factory() as session:
+        decision = _current(session, key)
+        assert decision.classification_status == "classified"
+        assert decision.content_origin == "external"
+        assert decision.document_number == "SYN-AUTH-88"
+        assert decision.canonical_issuer == "Synthetic Authority"
+
+
 def _current(session: Session, key: str) -> ClassificationDecision:
     return session.scalar(
         select(ClassificationDecision).where(

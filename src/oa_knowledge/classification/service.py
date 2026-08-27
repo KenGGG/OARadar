@@ -26,7 +26,11 @@ from oa_knowledge.db.models import (
 )
 
 from .evidence import AttachmentCandidate, ClassificationItem, Evidence, RuleOutcome
-from .metadata_rules import classify_from_metadata, collect_metadata_evidence
+from .metadata_rules import (
+    classify_from_metadata,
+    collect_metadata_evidence,
+    find_configured_document_number,
+)
 from .schemas import PrivateClassificationConfig
 
 
@@ -542,7 +546,11 @@ class ClassificationService:
             item_key=item_key,
             title=owner.title,
             initiator=owner.sender or "",
-            document_number=item.document_number if item is not None else None,
+            document_number=(
+                item.document_number
+                if item is not None and item.document_number
+                else find_configured_document_number(owner.title, self._config)
+            ),
             attachments=tuple(
                 AttachmentCandidate(
                     attachment_key=file.attachment_key,

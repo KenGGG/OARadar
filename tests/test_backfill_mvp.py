@@ -89,7 +89,7 @@ def _engine(reverse: bool = False):
         )
     special_specs = (
         ("internal_template", "Synthetic internal approval equipment", "synthetic.internal", None, 1, "verified", False),
-        ("external_number", "Synthetic external notice", "synthetic.internal", "SYN-AUTH-7", 1, "verified", False),
+        ("external_number", "SYN-AUTH-7", "synthetic.internal", None, 1, "verified", False),
         ("transfer", "【文件传阅】Synthetic notice", "synthetic.internal", None, 1, "verified", False),
         ("no_number", "Synthetic neutral no number", "synthetic.unknown", None, 1, "verified", False),
         ("multi_attachment", "Synthetic many files", "synthetic.internal", None, 4, "verified", False),

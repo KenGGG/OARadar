@@ -18,6 +18,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from oa_knowledge.archive.integrity import sha256_file
+from oa_knowledge.classification.metadata_rules import find_configured_document_number
 from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 from oa_knowledge.classification.service import (
@@ -156,7 +157,9 @@ def select_representative_items(
     ordinary: list[SampleItem] = []
     for manifest in manifests:
         item = items.get(manifest.oa_item_key)
-        document_number = item.document_number if item else None
+        document_number = (
+            item.document_number if item and item.document_number else None
+        ) or find_configured_document_number(manifest.title or "", config)
         initiator = (manifest.sender or (item.sender if item else "") or "").strip()
         role = initiator_roles.get(initiator.casefold(), "unknown")
         file_count, abnormal_count = file_stats.get(item.id, (0, 0)) if item else (0, 0)

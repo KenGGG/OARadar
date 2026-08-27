@@ -286,6 +286,17 @@ def collect_metadata_evidence(
     return sorted(evidence, key=_evidence_sort_key)
 
 
+def find_configured_document_number(
+    text: str, config: PrivateClassificationConfig
+) -> str | None:
+    """Return the first configured formal number present in existing metadata."""
+    for rule in config.document_number_issuers:
+        match = re.search(rule.pattern, text)
+        if match is not None:
+            return match.group(0).strip()
+    return None
+
+
 def _evidence_sort_key(entry: Evidence) -> tuple[object, ...]:
     return (
         entry.evidence_scope,
