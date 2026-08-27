@@ -155,6 +155,43 @@ def test_complete_persists_the_same_reconciled_summary() -> None:
     engine.dispose()
 
 
+def test_completed_report_and_summary_are_immutable_under_later_config_changes() -> (
+    None
+):
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    config = _config()
+    _seed(factory)
+    initial = ClassificationService(factory, config)
+    initial.create_run(_request("synthetic-completed-snapshot"))
+    initial.process_next("synthetic-completed-snapshot", limit=100)
+    expected = initial.complete("synthetic-completed-snapshot")
+
+    changed_config = PrivateClassificationConfig.model_validate(
+        {
+            **config.model_dump(),
+            "initiators": {
+                **config.model_dump()["initiators"],
+                "new.person": {"role": "mixed", "aliases": []},
+            },
+        }
+    )
+    later = ClassificationService(factory, changed_config)
+    repeated = later.complete("synthetic-completed-snapshot")
+    report = build_classification_run_report(
+        factory, "synthetic-completed-snapshot", changed_config
+    )
+
+    assert repeated == expected
+    assert report == expected
+    engine.dispose()
+
+
 def test_report_remains_bound_to_the_decisions_adopted_by_its_run() -> None:
     engine = create_engine(
         "sqlite://",

@@ -296,6 +296,12 @@ class ClassificationService:
     def complete(self, run_id: str):
         from .reporting import build_classification_run_report
 
+        with self._sessions() as session:
+            run = self._run(session, run_id)
+            if run.status == "completed":
+                return build_classification_run_report(
+                    self._sessions, run_id, self._config
+                )
         progress = self.progress(run_id)
         if progress.queued or progress.failed or progress.decided != progress.total:
             raise ValueError("classification run has unfinished items")

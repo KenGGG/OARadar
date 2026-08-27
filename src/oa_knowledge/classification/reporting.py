@@ -65,6 +65,45 @@ class ClassificationRunReport:
             "reconciled": self.reconciled,
         }
 
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> ClassificationRunReport:
+        roles = value.get("initiator_roles", {})
+        if not isinstance(roles, dict):
+            raise TypeError("stored classification report has invalid initiator roles")
+        return cls(
+            total=int(value["total"]),
+            excluded=int(value["excluded"]),
+            classification_target=int(value["classification_target"]),
+            publishable=int(value["publishable"]),
+            integrity_blocked=int(value["integrity_blocked"]),
+            needs_review=int(value["needs_review"]),
+            internal=int(value["internal"]),
+            external=int(value["external"]),
+            initiator_roles={
+                str(role): tuple(str(identifier) for identifier in identifiers)
+                for role, identifiers in roles.items()
+                if isinstance(identifiers, list)
+            },
+            unknown_initiators=tuple(
+                str(identifier)
+                for identifier in value["unknown_initiators"]  # type: ignore[index]
+            ),
+            decision_sources={
+                str(source): int(count)
+                for source, count in value["decision_sources"].items()  # type: ignore[index,union-attr]
+            },
+            needs_parse=int(value["needs_parse"]),
+            actual_parse_count=int(value["actual_parse_count"]),
+            expected_qwen_calls=int(value["expected_qwen_calls"]),
+            actual_qwen_calls=int(value["actual_qwen_calls"]),
+            conflicts=int(value["conflicts"]),
+            unrecognized_issuers=int(value["unrecognized_issuers"]),
+            canonical_document_deduplications=int(
+                value["canonical_document_deduplications"]
+            ),
+            reconciled=bool(value["reconciled"]),
+        )
+
 
 def build_classification_run_report(
     session_factory: Callable[[], Session],
@@ -77,6 +116,16 @@ def build_classification_run_report(
         )
         if run is None:
             raise ValueError("classification run not found")
+        if run.status == "completed":
+            try:
+                stored = json.loads(run.summary_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "completed classification run has invalid summary"
+                ) from exc
+            if not isinstance(stored, dict):
+                raise ValueError("completed classification run has invalid summary")
+            return ClassificationRunReport.from_dict(stored)
         rows = list(
             session.scalars(
                 select(ClassificationRunItem).where(
