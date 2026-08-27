@@ -14,6 +14,7 @@ EscalationAction = Literal["resolved", "parse_attachment", "needs_review"]
 class AttachmentCandidate:
     attachment_key: str
     filename: str
+    source_file_id: int | None = None
     document_number: str | None = None
     issuer: str | None = None
 
@@ -56,6 +57,7 @@ class Evidence:
     document_type: str | None = None
     normalized_title: str | None = None
     attachment_key: str | None = None
+    source_file_id: int | None = None
     person_identifier: str | None = None
     transfer_ordinal: int | None = None
     transfer_from: str | None = None

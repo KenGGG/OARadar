@@ -17,6 +17,7 @@ from oa_knowledge.db.models import (
     ArchivedFile,
     Base,
     ClassificationDecision,
+    ClassificationEvidence,
     ClassificationRun,
     ClassificationRunItem,
     OAItem,
@@ -418,3 +419,90 @@ def test_failed_new_decision_does_not_clear_existing_current_decision(
             )
             == "failed"
         )
+
+
+def test_completed_run_rejects_late_manual_change_without_rewriting_history(
+    factory: sessionmaker[Session], config: PrivateClassificationConfig
+) -> None:
+    _seed(factory)
+    service = ClassificationService(factory, config)
+    ref = service.create_run(_request("synthetic-completed-manual"))
+    service.process_next(ref.run_id, limit=100)
+    service.complete(ref.run_id)
+    with factory() as session:
+        before = session.scalar(
+            select(ClassificationRunItem.adopted_decision_id).where(
+                ClassificationRunItem.classification_run_id == ref.database_id,
+                ClassificationRunItem.oa_item_key == "done:internal",
+            )
+        )
+
+    with pytest.raises(ValueError, match="completed"):
+        service.set_manual_decision(
+            ManualDecisionCommand(
+                run_id=ref.run_id,
+                oa_item_key="done:internal",
+                actor="synthetic-reviewer",
+                reason="Synthetic late review",
+                classification_status="classified",
+                content_origin="internal",
+                business_category="01_公司治理与决策",
+                canonical_issuer=None,
+                flow_type="manual_review",
+                initiator_type="internal",
+            )
+        )
+
+    with factory() as session:
+        after = session.scalar(
+            select(ClassificationRunItem.adopted_decision_id).where(
+                ClassificationRunItem.classification_run_id == ref.database_id,
+                ClassificationRunItem.oa_item_key == "done:internal",
+            )
+        )
+        assert after == before
+
+
+def test_duplicate_attachment_keys_keep_evidence_linked_to_the_correct_file(
+    factory: sessionmaker[Session], config: PrivateClassificationConfig
+) -> None:
+    _seed(factory)
+    with factory.begin() as session:
+        item = session.scalar(
+            select(OAItem).where(OAItem.oa_item_key == "done:unknown")
+        )
+        assert item is not None
+        session.add(
+            ArchivedFile(
+                oa_item_id=item.id,
+                original_name="synthetic-embedded.pdf",
+                local_relpath="originals/done/unknown/synthetic-embedded.pdf",
+                size_bytes=11,
+                sha256=HASH_B,
+                attachment_key="synthetic-attachment",
+                file_role="archive_member",
+                source_container_key="zip-1",
+                depth=2,
+                download_status="verified",
+            )
+        )
+    service = ClassificationService(factory, config)
+    service.create_run(_request("synthetic-duplicate-attachment-key"))
+    service.process_next("synthetic-duplicate-attachment-key", limit=100)
+
+    with factory() as session:
+        decision = _current(session, "done:unknown")
+        evidence_ids = set(
+            session.scalars(
+                select(ClassificationEvidence.source_file_id).where(
+                    ClassificationEvidence.classification_decision_id == decision.id,
+                    ClassificationEvidence.evidence_type == "attachment_candidate",
+                )
+            )
+        )
+        files = set(
+            session.scalars(
+                select(ArchivedFile.id).where(ArchivedFile.oa_item_id == item.id)
+            )
+        )
+        assert evidence_ids == files

@@ -236,6 +236,8 @@ class ClassificationService:
             raise ValueError("manual actor and reason are required")
         with self._sessions.begin() as session:
             run = self._run(session, command.run_id)
+            if run.status == "completed":
+                raise ValueError("completed classification runs are immutable")
             run_item = session.scalar(
                 select(ClassificationRunItem).where(
                     ClassificationRunItem.classification_run_id == run.id,
@@ -514,7 +516,9 @@ class ClassificationService:
             document_number=item.document_number if item is not None else None,
             attachments=tuple(
                 AttachmentCandidate(
-                    attachment_key=file.attachment_key, filename=file.original_name
+                    attachment_key=file.attachment_key,
+                    filename=file.original_name,
+                    source_file_id=file.id,
                 )
                 for file in sorted(files, key=lambda row: (row.attachment_key, row.id))
             ),
@@ -612,12 +616,6 @@ class ClassificationService:
         evidence: list[Evidence],
         item_key: str,
     ) -> None:
-        item = session.scalar(select(OAItem).where(OAItem.oa_item_key == item_key))
-        source_ids = (
-            {file.attachment_key: file.id for file in item.files}
-            if item is not None
-            else {}
-        )
         for sequence, entry in enumerate(evidence, start=1):
             value = {
                 key: value
@@ -632,7 +630,7 @@ class ClassificationService:
                     evidence_scope=entry.evidence_scope,
                     value_json=_canonical_json(value),
                     confidence=entry.confidence,
-                    source_file_id=source_ids.get(entry.attachment_key),
+                    source_file_id=entry.source_file_id,
                 )
             )
 

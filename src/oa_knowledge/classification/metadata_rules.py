@@ -81,6 +81,7 @@ def _document_evidence(
     *,
     scope: str,
     attachment_key: str | None,
+    source_file_id: int | None,
     config: PrivateClassificationConfig,
 ) -> list[Evidence]:
     entries: list[Evidence] = []
@@ -91,6 +92,7 @@ def _document_evidence(
                 Evidence(
                     evidence_scope=scope,  # type: ignore[arg-type]
                     attachment_key=attachment_key,
+                    source_file_id=source_file_id,
                     code="document_number",
                     priority=1,
                     confidence=0.99,
@@ -112,6 +114,7 @@ def _issuer_evidence(
     *,
     scope: str,
     attachment_key: str | None,
+    source_file_id: int | None,
     config: PrivateClassificationConfig,
 ) -> Evidence:
     resolution = normalize_issuer(issuer, config.issuer_aliases)
@@ -119,6 +122,7 @@ def _issuer_evidence(
     return Evidence(
         evidence_scope=scope,  # type: ignore[arg-type]
         attachment_key=attachment_key,
+        source_file_id=source_file_id,
         code="explicit_issuer",
         priority=1,
         confidence=0.99,
@@ -151,13 +155,18 @@ def collect_metadata_evidence(
                 item.document_number,
                 scope="package",
                 attachment_key=None,
+                source_file_id=None,
                 config=config,
             )
         )
     if item.issuer:
         evidence.append(
             _issuer_evidence(
-                item.issuer, scope="package", attachment_key=None, config=config
+                item.issuer,
+                scope="package",
+                attachment_key=None,
+                source_file_id=None,
+                config=config,
             )
         )
 
@@ -247,6 +256,7 @@ def collect_metadata_evidence(
             Evidence(
                 evidence_scope="attachment",
                 attachment_key=attachment.attachment_key,
+                source_file_id=attachment.source_file_id,
                 code="attachment_candidate",
                 priority=99,
                 confidence=0.0,
@@ -258,6 +268,7 @@ def collect_metadata_evidence(
                     attachment.document_number,
                     scope="attachment",
                     attachment_key=attachment.attachment_key,
+                    source_file_id=attachment.source_file_id,
                     config=config,
                 )
             )
@@ -267,6 +278,7 @@ def collect_metadata_evidence(
                     attachment.issuer,
                     scope="attachment",
                     attachment_key=attachment.attachment_key,
+                    source_file_id=attachment.source_file_id,
                     config=config,
                 )
             )
