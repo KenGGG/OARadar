@@ -72,6 +72,7 @@ def test_replace_archive_prefix() -> None:
 @pytest.mark.parametrize(
     "rel,expected",
     [
+        (PurePosixPath("originals/2022/04/2022-04-22_x/y.pdf"), PurePosixPath("2022/04/2022-04-22_x/y.pdf")),
         (PurePosixPath("archive/raw/oa/done/2022/04/x/y.pdf"), PurePosixPath("done/2022/04/x/y.pdf")),
         (PurePosixPath("raw/pending/7/99/body.html"), PurePosixPath("pending/7/99/body.html")),
     ],
@@ -83,3 +84,15 @@ def test_markdown_tail_from_archive_path(rel: PurePosixPath, expected: PurePosix
 def test_markdown_tail_rejects_unknown_prefix() -> None:
     with pytest.raises(ValueError):
         markdown_tail_from_archive_path(PurePosixPath("data/other/x"))
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        PurePosixPath("originals/../escape"),
+        PurePosixPath("/raw/done/2022/04/x"),
+    ],
+)
+def test_markdown_tail_rejects_absolute_or_traversal_path(rel: PurePosixPath) -> None:
+    with pytest.raises(ValueError, match="safe relative"):
+        markdown_tail_from_archive_path(rel)

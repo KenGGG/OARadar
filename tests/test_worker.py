@@ -564,7 +564,7 @@ def test_worker_migrates_only_online_verified_legacy_archives(config_file: Path)
         job = session.scalar(select(OperationJob).where(
             OperationJob.job_type == "verified_archive_migration",
         ))
-        assert safe.archive_relpath.startswith("originals/done/")
+        assert safe.archive_relpath == "originals/unknown/unknown_safe"
         assert review.archive_relpath == review_rel
         assert job.status == "completed"
         parameters = json.loads(job.parameters_json)
@@ -663,6 +663,8 @@ def test_worker_claims_one_job_and_records_unsupported_type(config_file: Path) -
 
 def test_backfill_campaign_quarantines_failed_item_and_continues(config_file: Path, monkeypatch) -> None:
     settings = load_settings(config_file)
+    (settings.data_root / "originals").mkdir(parents=True)
+    (settings.data_root / "markdown").mkdir()
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
     with Session(engine) as session:
@@ -778,7 +780,7 @@ def test_worker_consumes_production_queue_when_operation_queue_is_empty(config_f
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    ProductionQueue(engine).enqueue("historical_done_backfill", "done-1", "attachment_inventory", "production-1")
+    ProductionQueue(engine).enqueue("realtime_done", "done-1", "attachment_inventory", "production-1")
     worker = OperationWorker(settings, config_path=config_file)
     handled = []
     monkeypatch.setattr(worker, "_execute_pipeline_task", lambda task: handled.append(task.id))
@@ -977,7 +979,7 @@ def test_done_parse_advances_to_source_publish_before_curation(config_file: Path
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.pdf", attachment_key="source-stage",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/source.pdf", download_status="verified",
+            local_relpath="originals/unknown/source.pdf", download_status="verified",
         )
         session.add(source); session.flush()
         session.add(ParseJob(
@@ -986,7 +988,7 @@ def test_done_parse_advances_to_source_publish_before_curation(config_file: Path
         ))
         session.commit()
         source_id = source.id
-    task_id = queue.enqueue("historical_done_backfill", "done:source-stage", "parse", "source-stage-task")
+    task_id = queue.enqueue("realtime_done", "done:source-stage", "parse", "source-stage-task")
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file); worker.owner = "worker-test"
     try:
@@ -1005,12 +1007,17 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
     engine = create_db_engine(settings.database_path)
     queue = ProductionQueue(engine)
     with Session(engine) as session:
-        item = OAItem(oa_item_key="done:publish", source_channel="done", title="Synthetic")
+        item = OAItem(
+            oa_item_key="done:publish",
+            source_channel="done",
+            title="Synthetic",
+            archive_relpath="originals/unknown/unknown_publish",
+        )
         session.add(item); session.flush()
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.pdf", attachment_key="publish",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/source.pdf", download_status="verified",
+            local_relpath="originals/unknown/source.pdf", download_status="verified",
         )
         session.add(source); session.flush()
         content = ContentObject(sha256="a" * 64, size_bytes=1)
@@ -1029,7 +1036,17 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
         )
         session.add(artifact); session.flush()
         content.active_parse_artifact_id = artifact.id
-        session.commit(); source_id = source.id
+        audit = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
+        session.add(audit); session.flush()
+        session.add(OnlineAuditItem(
+            run_id=audit.id,
+            oa_item_key=item.oa_item_key,
+            title=item.title,
+            status="matched",
+            comparison_reason="exact_match",
+            depth_limit_reached=False,
+        ))
+        session.commit(); source_id = source.id; parse_job_id = job.id
     task_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-task")
     task = queue.claim("worker-test")
     called: list[int] = []
@@ -1044,8 +1061,17 @@ def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_f
         worker.close()
     with Session(engine) as session:
         row = session.get(PipelineTask, task_id)
-        assert called == [source_id]
+        assert called == []
         assert row.stage == "classify" and row.status == "queued"
+
+    source_path = settings.data_root / "originals/unknown/source.pdf"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"%PDF synthetic")
+    with Session(engine) as session:
+        artifact = session.scalar(select(ParseArtifact).where(ParseArtifact.parse_job_id == parse_job_id))
+        assert artifact is not None
+        artifact.lifecycle_status = "superseded"
+        session.commit()
 
     missing_id = queue.enqueue("historical_done_backfill", "done:publish", "source_publish", "publish-missing")
     missing = queue.claim("worker-test")
@@ -1071,7 +1097,7 @@ def test_source_publish_records_unsupported_source_in_item_index_without_review(
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.wps"
+    source_path = settings.data_root / "originals/unknown/synthetic/source.wps"
     source_path.parent.mkdir(parents=True)
     source_path.write_bytes(b"synthetic unsupported source")
     with Session(engine) as session:
@@ -1085,13 +1111,13 @@ def test_source_publish_records_unsupported_source_in_item_index_without_review(
             file_role="direct_attachment",
             source_container_key="root",
             depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/source.wps",
+            local_relpath="originals/unknown/synthetic/source.wps",
             download_status="verified",
         ))
         session.commit()
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:unsupported", "source_publish", "unsupported-source",
+        "realtime_done", "done:unsupported", "source_publish", "unsupported-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)
@@ -1112,7 +1138,7 @@ def test_source_publish_records_parser_skipped_source_without_review(config_file
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.doc"
+    source_path = settings.data_root / "originals/unknown/synthetic/source.doc"
     source_path.parent.mkdir(parents=True)
     source_path.write_bytes(b"synthetic legacy document")
     with Session(engine) as session:
@@ -1122,7 +1148,7 @@ def test_source_publish_records_parser_skipped_source_without_review(config_file
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.doc", attachment_key="skipped",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/source.doc",
+            local_relpath="originals/unknown/synthetic/source.doc",
             download_status="verified",
         )
         session.add(source)
@@ -1135,7 +1161,7 @@ def test_source_publish_records_parser_skipped_source_without_review(config_file
         source_id = source.id
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:skipped", "source_publish", "skipped-source",
+        "realtime_done", "done:skipped", "source_publish", "skipped-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)
@@ -1158,7 +1184,7 @@ def test_source_publish_fails_rejected_quality_artifact_without_review(config_fi
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    source_path = settings.data_root / "archive/raw/oa/done/synthetic/source.docx"
+    source_path = settings.data_root / "originals/unknown/synthetic/source.docx"
     source_path.parent.mkdir(parents=True)
     source_path.write_bytes(b"synthetic low-quality document")
     digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -1172,7 +1198,7 @@ def test_source_publish_fails_rejected_quality_artifact_without_review(config_fi
         source = ArchivedFile(
             oa_item_id=item.id, original_name="source.docx", attachment_key="rejected",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/source.docx",
+            local_relpath="originals/unknown/synthetic/source.docx",
             download_status="verified", sha256=digest, content_object_id=content.id,
         )
         session.add(source)
@@ -1194,7 +1220,7 @@ def test_source_publish_fails_rejected_quality_artifact_without_review(config_fi
         source_id = source.id
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:rejected", "source_publish", "rejected-source",
+        "realtime_done", "done:rejected", "source_publish", "rejected-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)
@@ -1219,7 +1245,7 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
-    root = settings.data_root / "archive/raw/oa/done/synthetic"
+    root = settings.data_root / "originals/unknown/synthetic"
     root.mkdir(parents=True)
     (root / "first.docx").write_bytes(b"synthetic eligible source")
     (root / "second.wps").write_bytes(b"synthetic unsupported source")
@@ -1230,12 +1256,12 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
         first = ArchivedFile(
             oa_item_id=item.id, original_name="first.docx", attachment_key="first",
             file_role="direct_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/first.docx", download_status="verified",
+            local_relpath="originals/unknown/synthetic/first.docx", download_status="verified",
         )
         second = ArchivedFile(
             oa_item_id=item.id, original_name="second.wps", attachment_key="second",
             file_role="official_attachment", source_container_key="root", depth=1,
-            local_relpath="archive/raw/oa/done/synthetic/second.wps", download_status="verified",
+            local_relpath="originals/unknown/synthetic/second.wps", download_status="verified",
         )
         session.add_all([first, second]); session.flush()
         content = ContentObject(sha256=hashlib.sha256(b"synthetic eligible source").hexdigest(), size_bytes=25)
@@ -1266,7 +1292,7 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
     monkeypatch.setattr("oa_knowledge.source_markdown.service.publish_active_artifact", publish)
     queue = ProductionQueue(engine)
     task_id = queue.enqueue(
-        "historical_done_backfill", "done:preflight", "source_publish", "preflight-source",
+        "realtime_done", "done:preflight", "source_publish", "preflight-source",
     )
     task = queue.claim("worker-test")
     worker = OperationWorker(settings, config_path=config_file)
@@ -1277,7 +1303,7 @@ def test_source_publish_keeps_unsupported_files_out_of_valid_artifact_publicatio
         worker.close()
 
     with Session(engine) as session:
-        assert calls == [first_id]
+        assert calls == []
         row = session.get(PipelineTask, task_id)
         assert row.status == "queued"
         assert row.stage == "classify"

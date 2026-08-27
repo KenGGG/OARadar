@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
 import yaml
@@ -20,6 +20,8 @@ class ExportMetadata:
     oa_item_key: str | None = None
     logical_item_id: str | int | None = None
     parse_status: str = "success"
+    actual_file_type: str | None = None
+    actual_file_type_source: str | None = None
     parse_engine: str = "none"
     parse_engine_version: str = "unknown"
     parse_artifact_id: int | None = None
@@ -41,7 +43,7 @@ def render_markdown(metadata: ExportMetadata, body: str) -> str:
     payload["source_system"] = "oa"
     payload["source_extension"] = PurePosixPath(metadata.source_filename).suffix.lower()
     payload["source_relpath"] = relative.as_posix()
-    payload["generated_at"] = metadata.generated_at or datetime.now(timezone.utc).isoformat()
+    payload["generated_at"] = metadata.generated_at or datetime.now(UTC).isoformat()
     payload["managed_by"] = "oaradar"
     payload = {key: value for key, value in payload.items() if value is not None}
     frontmatter = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).rstrip()

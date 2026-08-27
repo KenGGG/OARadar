@@ -62,7 +62,7 @@ def _add_completed_item(session: Session, key: str, *, depth_limited: bool = Fal
     ))
     session.add(MarkdownExport(
         oa_item_id=oa_item.id, document_kind="item_index", source_sha256="1" * 64,
-        source_relpath=f"archive/raw/oa/done/{key}", markdown_relpath=f"{key}/_index.md",
+        source_relpath=f"originals/unknown/unknown_{key}", markdown_relpath=f"{key}/_index.md",
         parse_engine="item_index", parse_engine_version="v1", parse_config_hash="v1",
         schema_version=1, status="success", generated_at=datetime.now(timezone.utc),
     ))
@@ -174,7 +174,7 @@ def test_simple_status_completes_done_item_from_item_index_without_curation(conf
         item = session.scalar(select(OAItem).where(OAItem.oa_item_key == "oa:index-complete"))
         session.add(MarkdownExport(
             oa_item_id=item.id, document_kind="item_index", source_sha256="2" * 64,
-            source_relpath="archive/raw/oa/done/synthetic", markdown_relpath="source/done/synthetic/_index.md",
+            source_relpath="originals/unknown/unknown_synthetic", markdown_relpath="source/done/synthetic/_index.md",
             parse_engine="item_index", parse_engine_version="v1", parse_config_hash="v1",
             schema_version=1, status="success", generated_at=datetime.now(timezone.utc),
         ))
@@ -283,7 +283,7 @@ def test_simple_status_headline_still_in_progress(config_file: Path) -> None:
         _add_markdown_only_item(session, "oa:wip")  # 已下载 + MD，但无归类
     done = client.get("/api/simple-status").json()["done"]
     assert done["status"] == "working"
-    assert "仍在排队" in done["headline"]
+    assert "尚未完成" in done["headline"]
 
 
 def test_simple_status_headline_fallback_used(config_file: Path) -> None:

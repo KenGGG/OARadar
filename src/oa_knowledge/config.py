@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 # Keys whose presence in YAML means a plaintext credential is being stored inline.
 # Credentials must come from environment variables instead (see AGENTS.md). Exact
 # lower-cased match avoids substring false-positives (e.g. "bypass").
@@ -121,8 +120,8 @@ class ArchiveConfig(StrictModel):
 class ParserConfig(StrictModel):
     default_engine: str = "markitdown"
     supported_extensions: list[str] = [
-        ".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm",
-        ".txt", ".csv", ".json", ".xml", ".png", ".jpg", ".jpeg", ".tif", ".tiff",
+        ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".html", ".htm",
+        ".txt", ".csv", ".json", ".xml", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp",
     ]
     max_file_size_mb: int = 100
 
@@ -175,7 +174,7 @@ class FeishuConfig(StrictModel):
 OFFICIAL_FEISHU_HOSTS = frozenset({"open.feishu.cn", "open.feishu.com", "www.feishu.cn"})
 
 
-def validate_feishu_runtime_config(settings: "Settings") -> str:
+def validate_feishu_runtime_config(settings: Settings) -> str:
     """Return the effective Feishu runtime state.
 
     Unlike simply checking for an environment variable, this honors
@@ -238,7 +237,7 @@ class LlmConfig(StrictModel):
     context_safety_margin: int = 1024
 
     @model_validator(mode="after")
-    def apply_provider_choice(self) -> "LlmConfig":
+    def apply_provider_choice(self) -> LlmConfig:
         if self.active_provider != "ollama":
             raise ValueError("llm.active_provider must be ollama; OA model processing is local-only")
         if self.ollama_model != "qwen3.5:9b":
@@ -343,6 +342,7 @@ class WebConfig(StrictModel):
 
 
 class Settings(StrictModel):
+    classification_private_dir: Path | None = None
     app: AppConfig = AppConfig()
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     browser: BrowserConfig = BrowserConfig()
@@ -361,8 +361,20 @@ class Settings(StrictModel):
     pending_cleanup: PendingCleanupConfig = PendingCleanupConfig()
     web: WebConfig = WebConfig()
 
+    @field_validator("classification_private_dir")
+    @classmethod
+    def absolute_classification_private_dir(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        expanded = value.expanduser()
+        if not expanded.is_absolute():
+            raise ValueError("classification_private_dir must be an absolute local path")
+        # Preserve a final symlink for the private loader's fail-closed check.
+        # abspath normalizes the absolute spelling without dereferencing it.
+        return Path(os.path.abspath(expanded))
+
     @model_validator(mode="after")
-    def local_only(self) -> "Settings":
+    def local_only(self) -> Settings:
         if self.app.privacy_mode != "local_only":
             raise ValueError("privacy_mode must be local_only")
         for name, root in (("runtime.state_root", self.state_root), ("runtime.cache_root", self.cache_root)):
@@ -413,7 +425,7 @@ class Settings(StrictModel):
 
     @property
     def workspace_root(self) -> Path:
-        return self.data_root
+        return self.markdown_root
 
     @property
     def markdown_root(self) -> Path:
@@ -467,4 +479,7 @@ def load_settings(path: Path | None = None) -> Settings:
     env_web_require_auth = os.getenv("OA_WEB__REQUIRE_AUTH")
     if env_web_require_auth:
         raw.setdefault("web", {})["require_auth"] = env_web_require_auth.strip().lower() in {"1", "true", "yes", "on"}
+    env_classification_private_dir = os.getenv("OA_CLASSIFICATION_PRIVATE_DIR")
+    if env_classification_private_dir:
+        raw["classification_private_dir"] = env_classification_private_dir
     return Settings.model_validate(raw)

@@ -22,8 +22,41 @@ def _queue(config_file: Path) -> tuple[ProductionQueue, object]:
     return ProductionQueue(engine), settings
 
 
+def _authorize_history(queue: ProductionQueue, *logical_keys: str) -> None:
+    with Session(queue.engine) as session:
+        session.add_all([
+            OAItem(
+                oa_item_key=logical_key,
+                source_channel="done",
+                title=f"synthetic-{index}",
+                archive_relpath=f"originals/unknown/unknown_{index}",
+            )
+            for index, logical_key in enumerate(logical_keys, start=1)
+        ])
+        audit = OnlineAuditRun(
+            status="completed",
+            total_items=len(logical_keys),
+            completed_items=len(logical_keys),
+        )
+        session.add(audit)
+        session.flush()
+        session.add_all([
+            OnlineAuditItem(
+                run_id=audit.id,
+                oa_item_key=logical_key,
+                title=f"synthetic-{index}",
+                status="matched",
+                comparison_reason="exact_match",
+                depth_limit_reached=False,
+            )
+            for index, logical_key in enumerate(logical_keys, start=1)
+        ])
+        session.commit()
+
+
 def test_realtime_pending_and_done_are_claimed_before_historical(config_file: Path) -> None:
     queue, _ = _queue(config_file)
+    _authorize_history(queue, "item-3")
     queue.enqueue("historical_done_backfill", "item-3", "parse", "history-3")
     queue.enqueue("realtime_done", "item-2", "detail_sync", "done-2")
     queue.enqueue("realtime_pending", "item-1", "detail_sync", "pending-1")
@@ -55,6 +88,7 @@ def test_retire_non_core_tasks_marks_existing_curation_task_nonrecoverable(confi
 
 def test_historical_wave_finishes_parse_before_ollama(config_file: Path) -> None:
     queue, _ = _queue(config_file)
+    _authorize_history(queue, "item-1", "item-2")
     ollama_id = queue.enqueue("historical_done_backfill", "item-1", "ollama_extract", "history-1")
     parse_id = queue.enqueue("historical_done_backfill", "item-2", "parse", "history-2")
 
@@ -66,6 +100,7 @@ def test_historical_wave_finishes_parse_before_ollama(config_file: Path) -> None
 
 def test_historical_wave_orders_source_publish_before_curation(config_file: Path) -> None:
     queue, _ = _queue(config_file)
+    _authorize_history(queue, "item-1", "item-2")
     curation_id = queue.enqueue("historical_done_backfill", "item-1", "curation", "history-curation")
     publish_id = queue.enqueue("historical_done_backfill", "item-2", "source_publish", "history-publish")
 
@@ -93,11 +128,11 @@ def test_completed_audit_allows_only_safe_canonical_history(config_file: Path) -
             ),
             OAItem(
                 oa_item_key="done:canonical", source_channel="done", title="canonical",
-                archive_relpath="archive/raw/oa/done/unknown/canonical",
+                archive_relpath="originals/unknown/unknown_canonical",
             ),
             OAItem(
                 oa_item_key="done:unsafe-canonical", source_channel="done", title="unsafe",
-                archive_relpath="archive/raw/oa/done/unknown/unsafe",
+                archive_relpath="originals/unknown/unknown_unsafe",
             ),
         ))
         audit = OnlineAuditRun(status="completed", total_items=3, completed_items=3)
@@ -137,12 +172,44 @@ def test_completed_audit_allows_only_safe_canonical_history(config_file: Path) -
         assert session.get(PipelineTask, unsafe_id).status == "queued"
 
 
+def test_first_deploy_does_not_claim_unaudited_history(config_file: Path) -> None:
+    queue, _ = _queue(config_file)
+    with Session(queue.engine) as session:
+        session.add_all((
+            OAItem(
+                oa_item_key="done:legacy-first-deploy", source_channel="done", title="legacy",
+                archive_relpath="raw/done/unknown/legacy",
+            ),
+            OAItem(
+                oa_item_key="done:canonical-first-deploy", source_channel="done", title="canonical",
+                archive_relpath="originals/unknown/unknown_canonical",
+            ),
+        ))
+        session.commit()
+    task_ids = [
+        queue.enqueue(
+            "historical_done_backfill", logical_key, "parse", f"unaudited:{logical_key}",
+        )
+        for logical_key in (
+            "done:legacy-first-deploy",
+            "done:canonical-first-deploy",
+            "done:missing-first-deploy",
+        )
+    ]
+
+    assert queue.claim("worker-a") is None
+    with Session(queue.engine) as session:
+        assert {
+            session.get(PipelineTask, task_id).status for task_id in task_ids
+        } == {"queued"}
+
+
 def test_newer_running_audit_blocks_history_despite_older_safe_evidence(config_file: Path) -> None:
     queue, _ = _queue(config_file)
     with Session(queue.engine) as session:
         session.add(OAItem(
             oa_item_key="done:stale-evidence", source_channel="done", title="stale",
-            archive_relpath="archive/raw/oa/done/unknown/stale",
+            archive_relpath="originals/unknown/unknown_stale",
         ))
         completed = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
         session.add(completed); session.flush()
@@ -168,11 +235,11 @@ def test_finalize_ineligible_historical_tasks_parks_only_review_rows(config_file
         session.add_all((
             OAItem(
                 oa_item_key="done:safe", source_channel="done", title="safe",
-                archive_relpath="archive/raw/oa/done/unknown/safe",
+                archive_relpath="originals/unknown/unknown_safe",
             ),
             OAItem(
                 oa_item_key="done:unsafe", source_channel="done", title="unsafe",
-                archive_relpath="archive/raw/oa/done/unknown/unsafe",
+                archive_relpath="originals/unknown/unknown_unsafe",
             ),
             OAItem(
                 oa_item_key="done:migration-failed", source_channel="done", title="migration-failed",
@@ -230,7 +297,7 @@ def test_new_safe_audit_releases_previously_review_gated_history(config_file: Pa
     with Session(queue.engine) as session:
         session.add(OAItem(
             oa_item_key="done:resolved", source_channel="done", title="resolved",
-            archive_relpath="archive/raw/oa/done/unknown/resolved",
+            archive_relpath="originals/unknown/unknown_resolved",
         ))
         audit = OnlineAuditRun(status="completed", total_items=1, completed_items=1)
         session.add(audit); session.flush()
@@ -365,6 +432,7 @@ def test_start_historical_rebuild_requeues_completed_campaign_when_idle(config_f
             processing_status="downloaded",
         ))
         session.commit()
+    _authorize_history(queue, "d-rerun")
 
     first = queue.start_historical_rebuild()
     task = queue.claim("worker-a")
@@ -431,7 +499,7 @@ def test_bootstrap_resumes_fully_parsed_done_at_source_publish(config_file: Path
         )
         item = OAItem(
             oa_item_key="done:parsed", source_channel="done", title="已解析历史事项",
-            archive_relpath="archive/raw/oa/done/synthetic",
+            archive_relpath="originals/unknown/unknown_synthetic",
         )
         session.add_all([manifest, item]); session.flush()
         content = ContentObject(sha256=hashlib.sha256(b"source").hexdigest(), size_bytes=6)
@@ -439,7 +507,7 @@ def test_bootstrap_resumes_fully_parsed_done_at_source_publish(config_file: Path
         source = ArchivedFile(
             oa_item_id=item.id, attachment_key="source", file_role="direct_attachment",
             source_container_key="root", original_name="source.docx",
-            local_relpath="archive/raw/oa/done/synthetic/source.docx",
+            local_relpath="originals/unknown/unknown_synthetic/source.docx",
             download_status="verified", sha256=content.sha256, content_object_id=content.id,
         )
         session.add(source); session.flush()
@@ -490,7 +558,7 @@ def test_finish_and_retry_are_durable_and_do_not_block_next_task(config_file: Pa
 
 def test_explicit_retry_resets_failed_production_task(config_file: Path) -> None:
     queue, _ = _queue(config_file)
-    task_id = queue.enqueue("historical_done_backfill", "done:retry", "parse", "retry-me")
+    task_id = queue.enqueue("realtime_done", "done:retry", "parse", "retry-me")
     assert queue.claim("worker-a").id == task_id
     with Session(queue.engine) as session:
         task = session.get(PipelineTask, task_id)

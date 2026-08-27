@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,7 +13,7 @@ from oa_knowledge.config import Settings
 from oa_knowledge.data_governance.service import build_cleanup_plan
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import CleanupItem, ItemOccurrence, LogicalItem, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import CleanupItem, ItemOccurrence, LogicalItem
 
 
 def _write(data_root: Path, relpath: str, content: bytes = b"synthetic") -> Path:
@@ -24,40 +23,26 @@ def _write(data_root: Path, relpath: str, content: bytes = b"synthetic") -> Path
     return path
 
 
-def test_cleanup_plan_selects_only_rebuildable_unprotected_files(tmp_path: Path) -> None:
+def test_cleanup_plan_rejects_legacy_runtime_and_projection_trees_under_data_root(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     settings = Settings(app={"data_root": data_root})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
 
-    candidate_paths = {
-        "runtime/browser-profile/Default/Cache/cache.bin",
-        "runtime/browser-profile/Default/Code Cache/js/code.bin",
+    allowed_paths = {
+        "originals/2026/08/synthetic/source.pdf",
+        "markdown/2026/08/synthetic/source.pdf.md",
+    }
+    prohibited_candidate_paths = {
+        "browser-profile/Default/Cache/cache.bin",
+        "browser-profile/Default/Code Cache/js/code.bin",
         "runtime/reports/status.json",
         "parse/rebuildable.md",
+        "vault/rebuildable.md",
+        "workspace/rebuildable.md",
     }
-    protected_paths = {
-        "raw/done/2026/original.pdf",
-        "runtime/browser-profile/Default/Cookies",
-        "runtime/browser-profile/Default/Local Storage/session.bin",
-        "runtime/browser-profile/Default/Sessions/tab.bin",
-        "parse/active-input.md",
-        "parse/review-required.md",
-    }
-    for relpath in candidate_paths | protected_paths:
+    for relpath in allowed_paths | prohibited_candidate_paths:
         _write(data_root, relpath)
-
-    with Session(engine) as session:
-        session.add(PipelineTask(
-            queue_name="done", priority=1, logical_item_key="synthetic", stage="parse",
-            status="running", idempotency_key="active-task",
-            payload_json=json.dumps({"source_relpath": "parse/active-input.md"}),
-        ))
-        session.add(ReviewEntry(
-            kind="hash_mismatch", details_json=json.dumps({"relative_path": "parse/review-required.md"}),
-            status="pending",
-        ))
-        session.commit()
 
     summary = build_cleanup_plan(
         settings,
@@ -70,11 +55,13 @@ def test_cleanup_plan_selects_only_rebuildable_unprotected_files(tmp_path: Path)
             select(CleanupItem).where(CleanupItem.cleanup_run_id == summary.run_id)
         ).all()
     planned = {row.relative_path for row in rows}
-    assert planned == candidate_paths
-    assert summary.candidate_count == len(candidate_paths)
-    assert summary.candidate_bytes == sum((data_root / path).stat().st_size for path in candidate_paths)
+    # The two-root contract permits only originals/ and markdown/ below data_root.
+    # Runtime/cache and derived-work trees must be outside data_root, never cleanup candidates.
+    assert planned == set()
+    assert summary.candidate_count == 0
+    assert summary.candidate_bytes == 0
     assert set(summary.categories) == {"browser_cache", "runtime_reports", "rebuildable_projection"}
-    assert "original.pdf" not in repr(summary)
+    assert "source.pdf" not in repr(summary)
 
 
 def test_sent_pending_orphans_excludes_database_references_and_requires_cleaned_ledger(

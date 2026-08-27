@@ -1,0 +1,22 @@
+# Synthetic examples only. Runtime copies belong in ignored private/classification/.
+initiators:
+  synth.person.internal:
+    role: internal
+    aliases:
+      - Synthetic Internal Person
+  synth.person.external:
+    role: external
+    aliases:
+      - Synthetic External Person
+  synth.person.mixed:
+    role: mixed
+    aliases:
+      - Synthetic Mixed Person
+  synth.person.system:
+    role: system
+    aliases:
+      - Synthetic Workflow Account
+  synth.person.unknown:
+    role: unknown
+    aliases:
+      - Synthetic Unresolved Person

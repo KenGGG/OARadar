@@ -51,9 +51,11 @@ def _health_payload(settings: Settings, *, attempts: int = 1) -> dict:
         except (httpx.HTTPError, ValueError) as exc:
             last_error = exc
             if attempt + 1 < attempts:
-                time.sleep(min(2 ** attempt, 2))
+                time.sleep(min(2**attempt, 2))
     else:
-        raise MineruResponseError(f"MinerU health check failed: {last_error}") from last_error
+        raise MineruResponseError(
+            f"MinerU health check failed: {last_error}"
+        ) from last_error
     if not isinstance(payload, dict):
         raise MineruResponseError("MinerU health check returned an invalid payload")
     return payload
@@ -69,6 +71,12 @@ def mineru_available(settings: Settings) -> bool:
     return True
 
 
+def mineru_engine_version(settings: Settings) -> str:
+    """Return the local MinerU protocol/version used in a parse cache identity."""
+    health = _health_payload(settings)
+    return str(health.get("protocol_version") or health.get("version") or "api-v1")
+
+
 def _validate_member(name: str) -> PurePosixPath:
     member = PurePosixPath(name.replace("\\", "/"))
     if member.is_absolute() or ".." in member.parts or not member.parts:
@@ -80,9 +88,15 @@ def _extract_mineru_zip(payload: bytes, destination: Path) -> Path:
     """Validate every member before extracting and return the main Markdown path."""
     try:
         with zipfile.ZipFile(BytesIO(payload)) as archive:
-            members = [(info, _validate_member(info.filename)) for info in archive.infolist()]
+            members = [
+                (info, _validate_member(info.filename)) for info in archive.infolist()
+            ]
             markdown = sorted(
-                (path for info, path in members if not info.is_dir() and path.suffix.lower() == ".md"),
+                (
+                    path
+                    for info, path in members
+                    if not info.is_dir() and path.suffix.lower() == ".md"
+                ),
                 key=lambda path: (len(path.parts), path.as_posix()),
             )
             if not markdown:
@@ -101,23 +115,31 @@ def _extract_mineru_zip(payload: bytes, destination: Path) -> Path:
     selected = destination.joinpath(*markdown[0].parts)
     try:
         if not selected.read_text(encoding="utf-8").strip():
-            raise MineruResponseError("MinerU ZIP contains no non-empty Markdown result")
+            raise MineruResponseError(
+                "MinerU ZIP contains no non-empty Markdown result"
+            )
     except UnicodeError as exc:
         raise MineruResponseError("MinerU Markdown is not valid UTF-8") from exc
     return selected
 
 
-def _request_parse(file_path: Path, settings: Settings, *, attempts: int = 3) -> httpx.Response:
+def _request_parse(
+    file_path: Path, settings: Settings, *, attempts: int = 3
+) -> httpx.Response:
     last_error: httpx.HTTPError | None = None
     for attempt in range(attempts):
         try:
             with file_path.open("rb") as source, _client(settings) as client:
                 return client.post(
                     "/file_parse",
-                    files={"files": (file_path.name, source, "application/octet-stream")},
+                    files={
+                        "files": (file_path.name, source, "application/octet-stream")
+                    },
                     data={
                         "return_md": "true",
-                        "return_content_list": str(settings.mineru.output_content_list).lower(),
+                        "return_content_list": str(
+                            settings.mineru.output_content_list
+                        ).lower(),
                         "response_format_zip": "true",
                         "return_original_file": "false",
                     },
@@ -125,11 +147,17 @@ def _request_parse(file_path: Path, settings: Settings, *, attempts: int = 3) ->
         except httpx.HTTPError as exc:
             last_error = exc
             if attempt + 1 < attempts:
-                time.sleep(min(2 ** attempt, 2))
+                time.sleep(min(2**attempt, 2))
     raise MineruResponseError(f"MinerU request failed: {last_error}") from last_error
 
 
-def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | None = None) -> ParseResult:
+def parse_with_mineru(
+    file_path: Path,
+    settings: Settings,
+    output_dir: Path | None = None,
+    *,
+    profile_version: str = "legacy",
+) -> ParseResult:
     if not settings.mineru.enabled:
         raise RuntimeError("MinerU is not enabled in configuration")
     file_path = Path(file_path)
@@ -149,7 +177,9 @@ def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | No
     try:
         response = _request_parse(file_path, settings)
         if response.status_code >= 400:
-            raise MineruResponseError(f"MinerU HTTP {response.status_code}: {response.text[:300]}")
+            raise MineruResponseError(
+                f"MinerU HTTP {response.status_code}: {response.text[:300]}"
+            )
         content_type = response.headers.get("content-type", "").lower()
         prefix = response.content.lstrip()[:32].lower()
         if "html" in content_type or prefix.startswith((b"<!doctype html", b"<html")):
@@ -163,7 +193,9 @@ def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | No
         markdown_path = final_dir / relative_markdown
         text = markdown_path.read_text(encoding="utf-8")
         quality = assess_quality(text, file_path)
-        version = str(health.get("protocol_version") or health.get("version") or "api-v1")
+        version = str(
+            health.get("protocol_version") or health.get("version") or "api-v1"
+        )
         return ParseResult(
             output_path=markdown_path,
             engine="mineru",
@@ -175,6 +207,7 @@ def parse_with_mineru(file_path: Path, settings: Settings, output_dir: Path | No
             replacement_char_ratio=quality["replacement_char_ratio"],
             table_count=quality["table_count"],
             image_count=quality["image_count"],
+            profile_version=profile_version,
         )
     finally:
         if staging.exists():

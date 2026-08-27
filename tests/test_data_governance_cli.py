@@ -25,9 +25,9 @@ def test_data_cli_plan_and_status_are_aggregate_only(config_file: Path) -> None:
     status = runner.invoke(app, ["data", "status", "--config", str(config_file)])
 
     assert planned.exit_code == 0, planned.output
-    assert json.loads(planned.output)["candidate_count"] == 1
+    assert json.loads(planned.output)["candidate_count"] == 0
     payload = json.loads(status.output)
-    assert payload["runs"][0]["candidate_count"] == 1
+    assert payload["runs"][0]["candidate_count"] == 0
     assert "synthetic.json" not in status.output
 
 

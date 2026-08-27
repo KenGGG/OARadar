@@ -115,12 +115,15 @@ def replace_archive_prefix(value: str | None, old: str, new: str) -> str | None:
 def markdown_tail_from_archive_path(rel: PurePosixPath) -> PurePosixPath:
     """Return the Markdown workspace-relative tail for an archive path.
 
-    The Markdown mirror under ``workspace/raw/sources/oa`` only carries the
-    ``done/...`` or ``pending/...`` suffix, independent of whether the raw
-    archive lives under ``raw/`` or the unified ``archive/raw/oa/`` prefix.
+    Current archives map relative to ``originals/``. Legacy archives preserve
+    their historical ``done/...`` or ``pending/...`` Markdown tail.
     """
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError("archive path must be a safe relative path")
     parts = rel.parts
+    if is_current_archive_path(rel):
+        return PurePosixPath(*parts[len(ARCHIVE_PREFIX.parts):])
     for index, part in enumerate(parts):
         if part in (DONE_SEGMENT, PENDING_SEGMENT) and index + 1 < len(parts):
             return PurePosixPath(*parts[index:])
-    raise ValueError("archive path must contain a done/ or pending/ segment")
+    raise ValueError("archive path must be current or contain a done/ or pending/ segment")

@@ -57,7 +57,7 @@ def test_migrate_archive_paths_dry_run_does_not_move(config_file) -> None:
     assert counts["migrated"] == 2
     # Nothing was moved on disk.
     assert (settings.data_root / "raw/done/unknown/已办事项_x/a.pdf").is_file()
-    assert not (settings.data_root / "archive").exists()
+    assert not (settings.data_root / "originals").exists()
 
 
 def test_migrate_archive_paths_moves_and_rewrites_db(config_file) -> None:
@@ -71,23 +71,23 @@ def test_migrate_archive_paths_moves_and_rewrites_db(config_file) -> None:
     assert counts["migrated"] == 2
 
     # Directories moved under the unified prefix.
-    assert (settings.data_root / "archive/raw/oa/done/unknown/已办事项_x/a.pdf").is_file()
-    assert (settings.data_root / "archive/raw/oa/pending/1/5/b.pdf").is_file()
+    assert (settings.data_root / "originals/unknown/unknown_已办事项/a.pdf").is_file()
+    assert (settings.data_root / "originals/pending/1/5/b.pdf").is_file()
     # Source leaf directories are gone (empty parent dirs may remain).
     assert not (settings.data_root / "raw/done/unknown/已办事项_x").exists()
     assert not (settings.data_root / "raw/pending/1/5").exists()
 
     with Session(engine) as session:
         done = session.get(OAItem, done_id)
-        assert done.archive_relpath == "archive/raw/oa/done/unknown/已办事项_x"
+        assert done.archive_relpath == "originals/unknown/unknown_已办事项"
         f = session.scalar(select(ArchivedFile).where(ArchivedFile.oa_item_id == done_id))
-        assert f.local_relpath == "archive/raw/oa/done/unknown/已办事项_x/a.pdf"
+        assert f.local_relpath == "originals/unknown/unknown_已办事项/a.pdf"
         manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == "done:x"))
-        assert manifest.archive_relpath == "archive/raw/oa/done/unknown/已办事项_x"
+        assert manifest.archive_relpath == "originals/unknown/unknown_已办事项"
         pending = session.get(OAItem, pending_id)
-        assert pending.archive_relpath == "archive/raw/oa/pending/1/5"
+        assert pending.archive_relpath == "originals/pending/1/5"
         pf = session.scalar(select(ArchivedFile).where(ArchivedFile.oa_item_id == pending_id))
-        assert pf.local_relpath == "archive/raw/oa/pending/1/5/b.pdf"
+        assert pf.local_relpath == "originals/pending/1/5/b.pdf"
 
 
 def test_migrate_archive_paths_preserves_every_source_byte(config_file) -> None:
@@ -108,7 +108,7 @@ def test_migrate_archive_paths_preserves_every_source_byte(config_file) -> None:
     with Session(engine) as session:
         counts = migrate_archive_paths(session, settings, dry_run=False)
 
-    target = settings.data_root / "archive/raw/oa/done/unknown/已办事项_x"
+    target = settings.data_root / "originals/unknown/unknown_已办事项"
     after = {
         path.relative_to(target).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in target.rglob("*") if path.is_file()

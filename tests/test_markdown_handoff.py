@@ -55,7 +55,7 @@ def test_enqueue_missing_markdown_tasks_picks_up_verified(config_file) -> None:
         item = _make_item(session, "done:1")
         session.add(item); session.flush()
         f = _make_verified_file(session, item.id, role=MARKDOWN_SOURCE_ROLES[0],
-                                relpath="archive/raw/oa/done/2026/07/OA-1/attachments/报告.pdf")
+                                relpath="originals/2026/07/OA-1/attachments/报告.pdf")
         session.commit()
         fid = f.id
 
@@ -74,7 +74,7 @@ def test_enqueue_missing_markdown_tasks_skips_non_source_and_unverified(config_f
         item = _make_item(session, "done:2")
         session.add(item); session.flush()
         # role not in MARKDOWN_SOURCE_ROLES -> skipped
-        _make_verified_file(session, item.id, role="thumbnail", relpath="archive/raw/oa/done/x/t.png")
+        _make_verified_file(session, item.id, role="thumbnail", relpath="originals/unknown/x/t.png")
         # not verified -> skipped
         _make_verified_file(session, item.id, role=MARKDOWN_SOURCE_ROLES[0],
                             relpath=None, status="download_failed")
@@ -91,7 +91,7 @@ def test_enqueue_missing_markdown_tasks_idempotent_with_export(config_file) -> N
         item = _make_item(session, "done:3")
         session.add(item); session.flush()
         f = _make_verified_file(session, item.id, role=MARKDOWN_SOURCE_ROLES[0],
-                                relpath="archive/raw/oa/done/2026/07/OA-3/报告.pdf")
+                                relpath="originals/2026/07/OA-3/报告.pdf")
         session.flush()
         # Already successfully converted -> must not be re-queued.
         session.add(MarkdownExport(
@@ -109,14 +109,14 @@ def test_enqueue_missing_markdown_tasks_idempotent_with_export(config_file) -> N
 def test_audit_handoff_reports_counts(config_file) -> None:
     settings, engine = _engine(config_file)
     # Write a real verified source file so the on-disk existence check passes.
-    src = settings.data_root / "archive/raw/oa/done/2026/07/OA-4/报告.pdf"
+    src = settings.data_root / "originals/2026/07/OA-4/报告.pdf"
     src.parent.mkdir(parents=True)
     src.write_bytes(b"%PDF-1.4 synthetic")
     with Session(engine) as session:
         item = _make_item(session, "done:4")
         session.add(item); session.flush()
         f = _make_verified_file(session, item.id, role=MARKDOWN_SOURCE_ROLES[0],
-                                relpath="archive/raw/oa/done/2026/07/OA-4/报告.pdf")
+                                relpath="originals/2026/07/OA-4/报告.pdf")
         session.flush()
         session.add(MarkdownExport(
             source_file_id=f.id, source_relpath=f.local_relpath, markdown_relpath="workspace/raw/sources/oa/done/2026/07/OA-4/报告.pdf.md",
@@ -127,7 +127,7 @@ def test_audit_handoff_reports_counts(config_file) -> None:
         session.flush()
         # An orphan export (no backing ArchivedFile) whose source is also missing.
         session.add(MarkdownExport(
-            source_file_id=None, source_relpath="archive/raw/oa/done/missing/报告.pdf",
+            source_file_id=None, source_relpath="originals/unknown/missing/报告.pdf",
             markdown_relpath="workspace/raw/sources/oa/done/missing/报告.pdf.md",
             schema_version=SCHEMA_VERSION, status="success", source_sha256="0" * 64, parse_engine="direct-text", parse_engine_version="1", parse_config_hash="cfg",
         ))
@@ -145,12 +145,12 @@ def test_audit_handoff_reports_counts(config_file) -> None:
     assert report["missing_paths"] >= 1
 
 
-def test_markdown_output_path_excludes_archive_prefix(config_file) -> None:
-    # Plan §4.3: the raw archive prefix must not appear inside the workspace mirror.
+def test_markdown_output_path_mirrors_originals_under_markdown_root(config_file) -> None:
+    # The Markdown mirror is rooted at the distinct Markdown tree, never under originals.
     settings = load_settings(config_file)
     raw = settings.archive_root
-    source = settings.data_root / "archive/raw/oa/done/2026/07/OA-1/attachments/报告.pdf"
+    source = settings.data_root / "originals/2026/07/OA-1/attachments/报告.pdf"
     target = markdown_path_for_source(source, raw, settings.markdown_root)
-    rel = target.relative_to(settings.workspace_root).as_posix()
-    assert "archive/raw" not in rel
-    assert "sources/oa/done/2026/07/OA-1/attachments/报告.pdf.md" in rel
+    rel = target.relative_to(settings.markdown_root).as_posix()
+    assert "originals" not in rel
+    assert rel == "2026/07/OA-1/attachments/报告.pdf.md"

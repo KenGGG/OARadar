@@ -21,7 +21,8 @@ dependencies = [
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "itsdangerous>=2.2,<3",
-  "markitdown[docx,xlsx,pptx,pdf]>=0.1",
+  "markitdown[docx,xls,xlsx,pptx,pdf]>=0.1",
+  "olefile>=0.47,<1",
   "pymupdf>=1.24",
   "uvicorn>=0.35,<1",
 ]

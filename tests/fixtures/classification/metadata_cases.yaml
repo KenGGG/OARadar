@@ -1,0 +1,296 @@
+cases:
+  - id: internal_title_template
+    item:
+      item_key: synthetic-001
+      title: "Synthetic internal approval: equipment request"
+      initiator: synth.person.unknown
+    expected:
+      evidence_scopes: [package]
+      status: classified
+      origin: internal
+      business_category: 08_synthetic_administration
+      canonical_issuer: null
+      confidence: 0.96
+      decision_source: metadata_rule
+      transfer_chain: []
+      relay_from: null
+      action: resolved
+
+  - id: external_title_template
+    item:
+      item_key: synthetic-002
+      title: "Synthetic external circulation: policy notice"
+      initiator: synth.person.unknown
+    expected:
+      evidence_scopes: [package]
+      status: classified
+      origin: external
+      business_category: null
+      canonical_issuer: Synthetic Records Authority
+      confidence: 0.97
+      decision_source: metadata_rule
+      transfer_chain: []
+      relay_from: null
+      action: resolved
+
+  - id: document_number_mapping
+    item:
+      item_key: synthetic-003
+      title: "Circulation of SYN-AUTH-2026-7"
+      initiator: synth.person.internal
+      document_number: SYN-AUTH-2026-7
+    expected:
+      evidence_scopes: [package]
+      status: classified
+      origin: external
+      business_category: null
+      canonical_issuer: Synthetic Records Authority
+      confidence: 0.99
+      decision_source: metadata_rule
+      transfer_chain: []
+      relay_from: null
+      action: resolved
+
+  - id: explicit_issuer_alias_normalization
+    item:
+      item_key: synthetic-004
+      title: "Synthetic incoming material"
+      initiator: synth.person.unknown
+      issuer: "  ＳＲＡ  "
+    expected:
+      evidence_scopes: [package]
+      status: classified
+      origin: external
+      business_category: null
+      canonical_issuer: Synthetic Records Authority
+      confidence: 0.99
+      decision_source: metadata_rule
+      transfer_chain: []
+      relay_from: null
+      action: resolved
+
+  - id: direct_internal_transfer
+    item:
+      item_key: synthetic-005
+      title: "Forward: synthetic working note"
+      initiator: synth.person.internal.beta
+      transfer_people: [synth.person.internal, synth.person.internal.beta]
+    expected:
+      evidence_scopes: [package]
+      status: needs_review
+      origin: internal
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.92
+      decision_source: null
+      transfer_chain: [synth.person.internal, synth.person.internal.beta]
+      relay_from: synth.person.internal
+      action: needs_review
+
+  - id: three_level_internal_transfer
+    item:
+      item_key: synthetic-006
+      title: "Forward: synthetic multi-hop note"
+      initiator: synth.person.internal.gamma
+      transfer_people:
+        - synth.person.internal
+        - synth.person.internal.beta
+        - synth.person.internal.gamma
+    expected:
+      evidence_scopes: [package]
+      status: needs_review
+      origin: internal
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.92
+      decision_source: null
+      transfer_chain:
+        - synth.person.internal
+        - synth.person.internal.beta
+        - synth.person.internal.gamma
+      relay_from: synth.person.internal.beta
+      action: needs_review
+
+  - id: internal_initiator_fallback
+    item:
+      item_key: synthetic-007
+      title: "Synthetic neutral work item"
+      initiator: synth.person.internal
+    expected:
+      evidence_scopes: [package]
+      status: needs_review
+      origin: internal
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.86
+      decision_source: null
+      transfer_chain: []
+      relay_from: null
+      action: needs_review
+
+  - id: external_initiator_without_issuer
+    item:
+      item_key: synthetic-008
+      title: "Synthetic neutral incoming item"
+      initiator: synth.person.external
+    expected:
+      evidence_scopes: [package]
+      status: needs_review
+      origin: null
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.86
+      decision_source: null
+      transfer_chain: []
+      relay_from: null
+      action: needs_review
+
+  - id: mixed_initiator_observable
+    item:
+      item_key: synthetic-009
+      title: "Synthetic neutral mixed item"
+      initiator: synth.person.mixed
+    expected:
+      evidence_scopes: [package]
+      status: needs_review
+      origin: null
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.0
+      decision_source: null
+      transfer_chain: []
+      relay_from: null
+      action: needs_review
+
+  - id: system_initiator_observable
+    item:
+      item_key: synthetic-010
+      title: "Synthetic workflow notification"
+      initiator: synth.person.system
+    expected:
+      evidence_scopes: [package]
+      status: needs_review
+      origin: null
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.0
+      decision_source: null
+      transfer_chain: []
+      relay_from: null
+      action: needs_review
+
+  - id: unknown_initiator_observable
+    item:
+      item_key: synthetic-011
+      title: "Synthetic unknown item"
+      initiator: synth.person.unknown
+    expected:
+      evidence_scopes: [package]
+      status: needs_review
+      origin: null
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.0
+      decision_source: null
+      transfer_chain: []
+      relay_from: null
+      action: needs_review
+
+  - id: package_internal_with_external_attachment
+    item:
+      item_key: synthetic-012
+      title: "Synthetic internal approval: review incoming policy"
+      initiator: synth.person.internal
+      attachments:
+        - attachment_key: synthetic-att-1
+          filename: synthetic-policy.pdf
+          document_number: SYN-AUTH-2026-12
+    expected:
+      evidence_scopes: [attachment, package]
+      status: classified
+      origin: internal
+      business_category: 08_synthetic_administration
+      canonical_issuer: null
+      confidence: 0.96
+      decision_source: metadata_rule
+      transfer_chain: []
+      relay_from: null
+      action: resolved
+
+  - id: package_document_overrides_internal_initiator
+    item:
+      item_key: synthetic-013
+      title: "Synthetic incoming formal document"
+      initiator: synth.person.internal
+      document_number: SYN-AUTH-2026-13
+    expected:
+      evidence_scopes: [package]
+      status: classified
+      origin: external
+      business_category: null
+      canonical_issuer: Synthetic Records Authority
+      confidence: 0.99
+      decision_source: metadata_rule
+      transfer_chain: []
+      relay_from: null
+      action: resolved
+
+  - id: equal_priority_issuer_conflict
+    item:
+      item_key: synthetic-014
+      title: "Synthetic conflicting formal document"
+      initiator: synth.person.internal
+      document_number: SYN-AUTH-2026-14
+      issuer: Synthetic Alternate Authority
+      attachments:
+        - attachment_key: synthetic-att-2
+          filename: evidence.pdf
+    expected:
+      evidence_scopes: [attachment, package]
+      status: needs_review
+      origin: null
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.99
+      decision_source: null
+      transfer_chain: []
+      relay_from: null
+      action: parse_attachment
+
+  - id: unresolved_with_attachment_escalates_parse
+    item:
+      item_key: synthetic-015
+      title: "Synthetic neutral item with file"
+      initiator: synth.person.unknown
+      attachments:
+        - attachment_key: synthetic-att-3
+          filename: unknown.pdf
+    expected:
+      evidence_scopes: [attachment, package]
+      status: needs_review
+      origin: null
+      business_category: null
+      canonical_issuer: null
+      confidence: 0.0
+      decision_source: null
+      transfer_chain: []
+      relay_from: null
+      action: parse_attachment
+
+  - id: conservative_title_normalization
+    item:
+      item_key: synthetic-016
+      title: "【8月25日 12时】（第3次）  Synthetic   internal approval: 转发 SYN-AUTH-2026-88"
+      initiator: synth.person.unknown
+    expected:
+      evidence_scopes: [package]
+      status: classified
+      origin: internal
+      business_category: 08_synthetic_administration
+      canonical_issuer: null
+      confidence: 0.96
+      decision_source: metadata_rule
+      normalized_title: "Synthetic internal approval: 转发 SYN-AUTH-2026-88"
+      transfer_chain: []
+      relay_from: null
+      action: resolved

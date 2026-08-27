@@ -41,7 +41,7 @@ def publication_relpath(decision: DocumentDecision, *, fallback_date: str, colli
     year = date[:4] if len(date) >= 4 and date[:4].isdigit() else "未知年份"
     month = date[:7] if len(date) >= 7 and date[:4].isdigit() else "未知月份"
     title = sanitize_component(decision.normalized_title, collision_key=collision_key)
-    root = PurePosixPath("workspace", "curated", "oa")
+    root = PurePosixPath("curated", "oa")
     if decision.document_kind == "formal":
         issuer = sanitize_component(decision.issuer, collision_key=collision_key)
         number = sanitize_component(decision.document_number, collision_key=collision_key)

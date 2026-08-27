@@ -104,6 +104,69 @@ def require_engine(settings: Settings):
     return create_db_engine(settings.database_path)
 
 
+@app.command("backfill-mvp")
+def backfill_mvp_command(
+    run_id: str = typer.Option(..., "--run-id", help="Safe candidate run identifier"),
+    sample_size: int = typer.Option(100, "--sample-size", min=1, max=6144),
+    all_targets: bool = typer.Option(False, "--all-targets"),
+    config: Path | None = typer.Option(
+        None, "--config", exists=True, dir_okay=False
+    ),
+) -> None:
+    """Build an isolated candidate for a representative sample or all targets."""
+    from sqlalchemy.orm import sessionmaker
+
+    from oa_knowledge.backfill_mvp import (
+        BackfillMVPRequest,
+        BackfillMVPService,
+    )
+    from oa_knowledge.classification.private_config import (
+        load_private_classification_config,
+    )
+
+    settings = settings_option(config)
+    if settings.classification_private_dir is None:
+        typer.echo("classification private directory is not configured", err=True)
+        raise typer.Exit(1)
+    loaded = load_private_classification_config(settings.classification_private_dir)
+    engine = require_engine(settings)
+    try:
+        factory = sessionmaker(engine, expire_on_commit=False)
+        result = BackfillMVPService(
+            settings,
+            factory,
+            loaded.config,
+            private_config_sha256=loaded.config_sha256,
+        ).run(
+            BackfillMVPRequest(
+                run_id=run_id,
+                sample_size=sample_size,
+                all_targets=all_targets,
+            )
+        )
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": result.run_id,
+                    "output_root": str(result.output_root),
+                    "processed": result.processed,
+                    "packages": result.packages,
+                    "classified": result.classified,
+                    "needs_review": result.needs_review,
+                    "attachments_converted": result.attachments_converted,
+                    "attachments_failed": result.attachments_failed,
+                    "attachments_skipped": result.attachments_skipped,
+                    "exceptions": len(result.exceptions),
+                    "reconciled": True,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    finally:
+        engine.dispose()
+
+
 def _has_verified_attachment(session: Session, oa_item_key: str) -> bool:
     return bool(session.scalar(
         select(func.count()).select_from(ArchivedFile).join(OAItem).where(
@@ -934,8 +997,10 @@ def verified_attachment_resolver(engine, data_root: Path):
 def init_command(config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False)) -> None:
     settings = settings_option(config)
     secure_dir(settings.data_root)
-    for relative in ("state", "archive/raw/oa/pending", "archive/raw/oa/done", "parse/artifacts", "parse/staging", "parse/failed", "runtime", "logs", "backups", "workspace/raw/sources/oa/pending", "workspace/raw/sources/oa/done", "workspace/wiki"):
+    for relative in ("originals", "markdown"):
         secure_dir(settings.data_root / relative)
+    for root in (settings.state_root, settings.cache_root, settings.runtime_root):
+        secure_dir(root)
     upgrade_database(settings.database_path)
     os.chmod(settings.database_path, 0o600)
     typer.echo(f"initialized: {settings.data_root}")

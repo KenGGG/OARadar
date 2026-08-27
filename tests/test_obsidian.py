@@ -128,7 +128,10 @@ def test_wikilink_get_related() -> None:
 
 def test_publish_pipeline_creates_vault_structure(tmp_path: Path) -> None:
     """PublishPipeline should create vault directory structure."""
-    settings = Settings(app={"data_root": str(tmp_path)})
+    settings = Settings(
+        app={"data_root": str(tmp_path / "data")},
+        runtime={"state_root": tmp_path / "state", "cache_root": tmp_path / "cache"},
+    )
     vault_root = tmp_path / "vault"
     vault_root.mkdir()
     pipeline = PublishPipeline(settings, vault_root=vault_root)
@@ -138,7 +141,7 @@ def test_publish_pipeline_creates_vault_structure(tmp_path: Path) -> None:
     from oa_knowledge.db.migrate import upgrade_database
     from oa_knowledge.db.models import OAItem
 
-    db_path = tmp_path / "state" / "oa.db"
+    db_path = settings.database_path
     upgrade_database(db_path)
     engine = create_db_engine(db_path)
 

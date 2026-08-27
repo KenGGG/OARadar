@@ -241,7 +241,7 @@ class ProductionQueue:
             )
             canonical_keys = select(OAItem.oa_item_key).where(
                 OAItem.source_channel == "done",
-                OAItem.archive_relpath.like("archive/raw/oa/done/%"),
+                OAItem.archive_relpath.like("originals/%"),
             )
             rows = db_session.scalars(select(PipelineTask).where(
                 PipelineTask.queue_name == "historical_done_backfill",
@@ -298,7 +298,7 @@ class ProductionQueue:
             )
             canonical_keys = select(OAItem.oa_item_key).where(
                 OAItem.source_channel == "done",
-                OAItem.archive_relpath.like("archive/raw/oa/done/%"),
+                OAItem.archive_relpath.like("originals/%"),
             )
             rows = db_session.scalars(select(PipelineTask).where(
                 PipelineTask.queue_name == "historical_done_backfill",
@@ -430,6 +430,32 @@ class ProductionQueue:
                 conditions.append(PipelineTask.queue_name.in_(queue_names))
             if self.historical_paused(session):
                 conditions.append(PipelineTask.queue_name != "historical_done_backfill")
+            # Only the newest completed online audit may authorize history. An
+            # older completed run becomes stale as soon as a newer run is
+            # queued/running/reopened, and first deploy remains fail-closed.
+            canonical_done_keys = select(OAItem.oa_item_key).where(
+                OAItem.source_channel == "done",
+                OAItem.archive_relpath.like("originals/%"),
+            )
+            latest_audit_id = select(func.max(OnlineAuditRun.id)).scalar_subquery()
+            latest_audit_completed = exists(select(OnlineAuditRun.id).where(
+                OnlineAuditRun.id == latest_audit_id,
+                OnlineAuditRun.status == "completed",
+            ))
+            verified_done_keys = select(OnlineAuditItem.oa_item_key).where(
+                OnlineAuditItem.run_id == latest_audit_id,
+                OnlineAuditItem.status.in_(SAFE_AUDIT_STATUSES),
+                OnlineAuditItem.comparison_reason.in_(SAFE_COMPARISON_REASONS),
+                OnlineAuditItem.depth_limit_reached.is_(False),
+            )
+            conditions.append(or_(
+                PipelineTask.queue_name != "historical_done_backfill",
+                and_(
+                    latest_audit_completed,
+                    PipelineTask.logical_item_key.in_(canonical_done_keys),
+                    PipelineTask.logical_item_key.in_(verified_done_keys),
+                ),
+            ))
             history_wave = case(
                 (PipelineTask.queue_name == "historical_done_backfill", cast((PipelineTask.id - 1) / HISTORY_WAVE_SIZE, Integer)),
                 else_=0,

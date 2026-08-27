@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import tempfile
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from oa_knowledge.archive.integrity import sha256_text
+from oa_knowledge.parsers.format_router import detect_format, parser_attempts
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +26,45 @@ class ParseResult:
     replacement_char_ratio: float = 0.0
     table_count: int = 0
     image_count: int = 0
+    profile_version: str = "legacy"
 
     @property
     def config_hash(self) -> str:
-        payload = json.dumps({
-            "engine": self.engine,
-            "engine_version": self.engine_version,
-            "quality_score": self.quality_score,
-        }, sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(
+            {
+                "engine": self.engine,
+                "engine_version": self.engine_version,
+                "quality_score": self.quality_score,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return sha256_text(payload)
+
+
+def resolve_parser_version(engine: str, settings) -> str:
+    """Return a selected parser's implementation identity for a cache key.
+
+    The caller records this value before dispatching a versioned parse request;
+    it prevents a parser upgrade from silently reusing an older derivative.
+    """
+    if engine == "markitdown":
+        from oa_knowledge.parsers.markitdown_parser import markitdown_engine_version
+
+        return markitdown_engine_version()
+    if engine == "mineru":
+        from oa_knowledge.parsers.mineru_parser import mineru_engine_version
+
+        return mineru_engine_version(settings)
+    if engine == "wv":
+        from oa_knowledge.parsers.wv_parser import wv_engine_version
+
+        return wv_engine_version(settings)
+    if engine == "libreoffice":
+        from oa_knowledge.parsers.libreoffice_parser import libreoffice_engine_version
+
+        return libreoffice_engine_version()
+    raise ValueError(f"Unknown engine: {engine}")
 
 
 def preflight(file_path: Path) -> dict:
@@ -101,7 +131,7 @@ def preflight(file_path: Path) -> dict:
                 for img in images:
                     try:
                         rect = page.get_image_rects(img[0])
-                        for r in (rect if isinstance(rect, list) else [rect]):
+                        for r in rect if isinstance(rect, list) else [rect]:
                             if isinstance(r, fitz.Rect):
                                 total_image_area += r.width * r.height
                     except Exception:
@@ -117,7 +147,9 @@ def preflight(file_path: Path) -> dict:
                 info["text_chars_per_page"] = round(total_chars / doc.page_count, 1)
 
             # Heuristic hints
-            info["has_tables_hint"] = total_chars > 100 and _detect_table_pattern(file_path)
+            info["has_tables_hint"] = total_chars > 100 and _detect_table_pattern(
+                file_path
+            )
             info["has_large_images"] = (
                 info["image_area_ratio"] > 0.15 and info["has_embedded_text"] is False
             )
@@ -143,7 +175,8 @@ def _detect_table_pattern(file_path: Path) -> bool:
                     return True
                 # Alternating dash patterns
                 dash_lines = sum(
-                    1 for line in text.split("\n")
+                    1
+                    for line in text.split("\n")
                     if re.search(r"[+-]+\s+\|[+-]+\s+\|", line)
                 )
                 if dash_lines > 0:
@@ -159,6 +192,7 @@ def parse_file(
     settings,
     engine: str | None = None,
     output_dir: Path | None = None,
+    profile_version: str = "legacy",
 ) -> ParseResult:
     """Route a file to the best available parser engine.
 
@@ -172,64 +206,59 @@ def parse_file(
         - Other -> MarkItDown
     """
     from oa_knowledge.parsers.markitdown_parser import parse_with_markitdown
-    from oa_knowledge.parsers.mineru_parser import parse_with_mineru, mineru_available
+    from oa_knowledge.parsers.mineru_parser import mineru_available, parse_with_mineru
 
     file_path = Path(file_path)
     if not file_path.is_file():
         raise FileNotFoundError(f"File not found: {file_path}")
 
+    decision = detect_format(file_path)
+
     # Explicit engine override
     if engine:
         if engine == "markitdown":
-            return parse_with_markitdown(file_path, output_dir)
+            return parse_with_markitdown(
+                file_path, output_dir, profile_version=profile_version
+            )
         if engine == "mineru":
-            if file_path.suffix.lower() == ".pdf" and preflight(file_path).get("is_encrypted"):
+            if decision.actual_file_type == "pdf" and preflight(file_path).get(
+                "is_encrypted"
+            ):
                 raise RuntimeError("encrypted_document")
             # An explicit campaign request is authoritative. parse_with_mineru
             # performs its own retried health check; a separate probe here used
             # to reject healthy work whenever the GPU service was briefly busy.
-            return parse_with_mineru(file_path, settings, output_dir)
+            return parse_with_mineru(
+                file_path, settings, output_dir, profile_version=profile_version
+            )
+        if engine == "wv":
+            from oa_knowledge.parsers.wv_parser import parse_with_wv
+
+            return parse_with_wv(
+                file_path, settings, output_dir, profile_version=profile_version
+            )
+        if engine == "libreoffice":
+            from oa_knowledge.parsers.libreoffice_parser import parse_with_libreoffice
+
+            return parse_with_libreoffice(
+                file_path, output_dir, profile_version=profile_version
+            )
         raise ValueError(f"Unknown engine: {engine}")
 
-    # Preflight analysis
-    info = preflight(file_path)
-
-    # Handle encrypted/corrupted
-    if info.get("is_encrypted"):
-        raise RuntimeError("encrypted_document")
-    if info.get("is_corrupted"):
-        raise RuntimeError("corrupted_file")
-
-    suffix = file_path.suffix.lower()
-
-    # Office files always go to MarkItDown
-    if suffix in {".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls"}:
-        return parse_with_markitdown(file_path, output_dir)
-
-    # PDF routing
-    if suffix == ".pdf":
-        text_per_page = info.get("text_chars_per_page", 0)
-        image_ratio = info.get("image_area_ratio", 0)
-        has_tables = info.get("has_tables_hint", False)
-        has_large_images = info.get("has_large_images", False)
-
-        # Scanned / image-heavy PDF -> MinerU preferred
-        if has_large_images or (info.get("has_embedded_text") is False and text_per_page < 20):
-            if mineru_available(settings):
-                return parse_with_mineru(file_path, settings, output_dir)
-            # Fallback to MarkItDown if MinerU unavailable
-            return parse_with_markitdown(file_path, output_dir)
-
-        # PDF with tables -> MinerU preferred for better table handling
-        if has_tables and mineru_available(settings):
-            return parse_with_mineru(file_path, settings, output_dir)
-
-        # Digital PDF (good text density, low image ratio) -> MarkItDown
-        if text_per_page > 50 and image_ratio < 0.1:
-            return parse_with_markitdown(file_path, output_dir)
-
-        # Default PDF -> MarkItDown
-        return parse_with_markitdown(file_path, output_dir)
-
-    # Everything else -> MarkItDown
-    return parse_with_markitdown(file_path, output_dir)
+    if decision.status_code != "parseable":
+        raise RuntimeError(decision.status_code)
+    if decision.is_direct_text:
+        return parse_with_markitdown(file_path, output_dir, profile_version=profile_version)
+    engines = parser_attempts(decision, mineru_enabled=mineru_available(settings))
+    if not engines:
+        raise RuntimeError("unsupported_file_type")
+    primary = engines[0]
+    if primary == "mineru":
+        if decision.actual_file_type == "pdf":
+            info = preflight(file_path)
+            if info.get("is_encrypted"):
+                raise RuntimeError("encrypted_document")
+            if info.get("is_corrupted"):
+                raise RuntimeError("corrupted_file")
+        return parse_with_mineru(file_path, settings, output_dir, profile_version=profile_version)
+    return parse_with_markitdown(file_path, output_dir, profile_version=profile_version)

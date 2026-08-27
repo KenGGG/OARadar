@@ -119,21 +119,9 @@ def inventory_candidates(
             return
         candidates.setdefault(relpath, _candidate(settings, path, category, reason))
 
-    if "browser_cache" in categories:
-        profile = settings.data_root / settings.browser.user_data_dir
-        cache_names = {"Cache", "Code Cache", "GPUCache"}
-        for path in _files(profile):
-            if cache_names.intersection(path.relative_to(profile).parts):
-                add(path, "browser_cache", "rebuildable_browser_cache")
-
-    if "runtime_reports" in categories:
-        for path in _files(settings.data_root / "runtime/reports"):
-            add(path, "runtime_reports", "rebuildable_runtime_report")
-
-    if "rebuildable_projection" in categories:
-        for root_name in ("parse", "vault", "workspace"):
-            for path in _files(settings.data_root / root_name):
-                add(path, "rebuildable_projection", "rebuildable_derived_output")
+    # Browser/cache/runtime/projection data now lives outside ``data_root``.
+    # This legacy inventory ledger stores only data-root-relative paths, so
+    # these categories fail closed until a root-qualified ledger exists.
 
     if "expired_backups" in categories:
         for root_name in ("runtime/backups", "state/backups"):
