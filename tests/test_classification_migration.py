@@ -184,6 +184,35 @@ def test_0038_upgrade_and_downgrade_are_exact(tmp_path: Path) -> None:
     assert _parse_schema_snapshot(database_path) == before
 
 
+def test_0039_binds_run_items_to_adopted_decisions(tmp_path: Path) -> None:
+    database_path = tmp_path / "classification-adopted-decision.db"
+    upgrade_database(database_path)
+    command.downgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
+
+    command.upgrade(
+        _alembic_config(database_path), "0039_classification_run_adopted_decision"
+    )
+    engine = create_db_engine(database_path)
+    inspector = inspect(engine)
+    columns = {
+        column["name"] for column in inspector.get_columns("classification_run_items")
+    }
+    indexes = {
+        index["name"] for index in inspector.get_indexes("classification_run_items")
+    }
+    assert "adopted_decision_id" in columns
+    assert "ix_classification_run_item_adopted_decision" in indexes
+    engine.dispose()
+
+    command.downgrade(_alembic_config(database_path), "0038_oa_markdown_v1_classification")
+    downgraded = create_db_engine(database_path)
+    assert "adopted_decision_id" not in {
+        column["name"]
+        for column in inspect(downgraded).get_columns("classification_run_items")
+    }
+    downgraded.dispose()
+
+
 def test_0038_preserves_legacy_parse_duplicates_with_deterministic_profiles(
     tmp_path: Path,
 ) -> None:

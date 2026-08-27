@@ -392,6 +392,11 @@ class ClassificationRunItem(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     classification_run_id: Mapped[int] = mapped_column(ForeignKey("classification_runs.id", ondelete="CASCADE"), nullable=False)
     oa_item_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # The immutable decision version this run actually adopted.  Reports must
+    # never infer this from a later run's globally-current decision.
+    adopted_decision_id: Mapped[int | None] = mapped_column(
+        ForeignKey("classification_decisions.id", ondelete="SET NULL")
+    )
     inclusion_reason: Mapped[str] = mapped_column(String(40), nullable=False)
     stage: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

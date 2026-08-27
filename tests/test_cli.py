@@ -47,7 +47,7 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     assert {path.name for path in data_root.iterdir()} == {"originals", "markdown"}
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0038_oa_markdown_v1_classification"
+    assert json.loads(status.output)["schema"] == "0039_classification_run_adopted_decision"
 
 
 def test_schedule_enqueue_creates_worker_job_without_opening_browser(config_file: Path) -> None:

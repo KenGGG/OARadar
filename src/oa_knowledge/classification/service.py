@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.db.models import (
     ClassificationDecision,
+    ClassificationEvidence,
     ClassificationRun,
     ClassificationRunItem,
     OAItem,
@@ -285,6 +286,7 @@ class ClassificationService:
                 supersedes_decision_id=current.id if current else None,
             )
             self._swap_current(session, current, decision)
+            run_item.adopted_decision_id = decision.id
             run_item.stage = "decided"
             self._mirror_compatibility(session, command.oa_item_key, decision)
             return DecisionRef(decision.id, decision.version)
@@ -322,7 +324,7 @@ class ClassificationService:
             if run.status == "created":
                 run.status = "running"
                 run.started_at = _now()
-            row = session.scalar(
+            candidate = session.scalar(
                 select(ClassificationRunItem)
                 .where(
                     ClassificationRunItem.classification_run_id == run.id,
@@ -331,11 +333,19 @@ class ClassificationService:
                 .order_by(ClassificationRunItem.id)
                 .limit(1)
             )
-            if row is None:
+            if candidate is None:
                 return None
-            row.stage = "metadata"
-            row.attempts += 1
-            return row.id, row.oa_item_key
+            claimed = session.execute(
+                ClassificationRunItem.__table__.update()
+                .where(
+                    ClassificationRunItem.id == candidate.id,
+                    ClassificationRunItem.stage == "queued",
+                )
+                .values(stage="metadata", attempts=ClassificationRunItem.attempts + 1)
+            )
+            if claimed.rowcount != 1:
+                return None
+            return candidate.id, candidate.oa_item_key
 
     def _decide_claimed(self, run_id: str, run_item_id: int, item_key: str) -> None:
         with self._sessions.begin() as session:
@@ -345,12 +355,21 @@ class ClassificationService:
                 return
             current = self._current(session, item_key)
             if current is not None and current.manual_locked:
+                run_item.adopted_decision_id = current.id
+                if (
+                    run_item.inclusion_reason == "excluded"
+                    and current.classification_status != "excluded"
+                ):
+                    run_item.last_error_code = "manual_lock_policy_conflict"
                 run_item.stage = "decided"
                 return
             if run_item.inclusion_reason == "excluded":
                 decision = self._excluded_decision(session, run, item_key, current)
                 if decision is not None:
                     self._swap_current(session, current, decision)
+                    run_item.adopted_decision_id = decision.id
+                elif current is not None:
+                    run_item.adopted_decision_id = current.id
                 run_item.stage = "decided"
                 return
 
@@ -359,14 +378,19 @@ class ClassificationService:
             outcome = classify_from_metadata(evidence)
             if self._outcome_hook is not None:
                 outcome = self._outcome_hook(item, evidence, outcome)
-            input_sha = self._decision_input_sha(item, run_item.inclusion_reason, run)
+            input_sha = self._decision_input_sha(
+                session, item, run_item.inclusion_reason, run
+            )
             if current is not None and current.decision_input_sha256 == input_sha:
+                run_item.adopted_decision_id = current.id
                 run_item.stage = "decided"
                 return
             decision = self._automatic_decision(
                 session, run, item, evidence, outcome, input_sha, current
             )
             self._swap_current(session, current, decision)
+            self._persist_evidence(session, decision, evidence, item_key)
+            run_item.adopted_decision_id = decision.id
             self._mirror_compatibility(session, item_key, decision)
             run_item.stage = "decided"
 
@@ -380,7 +404,6 @@ class ClassificationService:
         input_sha: str,
         current: ClassificationDecision | None,
     ) -> ClassificationDecision:
-        del session
         return ClassificationDecision(
             classification_run_id=run.id,
             oa_item_key=item.item_key,
@@ -389,7 +412,7 @@ class ClassificationService:
             decision_input_sha256=input_sha,
             decision_source=outcome.decision_source or "metadata_rule",
             classification_status=outcome.classification_status,
-            content_integrity_status=self._integrity_status(item.item_key),
+            content_integrity_status=self._integrity_status(session, item.item_key),
             content_origin=outcome.content_origin,
             flow_type=outcome.flow_type,
             initiator=item.initiator,
@@ -426,7 +449,7 @@ class ClassificationService:
         current: ClassificationDecision | None,
     ) -> ClassificationDecision | None:
         item = self._classification_item(session, item_key)
-        input_sha = self._decision_input_sha(item, "excluded", run)
+        input_sha = self._decision_input_sha(session, item, "excluded", run)
         if current is not None and current.decision_input_sha256 == input_sha:
             return None
         return ClassificationDecision(
@@ -437,7 +460,7 @@ class ClassificationService:
             decision_input_sha256=input_sha,
             decision_source="metadata_rule",
             classification_status="excluded",
-            content_integrity_status=self._integrity_status(item_key),
+            content_integrity_status=self._integrity_status(session, item_key),
             content_origin=None,
             flow_type=None,
             initiator=item.initiator,
@@ -482,7 +505,7 @@ class ClassificationService:
         item = session.scalar(select(OAItem).where(OAItem.oa_item_key == item_key))
         if manifest is None and item is None:
             raise ValueError("frozen OA item no longer exists")
-        owner = item or manifest
+        owner = manifest or item
         files = list(item.files) if item is not None else []
         return ClassificationItem(
             item_key=item_key,
@@ -498,12 +521,70 @@ class ClassificationService:
         )
 
     def _decision_input_sha(
-        self, item: ClassificationItem, inclusion_reason: str, run: ClassificationRun
+        self,
+        session: Session,
+        item: ClassificationItem,
+        inclusion_reason: str,
+        run: ClassificationRun,
     ) -> str:
+        manifest = session.scalar(
+            select(OAManifestItem).where(OAManifestItem.oa_item_key == item.item_key)
+        )
+        owner = session.scalar(
+            select(OAItem).where(OAItem.oa_item_key == item.item_key)
+        )
+        attachment_inventory = []
+        if owner is not None:
+            attachment_inventory = [
+                {
+                    "attachment_key": row.attachment_key,
+                    "file_role": row.file_role,
+                    "source_container_key": row.source_container_key,
+                    "parent_file_id": row.parent_file_id,
+                    "depth": row.depth,
+                    "sha256": row.sha256.lower() if row.sha256 else None,
+                    "size_bytes": row.size_bytes,
+                    "download_status": row.download_status,
+                }
+                for row in sorted(
+                    owner.files,
+                    key=lambda row: (
+                        row.source_container_key,
+                        row.attachment_key,
+                        row.file_role,
+                        row.id,
+                    ),
+                )
+            ]
         return _sha256(
             {
                 "item": asdict(item),
                 "inclusion_reason": inclusion_reason,
+                "manifest": {
+                    "title": manifest.title if manifest else None,
+                    "sender": manifest.sender if manifest else None,
+                    "processing_status": manifest.processing_status
+                    if manifest
+                    else None,
+                    "no_attachment_confirmed": manifest.no_attachment_confirmed
+                    if manifest
+                    else None,
+                    "matched_exclusion_keyword": manifest.matched_exclusion_keyword
+                    if manifest
+                    else None,
+                    "completed_at": manifest.completed_at.isoformat()
+                    if manifest and manifest.completed_at
+                    else None,
+                },
+                "item_metadata": {
+                    "title": owner.title if owner else None,
+                    "sender": owner.sender if owner else None,
+                    "document_number": owner.document_number if owner else None,
+                    "completed_at": owner.completed_at.isoformat()
+                    if owner and owner.completed_at
+                    else None,
+                },
+                "attachment_inventory": attachment_inventory,
                 "rule_version": run.rule_version,
                 "schema_version": run.schema_version,
                 "prompt_version": run.prompt_version,
@@ -511,18 +592,49 @@ class ClassificationService:
             }
         )
 
-    def _integrity_status(self, item_key: str) -> str:
-        with self._sessions() as session:
-            manifest = session.scalar(
-                select(OAManifestItem).where(OAManifestItem.oa_item_key == item_key)
+    @staticmethod
+    def _integrity_status(session: Session, item_key: str) -> str:
+        manifest = session.scalar(
+            select(OAManifestItem).where(OAManifestItem.oa_item_key == item_key)
+        )
+        if manifest is None:
+            return "not_checked"
+        if manifest.no_attachment_confirmed:
+            return "no_attachment_confirmed"
+        if manifest.processing_status in {"download_failed", "failed"}:
+            return "download_failed"
+        return "ok" if manifest.processing_status == "downloaded" else "not_checked"
+
+    @staticmethod
+    def _persist_evidence(
+        session: Session,
+        decision: ClassificationDecision,
+        evidence: list[Evidence],
+        item_key: str,
+    ) -> None:
+        item = session.scalar(select(OAItem).where(OAItem.oa_item_key == item_key))
+        source_ids = (
+            {file.attachment_key: file.id for file in item.files}
+            if item is not None
+            else {}
+        )
+        for sequence, entry in enumerate(evidence, start=1):
+            value = {
+                key: value
+                for key, value in asdict(entry).items()
+                if value is not None and key not in {"normalized_title"}
+            }
+            session.add(
+                ClassificationEvidence(
+                    classification_decision_id=decision.id,
+                    sequence=sequence,
+                    evidence_type=entry.code,
+                    evidence_scope=entry.evidence_scope,
+                    value_json=_canonical_json(value),
+                    confidence=entry.confidence,
+                    source_file_id=source_ids.get(entry.attachment_key),
+                )
             )
-            if manifest is None:
-                return "not_checked"
-            if manifest.no_attachment_confirmed:
-                return "no_attachment_confirmed"
-            if manifest.processing_status in {"download_failed", "failed"}:
-                return "download_failed"
-            return "ok" if manifest.processing_status == "downloaded" else "not_checked"
 
     @staticmethod
     def _next_version_for_current(current: ClassificationDecision | None) -> int:

@@ -84,15 +84,18 @@ def build_classification_run_report(
                 )
             )
         )
+        adopted_ids = [
+            row.adopted_decision_id for row in rows if row.adopted_decision_id
+        ]
         decisions = {
-            decision.oa_item_key: decision
+            decision.id: decision
             for decision in session.scalars(
                 select(ClassificationDecision).where(
-                    ClassificationDecision.is_current.is_(True)
+                    ClassificationDecision.id.in_(adopted_ids)
                 )
             )
         }
-        frozen = [(row, decisions.get(row.oa_item_key)) for row in rows]
+        frozen = [(row, decisions.get(row.adopted_decision_id)) for row in rows]
         excluded = sum(row.inclusion_reason == "excluded" for row, _ in frozen)
         targets = [
             (row, decision)
@@ -139,13 +142,14 @@ def build_classification_run_report(
         evidence = (
             list(
                 session.scalars(
-                    select(ClassificationEvidence)
-                    .join(ClassificationDecision)
-                    .where(
-                        ClassificationDecision.oa_item_key.in_(
-                            [row.oa_item_key for row, _ in targets]
-                        ),
-                        ClassificationDecision.is_current.is_(True),
+                    select(ClassificationEvidence).where(
+                        ClassificationEvidence.classification_decision_id.in_(
+                            [
+                                decision.id
+                                for _, decision in targets
+                                if decision is not None
+                            ]
+                        )
                     )
                 )
             )
@@ -198,7 +202,13 @@ def build_classification_run_report(
                 for _, decision in targets
                 if decision is not None
             ),
-            conflicts=sum(bool(reason.get("conflict_codes")) for reason in reasons),
+            conflicts=(
+                sum(bool(reason.get("conflict_codes")) for reason in reasons)
+                + sum(
+                    row.last_error_code == "manual_lock_policy_conflict"
+                    for row, _ in frozen
+                )
+            ),
             unrecognized_issuers=sum(
                 _has_unrecognized_issuer(entry.value_json) for entry in evidence
             ),
