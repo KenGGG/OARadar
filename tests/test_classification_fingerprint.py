@@ -174,17 +174,28 @@ def test_fingerprint_is_a_lowercase_sha256_and_stable_across_row_mapping_and_rel
             ),
         ),
         lambda value: replace(
-            value,
-            content_integrity_status="missing",
-            readiness_evidence=replace(
-                value.readiness_evidence,
-                audit_status="missing_download",
-                audit_finished_at="2026-08-26T09:00:00Z",
-                audit_recognized_attachments=2,
-                audit_downloaded_attachments=1,
-                reason_codes=("AUDIT_INVENTORY_MISMATCH",),
+                value,
+                content_integrity_status="missing",
+                readiness_evidence=replace(
+                    value.readiness_evidence,
+                    audit_evidence_mode="full",
+                    audit_comparison_reason="inventory_mismatch",
+                    audit_status="missing_download",
+                    audit_finished_at="2026-08-26T09:00:00Z",
+                    audit_recognized_attachments=2,
+                    audit_database_attachments=2,
+                    audit_downloaded_attachments=1,
+                    audit_online_inventory_sha256=HASH_A,
+                    audit_local_inventory_sha256=HASH_B,
+                    audit_online_content_sha256=HASH_A,
+                    audit_local_content_sha256=HASH_B,
+                    audit_online_evidence_sha256=HASH_A,
+                    audit_local_evidence_sha256=HASH_B,
+                    audit_online_evidence_count=2,
+                    audit_local_evidence_count=1,
+                    reason_codes=("AUDIT_INVENTORY_MISMATCH",),
+                ),
             ),
-        ),
         lambda value: replace(
             value,
             attachments=(
@@ -465,45 +476,110 @@ def test_attachment_contract_captures_filenames_and_complete_container_topology(
     } <= fields.keys()
 
 
-@pytest.mark.parametrize(
-    ("field", "changed"),
-    [
-        ("audit_status", "matched"),
-        ("audit_recognized_attachments", 1),
-        ("audit_database_attachments", 1),
-        ("audit_downloaded_attachments", 1),
-        ("audit_online_inventory_sha256", HASH_A),
-        ("audit_local_inventory_sha256", HASH_A),
-        ("audit_online_content_sha256", HASH_A),
-        ("audit_local_content_sha256", HASH_A),
-        ("audit_online_evidence_sha256", HASH_A),
-        ("audit_local_evidence_sha256", HASH_A),
-    ],
-)
-def test_each_normalized_readiness_evidence_change_updates_fingerprint(
-    field: str, changed: object
-) -> None:
+def _full_audit_evidence() -> ReadinessEvidenceInput:
+    return replace(
+        _inputs().readiness_evidence,
+        audit_evidence_mode="full",
+        audit_comparison_reason="exact_match",
+        audit_status="matched",
+        audit_recognized_attachments=1,
+        audit_database_attachments=2,
+        audit_downloaded_attachments=1,
+        audit_online_evidence_count=1,
+        audit_local_evidence_count=1,
+        audit_online_inventory_sha256=HASH_A,
+        audit_local_inventory_sha256=HASH_A,
+        audit_online_content_sha256=HASH_B,
+        audit_local_content_sha256=HASH_B,
+        audit_online_evidence_sha256=HASH_C,
+        audit_local_evidence_sha256=HASH_C,
+    )
+
+
+def _count_only_audit_evidence() -> ReadinessEvidenceInput:
+    return replace(
+        _inputs().readiness_evidence,
+        audit_evidence_mode="count_only",
+        audit_comparison_reason="evidence_unavailable",
+        audit_status="matched",
+        audit_recognized_attachments=1,
+        audit_database_attachments=2,
+        audit_downloaded_attachments=1,
+        audit_online_evidence_count=0,
+        audit_local_evidence_count=1,
+        audit_online_inventory_sha256=None,
+        audit_local_inventory_sha256=HASH_A,
+        audit_online_content_sha256=None,
+        audit_local_content_sha256=HASH_B,
+        audit_online_evidence_sha256=HASH_A,
+        audit_local_evidence_sha256=HASH_C,
+    )
+
+
+@pytest.mark.parametrize("evidence", [_full_audit_evidence, _count_only_audit_evidence])
+def test_each_coherent_audit_evidence_mode_updates_fingerprint(evidence) -> None:
     inputs = _inputs()
 
-    updated = replace(
-        inputs,
-        readiness_evidence=replace(inputs.readiness_evidence, **{field: changed}),
-    )
+    updated = replace(inputs, readiness_evidence=evidence())
 
     assert decision_input_sha256(updated) != decision_input_sha256(inputs)
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        lambda: replace(_full_audit_evidence(), audit_recognized_attachments=2),
+        lambda: replace(_full_audit_evidence(), audit_local_inventory_sha256=HASH_B),
+        lambda: replace(_full_audit_evidence(), audit_local_evidence_sha256=None),
+        lambda: replace(_count_only_audit_evidence(), audit_online_inventory_sha256=HASH_A),
+        lambda: replace(
+            _full_audit_evidence(),
+            audit_status="missing_download",
+            reason_codes=("VERIFIED_STORED_EVIDENCE",),
+        ),
+    ],
+    ids=(
+        "impossible-counts",
+        "unequal-full-inventory",
+        "one-sided-full-evidence",
+        "count-only-has-online-hash",
+        "terminal-reason-conflicts-audit-status",
+    ),
+)
+def test_contradictory_raw_audit_bundles_are_rejected(evidence) -> None:
+    with pytest.raises(ValueError, match="readiness evidence"):
+        decision_input_sha256(replace(_inputs(), readiness_evidence=evidence()))
+
+
 def test_audit_timestamp_alone_does_not_invalidate_unchanged_effective_inputs() -> None:
     inputs = _inputs()
-    later = replace(
-        inputs,
-        readiness_evidence=replace(
-            inputs.readiness_evidence,
-            audit_finished_at="2026-08-27T09:00:00Z",
-        ),
+    earlier_evidence = replace(
+        _full_audit_evidence(), audit_finished_at="2026-08-26T09:00:00Z"
+    )
+    later_evidence = replace(
+        earlier_evidence, audit_finished_at="2026-08-27T09:00:00Z"
     )
 
-    assert decision_input_sha256(later) == decision_input_sha256(inputs)
+    assert decision_input_sha256(
+        replace(inputs, readiness_evidence=earlier_evidence)
+    ) == decision_input_sha256(replace(inputs, readiness_evidence=later_evidence))
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        lambda value: replace(value, audit_finished_at="2026-08-27T09:00:00Z"),
+        lambda value: replace(value, audit_depth_limit_reached=True),
+    ],
+    ids=("timestamp", "depth-limit"),
+)
+def test_no_audit_mode_rejects_orphan_audit_facts(evidence) -> None:
+    inputs = _inputs()
+
+    with pytest.raises(ValueError, match="readiness evidence"):
+        decision_input_sha256(
+            replace(inputs, readiness_evidence=evidence(inputs.readiness_evidence))
+        )
 
 
 def test_package_integrity_status_is_strictly_validated() -> None:
@@ -615,6 +691,8 @@ def test_readiness_adapter_is_lossless_and_inconsistent_inputs_are_rejected() ->
         evidence=ReadinessEvidence(
             manifest_processing_status="depth_limit_reached",
             manifest_no_attachment_confirmed=False,
+            audit_evidence_mode="full",
+            audit_comparison_reason="exact_match",
             audit_status="depth_limit_reached",
             audit_finished_at=datetime(2026, 8, 26, 9, tzinfo=timezone.utc),
             audit_recognized_attachments=1,
@@ -626,6 +704,8 @@ def test_readiness_adapter_is_lossless_and_inconsistent_inputs_are_rejected() ->
             audit_local_content_sha256=HASH_B,
             audit_online_evidence_sha256=HASH_C,
             audit_local_evidence_sha256=HASH_C,
+            audit_online_evidence_count=1,
+            audit_local_evidence_count=1,
             audit_depth_limit_reached=True,
         ),
     )

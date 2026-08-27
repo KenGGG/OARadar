@@ -54,6 +54,8 @@ class NormalizedOAMetadata:
 class ReadinessEvidenceInput:
     manifest_processing_status: str | None
     manifest_no_attachment_confirmed: bool
+    audit_evidence_mode: str = "none"
+    audit_comparison_reason: str | None = None
     audit_status: str | None = None
     audit_finished_at: datetime | str | None = None
     audit_recognized_attachments: int | None = None
@@ -65,6 +67,8 @@ class ReadinessEvidenceInput:
     audit_local_content_sha256: str | None = None
     audit_online_evidence_sha256: str | None = None
     audit_local_evidence_sha256: str | None = None
+    audit_online_evidence_count: int | None = None
+    audit_local_evidence_count: int | None = None
     audit_depth_limit_reached: bool = False
     reason_codes: Sequence[str] = ()
 
@@ -321,12 +325,26 @@ def _readiness_row(evidence: ReadinessEvidenceInput) -> dict[str, Any]:
     _optional_timestamp(
         evidence.audit_finished_at, field="readiness_evidence.audit_finished_at"
     )
+    evidence_mode = _plain_text(
+        evidence.audit_evidence_mode, field="readiness_evidence.audit_evidence_mode"
+    )
+    if evidence_mode not in {"none", "full", "count_only"}:
+        raise ValueError("readiness evidence mode is not supported")
+    if evidence_mode == "none" and (
+        evidence.audit_finished_at is not None or evidence.audit_depth_limit_reached
+    ):
+        raise ValueError("readiness evidence mode none contains audit facts")
     return {
         "manifest_processing_status": _optional_plain_text(
             evidence.manifest_processing_status,
             field="readiness_evidence.manifest_processing_status",
         ),
         "manifest_no_attachment_confirmed": evidence.manifest_no_attachment_confirmed,
+        "audit_evidence_mode": evidence_mode,
+        "audit_comparison_reason": _optional_plain_text(
+            evidence.audit_comparison_reason,
+            field="readiness_evidence.audit_comparison_reason",
+        ),
         "audit_status": _optional_plain_text(
             evidence.audit_status, field="readiness_evidence.audit_status"
         ),
@@ -371,6 +389,14 @@ def _readiness_row(evidence: ReadinessEvidenceInput) -> dict[str, Any]:
             evidence.audit_local_evidence_sha256,
             field="readiness_evidence.audit_local_evidence_sha256",
             optional=True,
+        ),
+        "audit_online_evidence_count": _optional_integer(
+            evidence.audit_online_evidence_count,
+            field="readiness_evidence.audit_online_evidence_count",
+        ),
+        "audit_local_evidence_count": _optional_integer(
+            evidence.audit_local_evidence_count,
+            field="readiness_evidence.audit_local_evidence_count",
         ),
         "audit_depth_limit_reached": evidence.audit_depth_limit_reached,
         "reason_codes": sorted(
@@ -554,9 +580,88 @@ _MISSING_REASONS = frozenset(
 )
 
 
+def _validate_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
+    mode = readiness_row["audit_evidence_mode"]
+    audit_status = readiness_row["audit_status"]
+    comparison_reason = readiness_row["audit_comparison_reason"]
+    raw_fields = (
+        audit_status,
+        comparison_reason,
+        readiness_row["audit_recognized_attachments"],
+        readiness_row["audit_database_attachments"],
+        readiness_row["audit_downloaded_attachments"],
+        readiness_row["audit_online_inventory_sha256"],
+        readiness_row["audit_local_inventory_sha256"],
+        readiness_row["audit_online_content_sha256"],
+        readiness_row["audit_local_content_sha256"],
+        readiness_row["audit_online_evidence_sha256"],
+        readiness_row["audit_local_evidence_sha256"],
+        readiness_row["audit_online_evidence_count"],
+        readiness_row["audit_local_evidence_count"],
+    )
+    if mode == "none":
+        if any(value is not None for value in raw_fields):
+            raise ValueError("readiness evidence mode none contains audit facts")
+        return
+    if audit_status is None:
+        raise ValueError("readiness evidence audit mode requires an audit status")
+
+    hash_pairs = (
+        (
+            readiness_row["audit_online_inventory_sha256"],
+            readiness_row["audit_local_inventory_sha256"],
+        ),
+        (
+            readiness_row["audit_online_content_sha256"],
+            readiness_row["audit_local_content_sha256"],
+        ),
+        (
+            readiness_row["audit_online_evidence_sha256"],
+            readiness_row["audit_local_evidence_sha256"],
+        ),
+    )
+    if mode == "full":
+        if comparison_reason == "evidence_unavailable":
+            raise ValueError("readiness evidence full mode has count-only reason")
+        if any((left is None) != (right is None) for left, right in hash_pairs):
+            raise ValueError("readiness evidence full mode has one-sided hashes")
+        if audit_status == "matched":
+            counts = (
+                readiness_row["audit_recognized_attachments"],
+                readiness_row["audit_downloaded_attachments"],
+                readiness_row["audit_online_evidence_count"],
+                readiness_row["audit_local_evidence_count"],
+            )
+            if any(value is None for value in counts) or len(set(counts)) != 1:
+                raise ValueError("readiness evidence matched counts contradict")
+            if any(left is None or left != right for left, right in hash_pairs):
+                raise ValueError("readiness evidence matched hashes contradict")
+    else:
+        if comparison_reason != "evidence_unavailable":
+            raise ValueError("readiness evidence count-only mode has wrong reason")
+        if (
+            readiness_row["audit_online_inventory_sha256"] is not None
+            or readiness_row["audit_online_content_sha256"] is not None
+        ):
+            raise ValueError("readiness evidence count-only mode has online hashes")
+        if audit_status == "matched":
+            recognized = readiness_row["audit_recognized_attachments"]
+            downloaded = readiness_row["audit_downloaded_attachments"]
+            if (
+                recognized is None
+                or recognized != downloaded
+                or readiness_row["audit_online_evidence_count"] != 0
+                or readiness_row["audit_local_evidence_count"] != downloaded
+                or readiness_row["audit_online_evidence_sha256"] is None
+                or readiness_row["audit_local_evidence_sha256"] is None
+            ):
+                raise ValueError("readiness evidence count-only facts contradict")
+
+
 def _validate_readiness_consistency(
     content_integrity_status: str, readiness_row: Mapping[str, Any]
 ) -> None:
+    _validate_audit_bundle(readiness_row)
     reasons = set(readiness_row["reason_codes"])
     if readiness_row["audit_depth_limit_reached"]:
         reasons.add("DEPTH_LIMIT_REACHED")
@@ -599,6 +704,10 @@ def _validate_readiness_consistency(
         raise ValueError("readiness evidence contradicts no-attachment status")
     if expected == "ok" and readiness_row["manifest_no_attachment_confirmed"]:
         raise ValueError("readiness evidence contradicts verified attachment status")
+    if expected in {"ok", "no_attachment_confirmed"} and readiness_row[
+        "audit_status"
+    ] not in {None, "matched"}:
+        raise ValueError("readiness evidence terminal status contradicts audit status")
 
 
 def readiness_evidence_from_assessment(assessment: object) -> ReadinessEvidenceInput:
@@ -611,6 +720,8 @@ def readiness_evidence_from_assessment(assessment: object) -> ReadinessEvidenceI
     return ReadinessEvidenceInput(
         manifest_processing_status=evidence.manifest_processing_status,
         manifest_no_attachment_confirmed=evidence.manifest_no_attachment_confirmed,
+        audit_evidence_mode=evidence.audit_evidence_mode,
+        audit_comparison_reason=evidence.audit_comparison_reason,
         audit_status=evidence.audit_status,
         audit_finished_at=evidence.audit_finished_at,
         audit_recognized_attachments=evidence.audit_recognized_attachments,
@@ -622,6 +733,8 @@ def readiness_evidence_from_assessment(assessment: object) -> ReadinessEvidenceI
         audit_local_content_sha256=evidence.audit_local_content_sha256,
         audit_online_evidence_sha256=evidence.audit_online_evidence_sha256,
         audit_local_evidence_sha256=evidence.audit_local_evidence_sha256,
+        audit_online_evidence_count=evidence.audit_online_evidence_count,
+        audit_local_evidence_count=evidence.audit_local_evidence_count,
         audit_depth_limit_reached=evidence.audit_depth_limit_reached,
         reason_codes=assessment.reason_codes,
     )

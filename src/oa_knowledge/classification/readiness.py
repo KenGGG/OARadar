@@ -72,6 +72,8 @@ class ReadinessEvidence:
 
     manifest_processing_status: str | None
     manifest_no_attachment_confirmed: bool
+    audit_evidence_mode: Literal["none", "full", "count_only"]
+    audit_comparison_reason: str | None
     audit_status: str | None
     audit_finished_at: datetime | None
     audit_recognized_attachments: int | None
@@ -83,6 +85,8 @@ class ReadinessEvidence:
     audit_local_content_sha256: str | None
     audit_online_evidence_sha256: str | None
     audit_local_evidence_sha256: str | None
+    audit_online_evidence_count: int | None
+    audit_local_evidence_count: int | None
     audit_depth_limit_reached: bool
 
 
@@ -181,13 +185,26 @@ def _chunks(values: Sequence[object]) -> Sequence[tuple[object, ...]]:
 
 
 def _evidence(manifest: OAManifestItem | None, audit: OnlineAuditItem | None) -> ReadinessEvidence:
-    online_sha, _ = _normalized_json_sha256(audit.online_evidence_json if audit else None)
-    local_sha, _ = _normalized_json_sha256(audit.local_evidence_json if audit else None)
+    online_sha, online_count = _normalized_json_sha256(
+        audit.online_evidence_json if audit else None
+    )
+    local_sha, local_count = _normalized_json_sha256(
+        audit.local_evidence_json if audit else None
+    )
+    evidence_mode: Literal["none", "full", "count_only"] = "none"
+    if audit is not None:
+        evidence_mode = (
+            "count_only"
+            if audit.comparison_reason == "evidence_unavailable"
+            else "full"
+        )
     return ReadinessEvidence(
         manifest_processing_status=manifest.processing_status if manifest else None,
         manifest_no_attachment_confirmed=bool(
             manifest is not None and manifest.no_attachment_confirmed
         ),
+        audit_evidence_mode=evidence_mode,
+        audit_comparison_reason=audit.comparison_reason if audit else None,
         audit_status=audit.status if audit else None,
         audit_finished_at=_utc(audit.finished_at) if audit else None,
         audit_recognized_attachments=audit.recognized_attachments if audit else None,
@@ -199,6 +216,8 @@ def _evidence(manifest: OAManifestItem | None, audit: OnlineAuditItem | None) ->
         audit_local_content_sha256=audit.local_content_sha256 if audit else None,
         audit_online_evidence_sha256=online_sha,
         audit_local_evidence_sha256=local_sha,
+        audit_online_evidence_count=online_count,
+        audit_local_evidence_count=local_count,
         audit_depth_limit_reached=bool(audit is not None and audit.depth_limit_reached),
     )
 
@@ -377,33 +396,45 @@ class ArchiveReadinessService:
             if online_sha is None or local_sha is None:
                 reasons.update({"AUDIT_EVIDENCE_INVALID", "NOT_CHECKED"})
             if audit.status == "matched":
-                counts = (
-                    audit.recognized_attachments,
-                    audit.database_attachments,
-                    audit.downloaded_attachments,
-                    online_count,
-                    local_count,
-                )
-                if any(count is None for count in counts) or len(set(counts)) != 1:
-                    reasons.add("AUDIT_INVENTORY_MISMATCH")
-                if online_sha is not None and local_sha is not None and online_sha != local_sha:
-                    reasons.add("AUDIT_INVENTORY_MISMATCH")
+                if audit.comparison_reason == "evidence_unavailable":
+                    if (
+                        audit.recognized_attachments is None
+                        or audit.recognized_attachments != audit.downloaded_attachments
+                        or online_count != 0
+                        or local_count != audit.downloaded_attachments
+                        or audit.online_inventory_sha256 is not None
+                        or audit.online_content_sha256 is not None
+                    ):
+                        reasons.add("AUDIT_INVENTORY_MISMATCH")
+                else:
+                    counts = (
+                        audit.recognized_attachments,
+                        audit.downloaded_attachments,
+                        online_count,
+                        local_count,
+                    )
+                    if any(count is None for count in counts) or len(set(counts)) != 1:
+                        reasons.add("AUDIT_INVENTORY_MISMATCH")
+                    if (
+                        online_sha is not None
+                        and local_sha is not None
+                        and online_sha != local_sha
+                    ):
+                        reasons.add("AUDIT_INVENTORY_MISMATCH")
 
-                inventory_hashes = (
-                    audit.online_inventory_sha256,
-                    audit.local_inventory_sha256,
-                )
-                if any(value is not None for value in inventory_hashes):
+                    inventory_hashes = (
+                        audit.online_inventory_sha256,
+                        audit.local_inventory_sha256,
+                    )
                     if not all(_is_sha256(value) for value in inventory_hashes):
                         reasons.update({"AUDIT_EVIDENCE_INVALID", "NOT_CHECKED"})
                     elif inventory_hashes[0].lower() != inventory_hashes[1].lower():
                         reasons.add("AUDIT_INVENTORY_MISMATCH")
 
-                content_hashes = (
-                    audit.online_content_sha256,
-                    audit.local_content_sha256,
-                )
-                if any(value is not None for value in content_hashes):
+                    content_hashes = (
+                        audit.online_content_sha256,
+                        audit.local_content_sha256,
+                    )
                     if not all(_is_sha256(value) for value in content_hashes):
                         reasons.update({"AUDIT_EVIDENCE_INVALID", "NOT_CHECKED"})
                     elif content_hashes[0].lower() != content_hashes[1].lower():
@@ -421,7 +452,14 @@ class ArchiveReadinessService:
                 reasons.add("NOT_CHECKED")
 
             if zero_pair and audit.status == "matched":
-                if any(count is not None and count > 0 for count in counts):
+                zero_counts = (
+                    audit.recognized_attachments,
+                    audit.database_attachments,
+                    audit.downloaded_attachments,
+                    online_count,
+                    local_count,
+                )
+                if any(count is not None and count > 0 for count in zero_counts):
                     reasons.add("ZERO_ATTACHMENT_AUDIT_CONFLICT")
                 elif audit.recognized_attachments is None:
                     reasons.update({"AUDIT_EVIDENCE_INVALID", "NOT_CHECKED"})

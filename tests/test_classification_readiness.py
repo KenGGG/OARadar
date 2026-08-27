@@ -23,6 +23,7 @@ from oa_knowledge.db.models import (
     OnlineAuditRun,
 )
 from oa_knowledge.source_roles import AUDIT_ATTACHMENT_ROLES
+from oa_knowledge.online_audit import fingerprint_attachments
 
 
 NOW = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
@@ -115,12 +116,17 @@ def _audit(
     local_evidence: tuple[tuple[str, str, int | None, str | None], ...] = (
         ("direct_attachment", "attachment-synthetic-1", 12, FILE_SHA),
     ),
-) -> None:
+    comparison_reason: str = "exact_match",
+) -> OnlineAuditItem:
+    online_inventory, online_content = fingerprint_attachments(list(online_evidence))
+    local_inventory, local_content = fingerprint_attachments(list(local_evidence))
+    if comparison_reason == "evidence_unavailable":
+        online_inventory = None
+        online_content = None
     run = OnlineAuditRun(status="completed", total_items=1, finished_at=finished_at)
     session.add(run)
     session.flush()
-    session.add(
-        OnlineAuditItem(
+    item = OnlineAuditItem(
             run_id=run.id,
             oa_item_key=key,
             title="Synthetic archive item",
@@ -128,6 +134,10 @@ def _audit(
             recognized_attachments=recognized_attachments,
             database_attachments=database_attachments,
             downloaded_attachments=downloaded_attachments,
+            online_inventory_sha256=online_inventory,
+            local_inventory_sha256=local_inventory,
+            online_content_sha256=online_content,
+            local_content_sha256=local_content,
             online_evidence_json=json.dumps(
                 [
                     {"role": role, "key": key, "size": size, "sha256": sha256}
@@ -141,10 +151,12 @@ def _audit(
                 ]
             ),
             depth_limit_reached=depth_limit_reached,
+            comparison_reason=comparison_reason,
             finished_at=finished_at,
         )
-    )
+    session.add(item)
     session.flush()
+    return item
 
 
 @pytest.mark.parametrize(
@@ -320,6 +332,46 @@ def test_matched_audit_with_contradictory_inventory_is_not_publishable(
     assert result.content_integrity_status == "missing"
     assert result.publishable is False
     assert "AUDIT_INVENTORY_MISMATCH" in result.reason_codes
+
+
+def test_count_only_matched_audit_accepts_real_producer_shape(session: Session) -> None:
+    _package(session)
+    _audit(
+        session,
+        status="matched",
+        recognized_attachments=1,
+        database_attachments=2,
+        downloaded_attachments=1,
+        online_evidence=(),
+        local_evidence=(
+            ("direct_attachment", "attachment-synthetic-1", 12, FILE_SHA),
+        ),
+        comparison_reason="evidence_unavailable",
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "ok"
+    assert result.publishable is True
+    assert result.evidence.audit_evidence_mode == "count_only"
+
+
+def test_full_evidence_matched_audit_ignores_reporting_only_database_count(
+    session: Session,
+) -> None:
+    _package(session)
+    _audit(
+        session,
+        status="matched",
+        recognized_attachments=1,
+        database_attachments=2,
+        downloaded_attachments=1,
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "ok"
+    assert result.evidence.audit_evidence_mode == "full"
 
 
 def test_audit_evidence_hash_is_stable_across_order_and_unicode_form() -> None:
