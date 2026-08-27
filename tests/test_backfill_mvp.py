@@ -17,6 +17,10 @@ from oa_knowledge.backfill_mvp import (
     select_representative_items,
 )
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
+from oa_knowledge.classification.service import (
+    ClassificationService,
+    CreateClassificationRun,
+)
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import (
     ArchivedFile,
@@ -356,6 +360,60 @@ def test_vertical_slice_builds_classified_and_review_packages_without_touching_o
         if path.is_file()
     }
     assert after == before
+
+
+def test_content_classification_stops_after_first_decisive_attachment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved OA must not parse every attachment after a rule resolves it."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:content-stop",
+        title="Synthetic unresolved project payment",
+        sender="synthetic.internal",
+        payloads=(
+            ("first.txt", "融资租赁项目立项材料".encode(), "verified"),
+            ("second.txt", b"unnecessary second attachment", "verified"),
+        ),
+    )
+    service = BackfillMVPService(
+        settings,
+        factory,
+        _config(),
+        private_config_sha256="a" * 64,
+    )
+    converted: list[str] = []
+    original_convert = service._convert_attachment
+
+    def track_conversion(package: Path, attachment, ordinal: int):
+        converted.append(attachment.file.original_name)
+        return original_convert(package, attachment, ordinal)
+
+    monkeypatch.setattr(service, "_convert_attachment", track_conversion)
+    classification = ClassificationService(
+        factory, _config(), outcome_hook=service._resolve_internal_outcome
+    )
+    classification.create_run(
+        CreateClassificationRun(
+            run_id="synthetic-content-stop",
+            run_kind="incremental",
+            manifest_sha256="b" * 64,
+            exclusion_policy_sha256="c" * 64,
+            rule_version="test",
+            schema_version="test",
+            prompt_version="test",
+            model_name="test",
+            private_config_sha256="a" * 64,
+            target_keys=("done:content-stop",),
+        )
+    )
+    classification.process_next("synthetic-content-stop", limit=2)
+
+    assert converted == ["first.txt"]
 
 
 def test_identical_completed_run_is_verified_and_reused(tmp_path: Path) -> None:

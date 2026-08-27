@@ -1123,8 +1123,11 @@ class BackfillMVPService:
                     if body:
                         parsed_bodies.append(body)
                         source_file_id = source_file_id or file.id
+                        resolved = classify_by_content(item.title, tuple(parsed_bodies))
+                        if resolved is not None:
+                            break
             bodies = tuple(parsed_bodies)
-            resolved = classify_by_content(item.title, bodies)
+            resolved = resolved or classify_by_content(item.title, bodies)
 
         if resolved is None and bodies:
             client = self._qwen_client
