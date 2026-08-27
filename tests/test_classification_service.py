@@ -172,6 +172,52 @@ def _request(run_id: str) -> CreateClassificationRun:
     )
 
 
+def test_scoped_run_freezes_all_exclusions_and_only_requested_targets(
+    factory: sessionmaker[Session], config: PrivateClassificationConfig
+) -> None:
+    _seed(factory)
+    service = ClassificationService(factory, config)
+    request = replace(
+        _request("synthetic-scoped"),
+        target_keys=("done:external", "done:internal"),
+    )
+
+    ref = service.create_run(request)
+    progress = service.process_next(ref.run_id, limit=100)
+
+    assert (ref.total_count, ref.target_count, ref.excluded_count) == (3, 2, 1)
+    assert progress.decided == 3
+    with factory() as session:
+        frozen = set(
+            session.scalars(
+                select(ClassificationRunItem.oa_item_key).where(
+                    ClassificationRunItem.classification_run_id == ref.database_id
+                )
+            )
+        )
+    assert frozen == {"done:excluded", "done:external", "done:internal"}
+
+
+def test_scoped_run_rejects_unknown_duplicate_or_excluded_target_keys(
+    factory: sessionmaker[Session], config: PrivateClassificationConfig
+) -> None:
+    _seed(factory)
+    service = ClassificationService(factory, config)
+
+    for target_keys in (
+        ("done:missing",),
+        ("done:internal", "done:internal"),
+        ("done:excluded",),
+    ):
+        with pytest.raises(ValueError):
+            service.create_run(
+                replace(
+                    _request(f"synthetic-invalid-{len(target_keys)}-{target_keys[0]}"),
+                    target_keys=target_keys,
+                )
+            )
+
+
 def _current(session: Session, key: str) -> ClassificationDecision:
     return session.scalar(
         select(ClassificationDecision).where(

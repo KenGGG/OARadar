@@ -53,6 +53,7 @@ class CreateClassificationRun:
     prompt_version: str
     model_name: str
     private_config_sha256: str
+    target_keys: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +124,28 @@ class ClassificationService:
                     )
                 )
             )
+            manifests_by_key = {row.oa_item_key: row for row in manifests}
+            target_keys = request.target_keys
+            if target_keys is not None:
+                if not target_keys:
+                    raise ValueError("scoped classification run requires target keys")
+                if len(set(target_keys)) != len(target_keys):
+                    raise ValueError("scoped classification target keys must be unique")
+                unknown = set(target_keys).difference(manifests_by_key)
+                if unknown:
+                    raise ValueError("scoped classification target key is unknown")
+                if any(
+                    self._inclusion_reason(manifests_by_key[key]) == "excluded"
+                    for key in target_keys
+                ):
+                    raise ValueError("excluded OA cannot be a scoped classification target")
+                target_key_set = set(target_keys)
+                manifests = [
+                    row
+                    for row in manifests
+                    if self._inclusion_reason(row) == "excluded"
+                    or row.oa_item_key in target_key_set
+                ]
             membership = [
                 {
                     "oa_item_key": row.oa_item_key,
