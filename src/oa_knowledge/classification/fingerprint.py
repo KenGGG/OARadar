@@ -579,6 +579,158 @@ _MISSING_REASONS = frozenset(
     }
 )
 
+_FULL_AUDIT_COMPARISON_REASONS = frozenset(
+    {
+        "exact_match",
+        "historical_retained",
+        "content_changed",
+        "attachment_identity_changed",
+        "attachment_role_changed",
+        "attachment_metadata_changed",
+        "inventory_changed",
+    }
+)
+_FULL_AUDIT_STATUSES = frozenset(
+    {
+        "matched",
+        "missing_download",
+        "historical_retained",
+        "inventory_mismatch",
+        "content_mismatch",
+        "content_unverified",
+        "depth_limit_reached",
+    }
+)
+_COUNT_ONLY_AUDIT_STATUSES = frozenset(
+    {"matched", "missing_download", "historical_retained"}
+)
+_EMPTY_EVIDENCE_SHA256 = hashlib.sha256(b"[]").hexdigest()
+
+
+def _expected_full_audit_status(readiness_row: Mapping[str, Any]) -> str:
+    recognized = readiness_row["audit_recognized_attachments"]
+    downloaded = readiness_row["audit_downloaded_attachments"]
+    if readiness_row["audit_depth_limit_reached"]:
+        return "depth_limit_reached"
+    if recognized > downloaded:
+        return "missing_download"
+    if (
+        readiness_row["audit_comparison_reason"] == "historical_retained"
+        and recognized < downloaded
+    ):
+        return "historical_retained"
+    if (
+        readiness_row["audit_online_inventory_sha256"]
+        != readiness_row["audit_local_inventory_sha256"]
+    ):
+        return "inventory_mismatch"
+    if recognized < downloaded:
+        return "historical_retained"
+    if readiness_row["audit_online_content_sha256"] is None:
+        return "content_unverified"
+    if (
+        readiness_row["audit_local_content_sha256"] is None
+        or readiness_row["audit_online_content_sha256"]
+        != readiness_row["audit_local_content_sha256"]
+    ):
+        return "content_mismatch"
+    return "matched"
+
+
+def _validate_full_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
+    audit_status = readiness_row["audit_status"]
+    comparison_reason = readiness_row["audit_comparison_reason"]
+    if audit_status == "access_failed":
+        if comparison_reason is not None:
+            raise ValueError("readiness evidence access failure has comparison facts")
+        return
+    if audit_status not in _FULL_AUDIT_STATUSES:
+        raise ValueError("readiness evidence full mode has unsupported audit status")
+    if comparison_reason not in _FULL_AUDIT_COMPARISON_REASONS:
+        raise ValueError("readiness evidence full mode has unsupported comparison reason")
+
+    recognized = readiness_row["audit_recognized_attachments"]
+    downloaded = readiness_row["audit_downloaded_attachments"]
+    online_count = readiness_row["audit_online_evidence_count"]
+    local_count = readiness_row["audit_local_evidence_count"]
+    if (
+        recognized is None
+        or downloaded is None
+        or online_count != recognized
+        or local_count != downloaded
+    ):
+        raise ValueError("readiness evidence full mode counts contradict")
+
+    online_inventory = readiness_row["audit_online_inventory_sha256"]
+    local_inventory = readiness_row["audit_local_inventory_sha256"]
+    online_evidence = readiness_row["audit_online_evidence_sha256"]
+    local_evidence = readiness_row["audit_local_evidence_sha256"]
+    if any(
+        value is None
+        for value in (
+            online_inventory,
+            local_inventory,
+            online_evidence,
+            local_evidence,
+        )
+    ):
+        raise ValueError("readiness evidence full mode is incomplete")
+
+    evidence_equal = online_evidence == local_evidence
+    if (comparison_reason == "exact_match") != evidence_equal:
+        raise ValueError("readiness evidence comparison reason contradicts ledgers")
+    if evidence_equal and (
+        online_inventory != local_inventory
+        or readiness_row["audit_online_content_sha256"]
+        != readiness_row["audit_local_content_sha256"]
+    ):
+        raise ValueError("readiness evidence summaries contradict exact ledgers")
+    if not evidence_equal and (
+        online_inventory == local_inventory
+        and readiness_row["audit_online_content_sha256"]
+        == readiness_row["audit_local_content_sha256"]
+    ):
+        raise ValueError("readiness evidence summaries contradict changed ledgers")
+
+    expected_status = _expected_full_audit_status(readiness_row)
+    if audit_status != expected_status:
+        raise ValueError("readiness evidence audit status contradicts raw facts")
+
+
+def _validate_count_only_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
+    audit_status = readiness_row["audit_status"]
+    if audit_status not in _COUNT_ONLY_AUDIT_STATUSES:
+        raise ValueError("readiness evidence count-only mode has unsupported status")
+    if readiness_row["audit_comparison_reason"] != "evidence_unavailable":
+        raise ValueError("readiness evidence count-only mode has wrong reason")
+    if (
+        readiness_row["audit_online_inventory_sha256"] is not None
+        or readiness_row["audit_online_content_sha256"] is not None
+    ):
+        raise ValueError("readiness evidence count-only mode has online hashes")
+
+    recognized = readiness_row["audit_recognized_attachments"]
+    downloaded = readiness_row["audit_downloaded_attachments"]
+    if (
+        recognized is None
+        or downloaded is None
+        or readiness_row["audit_online_evidence_count"] != 0
+        or readiness_row["audit_local_evidence_count"] != downloaded
+        or readiness_row["audit_online_evidence_sha256"] != _EMPTY_EVIDENCE_SHA256
+        or readiness_row["audit_local_evidence_sha256"] is None
+        or readiness_row["audit_local_inventory_sha256"] is None
+    ):
+        raise ValueError("readiness evidence count-only facts contradict")
+
+    if recognized > downloaded:
+        expected_status = "missing_download"
+    elif recognized < downloaded:
+        expected_status = "historical_retained"
+    else:
+        expected_status = "matched"
+    if audit_status != expected_status:
+        raise ValueError("readiness evidence audit status contradicts raw facts")
+
 
 def _validate_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
     mode = readiness_row["audit_evidence_mode"]
@@ -606,56 +758,10 @@ def _validate_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
     if audit_status is None:
         raise ValueError("readiness evidence audit mode requires an audit status")
 
-    hash_pairs = (
-        (
-            readiness_row["audit_online_inventory_sha256"],
-            readiness_row["audit_local_inventory_sha256"],
-        ),
-        (
-            readiness_row["audit_online_content_sha256"],
-            readiness_row["audit_local_content_sha256"],
-        ),
-        (
-            readiness_row["audit_online_evidence_sha256"],
-            readiness_row["audit_local_evidence_sha256"],
-        ),
-    )
     if mode == "full":
-        if comparison_reason == "evidence_unavailable":
-            raise ValueError("readiness evidence full mode has count-only reason")
-        if any((left is None) != (right is None) for left, right in hash_pairs):
-            raise ValueError("readiness evidence full mode has one-sided hashes")
-        if audit_status == "matched":
-            counts = (
-                readiness_row["audit_recognized_attachments"],
-                readiness_row["audit_downloaded_attachments"],
-                readiness_row["audit_online_evidence_count"],
-                readiness_row["audit_local_evidence_count"],
-            )
-            if any(value is None for value in counts) or len(set(counts)) != 1:
-                raise ValueError("readiness evidence matched counts contradict")
-            if any(left is None or left != right for left, right in hash_pairs):
-                raise ValueError("readiness evidence matched hashes contradict")
+        _validate_full_audit_bundle(readiness_row)
     else:
-        if comparison_reason != "evidence_unavailable":
-            raise ValueError("readiness evidence count-only mode has wrong reason")
-        if (
-            readiness_row["audit_online_inventory_sha256"] is not None
-            or readiness_row["audit_online_content_sha256"] is not None
-        ):
-            raise ValueError("readiness evidence count-only mode has online hashes")
-        if audit_status == "matched":
-            recognized = readiness_row["audit_recognized_attachments"]
-            downloaded = readiness_row["audit_downloaded_attachments"]
-            if (
-                recognized is None
-                or recognized != downloaded
-                or readiness_row["audit_online_evidence_count"] != 0
-                or readiness_row["audit_local_evidence_count"] != downloaded
-                or readiness_row["audit_online_evidence_sha256"] is None
-                or readiness_row["audit_local_evidence_sha256"] is None
-            ):
-                raise ValueError("readiness evidence count-only facts contradict")
+        _validate_count_only_audit_bundle(readiness_row)
 
 
 def _validate_readiness_consistency(

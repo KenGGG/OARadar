@@ -454,7 +454,6 @@ class ArchiveReadinessService:
             if zero_pair and audit.status == "matched":
                 zero_counts = (
                     audit.recognized_attachments,
-                    audit.database_attachments,
                     audit.downloaded_attachments,
                     online_count,
                     local_count,

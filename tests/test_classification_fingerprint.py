@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 from pathlib import Path
 import unicodedata
 
@@ -25,6 +26,7 @@ from oa_knowledge.classification.readiness import IntegrityAssessment, Readiness
 HASH_A = "a" * 64
 HASH_B = "b" * 64
 HASH_C = "c" * 64
+EMPTY_EVIDENCE_SHA256 = hashlib.sha256(b"[]").hexdigest()
 
 
 def _inputs() -> DecisionInputs:
@@ -179,7 +181,7 @@ def test_fingerprint_is_a_lowercase_sha256_and_stable_across_row_mapping_and_rel
                 readiness_evidence=replace(
                     value.readiness_evidence,
                     audit_evidence_mode="full",
-                    audit_comparison_reason="inventory_mismatch",
+                    audit_comparison_reason="inventory_changed",
                     audit_status="missing_download",
                     audit_finished_at="2026-08-26T09:00:00Z",
                     audit_recognized_attachments=2,
@@ -511,7 +513,7 @@ def _count_only_audit_evidence() -> ReadinessEvidenceInput:
         audit_local_inventory_sha256=HASH_A,
         audit_online_content_sha256=None,
         audit_local_content_sha256=HASH_B,
-        audit_online_evidence_sha256=HASH_A,
+        audit_online_evidence_sha256=EMPTY_EVIDENCE_SHA256,
         audit_local_evidence_sha256=HASH_C,
     )
 
@@ -549,6 +551,185 @@ def test_each_coherent_audit_evidence_mode_updates_fingerprint(evidence) -> None
 def test_contradictory_raw_audit_bundles_are_rejected(evidence) -> None:
     with pytest.raises(ValueError, match="readiness evidence"):
         decision_input_sha256(replace(_inputs(), readiness_evidence=evidence()))
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        lambda: replace(
+            _count_only_audit_evidence(),
+            audit_status="missing_download",
+            audit_recognized_attachments=0,
+            reason_codes=("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        lambda: replace(
+            _full_audit_evidence(),
+            audit_status="content_mismatch",
+            reason_codes=("SHA256_MISMATCH",),
+        ),
+        lambda: replace(
+            _full_audit_evidence(),
+            audit_status="content_mismatch",
+            audit_comparison_reason="exact_match",
+            audit_local_content_sha256=HASH_A,
+            audit_local_evidence_sha256=HASH_A,
+            reason_codes=("SHA256_MISMATCH",),
+        ),
+    ],
+    ids=(
+        "missing-download-has-fewer-recognized-than-downloaded",
+        "content-mismatch-has-equal-content",
+        "exact-match-reason-has-different-evidence",
+    ),
+)
+def test_nonmatched_audit_status_must_be_derived_from_raw_facts(evidence) -> None:
+    with pytest.raises(ValueError, match="readiness evidence"):
+        decision_input_sha256(
+            replace(
+                _inputs(),
+                content_integrity_status=(
+                    "sha256_mismatch"
+                    if evidence().audit_status == "content_mismatch"
+                    else "missing"
+                ),
+                readiness_evidence=evidence(),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("evidence", "integrity_status", "reason_codes"),
+    [
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="missing_download",
+                audit_comparison_reason="inventory_changed",
+                audit_recognized_attachments=2,
+                audit_online_evidence_count=2,
+                audit_local_inventory_sha256=HASH_B,
+                audit_local_content_sha256=HASH_A,
+                audit_online_evidence_sha256=HASH_A,
+                audit_local_evidence_sha256=HASH_B,
+            ),
+            "missing",
+            ("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="inventory_mismatch",
+                audit_comparison_reason="inventory_changed",
+                audit_local_inventory_sha256=HASH_B,
+                audit_online_evidence_sha256=HASH_A,
+                audit_local_evidence_sha256=HASH_B,
+            ),
+            "missing",
+            ("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="historical_retained",
+                audit_comparison_reason="historical_retained",
+                audit_downloaded_attachments=2,
+                audit_local_evidence_count=2,
+                audit_local_inventory_sha256=HASH_B,
+                audit_local_content_sha256=HASH_A,
+                audit_online_evidence_sha256=HASH_A,
+                audit_local_evidence_sha256=HASH_B,
+            ),
+            "missing",
+            ("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="content_mismatch",
+                audit_comparison_reason="content_changed",
+                audit_online_content_sha256=HASH_A,
+                audit_local_content_sha256=HASH_B,
+                audit_online_evidence_sha256=HASH_A,
+                audit_local_evidence_sha256=HASH_B,
+            ),
+            "sha256_mismatch",
+            ("SHA256_MISMATCH",),
+        ),
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="content_unverified",
+                audit_online_content_sha256=None,
+                audit_local_content_sha256=None,
+            ),
+            "not_checked",
+            ("NOT_CHECKED",),
+        ),
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="depth_limit_reached",
+                audit_depth_limit_reached=True,
+            ),
+            "missing",
+            ("DEPTH_LIMIT_REACHED",),
+        ),
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="access_failed",
+                audit_comparison_reason=None,
+            ),
+            "not_checked",
+            ("NOT_CHECKED",),
+        ),
+        (
+            lambda: replace(
+                _count_only_audit_evidence(),
+                audit_status="missing_download",
+                audit_recognized_attachments=2,
+            ),
+            "missing",
+            ("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        (
+            lambda: replace(
+                _count_only_audit_evidence(),
+                audit_status="historical_retained",
+                audit_downloaded_attachments=2,
+                audit_local_evidence_count=2,
+            ),
+            "missing",
+            ("AUDIT_INVENTORY_MISMATCH",),
+        ),
+    ],
+    ids=(
+        "full-missing-download",
+        "full-inventory-mismatch",
+        "full-historical-retained",
+        "full-content-mismatch",
+        "full-content-unverified",
+        "full-depth-limit",
+        "access-failed",
+        "count-only-missing-download",
+        "count-only-historical-retained",
+    ),
+)
+def test_coherent_nonmatched_audit_producer_shapes_are_accepted(
+    evidence, integrity_status: str, reason_codes: tuple[str, ...]
+) -> None:
+    inputs = _inputs()
+    audit_evidence = replace(evidence(), reason_codes=reason_codes)
+
+    digest = decision_input_sha256(
+        replace(
+            inputs,
+            content_integrity_status=integrity_status,
+            readiness_evidence=audit_evidence,
+        )
+    )
+
+    assert len(digest) == 64
 
 
 def test_audit_timestamp_alone_does_not_invalidate_unchanged_effective_inputs() -> None:

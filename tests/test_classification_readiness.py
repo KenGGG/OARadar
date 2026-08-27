@@ -374,6 +374,38 @@ def test_full_evidence_matched_audit_ignores_reporting_only_database_count(
     assert result.evidence.audit_evidence_mode == "full"
 
 
+@pytest.mark.parametrize(
+    "comparison_reason",
+    ["exact_match", "evidence_unavailable"],
+    ids=("full", "count-only"),
+)
+def test_confirmed_zero_attachments_ignores_reporting_only_database_count(
+    session: Session, comparison_reason: str
+) -> None:
+    _package(
+        session,
+        manifest_status="no_attachment",
+        no_attachment_confirmed=True,
+        file_status=None,
+    )
+    _audit(
+        session,
+        status="matched",
+        recognized_attachments=0,
+        database_attachments=2,
+        downloaded_attachments=0,
+        online_evidence=(),
+        local_evidence=(),
+        comparison_reason=comparison_reason,
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "no_attachment_confirmed"
+    assert result.publishable is True
+    assert "ZERO_ATTACHMENT_AUDIT_CONFLICT" not in result.reason_codes
+
+
 def test_audit_evidence_hash_is_stable_across_order_and_unicode_form() -> None:
     nfc = "caf\u00e9"
     nfd = unicodedata.normalize("NFD", nfc)
