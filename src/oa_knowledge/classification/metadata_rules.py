@@ -375,23 +375,31 @@ def classify_from_metadata(evidence: Sequence[Evidence]) -> RuleOutcome:
             conflict_codes=tuple(sorted({entry.code for entry in winners})),
         )
 
-    targets = {
-        (entry.content_origin, entry.canonical_issuer, entry.business_category)
-        for entry in winners
+    decision_fields = (
+        "content_origin",
+        "flow_type",
+        "canonical_issuer",
+        "business_category",
+        "document_number",
+        "document_type",
+    )
+    resolved_values = {
+        field: {
+            value for entry in winners if (value := getattr(entry, field)) is not None
+        }
+        for field in decision_fields
     }
-    if len(targets) != 1:
+    if any(len(values) > 1 for values in resolved_values.values()):
         return _unresolved(
             ordered,
             confidence=confidence,
             conflict_codes=tuple(sorted({entry.code for entry in winners})),
         )
 
-    winner = winners[0]
-    origin = winner.content_origin
+    origin = next(iter(resolved_values["content_origin"]), None)
+    canonical_issuer = next(iter(resolved_values["canonical_issuer"]), None)
     people = {entry.person_identifier for entry in ordered if entry.person_identifier}
-    if origin == "external" and (
-        not winner.canonical_issuer or winner.canonical_issuer in people
-    ):
+    if origin == "external" and (not canonical_issuer or canonical_issuer in people):
         return _unresolved(ordered, confidence=confidence)
 
     chain = _transfer_chain_from_evidence(ordered)
@@ -403,18 +411,25 @@ def classify_from_metadata(evidence: Sequence[Evidence]) -> RuleOutcome:
         None,
     )
     is_internal = origin == "internal"
+    issuer = min(
+        (entry.issuer for entry in winners if entry.issuer is not None),
+        key=_key,
+        default=None,
+    )
     return RuleOutcome(
         classification_status="classified",
         content_origin=origin,
-        flow_type=winner.flow_type,
+        flow_type=next(iter(resolved_values["flow_type"]), None),
         initiator_role=initiator_role,
-        business_category=(winner.business_category or "99_其他内部")
+        business_category=(
+            next(iter(resolved_values["business_category"]), None) or "99_其他内部"
+        )
         if is_internal
         else None,
-        issuer=winner.issuer if not is_internal else None,
-        canonical_issuer=winner.canonical_issuer if not is_internal else None,
-        document_number=winner.document_number,
-        document_type=winner.document_type,
+        issuer=issuer if not is_internal else None,
+        canonical_issuer=canonical_issuer if not is_internal else None,
+        document_number=next(iter(resolved_values["document_number"]), None),
+        document_type=next(iter(resolved_values["document_type"]), None),
         normalized_title=normalized_title,
         decision_source="metadata_rule",
         confidence=confidence,

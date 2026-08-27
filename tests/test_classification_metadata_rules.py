@@ -210,6 +210,184 @@ def test_equal_priority_conflict_cannot_be_hidden_by_confidence() -> None:
     assert outcome.conflict_codes == ("document_number", "explicit_issuer")
 
 
+def test_equal_priority_flow_type_conflict_is_unresolved() -> None:
+    evidence = [
+        Evidence(
+            evidence_scope="package",
+            code="internal_template_a",
+            priority=3,
+            confidence=0.96,
+            content_origin="internal",
+            flow_type="approval",
+            business_category="08_synthetic_administration",
+        ),
+        Evidence(
+            evidence_scope="package",
+            code="internal_template_b",
+            priority=3,
+            confidence=0.96,
+            content_origin="internal",
+            flow_type="circulation",
+            business_category="08_synthetic_administration",
+        ),
+    ]
+
+    outcome = classify_from_metadata(evidence)
+
+    assert outcome.classification_status == "needs_review"
+    assert outcome.flow_type is None
+    assert outcome.conflict_codes == ("internal_template_a", "internal_template_b")
+
+
+@pytest.mark.parametrize(
+    (
+        "first_document_number",
+        "first_document_type",
+        "second_document_number",
+        "second_document_type",
+    ),
+    [
+        ("SYN-AUTH-2026-1", "notice", "SYN-AUTH-2026-1", "directive"),
+        ("SYN-AUTH-2026-1", "notice", "SYN-AUTH-2026-2", "notice"),
+    ],
+)
+def test_equal_priority_document_metadata_conflict_is_unresolved(
+    first_document_number: str,
+    first_document_type: str,
+    second_document_number: str,
+    second_document_type: str,
+) -> None:
+    evidence = [
+        Evidence(
+            evidence_scope="package",
+            code="document_rule_a",
+            priority=1,
+            confidence=0.99,
+            content_origin="external",
+            flow_type="formal_document",
+            canonical_issuer="Synthetic Records Authority",
+            document_number=first_document_number,
+            document_type=first_document_type,
+        ),
+        Evidence(
+            evidence_scope="package",
+            code="document_rule_b",
+            priority=1,
+            confidence=0.99,
+            content_origin="external",
+            flow_type="formal_document",
+            canonical_issuer="Synthetic Records Authority",
+            document_number=second_document_number,
+            document_type=second_document_type,
+        ),
+    ]
+
+    forward = classify_from_metadata(evidence)
+    reversed_result = classify_from_metadata(tuple(reversed(evidence)))
+
+    assert forward == reversed_result
+    assert forward.classification_status == "needs_review"
+    assert forward.document_number is None
+    assert forward.document_type is None
+
+
+def test_compatible_equal_priority_winners_merge_independent_of_evidence_order() -> (
+    None
+):
+    evidence = [
+        Evidence(
+            evidence_scope="package",
+            code="document_number",
+            priority=1,
+            confidence=0.99,
+            content_origin="external",
+            flow_type="formal_document",
+            issuer="Synthetic Records Authority",
+            canonical_issuer="Synthetic Records Authority",
+            document_number="SYN-AUTH-2026-3",
+            document_type="notice",
+        ),
+        Evidence(
+            evidence_scope="package",
+            code="explicit_issuer",
+            priority=1,
+            confidence=0.99,
+            content_origin="external",
+            flow_type="formal_document",
+            issuer="SRA",
+            canonical_issuer="Synthetic Records Authority",
+        ),
+    ]
+
+    forward = classify_from_metadata(evidence)
+    reversed_result = classify_from_metadata(tuple(reversed(evidence)))
+
+    assert forward == reversed_result
+    assert forward.classification_status == "classified"
+    assert forward.canonical_issuer == "Synthetic Records Authority"
+    assert forward.document_number == "SYN-AUTH-2026-3"
+    assert forward.document_type == "notice"
+
+
+def test_overlapping_rules_are_unresolved_independent_of_declaration_order(
+    config: PrivateClassificationConfig,
+) -> None:
+    raw = config.model_dump(mode="python")
+    raw["title_templates"] = [
+        {
+            "pattern": r"^Synthetic overlapping",
+            "content_origin": "internal",
+            "flow_type": "flow-z",
+            "business_category": "08_synthetic_administration",
+        },
+        {
+            "pattern": r"overlapping title$",
+            "content_origin": "internal",
+            "flow_type": "flow-a",
+            "business_category": "08_synthetic_administration",
+        },
+    ]
+    raw["document_number_issuers"] = [
+        {
+            "pattern": r"^SYN-OVERLAP-",
+            "canonical_issuer": "Synthetic Records Authority",
+            "document_type": "type-z",
+        },
+        {
+            "pattern": r"-2026-1$",
+            "canonical_issuer": "Synthetic Records Authority",
+            "document_type": "type-a",
+        },
+    ]
+    forward_config = PrivateClassificationConfig.model_validate(raw)
+    reverse_raw = forward_config.model_dump(mode="python")
+    reverse_raw["title_templates"].reverse()
+    reverse_raw["document_number_issuers"].reverse()
+    reverse_config = PrivateClassificationConfig.model_validate(reverse_raw)
+
+    title_item = ClassificationItem(
+        item_key="synthetic-overlap-title",
+        title="Synthetic overlapping title",
+        initiator="synth.person.internal",
+    )
+    document_item = ClassificationItem(
+        item_key="synthetic-overlap-document",
+        title="Synthetic neutral document",
+        initiator="synth.person.internal",
+        document_number="SYN-OVERLAP-2026-1",
+    )
+
+    for item in (title_item, document_item):
+        forward = classify_from_metadata(
+            collect_metadata_evidence(item, forward_config)
+        )
+        reversed_result = classify_from_metadata(
+            collect_metadata_evidence(item, reverse_config)
+        )
+        assert forward == reversed_result
+        assert forward.classification_status == "needs_review"
+
+
 def test_result_is_independent_of_evidence_and_config_declaration_order(
     config: PrivateClassificationConfig,
 ) -> None:
