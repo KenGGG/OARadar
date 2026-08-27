@@ -184,6 +184,16 @@ def _chunks(values: Sequence[object]) -> Sequence[tuple[object, ...]]:
     )
 
 
+def _canonical_download_count_is_possible(
+    *, recognized: int | None, downloaded: int | None, local_count: int | None
+) -> bool:
+    if recognized is None or downloaded is None or local_count is None:
+        return False
+    if local_count < recognized:
+        return downloaded == local_count
+    return recognized <= downloaded <= local_count
+
+
 def _evidence(manifest: OAManifestItem | None, audit: OnlineAuditItem | None) -> ReadinessEvidence:
     online_sha, online_count = _normalized_json_sha256(
         audit.online_evidence_json if audit else None
@@ -399,9 +409,14 @@ class ArchiveReadinessService:
                 if audit.comparison_reason == "evidence_unavailable":
                     if (
                         audit.recognized_attachments is None
-                        or audit.recognized_attachments != audit.downloaded_attachments
                         or online_count != 0
-                        or local_count != audit.downloaded_attachments
+                        or not _canonical_download_count_is_possible(
+                            recognized=audit.recognized_attachments,
+                            downloaded=audit.downloaded_attachments,
+                            local_count=local_count,
+                        )
+                        or audit.recognized_attachments
+                        != audit.downloaded_attachments
                         or audit.online_inventory_sha256 is not None
                         or audit.online_content_sha256 is not None
                     ):

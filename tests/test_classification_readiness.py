@@ -356,6 +356,31 @@ def test_count_only_matched_audit_accepts_real_producer_shape(session: Session) 
     assert result.evidence.audit_evidence_mode == "count_only"
 
 
+def test_count_only_matched_accepts_same_sha_local_ledger_larger_than_download_count(
+    session: Session,
+) -> None:
+    _package(session)
+    _audit(
+        session,
+        status="matched",
+        recognized_attachments=1,
+        database_attachments=2,
+        downloaded_attachments=1,
+        online_evidence=(),
+        local_evidence=(
+            ("direct_attachment", "attachment-synthetic-1", 12, FILE_SHA),
+            ("direct_attachment", "attachment-synthetic-2", 12, FILE_SHA),
+        ),
+        comparison_reason="evidence_unavailable",
+    )
+
+    result = ArchiveReadinessService().assess(session, "done:synthetic-1")
+
+    assert result.content_integrity_status == "ok"
+    assert result.publishable is True
+    assert result.evidence.audit_local_evidence_count == 2
+
+
 def test_full_evidence_matched_audit_ignores_reporting_only_database_count(
     session: Session,
 ) -> None:

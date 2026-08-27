@@ -732,6 +732,112 @@ def test_coherent_nonmatched_audit_producer_shapes_are_accepted(
     assert len(digest) == 64
 
 
+@pytest.mark.parametrize(
+    ("evidence", "integrity_status", "reason_codes"),
+    [
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="historical_retained",
+                audit_comparison_reason="historical_retained",
+                audit_local_evidence_count=2,
+                audit_local_inventory_sha256=HASH_B,
+                audit_local_content_sha256=HASH_A,
+                audit_online_evidence_sha256=HASH_A,
+                audit_local_evidence_sha256=HASH_B,
+            ),
+            "missing",
+            ("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        (
+            lambda: replace(
+                _full_audit_evidence(),
+                audit_status="content_unverified",
+                audit_comparison_reason="content_changed",
+                audit_online_content_sha256=None,
+                audit_local_content_sha256=None,
+                audit_online_evidence_sha256=HASH_A,
+                audit_local_evidence_sha256=HASH_B,
+            ),
+            "not_checked",
+            ("NOT_CHECKED",),
+        ),
+    ],
+    ids=(
+        "same-sha-historical-subset-keeps-canonical-download-count",
+        "metadata-change-with-both-content-summaries-unverified",
+    ),
+)
+def test_canonical_download_and_unverified_content_producer_edges_are_accepted(
+    evidence, integrity_status: str, reason_codes: tuple[str, ...]
+) -> None:
+    inputs = _inputs()
+
+    digest = decision_input_sha256(
+        replace(
+            inputs,
+            content_integrity_status=integrity_status,
+            readiness_evidence=replace(evidence(), reason_codes=reason_codes),
+        )
+    )
+
+    assert len(digest) == 64
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        lambda: replace(
+            _full_audit_evidence(),
+            audit_status="historical_retained",
+            audit_downloaded_attachments=2,
+            audit_local_evidence_count=2,
+            reason_codes=("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        lambda: replace(
+            _full_audit_evidence(),
+            audit_status="inventory_mismatch",
+            audit_comparison_reason="content_changed",
+            audit_local_inventory_sha256=HASH_B,
+            audit_online_evidence_sha256=HASH_A,
+            audit_local_evidence_sha256=HASH_B,
+            reason_codes=("AUDIT_INVENTORY_MISMATCH",),
+        ),
+        lambda: replace(
+            _full_audit_evidence(),
+            audit_status="content_mismatch",
+            audit_comparison_reason="inventory_changed",
+            audit_online_content_sha256=HASH_A,
+            audit_local_content_sha256=HASH_B,
+            audit_online_evidence_sha256=HASH_A,
+            audit_local_evidence_sha256=HASH_B,
+            reason_codes=("SHA256_MISMATCH",),
+        ),
+    ],
+    ids=(
+        "equal-ledger-hash-with-different-ledger-counts",
+        "content-changed-reason-with-inventory-change",
+        "inventory-changed-reason-with-content-only-change",
+    ),
+)
+def test_comparison_reason_must_match_ledger_and_aggregate_facts(evidence) -> None:
+    audit_evidence = evidence()
+    integrity_status = (
+        "sha256_mismatch"
+        if audit_evidence.audit_status == "content_mismatch"
+        else "missing"
+    )
+
+    with pytest.raises(ValueError, match="readiness evidence"):
+        decision_input_sha256(
+            replace(
+                _inputs(),
+                content_integrity_status=integrity_status,
+                readiness_evidence=audit_evidence,
+            )
+        )
+
+
 def test_audit_timestamp_alone_does_not_invalidate_unchanged_effective_inputs() -> None:
     inputs = _inputs()
     earlier_evidence = replace(

@@ -607,6 +607,14 @@ _COUNT_ONLY_AUDIT_STATUSES = frozenset(
 _EMPTY_EVIDENCE_SHA256 = hashlib.sha256(b"[]").hexdigest()
 
 
+def _canonical_download_count_is_possible(
+    *, recognized: int, downloaded: int, local_count: int
+) -> bool:
+    if local_count < recognized:
+        return downloaded == local_count
+    return recognized <= downloaded <= local_count
+
+
 def _expected_full_audit_status(readiness_row: Mapping[str, Any]) -> str:
     recognized = readiness_row["audit_recognized_attachments"]
     downloaded = readiness_row["audit_downloaded_attachments"]
@@ -614,10 +622,7 @@ def _expected_full_audit_status(readiness_row: Mapping[str, Any]) -> str:
         return "depth_limit_reached"
     if recognized > downloaded:
         return "missing_download"
-    if (
-        readiness_row["audit_comparison_reason"] == "historical_retained"
-        and recognized < downloaded
-    ):
+    if readiness_row["audit_comparison_reason"] == "historical_retained":
         return "historical_retained"
     if (
         readiness_row["audit_online_inventory_sha256"]
@@ -657,7 +662,12 @@ def _validate_full_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
         recognized is None
         or downloaded is None
         or online_count != recognized
-        or local_count != downloaded
+        or local_count is None
+        or not _canonical_download_count_is_possible(
+            recognized=recognized,
+            downloaded=downloaded,
+            local_count=local_count,
+        )
     ):
         raise ValueError("readiness evidence full mode counts contradict")
 
@@ -679,18 +689,25 @@ def _validate_full_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
     evidence_equal = online_evidence == local_evidence
     if (comparison_reason == "exact_match") != evidence_equal:
         raise ValueError("readiness evidence comparison reason contradicts ledgers")
-    if evidence_equal and (
-        online_inventory != local_inventory
-        or readiness_row["audit_online_content_sha256"]
-        != readiness_row["audit_local_content_sha256"]
-    ):
-        raise ValueError("readiness evidence summaries contradict exact ledgers")
-    if not evidence_equal and (
-        online_inventory == local_inventory
-        and readiness_row["audit_online_content_sha256"]
-        == readiness_row["audit_local_content_sha256"]
-    ):
-        raise ValueError("readiness evidence summaries contradict changed ledgers")
+    online_content = readiness_row["audit_online_content_sha256"]
+    local_content = readiness_row["audit_local_content_sha256"]
+    if comparison_reason == "exact_match":
+        if (
+            online_count != local_count
+            or online_inventory != local_inventory
+            or online_content != local_content
+        ):
+            raise ValueError("readiness evidence summaries contradict exact ledgers")
+    elif comparison_reason == "content_changed":
+        if online_inventory != local_inventory or (
+            online_content == local_content and online_content is not None
+        ):
+            raise ValueError("readiness evidence content reason contradicts summaries")
+    else:
+        if online_inventory == local_inventory:
+            raise ValueError("readiness evidence inventory reason contradicts summaries")
+        if comparison_reason == "historical_retained" and local_count <= online_count:
+            raise ValueError("readiness evidence historical reason contradicts ledgers")
 
     expected_status = _expected_full_audit_status(readiness_row)
     if audit_status != expected_status:
@@ -715,7 +732,12 @@ def _validate_count_only_audit_bundle(readiness_row: Mapping[str, Any]) -> None:
         recognized is None
         or downloaded is None
         or readiness_row["audit_online_evidence_count"] != 0
-        or readiness_row["audit_local_evidence_count"] != downloaded
+        or readiness_row["audit_local_evidence_count"] is None
+        or not _canonical_download_count_is_possible(
+            recognized=recognized,
+            downloaded=downloaded,
+            local_count=readiness_row["audit_local_evidence_count"],
+        )
         or readiness_row["audit_online_evidence_sha256"] != _EMPTY_EVIDENCE_SHA256
         or readiness_row["audit_local_evidence_sha256"] is None
         or readiness_row["audit_local_inventory_sha256"] is None
