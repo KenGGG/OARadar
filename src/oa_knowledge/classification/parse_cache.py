@@ -76,6 +76,9 @@ class ParseArtifactRef:
     consulted: bool
     status: str
     error_code: str | None = None
+    engine: str | None = None
+    engine_version: str | None = None
+    quality_score: float | None = None
 
 
 class ParseCacheService:
@@ -428,6 +431,9 @@ class ParseCacheService:
             output_relpath=artifact.output_relpath,
             consulted=True,
             status="parsed",
+            engine=artifact.engine,
+            engine_version=artifact.engine_version,
+            quality_score=artifact.quality_score,
         )
 
     @staticmethod

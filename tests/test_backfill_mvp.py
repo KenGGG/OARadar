@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -201,6 +202,7 @@ def _settings(tmp_path: Path) -> Settings:
                 "state_root": str(tmp_path / "state"),
                 "cache_root": str(tmp_path / "cache"),
             },
+            "mineru": {"enabled": True},
         }
     )
 
@@ -405,13 +407,16 @@ def test_duplicate_attachment_content_is_parsed_once_and_materialized_twice(
     ) -> ParseResult:
         calls.append(source.name)
         output = output_dir / "parsed.md"
-        output.write_text("faithful parsed body\n", encoding="utf-8")
+        output.write_text(
+            "Faithful synthetic parsed body with enough effective characters for quality validation.\n",
+            encoding="utf-8",
+        )
         return ParseResult(
             output,
             engine,
             "synthetic-parser-v1",
             1.0,
-            text_length=20,
+            text_length=82,
             profile_version=profile_version,
         )
 
@@ -512,7 +517,214 @@ def test_attachment_failures_are_reported_without_stopping_later_packages(
     assert result.attachments_failed == 1
     assert result.attachments_skipped == 1
     assert {row.code for row in result.exceptions} == {
-        "parse_failed",
+        "parse_quality_failed",
         "unsupported_file_type",
     }
     assert any("later evidence" in path.read_text(encoding="utf-8") for path in result.output_root.rglob("*.md"))
+
+
+@pytest.mark.parametrize("suffix", (".pdf", ".png", ".jpg", ".tiff"))
+def test_visual_documents_use_mineru_then_at_most_one_markitdown_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    """Routing visual files straight to MarkItDown recreates empty OCR output."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:visual",
+        title="Synthetic internal approval visual",
+        sender="synthetic.internal",
+        payloads=((f"visual{suffix}", b"synthetic visual", "verified"),),
+    )
+    calls: list[str] = []
+
+    def fake_parse(
+        source: Path,
+        settings: Settings,
+        *,
+        engine: str,
+        output_dir: Path,
+        profile_version: str,
+    ) -> ParseResult:
+        calls.append(engine)
+        output = output_dir / f"{engine}.md"
+        body = "" if engine == "mineru" else "Readable synthetic fallback body with enough effective characters."
+        output.write_text(body, encoding="utf-8")
+        return ParseResult(
+            output,
+            engine,
+            "synthetic-parser-v2",
+            1.0,
+            text_length=len(body),
+            profile_version=profile_version,
+        )
+
+    monkeypatch.setattr("oa_knowledge.classification.parse_cache.parse_file", fake_parse)
+    monkeypatch.setattr(
+        "oa_knowledge.backfill_mvp.resolve_parser_version",
+        lambda engine, settings: "synthetic-parser-v2",
+    )
+
+    result = BackfillMVPService(
+        settings, factory, _config(), private_config_sha256="a" * 64
+    ).run(
+        BackfillMVPRequest(run_id=f"synthetic-visual-{suffix[1:]}", target_keys=("done:visual",))
+    )
+
+    assert calls == ["mineru", "markitdown"]
+    assert result.attachments_converted == 1
+    attachment = next(
+        path for path in result.output_root.rglob("*.md") if path.name != "_index.md"
+    )
+    frontmatter = yaml.safe_load(attachment.read_text(encoding="utf-8").split("---", 2)[1])
+    assert frontmatter["conversion_profile"] == "backfill-mvp-v2"
+    assert frontmatter["parse_engine"] == "markitdown"
+    assert frontmatter["fallback_reasons"] == ["empty_body"]
+
+
+def test_fragmented_parse_output_triggers_one_fallback_and_records_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A high parser score must not hide a document made of hundreds of fragments."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:fragmented",
+        title="Synthetic internal approval fragmented",
+        sender="synthetic.internal",
+        payloads=(("fragmented.pdf", b"synthetic fragmented", "verified"),),
+    )
+    calls: list[str] = []
+
+    def fake_parse(source, settings, *, engine, output_dir, profile_version):
+        calls.append(engine)
+        output = output_dir / f"{engine}.md"
+        body = "\n".join(f"fragment {index}" for index in range(40)) if engine == "mineru" else (
+            "This synthetic fallback paragraph is deliberately long enough to be read "
+            "as a coherent paragraph instead of a collection of broken lines."
+        )
+        output.write_text(body, encoding="utf-8")
+        return ParseResult(
+            output,
+            engine,
+            "synthetic-parser-v2",
+            1.0,
+            text_length=len(body),
+            profile_version=profile_version,
+        )
+
+    monkeypatch.setattr("oa_knowledge.classification.parse_cache.parse_file", fake_parse)
+    monkeypatch.setattr(
+        "oa_knowledge.backfill_mvp.resolve_parser_version",
+        lambda engine, settings: "synthetic-parser-v2",
+    )
+
+    result = BackfillMVPService(
+        settings, factory, _config(), private_config_sha256="a" * 64
+    ).run(BackfillMVPRequest(run_id="synthetic-fragmented", target_keys=("done:fragmented",)))
+
+    assert calls == ["mineru", "markitdown"]
+    attachment = next(
+        path for path in result.output_root.rglob("*.md") if path.name != "_index.md"
+    )
+    frontmatter = yaml.safe_load(attachment.read_text(encoding="utf-8").split("---", 2)[1])
+    assert frontmatter["fallback_reasons"] == ["fragmented_lines"]
+
+
+def test_two_low_quality_attempts_fail_instead_of_looping_or_publishing_empty_markdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing the two-attempt cap could loop; accepting attempt two publishes junk."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:bad-quality",
+        title="Synthetic internal approval bad quality",
+        sender="synthetic.internal",
+        payloads=(("bad.pdf", b"synthetic bad quality", "verified"),),
+    )
+    calls: list[str] = []
+
+    def fake_parse(source, settings, *, engine, output_dir, profile_version):
+        calls.append(engine)
+        output = output_dir / f"{engine}.md"
+        output.write_text("x", encoding="utf-8")
+        return ParseResult(
+            output,
+            engine,
+            "synthetic-parser-v2",
+            0.2,
+            text_length=1,
+            profile_version=profile_version,
+        )
+
+    monkeypatch.setattr("oa_knowledge.classification.parse_cache.parse_file", fake_parse)
+    monkeypatch.setattr(
+        "oa_knowledge.backfill_mvp.resolve_parser_version",
+        lambda engine, settings: "synthetic-parser-v2",
+    )
+
+    result = BackfillMVPService(
+        settings, factory, _config(), private_config_sha256="a" * 64
+    ).run(BackfillMVPRequest(run_id="synthetic-bad-quality", target_keys=("done:bad-quality",)))
+
+    assert calls == ["mineru", "markitdown"]
+    assert result.attachments_converted == 0
+    assert result.attachments_failed == 1
+    assert [row.code for row in result.exceptions] == ["parse_quality_failed"]
+    assert not [path for path in result.output_root.rglob("*.md") if path.name != "_index.md"]
+
+
+def test_office_documents_do_not_retry_with_an_unsupported_mineru_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blindly applying the visual fallback to Office files invokes an unsupported route."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:office",
+        title="Synthetic internal approval office",
+        sender="synthetic.internal",
+        payloads=(("office.docx", b"synthetic office", "verified"),),
+    )
+    calls: list[str] = []
+
+    def fake_parse(source, settings, *, engine, output_dir, profile_version):
+        calls.append(engine)
+        output = output_dir / "empty.md"
+        output.write_text("", encoding="utf-8")
+        return ParseResult(
+            output,
+            engine,
+            "synthetic-parser-v2",
+            0.1,
+            text_length=0,
+            profile_version=profile_version,
+        )
+
+    monkeypatch.setattr("oa_knowledge.classification.parse_cache.parse_file", fake_parse)
+    monkeypatch.setattr(
+        "oa_knowledge.backfill_mvp.resolve_parser_version",
+        lambda engine, settings: "synthetic-parser-v2",
+    )
+
+    result = BackfillMVPService(
+        settings, factory, _config(), private_config_sha256="a" * 64
+    ).run(BackfillMVPRequest(run_id="synthetic-office", target_keys=("done:office",)))
+
+    assert calls == ["markitdown"]
+    assert result.attachments_failed == 1
+    assert [row.code for row in result.exceptions] == ["parse_quality_failed"]

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
@@ -227,6 +228,40 @@ _RUN_ID = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _DIRECT_TEXT = frozenset(
     {".md", ".markdown", ".txt", ".html", ".htm", ".csv", ".json", ".xml"}
 )
+_VISUAL_DOCUMENTS = frozenset({".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"})
+_OFFICE_DOCUMENTS = frozenset({".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"})
+_PARSE_PROFILE = "backfill-mvp-v2"
+_MIN_EFFECTIVE_CHARACTERS = 40
+_MIN_QUALITY_SCORE = 0.5
+
+
+def _parse_engines(suffix: str, *, mineru_enabled: bool) -> tuple[str, ...]:
+    if suffix in _VISUAL_DOCUMENTS:
+        return ("mineru", "markitdown") if mineru_enabled else ("markitdown",)
+    if suffix in _OFFICE_DOCUMENTS or suffix in {".html", ".htm"}:
+        return ("markitdown",)
+    return ()
+
+
+def _parse_quality_reasons(body: str, quality_score: float | None) -> tuple[str, ...]:
+    reasons: list[str] = []
+    stripped = body.strip()
+    if not stripped:
+        reasons.append("empty_body")
+    else:
+        effective = re.findall(r"[A-Za-z0-9_\u3400-\u9fff]", stripped)
+        if len(effective) < _MIN_EFFECTIVE_CHARACTERS:
+            reasons.append("too_few_effective_characters")
+        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        if (
+            len(lines) >= 20
+            and statistics.median(len(line) for line in lines) <= 28
+            and sum(len(line) <= 32 for line in lines) / len(lines) >= 0.8
+        ):
+            reasons.append("fragmented_lines")
+    if quality_score is None or quality_score < _MIN_QUALITY_SCORE:
+        reasons.append("low_quality_score")
+    return tuple(reasons)
 
 
 def _json_sha256(value: object) -> str:
@@ -760,38 +795,82 @@ class BackfillMVPService:
         suffix = source.suffix.lower()
         if suffix in _DIRECT_TEXT:
             body = source.read_text(encoding="utf-8", errors="replace")
+            parse_engine = "direct-text"
+            parse_engine_version = "1"
+            parse_quality_score = 1.0
+            fallback_reasons: list[str] = []
         elif suffix in set(self._settings.parser.supported_extensions):
-            parser_name = "markitdown"
-            parser_version = resolve_parser_version(parser_name, self._settings)
-            profile = "backfill-mvp-v1"
-            config_sha = _json_sha256(
-                {
-                    "parser": self._settings.parser.model_dump(mode="json"),
-                    "profile": profile,
-                }
+            attempts: list[dict[str, object]] = []
+            body = ""
+            parse_engine = ""
+            parse_engine_version = ""
+            parse_quality_score: float | None = None
+            fallback_reasons = []
+            engines = _parse_engines(
+                suffix, mineru_enabled=self._settings.mineru.enabled
             )
-            parsed = self._parse_cache.get_or_parse(
-                ParseRequest(
-                    file_id=file.id,
-                    content_sha256=file.sha256,
-                    parser_name=parser_name,
-                    parser_version=parser_version,
-                    parse_profile_version=profile,
-                    parse_config_sha256=config_sha,
-                    metadata_unresolved=False,
-                    purpose="candidate_markdown",
+            for parser_name in engines[:2]:
+                parser_version = resolve_parser_version(parser_name, self._settings)
+                config_sha = _json_sha256(
+                    {
+                        "engine": parser_name,
+                        "parser": self._settings.parser.model_dump(mode="json"),
+                        "mineru": self._settings.mineru.model_dump(mode="json"),
+                        "profile": _PARSE_PROFILE,
+                        "quality_policy": {
+                            "minimum_effective_characters": _MIN_EFFECTIVE_CHARACTERS,
+                            "minimum_quality_score": _MIN_QUALITY_SCORE,
+                            "fragmented_line_median_max": 28,
+                            "fragmented_short_line_ratio": 0.8,
+                        },
+                    }
                 )
-            )
-            if parsed.status != "parsed" or not parsed.output_relpath:
+                parsed = self._parse_cache.get_or_parse(
+                    ParseRequest(
+                        file_id=file.id,
+                        content_sha256=file.sha256,
+                        parser_name=parser_name,
+                        parser_version=parser_version,
+                        parse_profile_version=_PARSE_PROFILE,
+                        parse_config_sha256=config_sha,
+                        metadata_unresolved=False,
+                        purpose="candidate_markdown",
+                    )
+                )
+                if parsed.status != "parsed" or not parsed.output_relpath:
+                    reasons = (parsed.error_code or "parse_failed",)
+                else:
+                    product = resolve_cache_path(self._settings, parsed.output_relpath)
+                    if not product.is_file():
+                        reasons = ("parse_output_missing",)
+                    else:
+                        candidate = product.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        reasons = _parse_quality_reasons(
+                            candidate, parsed.quality_score
+                        )
+                        if not reasons:
+                            body = candidate
+                            parse_engine = parsed.engine or parser_name
+                            parse_engine_version = (
+                                parsed.engine_version or parser_version
+                            )
+                            parse_quality_score = parsed.quality_score
+                            break
+                attempts.append(
+                    {"engine": parser_name, "reasons": list(reasons)}
+                )
+                fallback_reasons.extend(reasons)
+            if not body:
                 return (
                     "failed",
                     None,
-                    (parsed.error_code or "parse_failed", parsed.status),
+                    (
+                        "parse_quality_failed",
+                        json.dumps(attempts, ensure_ascii=False, sort_keys=True),
+                    ),
                 )
-            product = resolve_cache_path(self._settings, parsed.output_relpath)
-            if not product.is_file():
-                return "failed", None, ("parse_output_missing", "cache product missing")
-            body = product.read_text(encoding="utf-8", errors="replace")
         else:
             return "skipped", None, ("unsupported_file_type", suffix or "no suffix")
 
@@ -801,7 +880,11 @@ class BackfillMVPService:
         metadata = yaml.safe_dump(
             {
                 "source_sha256": source_sha,
-                "conversion_profile": "backfill-mvp-v1",
+                "conversion_profile": _PARSE_PROFILE,
+                "parse_engine": parse_engine,
+                "parse_engine_version": parse_engine_version,
+                "parse_quality_score": parse_quality_score,
+                "fallback_reasons": fallback_reasons,
             },
             allow_unicode=True,
             sort_keys=False,
