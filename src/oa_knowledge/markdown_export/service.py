@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import re
-import shutil
 import tempfile
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -18,13 +17,15 @@ from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem
 from oa_knowledge.markdown_export.paths import markdown_path_for_source
-from oa_knowledge.markdown_export.publisher import publish_markdown
-from oa_knowledge.markdown_export.publisher import IMAGE_LINK
-from oa_knowledge.markdown_export.render import ExportMetadata, SCHEMA_VERSION, render_markdown
+from oa_knowledge.markdown_export.publisher import IMAGE_LINK, publish_markdown
+from oa_knowledge.markdown_export.render import (
+    SCHEMA_VERSION,
+    ExportMetadata,
+    render_markdown,
+)
+from oa_knowledge.parsers.format_router import detect_format, parser_attempts
 from oa_knowledge.parsers.router import parse_file
 
-DIRECT_TEXT = {".md", ".markdown", ".txt", ".html", ".htm", ".csv", ".json", ".yaml", ".yml", ".xml"}
-PARSEABLE = {".pdf", ".docx", ".pptx", ".xlsx", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 INVALID_INLINE_IMAGE = re.compile(r"!\[[^]]*\]\(data:image/[^;)]+;base64\.\.\.\)", re.IGNORECASE)
 
 def sanitize_parser_markdown(content: str) -> str:
@@ -81,13 +82,13 @@ def _config_hash(settings: Settings, engine: str) -> str:
 
 
 def _engine_hint(source: Path, settings: Settings) -> tuple[str, str]:
-    if source.suffix.lower() in DIRECT_TEXT:
+    decision = detect_format(source)
+    if decision.is_direct_text:
         return "direct-text", "1"
-    if source.suffix.lower() not in PARSEABLE:
+    attempts = parser_attempts(decision, mineru_enabled=settings.mineru.enabled)
+    if not attempts:
         return "none", "1"
-    if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff"} and settings.mineru.enabled:
-        return "mineru", "api-v1"
-    return "auto", "router-v1"
+    return attempts[0], "format-router-v3.2"
 
 
 def _file_context(session: Session, settings: Settings, source: Path) -> tuple[ArchivedFile | None, OAItem | None]:
@@ -116,7 +117,7 @@ def convert_archive(settings: Settings, *, item: str | None = None, force: bool 
                 session.commit()
     finally:
         engine.dispose()
-    return {**summary.as_dict(), "markdown_dir": str(settings.markdown_root), "generated_at": datetime.now(timezone.utc).isoformat()}
+    return {**summary.as_dict(), "markdown_dir": str(settings.markdown_root), "generated_at": datetime.now(UTC).isoformat()}
 
 def convert_file_id(session: Session, settings: Settings, file_id: int, *, engine: str | None = None, force: bool = False) -> ConversionSummary:
     file = session.get(ArchivedFile, file_id)
@@ -162,12 +163,22 @@ def _convert_one(session: Session, settings: Settings, source: Path, relative: s
     try:
         with tempfile.TemporaryDirectory(prefix="oaradar-parse-", dir=settings.data_root / "parse" if (settings.data_root / "parse").exists() else None) as temp:
             assets: Path | None = None
-            suffix = source.suffix.lower()
-            if suffix in DIRECT_TEXT:
+            decision = detect_format(source)
+            attempts = parser_attempts(decision, mineru_enabled=settings.mineru.enabled)
+            if decision.is_direct_text:
                 body = source.read_text(encoding="utf-8", errors="replace")
                 status, parsed_engine, parsed_version, quality = "success", "direct-text", "1", 1.0
-            elif suffix in PARSEABLE:
-                result = parse_file(source, settings, engine=engine_override, output_dir=Path(temp))
+            elif attempts:
+                last_error: Exception | None = None
+                result = None
+                for selected_engine in (engine_override,) if engine_override else attempts[:2]:
+                    try:
+                        result = parse_file(source, settings, engine=selected_engine, output_dir=Path(temp))
+                        break
+                    except Exception as exc:  # noqa: BLE001 - deliberate bounded fallback
+                        last_error = exc
+                if result is None:
+                    raise last_error or RuntimeError("parse_failed")
                 body = sanitize_parser_markdown(result.output_path.read_text(encoding="utf-8"))
                 status, parsed_engine, parsed_version, quality = "success", result.engine, result.engine_version, result.quality_score
                 assets_candidate = result.output_path.parent
@@ -175,14 +186,15 @@ def _convert_one(session: Session, settings: Settings, source: Path, relative: s
                 if assets:
                     body = rewrite_parser_asset_links(body, destination, assets)
             else:
-                body = "该文件暂不支持内容解析。"
+                body = "该文件不生成正文 Markdown。"
                 status, parsed_engine, parsed_version, quality = "unsupported", "none", "1", None
             parsed_config_hash = _config_hash(settings, engine_hint)
-            error_code = "UNSUPPORTED_FILE_TYPE" if status == "unsupported" else None
+            error_code = decision.status_code.upper() if status == "unsupported" else None
             metadata = ExportMetadata(source_relpath=relative, source_filename=source.name, source_sha256=source_hash,
                 source_size_bytes=source.stat().st_size, source_file_id=file.id if file else None,
                 source_channel=item.source_channel if item else (relative.split("/", 1)[0] if "/" in relative else "unknown"),
                 oa_item_key=item.oa_item_key if item else None, logical_item_id=item.logical_item_id if item else None,
+                actual_file_type=decision.actual_file_type, actual_file_type_source=decision.detection_source,
                 parse_status=status, parse_engine=parsed_engine, parse_engine_version=parsed_version,
                 parse_config_hash=parsed_config_hash, quality_score=quality, last_error_code=error_code)
             content = render_markdown(metadata, body)
@@ -190,9 +202,9 @@ def _convert_one(session: Session, settings: Settings, source: Path, relative: s
         record.parse_engine, record.parse_engine_version, record.parse_config_hash = parsed_engine, parsed_version, config_hash
         record.status, record.quality_score, record.last_error_code, record.last_error = status, quality, error_code, None
         record.markdown_sha256 = hashlib.sha256(content.encode()).hexdigest()
-        record.generated_at = datetime.now(timezone.utc)
+        record.generated_at = datetime.now(UTC)
         setattr(summary, status, getattr(summary, status) + 1)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - export records the conversion exception
         terminal_code = terminal_source_error(exc)
         record.status = "unsupported" if terminal_code else "failed"
         record.last_error_code, record.last_error = terminal_code or type(exc).__name__.upper(), str(exc)[:2000]

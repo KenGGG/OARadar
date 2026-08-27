@@ -36,8 +36,9 @@ _CATEGORY_PATTERNS: tuple[tuple[BusinessCategory, tuple[str, ...]], ...] = (
 
 _TITLE_SUBJECT_RULES: tuple[tuple[BusinessCategory, tuple[str, ...]], ...] = (
     ("01_公司治理与决策", (r"董事会", r"股东(?:会|大会)", r"监事会", r"公司治理", r"公司章程")),
-    ("09_对外报送与监管反馈", (r"(?:报送|反馈|回复).*(?:金服集团|集团|监管|政府|主管部门)", r"(?:监管|对外|统计)报送")),
-    ("04_财务资金与融资", (r"银行授信", r"授信(?:额度|材料|申请)", r"融资材料", r"资金划转", r"银行账户")),
+    ("09_对外报送与监管反馈", (r"(?:报|报送|反馈|回复).*(?:金服集团|集团|监管|政府|主管部门)", r"(?:监管|对外|统计)报送")),
+    ("04_财务资金与融资", (r"银行授信", r"授信(?:额度|材料|申请)", r"融资材料", r"资金划转", r"银行账户", r"(?:电子银行|网银)", r"银行.*(?:协议|保密)")),
+    ("05_经营计划与绩效考核", (r"(?:重点)?督办(?:项目|事项)?", r"重点任务跟踪")),
     ("02_业务项目与投放租后", (
         r"租后(?:检查|报告|管理)", r"资产检查", r"资产分类", r"项目(?:立项|预审|评审|投放|合同)",
         r"(?:直租|直接租赁)", r"售后回租", r"联合承租", r"业务方案变更", r"融资租赁", r"租赁项目",
@@ -50,6 +51,7 @@ _TITLE_SUBJECT_RULES: tuple[tuple[BusinessCategory, tuple[str, ...]], ...] = (
 )
 
 _BUSINESS_BRIEF = re.compile(r"业务[一二三四五六七八九十\d]+部.*工作简报")
+_BUSINESS_MEETING = re.compile(r"业务(?:条线|[一二三四五六七八九十\d]+部)?.*工作会议纪要")
 
 _DOCUMENT_TYPES: tuple[tuple[str, str], ...] = (
     (r"立项申请书?", "立项申请书"),
@@ -78,6 +80,8 @@ def classify_by_content(
     title: str, bodies: tuple[str, ...]
 ) -> InternalClassification | None:
     body = "\n".join(bodies)
+    if _BUSINESS_MEETING.search(title) and not re.search(r"(?:项目|租赁).*(?:评审|专题|方案)|(?:项目|租赁)(?:评审|专题|方案)", title):
+        return _content_rule("05_经营计划与绩效考核", "业务工作会议纪要", title)
     if _BUSINESS_BRIEF.search(title):
         body_match = _subject_match(body, exclude={"05_经营计划与绩效考核"})
         if body_match is None:

@@ -334,7 +334,7 @@ def test_vertical_slice_builds_classified_and_review_packages_without_touching_o
     manifest = json.loads(
         (result.output_root / "build_manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == "backfill-mvp-v3"
+    assert manifest["schema_version"] == "backfill-mvp-v3.2"
     assert manifest["counts"]["selected"] == 2
     assert manifest["counts"]["packages"] == 2
     assert manifest["counts"]["classified"] == 1
@@ -635,7 +635,7 @@ def test_visual_documents_use_mineru_then_at_most_one_markitdown_fallback(
         path for path in result.output_root.rglob("*.md") if path.name != "_index.md"
     )
     frontmatter = yaml.safe_load(attachment.read_text(encoding="utf-8").split("---", 2)[1])
-    assert frontmatter["conversion_profile"] == "backfill-mvp-v3"
+    assert frontmatter["conversion_profile"] == "backfill-mvp-v3.2"
     assert frontmatter["parse_engine"] == "markitdown"
     assert frontmatter["fallback_reasons"] == ["empty_body"]
 

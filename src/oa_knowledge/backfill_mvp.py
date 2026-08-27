@@ -45,6 +45,7 @@ from oa_knowledge.db.models import (
     OAManifestItem,
 )
 from oa_knowledge.enrich.provider import make_llm_client
+from oa_knowledge.parsers.format_router import detect_format, parser_attempts
 from oa_knowledge.parsers.router import resolve_parser_version
 from oa_knowledge.runtime_paths import resolve_cache_path, resolve_original_path
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
@@ -244,12 +245,7 @@ def select_representative_items(
 
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
-_DIRECT_TEXT = frozenset(
-    {".md", ".markdown", ".txt", ".html", ".htm", ".csv", ".json", ".xml"}
-)
-_VISUAL_DOCUMENTS = frozenset({".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"})
-_OFFICE_DOCUMENTS = frozenset({".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"})
-_PARSE_PROFILE = "backfill-mvp-v3"
+_PARSE_PROFILE = "backfill-mvp-v3.2"
 _MIN_EFFECTIVE_CHARACTERS = 40
 _MIN_QUALITY_SCORE = 0.5
 
@@ -316,16 +312,6 @@ def canonicalize_attachment_aliases(
     )
 
 
-def _parse_engines(suffix: str, *, mineru_enabled: bool) -> tuple[str, ...]:
-    if suffix in _VISUAL_DOCUMENTS:
-        return ("mineru", "markitdown") if mineru_enabled else ("markitdown",)
-    if suffix == ".doc":
-        return ("markitdown", "wv")
-    if suffix in _OFFICE_DOCUMENTS or suffix in {".html", ".htm"}:
-        return ("markitdown",)
-    return ()
-
-
 def _parse_quality_reasons(body: str, quality_score: float | None) -> tuple[str, ...]:
     reasons: list[str] = []
     stripped = body.strip()
@@ -336,10 +322,15 @@ def _parse_quality_reasons(body: str, quality_score: float | None) -> tuple[str,
         if len(effective) < _MIN_EFFECTIVE_CHARACTERS:
             reasons.append("too_few_effective_characters")
         lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        structured = (
+            sum("|" in line for line in lines) >= 3
+            or sum(bool(re.match(r"^[^:：]{1,24}[:：]", line)) for line in lines) >= 5
+        )
         if (
             len(lines) >= 20
             and statistics.median(len(line) for line in lines) <= 28
             and sum(len(line) <= 32 for line in lines) / len(lines) >= 0.8
+            and not structured
         ):
             reasons.append("fragmented_lines")
     if quality_score is None or quality_score < _MIN_QUALITY_SCORE:
@@ -396,9 +387,9 @@ class BackfillMVPService:
                 run_kind="full" if request.all_targets else "incremental",
                 manifest_sha256=manifest_sha,
                 exclusion_policy_sha256=exclusion_sha,
-                rule_version="backfill-mvp-v3.1",
+                rule_version="backfill-mvp-v3.2",
                 schema_version="classification-v1",
-                prompt_version="internal-business-v3.1",
+                prompt_version="internal-business-v3.2",
                 model_name=self._settings.llm.model,
                 private_config_sha256=self._private_config_sha256,
                 target_keys=target_keys,
@@ -876,7 +867,7 @@ class BackfillMVPService:
     def _package_relpath(
         self, item: OAItem, decision: ClassificationDecision
     ) -> Path:
-        completed = item.completed_at
+        completed = item.completed_at or item.initiated_at or item.received_at
         year = f"{completed.year:04d}" if completed else "unknown-year"
         month = f"{completed.month:02d}" if completed else "unknown-month"
         day = completed.strftime("%Y%m%d") if completed else "unknown-date"
@@ -917,22 +908,22 @@ class BackfillMVPService:
         if not file.sha256 or source_sha != file.sha256:
             return "failed", None, ("sha256_mismatch", "source hash changed")
 
-        suffix = source.suffix.lower()
-        if suffix in _DIRECT_TEXT:
+        format_decision = detect_format(source)
+        if format_decision.is_direct_text:
             body = source.read_text(encoding="utf-8", errors="replace")
             parse_engine = "direct-text"
             parse_engine_version = "1"
             parse_quality_score = 1.0
             fallback_reasons: list[str] = []
-        elif suffix in set(self._settings.parser.supported_extensions):
+        elif format_decision.status_code == "parseable":
             attempts: list[dict[str, object]] = []
             body = ""
             parse_engine = ""
             parse_engine_version = ""
             parse_quality_score: float | None = None
             fallback_reasons = []
-            engines = _parse_engines(
-                suffix, mineru_enabled=self._settings.mineru.enabled
+            engines = parser_attempts(
+                format_decision, mineru_enabled=self._settings.mineru.enabled
             )
             for parser_name in engines[:2]:
                 parser_version = resolve_parser_version(parser_name, self._settings)
@@ -942,6 +933,7 @@ class BackfillMVPService:
                         "parser": self._settings.parser.model_dump(mode="json"),
                         "mineru": self._settings.mineru.model_dump(mode="json"),
                         "profile": _PARSE_PROFILE,
+                        "actual_file_type": format_decision.actual_file_type,
                         "quality_policy": {
                             "minimum_effective_characters": _MIN_EFFECTIVE_CHARACTERS,
                             "minimum_quality_score": _MIN_QUALITY_SCORE,
@@ -997,7 +989,7 @@ class BackfillMVPService:
                     ),
                 )
         else:
-            return "skipped", None, ("unsupported_file_type", suffix or "no suffix")
+            return "skipped", None, (format_decision.status_code, format_decision.actual_file_type)
 
         stem = sanitize_component(Path(file.original_name).stem, collision_key=source_sha)
         prefix = "正文" if file.file_role == "official_body" else f"附件{ordinal:02d}"
@@ -1005,6 +997,9 @@ class BackfillMVPService:
         metadata = yaml.safe_dump(
             {
                 "source_sha256": source_sha,
+                "actual_file_type": format_decision.actual_file_type,
+                "actual_file_type_source": format_decision.detection_source,
+                "filename_normalized": format_decision.filename_normalized,
                 "conversion_profile": _PARSE_PROFILE,
                 "parse_engine": parse_engine,
                 "parse_engine_version": parse_engine_version,
