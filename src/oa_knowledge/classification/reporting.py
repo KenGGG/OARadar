@@ -67,41 +67,77 @@ class ClassificationRunReport:
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> ClassificationRunReport:
-        roles = value.get("initiator_roles", {})
-        if not isinstance(roles, dict):
-            raise TypeError("stored classification report has invalid initiator roles")
+        integer_fields = (
+            "total",
+            "excluded",
+            "classification_target",
+            "publishable",
+            "integrity_blocked",
+            "needs_review",
+            "internal",
+            "external",
+            "needs_parse",
+            "actual_parse_count",
+            "expected_qwen_calls",
+            "actual_qwen_calls",
+            "conflicts",
+            "unrecognized_issuers",
+            "canonical_document_deduplications",
+        )
+        required = {
+            *integer_fields,
+            "initiator_roles",
+            "unknown_initiators",
+            "decision_sources",
+            "reconciled",
+        }
+        roles = value.get("initiator_roles")
+        unknown = value.get("unknown_initiators")
+        sources = value.get("decision_sources")
+        if (
+            set(value) != required
+            or any(type(value[field]) is not int for field in integer_fields)
+            or not isinstance(roles, dict)
+            or set(roles) != {"internal", "external", "mixed", "system", "unknown"}
+            or any(
+                not isinstance(identifiers, list)
+                or any(not isinstance(identifier, str) for identifier in identifiers)
+                for identifiers in roles.values()
+            )
+            or not isinstance(unknown, list)
+            or any(not isinstance(identifier, str) for identifier in unknown)
+            or not isinstance(sources, dict)
+            or any(
+                not isinstance(source, str) or type(count) is not int
+                for source, count in sources.items()
+            )
+            or type(value.get("reconciled")) is not bool
+        ):
+            raise ValueError("stored classification report has invalid summary")
         return cls(
-            total=int(value["total"]),
-            excluded=int(value["excluded"]),
-            classification_target=int(value["classification_target"]),
-            publishable=int(value["publishable"]),
-            integrity_blocked=int(value["integrity_blocked"]),
-            needs_review=int(value["needs_review"]),
-            internal=int(value["internal"]),
-            external=int(value["external"]),
+            total=value["total"],  # type: ignore[arg-type]
+            excluded=value["excluded"],  # type: ignore[arg-type]
+            classification_target=value["classification_target"],  # type: ignore[arg-type]
+            publishable=value["publishable"],  # type: ignore[arg-type]
+            integrity_blocked=value["integrity_blocked"],  # type: ignore[arg-type]
+            needs_review=value["needs_review"],  # type: ignore[arg-type]
+            internal=value["internal"],  # type: ignore[arg-type]
+            external=value["external"],  # type: ignore[arg-type]
             initiator_roles={
-                str(role): tuple(str(identifier) for identifier in identifiers)
-                for role, identifiers in roles.items()
-                if isinstance(identifiers, list)
+                role: tuple(identifiers) for role, identifiers in roles.items()
             },
-            unknown_initiators=tuple(
-                str(identifier)
-                for identifier in value["unknown_initiators"]  # type: ignore[index]
-            ),
-            decision_sources={
-                str(source): int(count)
-                for source, count in value["decision_sources"].items()  # type: ignore[index,union-attr]
-            },
-            needs_parse=int(value["needs_parse"]),
-            actual_parse_count=int(value["actual_parse_count"]),
-            expected_qwen_calls=int(value["expected_qwen_calls"]),
-            actual_qwen_calls=int(value["actual_qwen_calls"]),
-            conflicts=int(value["conflicts"]),
-            unrecognized_issuers=int(value["unrecognized_issuers"]),
-            canonical_document_deduplications=int(
-                value["canonical_document_deduplications"]
-            ),
-            reconciled=bool(value["reconciled"]),
+            unknown_initiators=tuple(unknown),
+            decision_sources=sources,
+            needs_parse=value["needs_parse"],  # type: ignore[arg-type]
+            actual_parse_count=value["actual_parse_count"],  # type: ignore[arg-type]
+            expected_qwen_calls=value["expected_qwen_calls"],  # type: ignore[arg-type]
+            actual_qwen_calls=value["actual_qwen_calls"],  # type: ignore[arg-type]
+            conflicts=value["conflicts"],  # type: ignore[arg-type]
+            unrecognized_issuers=value["unrecognized_issuers"],  # type: ignore[arg-type]
+            canonical_document_deduplications=value[
+                "canonical_document_deduplications"
+            ],  # type: ignore[arg-type]
+            reconciled=value["reconciled"],  # type: ignore[arg-type]
         )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -15,6 +16,7 @@ from oa_knowledge.db.models import (
     Base,
     ClassificationDecision,
     ClassificationEvidence,
+    ClassificationRun,
     OAItem,
     OAManifestItem,
 )
@@ -189,6 +191,48 @@ def test_completed_report_and_summary_are_immutable_under_later_config_changes()
 
     assert repeated == expected
     assert report == expected
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "summary",
+    (
+        '{"total":4}',
+        (
+            '{"total":4,"excluded":1,"classification_target":3,"publishable":2,'
+            '"integrity_blocked":0,"needs_review":1,"internal":1,"external":1,'
+            '"initiator_roles":{},"unknown_initiators":[],"decision_sources":{},'
+            '"needs_parse":0,"actual_parse_count":0,"expected_qwen_calls":0,'
+            '"actual_qwen_calls":0,"conflicts":0,"unrecognized_issuers":0,'
+            '"canonical_document_deduplications":0,"reconciled":"false"}'
+        ),
+    ),
+)
+def test_completed_run_rejects_malformed_stored_summary(summary: str) -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    config = _config()
+    _seed(factory)
+    service = ClassificationService(factory, config)
+    service.create_run(_request("synthetic-malformed-snapshot"))
+    service.process_next("synthetic-malformed-snapshot", limit=100)
+    service.complete("synthetic-malformed-snapshot")
+    with factory.begin() as session:
+        run = session.scalar(
+            select(ClassificationRun).where(
+                ClassificationRun.run_id == "synthetic-malformed-snapshot"
+            )
+        )
+        assert run is not None
+        run.summary_json = summary
+
+    with pytest.raises(ValueError, match="invalid summary"):
+        build_classification_run_report(factory, "synthetic-malformed-snapshot", config)
     engine.dispose()
 
 
