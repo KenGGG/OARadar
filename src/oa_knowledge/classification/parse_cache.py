@@ -229,7 +229,11 @@ class ParseCacheService:
                 status="parse_failed",
                 error_code="parser_identity_mismatch",
             )
-        except (OSError, RuntimeError, ValueError):
+        except Exception:  # noqa: BLE001
+            # Parser libraries raise heterogeneous format exceptions (including
+            # MarkItDown's UnsupportedFormatException).  They are per-file
+            # parse failures, so callers can make their one bounded fallback
+            # decision instead of losing the entire candidate build.
             self._mark_job_failed(job_id)
             return ParseArtifactRef(
                 None,

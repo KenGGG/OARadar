@@ -68,16 +68,39 @@ def test_ambiguous_internal_content_does_not_default_to_99() -> None:
     assert result is None
 
 
+@pytest.mark.parametrize(
+    ("title", "body", "category"),
+    [
+        ("光机电客户租后检查及资产分类", "本次材料含财务数据和风险提示。", "02_业务项目与投放租后"),
+        ("九州能源直租项目租后报告", "出现资产与资金等常规词。", "02_业务项目与投放租后"),
+        ("西陇科学售后回租项目业务方案变更", "项目风险分析。", "02_业务项目与投放租后"),
+        ("五舟科技项目预审会决议申请续议", "项目评审材料。", "02_业务项目与投放租后"),
+        ("报送金服集团—我司走访及服务企业更新数据", "客户资产信息。", "09_对外报送与监管反馈"),
+        ("业务一部工作简报", "本周常规经营工作安排。", "05_经营计划与绩效考核"),
+    ],
+)
+def test_business_subject_beats_incidental_risk_finance_or_document_form(
+    title: str, body: str, category: str
+) -> None:
+    module = _module()
+
+    result = module.classify_by_content(title, (body,))
+
+    assert result is not None
+    assert result.business_category == category
+
+
 class _FakeClient:
-    def __init__(self, payload: dict | None = None, *, error: str | None = None):
+    def __init__(self, payload: dict | None = None, *, error: str | None = None, raw_content: str | None = None):
         self.payload = payload
         self.error = error
+        self.raw_content = raw_content
         self.calls = 0
 
     def chat(self, system_prompt: str, user_prompt: str, *, json_schema: dict):
         self.calls += 1
         return {
-            "content": json.dumps(self.payload, ensure_ascii=False)
+            "content": self.raw_content if self.raw_content is not None else json.dumps(self.payload, ensure_ascii=False)
             if self.payload is not None
             else None,
             "model": "synthetic-qwen",
@@ -156,3 +179,34 @@ def test_low_confidence_or_invalid_qwen_output_becomes_needs_review(
     )
 
     assert result is None
+
+
+def test_qwen_accepts_one_schema_valid_object_after_a_leading_think_block() -> None:
+    module = _module()
+    raw = "<think>internal reasoning is not part of the answer</think>\n" + json.dumps(
+        _qwen_payload("02_业务项目与投放租后"), ensure_ascii=False
+    )
+    classifier = module.LocalQwenInternalClassifier(_FakeClient(raw_content=raw))
+
+    result = classifier.classify("Synthetic ambiguous title", ("Synthetic attachment evidence",), None)
+
+    assert result is not None
+    assert result.business_category == "02_业务项目与投放租后"
+    assert classifier.last_rejection_code is None
+
+
+@pytest.mark.parametrize(
+    ("raw_content", "expected_reason"),
+    [
+        ('{"business_category":"10_不存在"}', "schema_invalid"),
+        ("<think>only reasoning</think>", "json_missing"),
+    ],
+)
+def test_qwen_rejection_reason_is_explicit_without_loosening_the_schema(
+    raw_content: str, expected_reason: str
+) -> None:
+    module = _module()
+    classifier = module.LocalQwenInternalClassifier(_FakeClient(raw_content=raw_content))
+
+    assert classifier.classify("Synthetic uncertain title", ("Synthetic uncertain attachment",), None) is None
+    assert classifier.last_rejection_code == expected_reason

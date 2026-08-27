@@ -121,7 +121,7 @@ class ArchiveConfig(StrictModel):
 class ParserConfig(StrictModel):
     default_engine: str = "markitdown"
     supported_extensions: list[str] = [
-        ".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm",
+        ".pdf", ".doc", ".docx", ".pptx", ".xlsx", ".html", ".htm",
         ".txt", ".csv", ".json", ".xml", ".png", ".jpg", ".jpeg", ".tif", ".tiff",
     ]
     max_file_size_mb: int = 100

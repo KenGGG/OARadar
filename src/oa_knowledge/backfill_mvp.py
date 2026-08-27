@@ -89,6 +89,14 @@ class BackfillMVPResult:
     exceptions: tuple[BackfillException, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalAttachment:
+    """One candidate attachment plus every archive alias for the same file."""
+
+    file: ArchivedFile
+    aliases: tuple[ArchivedFile, ...]
+
+
 _SPECIAL_PRIORITY = (
     "attachment_abnormal",
     "no_attachment",
@@ -241,14 +249,78 @@ _DIRECT_TEXT = frozenset(
 )
 _VISUAL_DOCUMENTS = frozenset({".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"})
 _OFFICE_DOCUMENTS = frozenset({".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"})
-_PARSE_PROFILE = "backfill-mvp-v2"
+_PARSE_PROFILE = "backfill-mvp-v3"
 _MIN_EFFECTIVE_CHARACTERS = 40
 _MIN_QUALITY_SCORE = 0.5
+
+
+def _is_truncated_filename(name: str) -> bool:
+    return bool(re.search(r"(?:\.{3,}|…)(?:\.[^.]+)?$", name.strip()))
+
+
+def _filename_aliases(left: str, right: str) -> bool:
+    """Recognize OA's shortened display name without merging unrelated files."""
+    if left == right:
+        return True
+    left_path, right_path = Path(left), Path(right)
+    if left_path.suffix.lower() != right_path.suffix.lower():
+        return False
+    left_stem, right_stem = left_path.stem, right_path.stem
+    if _is_truncated_filename(left):
+        prefix = re.sub(r"(?:\.{3,}|…)$", "", left_stem)
+        return len(prefix) >= 3 and right_stem.startswith(prefix)
+    if _is_truncated_filename(right):
+        prefix = re.sub(r"(?:\.{3,}|…)$", "", right_stem)
+        return len(prefix) >= 3 and left_stem.startswith(prefix)
+    return False
+
+
+def _attachment_preference(file: ArchivedFile) -> tuple[int, int, int]:
+    """Choose the readable CAP4 attachment when two UI surfaces are aliases."""
+    return (
+        0 if _is_truncated_filename(file.original_name) else 1,
+        1 if file.file_role == "official_attachment" else 0,
+        len(file.original_name),
+    )
+
+
+def canonicalize_attachment_aliases(
+    files: list[ArchivedFile],
+) -> tuple[CanonicalAttachment, ...]:
+    """Collapse only known CAP4/panel duplicate aliases within one container."""
+    groups: list[list[ArchivedFile]] = []
+    for file in files:
+        for group in groups:
+            representative = group[0]
+            compatible_roles = {
+                representative.file_role,
+                file.file_role,
+            } <= {"direct_attachment", "official_attachment"}
+            if (
+                compatible_roles
+                and representative.source_container_key == file.source_container_key
+                and representative.sha256
+                and representative.sha256 == file.sha256
+                and _filename_aliases(representative.original_name, file.original_name)
+            ):
+                group.append(file)
+                break
+        else:
+            groups.append([file])
+    return tuple(
+        CanonicalAttachment(
+            file=max(group, key=_attachment_preference),
+            aliases=tuple(sorted(group, key=lambda file: file.id)),
+        )
+        for group in groups
+    )
 
 
 def _parse_engines(suffix: str, *, mineru_enabled: bool) -> tuple[str, ...]:
     if suffix in _VISUAL_DOCUMENTS:
         return ("mineru", "markitdown") if mineru_enabled else ("markitdown",)
+    if suffix == ".doc":
+        return ("markitdown", "wv")
     if suffix in _OFFICE_DOCUMENTS or suffix in {".html", ".htm"}:
         return ("markitdown",)
     return ()
@@ -300,10 +372,12 @@ class BackfillMVPService:
         self._private_config_sha256 = private_config_sha256
         self._parse_cache = ParseCacheService(session_factory, settings)
         self._qwen_client = qwen_client
+        self._qwen_outcomes: Counter[str] = Counter()
 
     def run(self, request: BackfillMVPRequest) -> BackfillMVPResult:
         if not _RUN_ID.fullmatch(request.run_id):
             raise ValueError("run_id must be a safe local identifier")
+        self._qwen_outcomes = Counter()
         selected = self._selected(request)
         target_keys = tuple(row.oa_item_key for row in selected)
         manifest_sha, exclusion_sha = self._input_hashes()
@@ -322,9 +396,9 @@ class BackfillMVPService:
                 run_kind="full" if request.all_targets else "incremental",
                 manifest_sha256=manifest_sha,
                 exclusion_policy_sha256=exclusion_sha,
-                rule_version="backfill-mvp-v2.1",
+                rule_version="backfill-mvp-v3.1",
                 schema_version="classification-v1",
-                prompt_version="internal-business-v2.1",
+                prompt_version="internal-business-v3.1",
                 model_name=self._settings.llm.model,
                 private_config_sha256=self._private_config_sha256,
                 target_keys=target_keys,
@@ -339,6 +413,7 @@ class BackfillMVPService:
         exceptions: list[BackfillException] = []
         classification_rows: list[dict[str, object]] = []
         classified = needs_review = converted = failed = skipped = attempted = 0
+        attachment_source_records = duplicate_aliases = 0
         packages = 0
         try:
             for sample in selected:
@@ -404,12 +479,16 @@ class BackfillMVPService:
                     }
                 )
 
+                canonical_files = canonicalize_attachment_aliases(files)
+                attachment_source_records += len(files)
+                duplicate_aliases += len(files) - len(canonical_files)
                 links: list[tuple[str, str]] = []
                 item_exceptions: list[BackfillException] = []
-                for ordinal, file in enumerate(files, 1):
+                for ordinal, attachment in enumerate(canonical_files, 1):
+                    file = attachment.file
                     attempted += 1
                     outcome, filename, problem = self._convert_attachment(
-                        package, file, ordinal
+                        package, attachment, ordinal
                     )
                     if outcome == "converted" and filename is not None:
                         converted += 1
@@ -450,6 +529,9 @@ class BackfillMVPService:
                 attachments_converted=converted,
                 attachments_failed=failed,
                 attachments_skipped=skipped,
+                attachment_source_records=attachment_source_records,
+                attachment_duplicate_aliases=duplicate_aliases,
+                qwen_outcomes=dict(sorted(self._qwen_outcomes.items())),
             )
             os.replace(stage, final)
         except Exception:
@@ -619,6 +701,9 @@ class BackfillMVPService:
         attachments_converted: int,
         attachments_failed: int,
         attachments_skipped: int,
+        attachment_source_records: int,
+        attachment_duplicate_aliases: int,
+        qwen_outcomes: dict[str, int],
     ) -> None:
         self._write_csv(
             stage / "sample.csv",
@@ -672,6 +757,8 @@ class BackfillMVPService:
             "classified": classified,
             "needs_review": needs_review,
             "packages": packages,
+            "attachments_source_records": attachment_source_records,
+            "attachments_duplicate_aliases": attachment_duplicate_aliases,
             "attachments_attempted": attachments_attempted,
             "attachments_converted": attachments_converted,
             "attachments_failed": attachments_failed,
@@ -688,7 +775,11 @@ class BackfillMVPService:
             + counts["attachments_failed"]
             + counts["attachments_skipped"]
         )
-        if not selected_equation or not attachment_equation:
+        source_record_equation = counts["attachments_source_records"] == (
+            counts["attachments_attempted"]
+            + counts["attachments_duplicate_aliases"]
+        )
+        if not selected_equation or not attachment_equation or not source_record_equation:
             raise RuntimeError("backfill MVP counts do not reconcile")
         files = [
             {
@@ -705,10 +796,13 @@ class BackfillMVPService:
             "input_sha256": input_sha,
             "counts": counts,
             "exception_codes": dict(sorted(Counter(row.code for row in exceptions).items())),
+            "qwen_outcomes": qwen_outcomes,
+            "parser_environment": self._parser_environment(),
             "reconciliation": {
                 "ok": True,
                 "selected_equation": selected_equation,
                 "attachment_equation": attachment_equation,
+                "source_record_equation": source_record_equation,
             },
             "files": files,
             "note": "files lists every candidate payload except this self-describing manifest",
@@ -717,6 +811,19 @@ class BackfillMVPService:
             json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
         )
+
+    def _parser_environment(self) -> dict[str, str]:
+        from oa_knowledge.parsers.antiword_parser import antiword_engine_version
+        from oa_knowledge.parsers.wv_parser import wv_engine_version
+
+        environment: dict[str, str] = {}
+        for name, resolver in (("antiword", antiword_engine_version), ("wv", wv_engine_version)):
+            try:
+                environment[name] = resolver(self._settings)
+            except (OSError, RuntimeError):
+                environment[name] = "unavailable"
+        return environment
+
 
     def _load_existing(self, root: Path, input_sha: str) -> BackfillMVPResult:
         try:
@@ -791,8 +898,9 @@ class BackfillMVPService:
         return Path("external", issuer, year, month, leaf)
 
     def _convert_attachment(
-        self, package: Path, file: ArchivedFile, ordinal: int
+        self, package: Path, attachment: CanonicalAttachment, ordinal: int
     ) -> tuple[str, str | None, tuple[str, str] | None]:
+        file = attachment.file
         if file.download_status != "verified":
             return "failed", None, ("content_not_verified", file.download_status)
         if not file.local_relpath:
@@ -902,6 +1010,17 @@ class BackfillMVPService:
                 "parse_engine_version": parse_engine_version,
                 "parse_quality_score": parse_quality_score,
                 "fallback_reasons": fallback_reasons,
+                "source_file_id": file.id,
+                "source_attachment_aliases": [
+                    {
+                        "file_id": alias.id,
+                        "attachment_key": alias.attachment_key,
+                        "original_name": alias.original_name,
+                        "file_role": alias.file_role,
+                        "local_relpath": alias.local_relpath,
+                    }
+                    for alias in attachment.aliases
+                ],
             },
             allow_unicode=True,
             sort_keys=False,
@@ -992,9 +1111,12 @@ class BackfillMVPService:
                     session.expunge(file)
             with tempfile.TemporaryDirectory(prefix="oaradar-classification-v2-") as root:
                 package = Path(root)
-                for ordinal, file in enumerate(detached, 1):
+                for ordinal, attachment in enumerate(
+                    canonicalize_attachment_aliases(detached), 1
+                ):
+                    file = attachment.file
                     status, filename, _problem = self._convert_attachment(
-                        package, file, ordinal
+                        package, attachment, ordinal
                     )
                     if status != "converted" or filename is None:
                         continue
@@ -1017,10 +1139,14 @@ class BackfillMVPService:
                     max_retries=self._settings.llm.max_retries,
                     max_tokens=512,
                 )
-            resolved = LocalQwenInternalClassifier(
+            classifier = LocalQwenInternalClassifier(
                 client,
                 confidence_threshold=self._settings.curation.confidence_threshold,
-            ).classify(item.title, bodies, document_type)
+            )
+            resolved = classifier.classify(item.title, bodies, document_type)
+            self._qwen_outcomes[
+                "accepted" if resolved is not None else classifier.last_rejection_code or "rejected"
+            ] += 1
 
         if resolved is None:
             return replace(outcome, document_type=document_type)

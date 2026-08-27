@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -334,7 +334,7 @@ def test_vertical_slice_builds_classified_and_review_packages_without_touching_o
     manifest = json.loads(
         (result.output_root / "build_manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == "backfill-mvp-v2"
+    assert manifest["schema_version"] == "backfill-mvp-v3"
     assert manifest["counts"]["selected"] == 2
     assert manifest["counts"]["packages"] == 2
     assert manifest["counts"]["classified"] == 1
@@ -344,6 +344,7 @@ def test_vertical_slice_builds_classified_and_review_packages_without_touching_o
     assert manifest["reconciliation"]["ok"] is True
     assert manifest["reconciliation"]["selected_equation"] is True
     assert manifest["reconciliation"]["attachment_equation"] is True
+    assert set(manifest["parser_environment"]) == {"antiword", "wv"}
     for file_row in manifest["files"]:
         path = result.output_root / file_row["path"]
         assert path.is_file()
@@ -455,9 +456,55 @@ def test_duplicate_attachment_content_is_parsed_once_and_materialized_twice(
         if path.name != "_index.md"
     ]
     assert len(attachments) == 2
-    assert {path.read_text(encoding="utf-8") for path in attachments} == {
-        attachments[0].read_text(encoding="utf-8")
+    rendered = [path.read_text(encoding="utf-8") for path in attachments]
+    assert all("Faithful synthetic parsed body" in text for text in rendered)
+    assert {yaml.safe_load(text.split("---", 2)[1])["source_sha256"] for text in rendered} == {
+        hashlib.sha256(payload).hexdigest()
     }
+
+
+def test_same_oa_truncated_alias_materializes_one_canonical_attachment(
+    tmp_path: Path,
+) -> None:
+    """A CAP4/legacy-panel alias must not become a second Package attachment."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    payload = b"faithful synthetic alias content with enough readable characters"
+    _add_item(
+        factory,
+        settings,
+        key="done:alias",
+        title="Synthetic internal approval equipment",
+        sender="synthetic.internal",
+        payloads=(
+            ("完整附件.txt", payload, "verified"),
+            ("完整附....txt", payload, "verified"),
+        ),
+    )
+    with factory.begin() as session:
+        rows = list(session.scalars(select(ArchivedFile).order_by(ArchivedFile.id)))
+        rows[0].file_role = "official_attachment"
+        rows[0].source_container_key = "collaboration:alias"
+        rows[1].file_role = "direct_attachment"
+        rows[1].source_container_key = "collaboration:alias"
+
+    result = BackfillMVPService(
+        settings, factory, _config(), private_config_sha256="a" * 64
+    ).run(BackfillMVPRequest(run_id="synthetic-alias", target_keys=("done:alias",)))
+
+    attachments = [
+        path for path in result.output_root.rglob("*.md") if path.name != "_index.md"
+    ]
+    index = next(result.output_root.rglob("_index.md")).read_text(encoding="utf-8")
+    manifest = json.loads(
+        (result.output_root / "build_manifest.json").read_text(encoding="utf-8")
+    )
+    assert result.attachments_attempted == 1
+    assert result.attachments_converted == 1
+    assert len(attachments) == 1
+    assert "完整附件" in attachments[0].name
+    assert index.count("](<附件") == 1
+    assert manifest["counts"]["attachments_duplicate_aliases"] == 1
 
 
 def test_attachment_failures_are_reported_without_stopping_later_packages(
@@ -588,7 +635,7 @@ def test_visual_documents_use_mineru_then_at_most_one_markitdown_fallback(
         path for path in result.output_root.rglob("*.md") if path.name != "_index.md"
     )
     frontmatter = yaml.safe_load(attachment.read_text(encoding="utf-8").split("---", 2)[1])
-    assert frontmatter["conversion_profile"] == "backfill-mvp-v2"
+    assert frontmatter["conversion_profile"] == "backfill-mvp-v3"
     assert frontmatter["parse_engine"] == "markitdown"
     assert frontmatter["fallback_reasons"] == ["empty_body"]
 
@@ -737,6 +784,95 @@ def test_office_documents_do_not_retry_with_an_unsupported_mineru_route(
     assert [row.code for row in result.exceptions] == ["parse_quality_failed"]
 
 
+def test_legacy_doc_uses_markitdown_then_wv_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A WPS binary DOC must get one compatible fallback instead of being skipped."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:legacy-doc",
+        title="Synthetic internal approval legacy DOC",
+        sender="synthetic.internal",
+        payloads=(("legacy.doc", b"synthetic legacy doc", "verified"),),
+    )
+    calls: list[str] = []
+
+    def fake_parse(source, settings, *, engine, output_dir, profile_version):
+        calls.append(engine)
+        output = output_dir / f"{engine}.md"
+        body = "" if engine == "markitdown" else (
+            "Readable synthetic legacy document body with enough characters to "
+            "pass the candidate quality gate."
+        )
+        output.write_text(body, encoding="utf-8")
+        return ParseResult(
+            output, engine, f"{engine}-test-v1", 1.0,
+            text_length=len(body), profile_version=profile_version,
+        )
+
+    monkeypatch.setattr("oa_knowledge.classification.parse_cache.parse_file", fake_parse)
+    monkeypatch.setattr(
+        "oa_knowledge.backfill_mvp.resolve_parser_version",
+        lambda engine, settings: f"{engine}-test-v1",
+    )
+
+    result = BackfillMVPService(
+        settings, factory, _config(), private_config_sha256="a" * 64
+    ).run(BackfillMVPRequest(run_id="synthetic-legacy-doc", target_keys=("done:legacy-doc",)))
+
+    attachment = next(
+        path for path in result.output_root.rglob("*.md") if path.name != "_index.md"
+    )
+    metadata = yaml.safe_load(attachment.read_text(encoding="utf-8").split("---", 2)[1])
+    assert calls == ["markitdown", "wv"]
+    assert result.attachments_converted == 1
+    assert metadata["parse_engine"] == "wv"
+    assert metadata["parse_engine_version"] == "wv-test-v1"
+    assert metadata["fallback_reasons"] == ["empty_body"]
+
+
+def test_legacy_doc_falls_back_when_markitdown_rejects_the_binary_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parser exception is a fallback reason, not a batch-stopping exception."""
+    from markitdown._exceptions import UnsupportedFormatException
+
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory, settings, key="done:legacy-doc-error",
+        title="Synthetic internal approval legacy DOC", sender="synthetic.internal",
+        payloads=(("legacy.doc", b"synthetic legacy doc", "verified"),),
+    )
+    calls: list[str] = []
+
+    def fake_parse(source, settings, *, engine, output_dir, profile_version):
+        calls.append(engine)
+        if engine == "markitdown":
+            raise UnsupportedFormatException("synthetic unsupported legacy DOC")
+        output = output_dir / "wv.md"
+        output.write_text("Readable synthetic legacy fallback body with enough characters.", encoding="utf-8")
+        return ParseResult(output, "wv", "wv-test-v1", 1.0, text_length=60, profile_version=profile_version)
+
+    monkeypatch.setattr("oa_knowledge.classification.parse_cache.parse_file", fake_parse)
+    monkeypatch.setattr(
+        "oa_knowledge.backfill_mvp.resolve_parser_version",
+        lambda engine, settings: f"{engine}-test-v1",
+    )
+
+    result = BackfillMVPService(settings, factory, _config(), private_config_sha256="a" * 64).run(
+        BackfillMVPRequest(run_id="synthetic-legacy-doc-error", target_keys=("done:legacy-doc-error",))
+    )
+
+    assert calls == ["markitdown", "wv"]
+    assert result.attachments_converted == 1
+
+
 def test_v2_classifies_an_unresolved_internal_item_from_attachment_content(
     tmp_path: Path,
 ) -> None:
@@ -828,6 +964,10 @@ def test_v2_calls_local_qwen_only_after_title_and_content_rules_are_unresolved(
     assert row["business_category"] == "99_其他内部"
     assert row["document_type"] == "会议纪要"
     assert row["decision_source"] == "local_qwen"
+    manifest = json.loads(
+        (result.output_root / "build_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["qwen_outcomes"] == {"accepted": 1}
     with factory() as session:
         qwen_evidence = session.query(ClassificationEvidence).filter_by(
             evidence_type="local_qwen"

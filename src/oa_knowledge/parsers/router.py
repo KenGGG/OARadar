@@ -55,6 +55,10 @@ def resolve_parser_version(engine: str, settings) -> str:
         from oa_knowledge.parsers.mineru_parser import mineru_engine_version
 
         return mineru_engine_version(settings)
+    if engine == "wv":
+        from oa_knowledge.parsers.wv_parser import wv_engine_version
+
+        return wv_engine_version(settings)
     raise ValueError(f"Unknown engine: {engine}")
 
 
@@ -218,6 +222,12 @@ def parse_file(
             # performs its own retried health check; a separate probe here used
             # to reject healthy work whenever the GPU service was briefly busy.
             return parse_with_mineru(
+                file_path, settings, output_dir, profile_version=profile_version
+            )
+        if engine == "wv":
+            from oa_knowledge.parsers.wv_parser import parse_with_wv
+
+            return parse_with_wv(
                 file_path, settings, output_dir, profile_version=profile_version
             )
         raise ValueError(f"Unknown engine: {engine}")
