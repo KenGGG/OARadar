@@ -11,7 +11,7 @@ import shutil
 import statistics
 import tempfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
@@ -19,6 +19,16 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from oa_knowledge.archive.integrity import sha256_file
+from oa_knowledge.classification.evidence import (
+    ClassificationItem,
+    Evidence,
+    RuleOutcome,
+)
+from oa_knowledge.classification.internal_classification import (
+    LocalQwenInternalClassifier,
+    classify_by_content,
+    extract_document_type,
+)
 from oa_knowledge.classification.metadata_rules import find_configured_document_number
 from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
@@ -34,6 +44,7 @@ from oa_knowledge.db.models import (
     OAItem,
     OAManifestItem,
 )
+from oa_knowledge.enrich.provider import make_llm_client
 from oa_knowledge.parsers.router import resolve_parser_version
 from oa_knowledge.runtime_paths import resolve_cache_path, resolve_original_path
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
@@ -281,12 +292,14 @@ class BackfillMVPService:
         config: PrivateClassificationConfig,
         *,
         private_config_sha256: str,
+        qwen_client: object | None = None,
     ) -> None:
         self._settings = settings
         self._sessions = session_factory
         self._config = config
         self._private_config_sha256 = private_config_sha256
         self._parse_cache = ParseCacheService(session_factory, settings)
+        self._qwen_client = qwen_client
 
     def run(self, request: BackfillMVPRequest) -> BackfillMVPResult:
         if not _RUN_ID.fullmatch(request.run_id):
@@ -300,17 +313,19 @@ class BackfillMVPService:
         final = builds / request.run_id
         if final.exists():
             return self._load_existing(final, input_sha)
-        classification = ClassificationService(self._sessions, self._config)
+        classification = ClassificationService(
+            self._sessions, self._config, outcome_hook=self._resolve_internal_outcome
+        )
         run = classification.create_run(
             CreateClassificationRun(
                 run_id=request.run_id,
                 run_kind="full" if request.all_targets else "incremental",
                 manifest_sha256=manifest_sha,
                 exclusion_policy_sha256=exclusion_sha,
-                rule_version="backfill-mvp-metadata-v1",
+                rule_version="backfill-mvp-v2",
                 schema_version="classification-v1",
-                prompt_version="not-used",
-                model_name="disabled-for-mvp",
+                prompt_version="internal-business-v2",
+                model_name=self._settings.llm.model,
                 private_config_sha256=self._private_config_sha256,
                 target_keys=target_keys,
             )
@@ -380,6 +395,7 @@ class BackfillMVPService:
                         "classification_status": decision.classification_status,
                         "content_origin": decision.content_origin or "",
                         "business_category": decision.business_category or "",
+                        "document_type": decision.document_type or "",
                         "canonical_issuer": decision.canonical_issuer or "",
                         "content_integrity_status": decision.content_integrity_status,
                         "confidence": decision.classification_confidence,
@@ -623,6 +639,7 @@ class BackfillMVPService:
                 "classification_status",
                 "content_origin",
                 "business_category",
+                "document_type",
                 "canonical_issuer",
                 "content_integrity_status",
                 "confidence",
@@ -917,6 +934,7 @@ class BackfillMVPService:
                 "business_category": decision.business_category,
                 "canonical_issuer": decision.canonical_issuer,
                 "document_number": decision.document_number,
+                "document_type": decision.document_type,
                 "classification_confidence": decision.classification_confidence,
                 "decision_source": decision.decision_source,
             },
@@ -943,3 +961,89 @@ class BackfillMVPService:
             lines.extend(["", "## 候选构建异常", ""])
             lines.extend(f"- `{row.code}`：{row.detail}" for row in exceptions)
         (package / "_index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _resolve_internal_outcome(
+        self,
+        item: ClassificationItem,
+        evidence: list[Evidence],
+        outcome: RuleOutcome,
+    ) -> RuleOutcome:
+        if (
+            outcome.content_origin != "internal"
+            or outcome.business_category is not None
+            or outcome.classification_status != "needs_review"
+        ):
+            return outcome
+
+        document_type = outcome.document_type or extract_document_type(item.title)
+        resolved = classify_by_content(item.title, ())
+        bodies: tuple[str, ...] = ()
+        source_file_id: int | None = None
+        if resolved is None and item.attachments:
+            parsed_bodies: list[str] = []
+            with self._sessions() as session:
+                files = [
+                    session.get(ArchivedFile, attachment.source_file_id)
+                    for attachment in item.attachments
+                    if attachment.source_file_id is not None
+                ]
+                detached = [file for file in files if file is not None]
+                for file in detached:
+                    session.expunge(file)
+            with tempfile.TemporaryDirectory(prefix="oaradar-classification-v2-") as root:
+                package = Path(root)
+                for ordinal, file in enumerate(detached, 1):
+                    status, filename, _problem = self._convert_attachment(
+                        package, file, ordinal
+                    )
+                    if status != "converted" or filename is None:
+                        continue
+                    rendered = (package / filename).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    parts = rendered.split("---", 2)
+                    body = parts[2].strip() if len(parts) == 3 else rendered.strip()
+                    if body:
+                        parsed_bodies.append(body)
+                        source_file_id = source_file_id or file.id
+            bodies = tuple(parsed_bodies)
+            resolved = classify_by_content(item.title, bodies)
+
+        if resolved is None and bodies:
+            client = self._qwen_client
+            if client is None:
+                client = make_llm_client(
+                    self._settings.llm,
+                    max_retries=self._settings.llm.max_retries,
+                    max_tokens=512,
+                )
+            resolved = LocalQwenInternalClassifier(
+                client,
+                confidence_threshold=self._settings.curation.confidence_threshold,
+            ).classify(item.title, bodies, document_type)
+
+        if resolved is None:
+            return replace(outcome, document_type=document_type)
+
+        evidence.append(
+            Evidence(
+                evidence_scope="attachment" if bodies else "package",
+                code=resolved.decision_source,
+                priority=10,
+                confidence=resolved.confidence,
+                decision_source=resolved.decision_source,
+                content_origin="internal",
+                business_category=resolved.business_category,
+                document_type=resolved.document_type or document_type,
+                source_file_id=source_file_id,
+            )
+        )
+        return replace(
+            outcome,
+            classification_status="classified",
+            business_category=resolved.business_category,
+            document_type=resolved.document_type or document_type,
+            decision_source=resolved.decision_source,
+            confidence=resolved.confidence,
+            escalation_action="resolved",
+        )

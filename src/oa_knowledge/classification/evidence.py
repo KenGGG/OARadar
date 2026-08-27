@@ -6,7 +6,7 @@ from typing import Literal
 from .schemas import ContentOrigin, InitiatorRole
 
 EvidenceScope = Literal["package", "attachment"]
-DecisionSource = Literal["metadata_rule"]
+DecisionSource = Literal["metadata_rule", "content_rule", "local_qwen"]
 EscalationAction = Literal["resolved", "parse_attachment", "needs_review"]
 
 

@@ -77,15 +77,15 @@ cases:
       transfer_people: [synth.person.internal, synth.person.internal.beta]
     expected:
       evidence_scopes: [package]
-      status: classified
+      status: needs_review
       origin: internal
-      business_category: 99_其他内部
+      business_category: null
       canonical_issuer: null
       confidence: 0.92
-      decision_source: metadata_rule
+      decision_source: null
       transfer_chain: [synth.person.internal, synth.person.internal.beta]
       relay_from: synth.person.internal
-      action: resolved
+      action: needs_review
 
   - id: three_level_internal_transfer
     item:
@@ -98,18 +98,18 @@ cases:
         - synth.person.internal.gamma
     expected:
       evidence_scopes: [package]
-      status: classified
+      status: needs_review
       origin: internal
-      business_category: 99_其他内部
+      business_category: null
       canonical_issuer: null
       confidence: 0.92
-      decision_source: metadata_rule
+      decision_source: null
       transfer_chain:
         - synth.person.internal
         - synth.person.internal.beta
         - synth.person.internal.gamma
       relay_from: synth.person.internal.beta
-      action: resolved
+      action: needs_review
 
   - id: internal_initiator_fallback
     item:
@@ -118,15 +118,15 @@ cases:
       initiator: synth.person.internal
     expected:
       evidence_scopes: [package]
-      status: classified
+      status: needs_review
       origin: internal
-      business_category: 99_其他内部
+      business_category: null
       canonical_issuer: null
       confidence: 0.86
-      decision_source: metadata_rule
+      decision_source: null
       transfer_chain: []
       relay_from: null
-      action: resolved
+      action: needs_review
 
   - id: external_initiator_without_issuer
     item:

@@ -728,3 +728,96 @@ def test_office_documents_do_not_retry_with_an_unsupported_mineru_route(
     assert calls == ["markitdown"]
     assert result.attachments_failed == 1
     assert [row.code for row in result.exceptions] == ["parse_quality_failed"]
+
+
+def test_v2_classifies_an_unresolved_internal_item_from_attachment_content(
+    tmp_path: Path,
+) -> None:
+    """Leaving the metadata-only service in place sends every unknown internal item to review."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:content-rule",
+        title="Synthetic 立项申请书",
+        sender="synthetic.internal",
+        payloads=(("evidence.txt", "融资租赁项目评审及投放条件".encode(), "verified"),),
+    )
+
+    result = BackfillMVPService(
+        settings, factory, _config(), private_config_sha256="a" * 64
+    ).run(
+        BackfillMVPRequest(
+            run_id="synthetic-content-rule-v2", target_keys=("done:content-rule",)
+        )
+    )
+
+    assert result.classified == 1
+    with (result.output_root / "classification.csv").open(
+        encoding="utf-8-sig", newline=""
+    ) as stream:
+        row = next(__import__("csv").DictReader(stream))
+    assert row["business_category"] == "02_业务项目与投放租后"
+    assert row["document_type"] == "立项申请书"
+    assert row["decision_source"] == "content_rule"
+
+
+def test_v2_calls_local_qwen_only_after_title_and_content_rules_are_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Defaulting before the last stage would prevent the required local-Qwen fallback."""
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:qwen",
+        title="Synthetic 会议纪要",
+        sender="synthetic.internal",
+        payloads=(("evidence.txt", b"Synthetic ambiguous internal evidence", "verified"),),
+    )
+    class FakeClient:
+        calls = 0
+
+        def chat(self, system_prompt: str, user_prompt: str, *, json_schema: dict):
+            self.calls += 1
+            return {
+                "content": json.dumps(
+                    {
+                        "business_category": "99_其他内部",
+                        "document_type": "会议纪要",
+                        "confidence": 0.9,
+                        "evidence_quote": "Synthetic evidence outside the existing categories.",
+                        "outside_existing_categories": True,
+                        "reason": "Synthetic evidence supports the final fallback category.",
+                    },
+                    ensure_ascii=False,
+                ),
+                "model": "synthetic-qwen",
+                "usage": None,
+                "error": None,
+                "elapsed_seconds": 0.01,
+            }
+
+    client = FakeClient()
+
+    result = BackfillMVPService(
+        settings,
+        factory,
+        _config(),
+        private_config_sha256="a" * 64,
+        qwen_client=client,
+    ).run(
+        BackfillMVPRequest(run_id="synthetic-qwen-v2", target_keys=("done:qwen",))
+    )
+
+    assert client.calls == 1
+    assert result.classified == 1
+    with (result.output_root / "classification.csv").open(
+        encoding="utf-8-sig", newline=""
+    ) as stream:
+        row = next(__import__("csv").DictReader(stream))
+    assert row["business_category"] == "99_其他内部"
+    assert row["document_type"] == "会议纪要"
+    assert row["decision_source"] == "local_qwen"

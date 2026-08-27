@@ -509,7 +509,10 @@ def test_origin_directory_invariants_are_enforced() -> None:
         ]
     )
 
-    assert internal.business_category == "99_其他内部"
+    assert internal.classification_status == "needs_review"
+    assert internal.content_origin == "internal"
+    assert internal.business_category is None
+    assert internal.escalation_action == "needs_review"
     assert internal.canonical_issuer is None
     assert invalid_external.classification_status == "needs_review"
     assert invalid_external.business_category is None

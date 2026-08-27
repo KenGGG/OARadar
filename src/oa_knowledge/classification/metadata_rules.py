@@ -11,6 +11,7 @@ from .evidence import (
     RuleOutcome,
     TransferHop,
 )
+from .internal_classification import extract_document_type
 from .schemas import InitiatorProfile, PrivateClassificationConfig
 
 _DATE_WRAPPER = re.compile(
@@ -148,6 +149,17 @@ def collect_metadata_evidence(
             normalized_title=normalized_title,
         )
     ]
+    document_type = extract_document_type(normalized_title)
+    if document_type:
+        evidence.append(
+            Evidence(
+                evidence_scope="package",
+                code="title_document_type",
+                priority=99,
+                confidence=0.9,
+                document_type=document_type,
+            )
+        )
 
     if item.document_number:
         evidence.extend(
@@ -439,25 +451,46 @@ def classify_from_metadata(evidence: Sequence[Evidence]) -> RuleOutcome:
         None,
     )
     is_internal = origin == "internal"
+    document_type = next(
+        (entry.document_type for entry in ordered if entry.document_type), None
+    )
     issuer = min(
         (entry.issuer for entry in winners if entry.issuer is not None),
         key=_issuer_selection_key,
         default=None,
     )
+    business_category = next(iter(resolved_values["business_category"]), None)
+    if is_internal and business_category is None:
+        has_attachment = any(
+            entry.evidence_scope == "attachment" for entry in ordered
+        )
+        return RuleOutcome(
+            classification_status="needs_review",
+            content_origin="internal",
+            flow_type=next(iter(resolved_values["flow_type"]), None),
+            initiator_role=initiator_role,
+            business_category=None,
+            issuer=None,
+            canonical_issuer=None,
+            document_number=next(iter(resolved_values["document_number"]), None),
+            document_type=document_type,
+            normalized_title=normalized_title,
+            decision_source=None,
+            confidence=confidence,
+            transfer_chain=chain,
+            relay_from=chain[-2].person_identifier if len(chain) > 1 else None,
+            escalation_action="parse_attachment" if has_attachment else "needs_review",
+        )
     return RuleOutcome(
         classification_status="classified",
         content_origin=origin,
         flow_type=next(iter(resolved_values["flow_type"]), None),
         initiator_role=initiator_role,
-        business_category=(
-            next(iter(resolved_values["business_category"]), None) or "99_其他内部"
-        )
-        if is_internal
-        else None,
+        business_category=business_category if is_internal else None,
         issuer=issuer if not is_internal else None,
         canonical_issuer=canonical_issuer if not is_internal else None,
         document_number=next(iter(resolved_values["document_number"]), None),
-        document_type=next(iter(resolved_values["document_type"]), None),
+        document_type=document_type,
         normalized_title=normalized_title,
         decision_source="metadata_rule",
         confidence=confidence,
