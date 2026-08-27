@@ -334,6 +334,7 @@ def test_vertical_slice_builds_classified_and_review_packages_without_touching_o
     manifest = json.loads(
         (result.output_root / "build_manifest.json").read_text(encoding="utf-8")
     )
+    assert manifest["schema_version"] == "backfill-mvp-v2"
     assert manifest["counts"]["selected"] == 2
     assert manifest["counts"]["packages"] == 2
     assert manifest["counts"]["classified"] == 1

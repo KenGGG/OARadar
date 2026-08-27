@@ -521,7 +521,7 @@ class BackfillMVPService:
                     for row in selected
                 ],
                 "files": file_rows,
-                "profile": "backfill-mvp-v1",
+                "profile": _PARSE_PROFILE,
             }
         )
 
@@ -700,7 +700,7 @@ class BackfillMVPService:
             if path.is_file() and path.name != "build_manifest.json"
         ]
         manifest = {
-            "schema_version": "backfill-mvp-v1",
+            "schema_version": _PARSE_PROFILE,
             "run_id": request.run_id,
             "input_sha256": input_sha,
             "counts": counts,
