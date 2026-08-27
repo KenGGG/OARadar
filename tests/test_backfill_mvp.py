@@ -18,7 +18,13 @@ from oa_knowledge.backfill_mvp import (
 )
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 from oa_knowledge.config import Settings
-from oa_knowledge.db.models import ArchivedFile, Base, OAItem, OAManifestItem
+from oa_knowledge.db.models import (
+    ArchivedFile,
+    Base,
+    ClassificationEvidence,
+    OAItem,
+    OAManifestItem,
+)
 from oa_knowledge.parsers.router import ParseResult
 
 
@@ -821,3 +827,11 @@ def test_v2_calls_local_qwen_only_after_title_and_content_rules_are_unresolved(
     assert row["business_category"] == "99_其他内部"
     assert row["document_type"] == "会议纪要"
     assert row["decision_source"] == "local_qwen"
+    with factory() as session:
+        qwen_evidence = session.query(ClassificationEvidence).filter_by(
+            evidence_type="local_qwen"
+        ).one()
+    evidence_value = json.loads(qwen_evidence.value_json)
+    assert evidence_value["evidence_excerpt"] == (
+        "Synthetic evidence outside the existing categories."
+    )

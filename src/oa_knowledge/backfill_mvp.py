@@ -322,9 +322,9 @@ class BackfillMVPService:
                 run_kind="full" if request.all_targets else "incremental",
                 manifest_sha256=manifest_sha,
                 exclusion_policy_sha256=exclusion_sha,
-                rule_version="backfill-mvp-v2",
+                rule_version="backfill-mvp-v2.1",
                 schema_version="classification-v1",
-                prompt_version="internal-business-v2",
+                prompt_version="internal-business-v2.1",
                 model_name=self._settings.llm.model,
                 private_config_sha256=self._private_config_sha256,
                 target_keys=target_keys,
@@ -1035,6 +1035,7 @@ class BackfillMVPService:
                 content_origin="internal",
                 business_category=resolved.business_category,
                 document_type=resolved.document_type or document_type,
+                evidence_excerpt=resolved.evidence,
                 source_file_id=source_file_id,
             )
         )

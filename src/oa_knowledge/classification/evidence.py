@@ -55,6 +55,7 @@ class Evidence:
     canonical_issuer: str | None = None
     document_number: str | None = None
     document_type: str | None = None
+    evidence_excerpt: str | None = None
     normalized_title: str | None = None
     attachment_key: str | None = None
     source_file_id: int | None = None
