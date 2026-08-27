@@ -1,10 +1,10 @@
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
-from typer.testing import CliRunner
 from sqlalchemy.orm import Session
+from typer.testing import CliRunner
 
 from oa_knowledge.cli import _oa_detail_url, _sanitize_operational_error, app
 from oa_knowledge.collector import LoginState
@@ -13,7 +13,13 @@ from oa_knowledge.collector.done import DiscoveredDoneItem
 from oa_knowledge.collector.pending import DiscoveredPendingItem, PendingDiscovery
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import BatchItem, CollectionBatch, OperationJob
+from oa_knowledge.db.models import (
+    BatchItem,
+    CollectionBatch,
+    OAItem,
+    OAManifestItem,
+    OperationJob,
+)
 
 runner = CliRunner()
 
@@ -48,6 +54,99 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
     assert json.loads(status.output)["schema"] == "0039_classification_run_adopted_decision"
+
+
+def test_backfill_mvp_cli_exposes_sample_and_full_modes() -> None:
+    result = runner.invoke(app, ["backfill-mvp", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--run-id" in result.output
+    assert "--sample-size" in result.output
+    assert "--all-targets" in result.output
+
+
+def test_backfill_mvp_cli_builds_a_reconciled_candidate(
+    config_file: Path, monkeypatch
+) -> None:
+    from oa_knowledge.classification.schemas import PrivateClassificationConfig
+
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+    settings = load_settings(config_file)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add_all(
+            [
+                OAManifestItem(
+                    oa_item_key="done:cli-mvp",
+                    title="Synthetic unresolved CLI matter",
+                    sender="synthetic.unknown",
+                    list_page=1,
+                    list_ordinal=1,
+                    processing_status="no_attachment",
+                    no_attachment_confirmed=True,
+                ),
+                OAItem(
+                    oa_item_key="done:cli-mvp",
+                    source_channel="done",
+                    title="Synthetic unresolved CLI matter",
+                    sender="synthetic.unknown",
+                    pipeline_status="files_verified",
+                ),
+            ]
+        )
+        session.commit()
+    engine.dispose()
+    private_dir = config_file.parent / "private-classification"
+    monkeypatch.setenv("OA_CLASSIFICATION_PRIVATE_DIR", str(private_dir))
+    private_config = PrivateClassificationConfig.model_validate(
+        {
+            "initiators": {
+                "synthetic.unknown": {"role": "unknown", "aliases": []}
+            },
+            "document_number_issuers": [
+                {
+                    "pattern": r"^SYN-[0-9]+$",
+                    "canonical_issuer": "Synthetic Authority",
+                }
+            ],
+            "issuer_aliases": {"Synthetic Authority": "Synthetic Authority"},
+            "title_templates": [
+                {
+                    "pattern": r"^Synthetic internal",
+                    "content_origin": "internal",
+                    "flow_type": "approval",
+                    "business_category": "99_其他内部",
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.classification.private_config.load_private_classification_config",
+        lambda root: SimpleNamespace(
+            config=private_config, config_sha256="a" * 64
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "backfill-mvp",
+            "--run-id",
+            "synthetic-cli-mvp",
+            "--sample-size",
+            "1",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["processed"] == 1
+    assert payload["packages"] == 1
+    assert payload["needs_review"] == 1
+    assert payload["reconciled"] is True
+    assert (Path(payload["output_root"]) / "build_manifest.json").is_file()
 
 
 def test_schedule_enqueue_creates_worker_job_without_opening_browser(config_file: Path) -> None:

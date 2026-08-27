@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
 import re
 import shutil
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -254,6 +256,12 @@ class BackfillMVPService:
         selected = self._selected(request)
         target_keys = tuple(row.oa_item_key for row in selected)
         manifest_sha, exclusion_sha = self._input_hashes()
+        input_sha = self._run_input_sha(selected, manifest_sha, exclusion_sha)
+        builds = self._settings.markdown_root / ".builds"
+        builds.mkdir(parents=True, exist_ok=True)
+        final = builds / request.run_id
+        if final.exists():
+            return self._load_existing(final, input_sha)
         classification = ClassificationService(self._sessions, self._config)
         run = classification.create_run(
             CreateClassificationRun(
@@ -274,13 +282,9 @@ class BackfillMVPService:
         )
         classification.complete(run.run_id)
 
-        builds = self._settings.markdown_root / ".builds"
-        builds.mkdir(parents=True, exist_ok=True)
-        final = builds / request.run_id
-        if final.exists():
-            raise FileExistsError("candidate run directory already exists")
         stage = Path(tempfile.mkdtemp(prefix=f".{request.run_id}.", dir=builds))
         exceptions: list[BackfillException] = []
+        classification_rows: list[dict[str, object]] = []
         classified = needs_review = converted = failed = skipped = attempted = 0
         packages = 0
         try:
@@ -332,6 +336,19 @@ class BackfillMVPService:
                     classified += 1
                 else:
                     needs_review += 1
+                classification_rows.append(
+                    {
+                        "oa_item_key": item.oa_item_key,
+                        "classification_status": decision.classification_status,
+                        "content_origin": decision.content_origin or "",
+                        "business_category": decision.business_category or "",
+                        "canonical_issuer": decision.canonical_issuer or "",
+                        "content_integrity_status": decision.content_integrity_status,
+                        "confidence": decision.classification_confidence,
+                        "decision_source": decision.decision_source,
+                        "reason": decision.classification_reason_json,
+                    }
+                )
 
                 links: list[tuple[str, str]] = []
                 item_exceptions: list[BackfillException] = []
@@ -365,6 +382,21 @@ class BackfillMVPService:
                     links,
                     item_exceptions,
                 )
+            self._write_reports(
+                stage,
+                request,
+                selected,
+                classification_rows,
+                exceptions,
+                input_sha=input_sha,
+                classified=classified,
+                needs_review=needs_review,
+                packages=packages,
+                attachments_attempted=attempted,
+                attachments_converted=converted,
+                attachments_failed=failed,
+                attachments_skipped=skipped,
+            )
             os.replace(stage, final)
         except Exception:
             shutil.rmtree(stage, ignore_errors=True)
@@ -383,6 +415,60 @@ class BackfillMVPService:
             attachments_failed=failed,
             attachments_skipped=skipped,
             exceptions=tuple(exceptions),
+        )
+
+    def _run_input_sha(
+        self,
+        selected: tuple[SampleItem, ...],
+        manifest_sha: str,
+        exclusion_sha: str,
+    ) -> str:
+        keys = tuple(row.oa_item_key for row in selected)
+        with self._sessions() as session:
+            items = {
+                row.oa_item_key: row
+                for row in session.scalars(
+                    select(OAItem).where(OAItem.oa_item_key.in_(keys))
+                )
+            }
+            item_ids = tuple(row.id for row in items.values())
+            files = list(
+                session.scalars(
+                    select(ArchivedFile)
+                    .where(ArchivedFile.oa_item_id.in_(item_ids))
+                    .order_by(ArchivedFile.oa_item_id, ArchivedFile.id)
+                )
+            ) if item_ids else []
+        file_rows = [
+            {
+                "oa_item_key": next(
+                    key for key, item in items.items() if item.id == file.oa_item_id
+                ),
+                "file_id": file.id,
+                "role": file.file_role,
+                "path": file.local_relpath,
+                "size": file.size_bytes,
+                "sha256": file.sha256,
+                "status": file.download_status,
+            }
+            for file in files
+        ]
+        return _json_sha256(
+            {
+                "manifest_sha256": manifest_sha,
+                "exclusion_sha256": exclusion_sha,
+                "private_config_sha256": self._private_config_sha256,
+                "selected": [
+                    {
+                        "oa_item_key": row.oa_item_key,
+                        "bucket": row.bucket,
+                        "reason": row.reason,
+                    }
+                    for row in selected
+                ],
+                "files": file_rows,
+                "profile": "backfill-mvp-v1",
+            }
         )
 
     def _selected(self, request: BackfillMVPRequest) -> tuple[SampleItem, ...]:
@@ -423,19 +509,207 @@ class BackfillMVPService:
                 session.execute(
                     select(
                         OAManifestItem.oa_item_key,
+                        OAManifestItem.title,
+                        OAManifestItem.sender,
+                        OAManifestItem.completed_at,
                         OAManifestItem.processing_status,
                         OAManifestItem.matched_exclusion_keyword,
                         OAManifestItem.no_attachment_confirmed,
                     ).order_by(OAManifestItem.oa_item_key)
                 )
             )
-        manifest = [tuple(row) for row in rows]
+        manifest = [dict(row._mapping) for row in rows]
         excluded = [
-            row[0]
+            row["oa_item_key"]
             for row in manifest
-            if row[1] == "skipped" or (row[2] or "").strip()
+            if row["processing_status"] == "skipped"
+            or (row["matched_exclusion_keyword"] or "").strip()
         ]
         return _json_sha256(manifest), _json_sha256(excluded)
+
+    def _baseline_counts(self) -> tuple[int, int, int]:
+        with self._sessions() as session:
+            total = session.scalar(
+                select(func.count()).select_from(OAManifestItem)
+            ) or 0
+            excluded = session.scalar(
+                select(func.count())
+                .select_from(OAManifestItem)
+                .where(
+                    (OAManifestItem.processing_status == "skipped")
+                    | (func.coalesce(OAManifestItem.matched_exclusion_keyword, "") != "")
+                )
+            ) or 0
+        return total, excluded, total - excluded
+
+    @staticmethod
+    def _write_csv(path: Path, fieldnames: tuple[str, ...], rows: list[dict]) -> None:
+        with path.open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _write_reports(
+        self,
+        stage: Path,
+        request: BackfillMVPRequest,
+        selected: tuple[SampleItem, ...],
+        classification_rows: list[dict[str, object]],
+        exceptions: list[BackfillException],
+        *,
+        input_sha: str,
+        classified: int,
+        needs_review: int,
+        packages: int,
+        attachments_attempted: int,
+        attachments_converted: int,
+        attachments_failed: int,
+        attachments_skipped: int,
+    ) -> None:
+        self._write_csv(
+            stage / "sample.csv",
+            ("oa_item_key", "bucket", "reason"),
+            [
+                {
+                    "oa_item_key": row.oa_item_key,
+                    "bucket": row.bucket,
+                    "reason": row.reason,
+                }
+                for row in selected
+            ],
+        )
+        self._write_csv(
+            stage / "classification.csv",
+            (
+                "oa_item_key",
+                "classification_status",
+                "content_origin",
+                "business_category",
+                "canonical_issuer",
+                "content_integrity_status",
+                "confidence",
+                "decision_source",
+                "reason",
+            ),
+            sorted(classification_rows, key=lambda row: str(row["oa_item_key"])),
+        )
+        exception_rows = [
+            {
+                "oa_item_key": row.oa_item_key,
+                "file_id": row.file_id if row.file_id is not None else "",
+                "code": row.code,
+                "detail": row.detail,
+            }
+            for row in exceptions
+        ]
+        self._write_csv(
+            stage / "exceptions.csv",
+            ("oa_item_key", "file_id", "code", "detail"),
+            exception_rows,
+        )
+        total, excluded, target = self._baseline_counts()
+        counts = {
+            "manifest_total": total,
+            "excluded": excluded,
+            "target": target,
+            "selected": len(selected),
+            "processed": len(selected),
+            "classified": classified,
+            "needs_review": needs_review,
+            "packages": packages,
+            "attachments_attempted": attachments_attempted,
+            "attachments_converted": attachments_converted,
+            "attachments_failed": attachments_failed,
+            "attachments_skipped": attachments_skipped,
+            "exceptions": len(exceptions),
+        }
+        selected_equation = (
+            counts["selected"]
+            == counts["packages"]
+            == counts["classified"] + counts["needs_review"]
+        )
+        attachment_equation = counts["attachments_attempted"] == (
+            counts["attachments_converted"]
+            + counts["attachments_failed"]
+            + counts["attachments_skipped"]
+        )
+        if not selected_equation or not attachment_equation:
+            raise RuntimeError("backfill MVP counts do not reconcile")
+        files = [
+            {
+                "path": path.relative_to(stage).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+            for path in sorted(stage.rglob("*"))
+            if path.is_file() and path.name != "build_manifest.json"
+        ]
+        manifest = {
+            "schema_version": "backfill-mvp-v1",
+            "run_id": request.run_id,
+            "input_sha256": input_sha,
+            "counts": counts,
+            "exception_codes": dict(sorted(Counter(row.code for row in exceptions).items())),
+            "reconciliation": {
+                "ok": True,
+                "selected_equation": selected_equation,
+                "attachment_equation": attachment_equation,
+            },
+            "files": files,
+            "note": "files lists every candidate payload except this self-describing manifest",
+        }
+        (stage / "build_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _load_existing(self, root: Path, input_sha: str) -> BackfillMVPResult:
+        try:
+            manifest = json.loads(
+                (root / "build_manifest.json").read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            raise ValueError("existing candidate run has no valid manifest") from exc
+        if manifest.get("input_sha256") != input_sha:
+            raise ValueError("existing candidate run has different inputs")
+        if not manifest.get("reconciliation", {}).get("ok"):
+            raise ValueError("existing candidate run is not reconciled")
+        for row in manifest.get("files", []):
+            path = root / row["path"]
+            if (
+                not path.is_file()
+                or path.stat().st_size != row["size"]
+                or sha256_file(path) != row["sha256"]
+            ):
+                raise ValueError("existing candidate file verification failed")
+        exceptions: list[BackfillException] = []
+        with (root / "exceptions.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as stream:
+            for row in csv.DictReader(stream):
+                exceptions.append(
+                    BackfillException(
+                        row["oa_item_key"],
+                        int(row["file_id"]) if row["file_id"] else None,
+                        row["code"],
+                        row["detail"],
+                    )
+                )
+        counts = manifest["counts"]
+        return BackfillMVPResult(
+            run_id=manifest["run_id"],
+            output_root=root,
+            selected=counts["selected"],
+            processed=counts["processed"],
+            packages=counts["packages"],
+            classified=counts["classified"],
+            needs_review=counts["needs_review"],
+            attachments_attempted=counts["attachments_attempted"],
+            attachments_converted=counts["attachments_converted"],
+            attachments_failed=counts["attachments_failed"],
+            attachments_skipped=counts["attachments_skipped"],
+            exceptions=tuple(exceptions),
+        )
 
     def _package_relpath(
         self, item: OAItem, decision: ClassificationDecision

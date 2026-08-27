@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -319,12 +320,61 @@ def test_vertical_slice_builds_classified_and_review_packages_without_touching_o
     assert len(attachments) == 1
     assert "faithful synthetic evidence" in attachments[0].read_text(encoding="utf-8")
     assert any("needs_review" in path.parts for path in indexes)
+    for name in ("sample.csv", "classification.csv", "exceptions.csv"):
+        report = result.output_root / name
+        assert report.read_bytes().startswith(b"\xef\xbb\xbf")
+    manifest = json.loads(
+        (result.output_root / "build_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["counts"]["selected"] == 2
+    assert manifest["counts"]["packages"] == 2
+    assert manifest["counts"]["classified"] == 1
+    assert manifest["counts"]["needs_review"] == 1
+    assert manifest["counts"]["attachments_attempted"] == 1
+    assert manifest["counts"]["attachments_converted"] == 1
+    assert manifest["reconciliation"]["ok"] is True
+    assert manifest["reconciliation"]["selected_equation"] is True
+    assert manifest["reconciliation"]["attachment_equation"] is True
+    for file_row in manifest["files"]:
+        path = result.output_root / file_row["path"]
+        assert path.is_file()
+        assert path.stat().st_size == file_row["size"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == file_row["sha256"]
     after = {
         path.relative_to(settings.originals_root).as_posix(): path.read_bytes()
         for path in settings.originals_root.rglob("*")
         if path.is_file()
     }
     assert after == before
+
+
+def test_identical_completed_run_is_verified_and_reused(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    factory = _factory()
+    _add_item(
+        factory,
+        settings,
+        key="done:resume",
+        title="Synthetic internal approval resume",
+        sender="synthetic.internal",
+        no_attachment=True,
+    )
+    service = BackfillMVPService(
+        settings,
+        factory,
+        _config(),
+        private_config_sha256="a" * 64,
+    )
+    request = BackfillMVPRequest(
+        run_id="synthetic-resume", target_keys=("done:resume",)
+    )
+
+    first = service.run(request)
+    first_manifest = (first.output_root / "build_manifest.json").read_bytes()
+    second = service.run(request)
+
+    assert second == first
+    assert (second.output_root / "build_manifest.json").read_bytes() == first_manifest
 
 
 def test_duplicate_attachment_content_is_parsed_once_and_materialized_twice(
