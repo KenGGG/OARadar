@@ -22,7 +22,10 @@ def markitdown_engine_version() -> str:
 
 
 def parse_with_markitdown(
-    file_path: Path, output_dir: Path | None = None
+    file_path: Path,
+    output_dir: Path | None = None,
+    *,
+    profile_version: str = "legacy",
 ) -> ParseResult:
     """Convert a file to Markdown using MarkItDown.
 
@@ -82,6 +85,7 @@ def parse_with_markitdown(
         replacement_char_ratio=quality["replacement_char_ratio"],
         table_count=quality["table_count"],
         image_count=quality["image_count"],
+        profile_version=profile_version,
     )
 
 

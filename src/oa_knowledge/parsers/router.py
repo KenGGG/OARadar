@@ -25,6 +25,7 @@ class ParseResult:
     replacement_char_ratio: float = 0.0
     table_count: int = 0
     image_count: int = 0
+    profile_version: str = "legacy"
 
     @property
     def config_hash(self) -> str:
@@ -182,6 +183,7 @@ def parse_file(
     settings,
     engine: str | None = None,
     output_dir: Path | None = None,
+    profile_version: str = "legacy",
 ) -> ParseResult:
     """Route a file to the best available parser engine.
 
@@ -204,7 +206,9 @@ def parse_file(
     # Explicit engine override
     if engine:
         if engine == "markitdown":
-            return parse_with_markitdown(file_path, output_dir)
+            return parse_with_markitdown(
+                file_path, output_dir, profile_version=profile_version
+            )
         if engine == "mineru":
             if file_path.suffix.lower() == ".pdf" and preflight(file_path).get(
                 "is_encrypted"
@@ -213,7 +217,9 @@ def parse_file(
             # An explicit campaign request is authoritative. parse_with_mineru
             # performs its own retried health check; a separate probe here used
             # to reject healthy work whenever the GPU service was briefly busy.
-            return parse_with_mineru(file_path, settings, output_dir)
+            return parse_with_mineru(
+                file_path, settings, output_dir, profile_version=profile_version
+            )
         raise ValueError(f"Unknown engine: {engine}")
 
     # Preflight analysis
@@ -229,7 +235,9 @@ def parse_file(
 
     # Office files always go to MarkItDown
     if suffix in {".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls"}:
-        return parse_with_markitdown(file_path, output_dir)
+        return parse_with_markitdown(
+            file_path, output_dir, profile_version=profile_version
+        )
 
     # PDF routing
     if suffix == ".pdf":
@@ -243,20 +251,32 @@ def parse_file(
             info.get("has_embedded_text") is False and text_per_page < 20
         ):
             if mineru_available(settings):
-                return parse_with_mineru(file_path, settings, output_dir)
+                return parse_with_mineru(
+                    file_path, settings, output_dir, profile_version=profile_version
+                )
             # Fallback to MarkItDown if MinerU unavailable
-            return parse_with_markitdown(file_path, output_dir)
+            return parse_with_markitdown(
+                file_path, output_dir, profile_version=profile_version
+            )
 
         # PDF with tables -> MinerU preferred for better table handling
         if has_tables and mineru_available(settings):
-            return parse_with_mineru(file_path, settings, output_dir)
+            return parse_with_mineru(
+                file_path, settings, output_dir, profile_version=profile_version
+            )
 
         # Digital PDF (good text density, low image ratio) -> MarkItDown
         if text_per_page > 50 and image_ratio < 0.1:
-            return parse_with_markitdown(file_path, output_dir)
+            return parse_with_markitdown(
+                file_path, output_dir, profile_version=profile_version
+            )
 
         # Default PDF -> MarkItDown
-        return parse_with_markitdown(file_path, output_dir)
+        return parse_with_markitdown(
+            file_path, output_dir, profile_version=profile_version
+        )
 
     # Everything else -> MarkItDown
-    return parse_with_markitdown(file_path, output_dir)
+    return parse_with_markitdown(
+        file_path, output_dir, profile_version=profile_version
+    )

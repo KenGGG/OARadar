@@ -152,7 +152,11 @@ def _request_parse(
 
 
 def parse_with_mineru(
-    file_path: Path, settings: Settings, output_dir: Path | None = None
+    file_path: Path,
+    settings: Settings,
+    output_dir: Path | None = None,
+    *,
+    profile_version: str = "legacy",
 ) -> ParseResult:
     if not settings.mineru.enabled:
         raise RuntimeError("MinerU is not enabled in configuration")
@@ -203,6 +207,7 @@ def parse_with_mineru(
             replacement_char_ratio=quality["replacement_char_ratio"],
             table_count=quality["table_count"],
             image_count=quality["image_count"],
+            profile_version=profile_version,
         )
     finally:
         if staging.exists():

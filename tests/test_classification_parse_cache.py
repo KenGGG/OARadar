@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -100,13 +103,25 @@ def _request(file: ArchivedFile, **overrides: object):
 
 def _fake_router(calls: list[int]):
     def parse(
-        source: Path, settings: Settings, *, engine: str, output_dir: Path
+        source: Path,
+        settings: Settings,
+        *,
+        engine: str,
+        output_dir: Path,
+        profile_version: str,
     ) -> ParseResult:
         calls.append(1)
         output = output_dir / "staged.md"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(f"# Parsed {source.name}\n", encoding="utf-8")
-        return ParseResult(output, engine, "test-parser-v1", 1.0, text_length=20)
+        return ParseResult(
+            output,
+            engine,
+            "test-parser-v1",
+            1.0,
+            text_length=20,
+            profile_version=profile_version,
+        )
 
     return parse
 
@@ -247,3 +262,195 @@ def test_depth_limited_required_attachment_is_blocked_and_queued_for_review(
         assert review is not None
         assert review.file_id == file.id
         assert review.container_key == "container:ten"
+
+
+def test_missing_cached_product_is_atomically_rebuilt_under_the_same_identity(
+    tmp_path: Path,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleaned derived product must not leave its unique artifact row unusable."""
+    from oa_knowledge.classification.parse_cache import ParseCacheService
+
+    settings = _settings(tmp_path)
+    with session_factory() as session:
+        file = _seed_file(
+            session, settings, key="oa:rebuild", filename="body.txt", payload=b"same"
+        )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "oa_knowledge.classification.parse_cache.parse_file", _fake_router(calls)
+    )
+    service = ParseCacheService(session_factory, settings)
+
+    first = service.get_or_parse(_request(file))
+    assert first.output_relpath is not None
+    (settings.cache_root / first.output_relpath).unlink()
+    rebuilt = service.get_or_parse(_request(file))
+
+    assert rebuilt.artifact_id == first.artifact_id
+    assert rebuilt.status == "parsed"
+    assert (settings.cache_root / rebuilt.output_relpath).is_file()
+    assert calls == [1, 1]
+
+
+def test_first_same_sha_requests_converge_when_content_object_insert_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A competing first ContentObject insert must not fail an otherwise valid parse."""
+    from oa_knowledge.classification.parse_cache import ParseCacheService
+
+    settings = _settings(tmp_path)
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'race.db'}",
+        future=True,
+        connect_args={"timeout": 10},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    with factory() as session:
+        first = _seed_file(
+            session, settings, key="oa:race-one", filename="one.txt", payload=b"same"
+        )
+        second = _seed_file(
+            session, settings, key="oa:race-two", filename="two.txt", payload=b"same"
+        )
+
+    insert_barrier = threading.Barrier(2)
+
+    def align_first_content_inserts(*args: object) -> None:
+        statement = str(args[2])
+        if "INSERT INTO content_objects" in statement:
+            insert_barrier.wait(timeout=10)
+
+    event.listen(engine, "before_cursor_execute", align_first_content_inserts)
+    calls: list[int] = []
+    calls_lock = threading.Lock()
+
+    def parse(
+        source: Path,
+        settings: Settings,
+        *,
+        engine: str,
+        output_dir: Path,
+        profile_version: str,
+    ) -> ParseResult:
+        with calls_lock:
+            calls.append(1)
+        output = output_dir / "staged.md"
+        output.write_text(f"# {source.name}\n", encoding="utf-8")
+        return ParseResult(
+            output,
+            engine,
+            "test-parser-v1",
+            1.0,
+            profile_version=profile_version,
+        )
+
+    monkeypatch.setattr("oa_knowledge.classification.parse_cache.parse_file", parse)
+    service = ParseCacheService(factory, settings)
+    start = threading.Barrier(2)
+    refs: list[object] = []
+    errors: list[BaseException] = []
+
+    def run(file: ArchivedFile) -> None:
+        try:
+            start.wait(timeout=10)
+            refs.append(service.get_or_parse(_request(file)))
+        except (OSError, RuntimeError, SQLAlchemyError) as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(file,)) for file in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+    event.remove(engine, "before_cursor_execute", align_first_content_inserts)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(refs) == 2
+    with factory() as session:
+        assert len(session.scalars(select(ContentObject)).all()) == 1
+
+
+def test_parser_result_with_a_different_engine_or_version_is_never_cached_as_requested(
+    tmp_path: Path,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trusting a stale requested identity would label new parser output incorrectly."""
+    from oa_knowledge.classification.parse_cache import ParseCacheService
+
+    settings = _settings(tmp_path)
+    with session_factory() as session:
+        file = _seed_file(
+            session, settings, key="oa:identity", filename="body.txt", payload=b"same"
+        )
+
+    def mismatched_parse(
+        source: Path,
+        settings: Settings,
+        *,
+        engine: str,
+        output_dir: Path,
+        profile_version: str,
+    ) -> ParseResult:
+        output = output_dir / "staged.md"
+        output.write_text("# mismatched\n", encoding="utf-8")
+        return ParseResult(output, "mineru", "unexpected-v2", 1.0)
+
+    monkeypatch.setattr(
+        "oa_knowledge.classification.parse_cache.parse_file", mismatched_parse
+    )
+
+    result = ParseCacheService(session_factory, settings).get_or_parse(_request(file))
+
+    assert result.status == "parse_failed"
+    assert result.error_code == "parser_identity_mismatch"
+    with session_factory() as session:
+        assert len(session.scalars(select(ParseArtifact)).all()) == 0
+
+
+def test_parser_result_with_a_different_profile_is_never_cached_as_requested(
+    tmp_path: Path,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignoring the returned profile would make a profile upgrade reuse stale output."""
+    from oa_knowledge.classification.parse_cache import ParseCacheService
+
+    settings = _settings(tmp_path)
+    with session_factory() as session:
+        file = _seed_file(
+            session, settings, key="oa:profile", filename="body.txt", payload=b"same"
+        )
+
+    def mismatched_parse(
+        source: Path,
+        settings: Settings,
+        *,
+        engine: str,
+        output_dir: Path,
+        profile_version: str,
+    ) -> SimpleNamespace:
+        output = output_dir / "staged.md"
+        output.write_text("# mismatched profile\n", encoding="utf-8")
+        return SimpleNamespace(
+            output_path=output,
+            engine="markitdown",
+            engine_version="test-parser-v1",
+            profile_version="classification-v2",
+            quality_score=1.0,
+        )
+
+    monkeypatch.setattr(
+        "oa_knowledge.classification.parse_cache.parse_file", mismatched_parse
+    )
+
+    result = ParseCacheService(session_factory, settings).get_or_parse(_request(file))
+
+    assert result.status == "parse_failed"
+    assert result.error_code == "parser_identity_mismatch"
+    with session_factory() as session:
+        assert len(session.scalars(select(ParseArtifact)).all()) == 0

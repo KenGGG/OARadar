@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -39,6 +40,10 @@ from oa_knowledge.runtime_paths import (
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9._-]+$")
 _PARSEABLE_INTEGRITY = frozenset({"ok"})
+
+
+class _ParserIdentityMismatch(RuntimeError):
+    """The selected parser did not produce the requested cache identity."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,8 +190,14 @@ class ParseCacheService:
         staging = Path(tempfile.mkdtemp(prefix=".classification-parse-", dir=root))
         try:
             result = parse_file(
-                source, self._settings, engine=request.parser_name, output_dir=staging
+                source,
+                self._settings,
+                engine=request.parser_name,
+                output_dir=staging,
+                profile_version=request.parse_profile_version,
             )
+            if not self._matches_requested_identity(result, request):
+                raise _ParserIdentityMismatch("parser_identity_mismatch")
             if not result.output_path.is_file():
                 raise RuntimeError("parse_output_missing")
             output_relpath = self._output_relpath(request)
@@ -196,6 +207,15 @@ class ParseCacheService:
                 output_relpath,
             )
             product_sha = sha256_file(destination)
+        except _ParserIdentityMismatch:
+            self._mark_job_failed(job_id, error_code="parser_identity_mismatch")
+            return ParseArtifactRef(
+                None,
+                None,
+                consulted=True,
+                status="parse_failed",
+                error_code="parser_identity_mismatch",
+            )
         except (OSError, RuntimeError, ValueError):
             self._mark_job_failed(job_id)
             return ParseArtifactRef(
@@ -243,12 +263,21 @@ class ParseCacheService:
                 return self._ref(artifact)
         except IntegrityError:
             # A concurrent worker won the unique identity race. The product is
-            # deterministic derived data, so discard our transaction and read
-            # the durable winner instead of manufacturing a second artifact.
+            # deterministic derived data. Reuse the durable row and refresh
+            # its atomically-written product rather than manufacturing a
+            # second artifact. This also heals a missing derivative whose row
+            # still occupies the immutable cache identity.
             with self._session_factory() as session:
-                artifact = self._existing_artifact(session, content_object_id, request)
+                artifact = self._identity_artifact(session, content_object_id, request)
                 if artifact is None:
                     raise
+                artifact.output_relpath = output_relpath
+                artifact.product_sha256 = product_sha
+                artifact.quality_score = result.quality_score
+                artifact.quality_status = (
+                    "low" if result.quality_score < 0.5 else "ok"
+                )
+                artifact.lifecycle_status = "valid"
                 job = session.get(ParseJob, job_id)
                 if job is not None:
                     job.status = "duplicate"
@@ -299,35 +328,37 @@ class ParseCacheService:
     def _content_object(
         session: Session, sha256: str, file: ArchivedFile, source: Path
     ) -> ContentObject:
-        content = session.scalar(
-            select(ContentObject).where(ContentObject.sha256 == sha256)
-        )
-        if content is None:
-            content = ContentObject(
+        session.execute(
+            sqlite_insert(ContentObject)
+            .values(
                 sha256=sha256,
                 size_bytes=file.size_bytes
                 if file.size_bytes is not None
                 else source.stat().st_size,
                 detected_type=source.suffix.lstrip(".") or "unknown",
             )
-            session.add(content)
-            session.flush()
+            .on_conflict_do_nothing(index_elements=("sha256",))
+        )
+        content = session.scalar(
+            select(ContentObject).where(ContentObject.sha256 == sha256)
+        )
+        if content is None:
+            raise RuntimeError("content_object_unavailable")
         return content
+
+    @staticmethod
+    def _matches_requested_identity(result: object, request: ParseRequest) -> bool:
+        return (
+            getattr(result, "engine", None) == request.parser_name
+            and getattr(result, "engine_version", None) == request.parser_version
+            and getattr(result, "profile_version", None) == request.parse_profile_version
+        )
 
     def _existing_artifact(
         self, session: Session, content_object_id: int, request: ParseRequest
     ) -> ParseArtifact | None:
-        artifact = session.scalar(
-            select(ParseArtifact).where(
-                ParseArtifact.content_object_id == content_object_id,
-                ParseArtifact.engine == request.parser_name,
-                ParseArtifact.engine_version == request.parser_version,
-                ParseArtifact.profile_version == request.parse_profile_version,
-                ParseArtifact.config_hash == request.parse_config_sha256,
-                ParseArtifact.lifecycle_status == "valid",
-            )
-        )
-        if artifact is None:
+        artifact = self._identity_artifact(session, content_object_id, request)
+        if artifact is None or artifact.lifecycle_status != "valid":
             return None
         try:
             product = resolve_cache_path(self._settings, artifact.output_relpath)
@@ -340,6 +371,20 @@ class ParseCacheService:
         ):
             return None
         return artifact
+
+    @staticmethod
+    def _identity_artifact(
+        session: Session, content_object_id: int, request: ParseRequest
+    ) -> ParseArtifact | None:
+        return session.scalar(
+            select(ParseArtifact).where(
+                ParseArtifact.content_object_id == content_object_id,
+                ParseArtifact.engine == request.parser_name,
+                ParseArtifact.engine_version == request.parser_version,
+                ParseArtifact.profile_version == request.parse_profile_version,
+                ParseArtifact.config_hash == request.parse_config_sha256,
+            )
+        )
 
     @staticmethod
     def _enqueue_depth_review(
@@ -393,10 +438,10 @@ class ParseCacheService:
             f"work/classification-parse/{request.content_sha256[:2]}/{artifact_key}.md"
         )
 
-    def _mark_job_failed(self, job_id: int) -> None:
+    def _mark_job_failed(self, job_id: int, *, error_code: str = "parse_failed") -> None:
         with self._session_factory() as session:
             job = session.get(ParseJob, job_id)
             if job is not None:
                 job.status = "failed"
-                job.error_code = "parse_failed"
+                job.error_code = error_code
                 session.commit()
