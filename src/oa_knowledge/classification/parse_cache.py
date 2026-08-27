@@ -15,6 +15,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -62,6 +63,7 @@ class ParseRequest:
     parse_profile_version: str
     parse_config_sha256: str
     metadata_unresolved: bool
+    purpose: Literal["classification", "candidate_markdown"] = "classification"
     content_integrity_status: str = "ok"
     depth_limit_reached: bool = False
     container_key: str | None = None
@@ -92,7 +94,15 @@ class ParseCacheService:
         If two workers parse the same identity, the losing worker rolls back
         its insert and returns the durable winner.
         """
-        if not request.metadata_unresolved:
+        if request.purpose not in {"classification", "candidate_markdown"}:
+            return ParseArtifactRef(
+                None,
+                None,
+                consulted=False,
+                status="integrity_blocked",
+                error_code="invalid_purpose",
+            )
+        if request.purpose == "classification" and not request.metadata_unresolved:
             return ParseArtifactRef(None, None, consulted=False, status="not_required")
         invalid = self._validate_request(request)
         if invalid is not None:

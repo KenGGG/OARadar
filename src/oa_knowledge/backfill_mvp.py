@@ -2,14 +2,37 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
+import yaml
 from sqlalchemy import case, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
+from oa_knowledge.archive.integrity import sha256_file
+from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
-from oa_knowledge.db.models import ArchivedFile, OAItem, OAManifestItem
+from oa_knowledge.classification.service import (
+    ClassificationService,
+    CreateClassificationRun,
+)
+from oa_knowledge.config import Settings
+from oa_knowledge.curation.canonical import sanitize_component
+from oa_knowledge.db.models import (
+    ArchivedFile,
+    ClassificationDecision,
+    OAItem,
+    OAManifestItem,
+)
+from oa_knowledge.parsers.router import resolve_parser_version
+from oa_knowledge.runtime_paths import resolve_cache_path, resolve_original_path
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +40,38 @@ class SampleItem:
     oa_item_key: str
     bucket: str
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillMVPRequest:
+    run_id: str
+    sample_size: int = 100
+    all_targets: bool = False
+    target_keys: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillException:
+    oa_item_key: str
+    file_id: int | None
+    code: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillMVPResult:
+    run_id: str
+    output_root: Path
+    selected: int
+    processed: int
+    packages: int
+    classified: int
+    needs_review: int
+    attachments_attempted: int
+    attachments_converted: int
+    attachments_failed: int
+    attachments_skipped: int
+    exceptions: tuple[BackfillException, ...]
 
 
 _SPECIAL_PRIORITY = (
@@ -161,3 +216,370 @@ def select_representative_items(
     if len(selected) != sample_size:
         raise ValueError("not enough target OA items for requested sample")
     return tuple(sorted(selected, key=lambda row: row.oa_item_key))
+
+
+_RUN_ID = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_DIRECT_TEXT = frozenset(
+    {".md", ".markdown", ".txt", ".html", ".htm", ".csv", ".json", ".xml"}
+)
+
+
+def _json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class BackfillMVPService:
+    """Connect existing classification and parsing into one candidate build."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        session_factory: sessionmaker[Session],
+        config: PrivateClassificationConfig,
+        *,
+        private_config_sha256: str,
+    ) -> None:
+        self._settings = settings
+        self._sessions = session_factory
+        self._config = config
+        self._private_config_sha256 = private_config_sha256
+        self._parse_cache = ParseCacheService(session_factory, settings)
+
+    def run(self, request: BackfillMVPRequest) -> BackfillMVPResult:
+        if not _RUN_ID.fullmatch(request.run_id):
+            raise ValueError("run_id must be a safe local identifier")
+        selected = self._selected(request)
+        target_keys = tuple(row.oa_item_key for row in selected)
+        manifest_sha, exclusion_sha = self._input_hashes()
+        classification = ClassificationService(self._sessions, self._config)
+        run = classification.create_run(
+            CreateClassificationRun(
+                run_id=request.run_id,
+                run_kind="full" if request.all_targets else "incremental",
+                manifest_sha256=manifest_sha,
+                exclusion_policy_sha256=exclusion_sha,
+                rule_version="backfill-mvp-metadata-v1",
+                schema_version="classification-v1",
+                prompt_version="not-used",
+                model_name="disabled-for-mvp",
+                private_config_sha256=self._private_config_sha256,
+                target_keys=target_keys,
+            )
+        )
+        classification.process_next(
+            run.run_id, limit=run.target_count + run.excluded_count
+        )
+        classification.complete(run.run_id)
+
+        builds = self._settings.markdown_root / ".builds"
+        builds.mkdir(parents=True, exist_ok=True)
+        final = builds / request.run_id
+        if final.exists():
+            raise FileExistsError("candidate run directory already exists")
+        stage = Path(tempfile.mkdtemp(prefix=f".{request.run_id}.", dir=builds))
+        exceptions: list[BackfillException] = []
+        classified = needs_review = converted = failed = skipped = attempted = 0
+        packages = 0
+        try:
+            for sample in selected:
+                with self._sessions() as session:
+                    item = session.scalar(
+                        select(OAItem).where(
+                            OAItem.oa_item_key == sample.oa_item_key,
+                            OAItem.source_channel == "done",
+                        )
+                    )
+                    decision = session.scalar(
+                        select(ClassificationDecision).where(
+                            ClassificationDecision.oa_item_key == sample.oa_item_key,
+                            ClassificationDecision.is_current.is_(True),
+                        )
+                    )
+                    manifest = session.scalar(
+                        select(OAManifestItem).where(
+                            OAManifestItem.oa_item_key == sample.oa_item_key
+                        )
+                    )
+                    files = (
+                        list(
+                            session.scalars(
+                                select(ArchivedFile)
+                                .where(
+                                    ArchivedFile.oa_item_id == item.id,
+                                    ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+                                )
+                                .order_by(ArchivedFile.id)
+                            )
+                        )
+                        if item is not None
+                        else []
+                    )
+                    if item is None or decision is None or manifest is None:
+                        raise RuntimeError("selected OA classification snapshot is missing")
+                    session.expunge(item)
+                    session.expunge(decision)
+                    session.expunge(manifest)
+                    for file in files:
+                        session.expunge(file)
+
+                package = stage / "packages" / self._package_relpath(item, decision)
+                package.mkdir(parents=True, exist_ok=False)
+                packages += 1
+                if decision.classification_status == "classified":
+                    classified += 1
+                else:
+                    needs_review += 1
+
+                links: list[tuple[str, str]] = []
+                item_exceptions: list[BackfillException] = []
+                for ordinal, file in enumerate(files, 1):
+                    attempted += 1
+                    outcome, filename, problem = self._convert_attachment(
+                        package, file, ordinal
+                    )
+                    if outcome == "converted" and filename is not None:
+                        converted += 1
+                        links.append((filename, file.original_name))
+                    elif outcome == "skipped":
+                        skipped += 1
+                    else:
+                        failed += 1
+                    if problem is not None:
+                        item_exceptions.append(
+                            BackfillException(
+                                sample.oa_item_key,
+                                file.id,
+                                problem[0],
+                                problem[1],
+                            )
+                        )
+                exceptions.extend(item_exceptions)
+                self._write_index(
+                    package,
+                    item,
+                    manifest,
+                    decision,
+                    links,
+                    item_exceptions,
+                )
+            os.replace(stage, final)
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+
+        return BackfillMVPResult(
+            run_id=request.run_id,
+            output_root=final,
+            selected=len(selected),
+            processed=len(selected),
+            packages=packages,
+            classified=classified,
+            needs_review=needs_review,
+            attachments_attempted=attempted,
+            attachments_converted=converted,
+            attachments_failed=failed,
+            attachments_skipped=skipped,
+            exceptions=tuple(exceptions),
+        )
+
+    def _selected(self, request: BackfillMVPRequest) -> tuple[SampleItem, ...]:
+        if request.target_keys is not None:
+            if not request.target_keys:
+                raise ValueError("target_keys must not be empty")
+            if len(set(request.target_keys)) != len(request.target_keys):
+                raise ValueError("target_keys must be unique")
+            return tuple(
+                SampleItem(key, "explicit", "explicit MVP target")
+                for key in sorted(request.target_keys)
+            )
+        with self._sessions() as session:
+            if request.all_targets:
+                keys = tuple(
+                    session.scalars(
+                        select(OAManifestItem.oa_item_key)
+                        .where(
+                            OAManifestItem.processing_status != "skipped",
+                            func.coalesce(
+                                OAManifestItem.matched_exclusion_keyword, ""
+                            )
+                            == "",
+                        )
+                        .order_by(OAManifestItem.oa_item_key)
+                    )
+                )
+                return tuple(
+                    SampleItem(key, "all_targets", "full target set") for key in keys
+                )
+            return select_representative_items(
+                session, self._config, request.sample_size
+            )
+
+    def _input_hashes(self) -> tuple[str, str]:
+        with self._sessions() as session:
+            rows = list(
+                session.execute(
+                    select(
+                        OAManifestItem.oa_item_key,
+                        OAManifestItem.processing_status,
+                        OAManifestItem.matched_exclusion_keyword,
+                        OAManifestItem.no_attachment_confirmed,
+                    ).order_by(OAManifestItem.oa_item_key)
+                )
+            )
+        manifest = [tuple(row) for row in rows]
+        excluded = [
+            row[0]
+            for row in manifest
+            if row[1] == "skipped" or (row[2] or "").strip()
+        ]
+        return _json_sha256(manifest), _json_sha256(excluded)
+
+    def _package_relpath(
+        self, item: OAItem, decision: ClassificationDecision
+    ) -> Path:
+        completed = item.completed_at
+        year = f"{completed.year:04d}" if completed else "unknown-year"
+        month = f"{completed.month:02d}" if completed else "unknown-month"
+        day = completed.strftime("%Y%m%d") if completed else "unknown-date"
+        suffix = hashlib.sha256(item.oa_item_key.encode("utf-8")).hexdigest()[:12]
+        title = sanitize_component(
+            decision.normalized_title or item.title,
+            collision_key=suffix,
+            max_length=100,
+        )
+        leaf = sanitize_component(
+            f"{day}-{title}--oa_{suffix}", collision_key=suffix, max_length=140
+        )
+        if decision.classification_status != "classified":
+            return Path("needs_review", year, month, leaf)
+        if decision.content_origin == "internal":
+            category = sanitize_component(decision.business_category or "99_其他内部")
+            return Path("internal", category, year, month, leaf)
+        issuer = sanitize_component(decision.canonical_issuer or "未识别发文单位")
+        return Path("external", issuer, year, month, leaf)
+
+    def _convert_attachment(
+        self, package: Path, file: ArchivedFile, ordinal: int
+    ) -> tuple[str, str | None, tuple[str, str] | None]:
+        if file.download_status != "verified":
+            return "failed", None, ("content_not_verified", file.download_status)
+        if not file.local_relpath:
+            return "failed", None, ("file_missing", "source path is absent")
+        try:
+            source = resolve_original_path(self._settings, file.local_relpath)
+        except ValueError:
+            return "failed", None, ("unsafe_source_path", "source is outside originals")
+        if not source.is_file():
+            return "failed", None, ("file_missing", "source file is absent")
+        if file.size_bytes is not None and source.stat().st_size != file.size_bytes:
+            return "failed", None, ("size_mismatch", "source size changed")
+        source_sha = sha256_file(source)
+        if not file.sha256 or source_sha != file.sha256:
+            return "failed", None, ("sha256_mismatch", "source hash changed")
+
+        suffix = source.suffix.lower()
+        if suffix in _DIRECT_TEXT:
+            body = source.read_text(encoding="utf-8", errors="replace")
+        elif suffix in set(self._settings.parser.supported_extensions):
+            parser_name = "markitdown"
+            parser_version = resolve_parser_version(parser_name, self._settings)
+            profile = "backfill-mvp-v1"
+            config_sha = _json_sha256(
+                {
+                    "parser": self._settings.parser.model_dump(mode="json"),
+                    "profile": profile,
+                }
+            )
+            parsed = self._parse_cache.get_or_parse(
+                ParseRequest(
+                    file_id=file.id,
+                    content_sha256=file.sha256,
+                    parser_name=parser_name,
+                    parser_version=parser_version,
+                    parse_profile_version=profile,
+                    parse_config_sha256=config_sha,
+                    metadata_unresolved=False,
+                    purpose="candidate_markdown",
+                )
+            )
+            if parsed.status != "parsed" or not parsed.output_relpath:
+                return (
+                    "failed",
+                    None,
+                    (parsed.error_code or "parse_failed", parsed.status),
+                )
+            product = resolve_cache_path(self._settings, parsed.output_relpath)
+            if not product.is_file():
+                return "failed", None, ("parse_output_missing", "cache product missing")
+            body = product.read_text(encoding="utf-8", errors="replace")
+        else:
+            return "skipped", None, ("unsupported_file_type", suffix or "no suffix")
+
+        stem = sanitize_component(Path(file.original_name).stem, collision_key=source_sha)
+        prefix = "正文" if file.file_role == "official_body" else f"附件{ordinal:02d}"
+        filename = f"{prefix}_{stem}.md" if prefix != "正文" else "正文.md"
+        metadata = yaml.safe_dump(
+            {
+                "source_sha256": source_sha,
+                "conversion_profile": "backfill-mvp-v1",
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        (package / filename).write_text(
+            f"---\n{metadata}---\n\n{body.rstrip()}\n", encoding="utf-8"
+        )
+        return "converted", filename, None
+
+    @staticmethod
+    def _write_index(
+        package: Path,
+        item: OAItem,
+        manifest: OAManifestItem,
+        decision: ClassificationDecision,
+        links: list[tuple[str, str]],
+        exceptions: list[BackfillException],
+    ) -> None:
+        frontmatter = yaml.safe_dump(
+            {
+                "oa_item_key": item.oa_item_key,
+                "title": item.title,
+                "initiator": item.sender,
+                "completed_at": item.completed_at.isoformat()
+                if item.completed_at
+                else None,
+                "classification_status": decision.classification_status,
+                "content_integrity_status": decision.content_integrity_status,
+                "content_origin": decision.content_origin,
+                "business_category": decision.business_category,
+                "canonical_issuer": decision.canonical_issuer,
+                "document_number": decision.document_number,
+                "classification_confidence": decision.classification_confidence,
+                "decision_source": decision.decision_source,
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        lines = [
+            "---",
+            frontmatter.rstrip(),
+            "---",
+            "",
+            f"# {item.title}",
+            "",
+            "## 附件",
+            "",
+        ]
+        if links:
+            lines.extend(f"- [{label}](<{filename}>)" for filename, label in links)
+        elif manifest.no_attachment_confirmed:
+            lines.append("- 无附件（OA 清单已确认）。")
+        else:
+            lines.append("- 没有成功生成的附件 Markdown。")
+        if exceptions:
+            lines.extend(["", "## 候选构建异常", ""])
+            lines.extend(f"- `{row.code}`：{row.detail}" for row in exceptions)
+        (package / "_index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

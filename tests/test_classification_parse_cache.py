@@ -224,6 +224,59 @@ def test_metadata_resolved_request_does_not_open_or_parse_an_attachment(
     assert calls == []
 
 
+def test_candidate_markdown_can_reuse_cache_after_metadata_classification(
+    tmp_path: Path,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from oa_knowledge.classification.parse_cache import ParseCacheService
+
+    settings = _settings(tmp_path)
+    with session_factory() as session:
+        file = _seed_file(
+            session,
+            settings,
+            key="oa:candidate",
+            filename="candidate.txt",
+            payload=b"same",
+        )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "oa_knowledge.classification.parse_cache.parse_file", _fake_router(calls)
+    )
+
+    ref = ParseCacheService(session_factory, settings).get_or_parse(
+        _request(
+            file,
+            metadata_unresolved=False,
+            purpose="candidate_markdown",
+        )
+    )
+
+    assert ref.status == "parsed"
+    assert calls == [1]
+
+
+def test_parse_cache_rejects_unknown_request_purpose(
+    tmp_path: Path,
+    session_factory: sessionmaker[Session],
+) -> None:
+    from oa_knowledge.classification.parse_cache import ParseCacheService
+
+    settings = _settings(tmp_path)
+    with session_factory() as session:
+        file = _seed_file(
+            session, settings, key="oa:purpose", filename="body.txt", payload=b"same"
+        )
+
+    ref = ParseCacheService(session_factory, settings).get_or_parse(
+        _request(file, purpose="not-a-purpose")
+    )
+
+    assert ref.status == "integrity_blocked"
+    assert ref.error_code == "invalid_purpose"
+
+
 def test_depth_limited_required_attachment_is_blocked_and_queued_for_review(
     tmp_path: Path,
     session_factory: sessionmaker[Session],
