@@ -23,6 +23,11 @@ def _key(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
 
 
+def _issuer_selection_key(value: str) -> tuple[str, str, str]:
+    normalized_spelling = " ".join(unicodedata.normalize("NFKC", value).split())
+    return (_key(value), normalized_spelling, value)
+
+
 def _normalize_title(raw: str) -> str:
     title = unicodedata.normalize("NFKC", raw)
     while True:
@@ -413,7 +418,7 @@ def classify_from_metadata(evidence: Sequence[Evidence]) -> RuleOutcome:
     is_internal = origin == "internal"
     issuer = min(
         (entry.issuer for entry in winners if entry.issuer is not None),
-        key=_key,
+        key=_issuer_selection_key,
         default=None,
     )
     return RuleOutcome(

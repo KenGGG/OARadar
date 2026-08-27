@@ -329,6 +329,36 @@ def test_compatible_equal_priority_winners_merge_independent_of_evidence_order()
     assert forward.document_type == "notice"
 
 
+def test_compatible_normalized_equivalent_issuers_ignore_code_and_input_order() -> None:
+    def issuer_evidence(code: str, raw_issuer: str) -> Evidence:
+        return Evidence(
+            evidence_scope="package",
+            code=code,
+            priority=1,
+            confidence=0.99,
+            content_origin="external",
+            flow_type="formal_document",
+            issuer=raw_issuer,
+            canonical_issuer="Synthetic Records Authority",
+        )
+
+    first = classify_from_metadata(
+        [
+            issuer_evidence("issuer_a", "ＳＲＡ"),
+            issuer_evidence("issuer_b", "sra"),
+        ]
+    )
+    swapped = classify_from_metadata(
+        [
+            issuer_evidence("issuer_b", "ＳＲＡ"),
+            issuer_evidence("issuer_a", "sra"),
+        ][::-1]
+    )
+
+    assert first == swapped
+    assert first.classification_status == "classified"
+
+
 def test_overlapping_rules_are_unresolved_independent_of_declaration_order(
     config: PrivateClassificationConfig,
 ) -> None:
