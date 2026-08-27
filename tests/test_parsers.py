@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import io
 import hashlib
-import json
+import io
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from oa_knowledge.config import Settings, load_settings
-from oa_knowledge.constants import PipelineStatus
+from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import (
@@ -24,19 +21,26 @@ from oa_knowledge.db.models import (
     ParseArtifact,
     ParseJob,
 )
-from oa_knowledge.pipeline import ParsePipeline
-from oa_knowledge.parsers.markitdown_parser import parse_with_markitdown
 from oa_knowledge.parsers.eligibility import evaluate_eligibility
+from oa_knowledge.parsers.markitdown_parser import parse_with_markitdown
 from oa_knowledge.parsers.mineru_parser import (
     MineruResponseError,
     _extract_mineru_zip,
     parse_with_mineru,
 )
 from oa_knowledge.parsers.quality import assess_quality
-from oa_knowledge.parsers.router import ParseResult, parse_file, preflight
+from oa_knowledge.parsers.router import (
+    ParseResult,
+    parse_file,
+    preflight,
+    resolve_parser_version,
+)
+from oa_knowledge.pipeline import ParsePipeline
 
 
-def _make_synthetic_pdf(tmp_path: Path, name: str = "test.pdf", content: str = "") -> Path:
+def _make_synthetic_pdf(
+    tmp_path: Path, name: str = "test.pdf", content: str = ""
+) -> Path:
     """Create a minimal synthetic PDF file for testing."""
     pdf_path = tmp_path / name
     # Create a minimal valid PDF
@@ -55,20 +59,24 @@ def _make_synthetic_pdf(tmp_path: Path, name: str = "test.pdf", content: str = "
     return pdf_path
 
 
-def _make_synthetic_docx(tmp_path: Path, name: str = "test.docx", content: str = "") -> Path:
+def _make_synthetic_docx(
+    tmp_path: Path, name: str = "test.docx", content: str = ""
+) -> Path:
     """Create a minimal synthetic DOCX (ZIP with [Content_Types].xml)."""
     import zipfile
 
     docx_path = tmp_path / name
     with zipfile.ZipFile(docx_path, "w") as zf:
         zf.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types></Types>')
-        zf.writestr("word/document.xml", f'<w:document>{content}</w:document>')
+        zf.writestr("word/document.xml", f"<w:document>{content}</w:document>")
     return docx_path
 
 
 def _make_synthetic_html(tmp_path: Path, name: str = "test.html") -> Path:
     html_path = tmp_path / name
-    html_path.write_text("<html><body><p>Hello world</p></body></html>", encoding="utf-8")
+    html_path.write_text(
+        "<html><body><p>Hello world</p></body></html>", encoding="utf-8"
+    )
     return html_path
 
 
@@ -137,7 +145,11 @@ def test_quality_high_replacement_chars() -> None:
 def test_quality_preflight_empty_pages() -> None:
     """Preflight with >20% empty pages should trigger warning."""
     md = "some text"
-    preflight_info = {"page_count": 10, "empty_page_count": 5, "has_embedded_text": True}
+    preflight_info = {
+        "page_count": 10,
+        "empty_page_count": 5,
+        "has_embedded_text": True,
+    }
     result = assess_quality(md, Path("test.pdf"), preflight_info=preflight_info)
     assert any("over_20_percent_empty_pages" in w for w in result["warnings"])
 
@@ -233,6 +245,26 @@ def test_parse_result_config_hash_deterministic() -> None:
     assert r1.config_hash == r2.config_hash
 
 
+def test_resolve_parser_version_uses_the_selected_local_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache key must not reuse output after the selected parser changes version."""
+    settings = Settings(mineru={"enabled": True})
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.markitdown_parser.markitdown_engine_version",
+        lambda: "markitdown-test-v2",
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.mineru_parser.mineru_engine_version",
+        lambda _settings: "mineru-test-v3",
+    )
+
+    assert resolve_parser_version("markitdown", settings) == "markitdown-test-v2"
+    assert resolve_parser_version("mineru", settings) == "mineru-test-v3"
+    with pytest.raises(ValueError, match="Unknown engine"):
+        resolve_parser_version("unknown", settings)
+
+
 @pytest.mark.parametrize(
     ("name", "content", "reason"),
     [
@@ -255,7 +287,9 @@ def test_knowledge_eligibility_rejects_non_documents(
     assert decision.reason_code == reason
 
 
-def test_knowledge_eligibility_marks_duplicate_without_losing_source(tmp_path: Path) -> None:
+def test_knowledge_eligibility_marks_duplicate_without_losing_source(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "document.txt"
     path.write_text("Synthetic business content", encoding="utf-8")
 
@@ -266,7 +300,9 @@ def test_knowledge_eligibility_marks_duplicate_without_losing_source(tmp_path: P
     assert decision.evidence["preserve_source_reference"] is True
 
 
-def test_knowledge_eligibility_uses_pdf_signature_when_oa_name_has_size_suffix(tmp_path: Path) -> None:
+def test_knowledge_eligibility_uses_pdf_signature_when_oa_name_has_size_suffix(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "document.pdf (903KB)"
     path.write_bytes(b"%PDF-1.4\nsynthetic")
 
@@ -334,7 +370,9 @@ def test_extract_mineru_zip_rejects_empty_markdown(tmp_path: Path) -> None:
         _extract_mineru_zip(payload, tmp_path / "output")
 
 
-def test_parse_with_mineru_rejects_html_response(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parse_with_mineru_rejects_html_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import httpx
 
     pdf = _make_synthetic_pdf(tmp_path)
@@ -343,7 +381,11 @@ def test_parse_with_mineru_rejects_html_response(tmp_path: Path, monkeypatch: py
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json={"status": "ok"})
-        return httpx.Response(200, content=b"<!doctype html><title>Error</title>", headers={"content-type": "text/html"})
+        return httpx.Response(
+            200,
+            content=b"<!doctype html><title>Error</title>",
+            headers={"content-type": "text/html"},
+        )
 
     monkeypatch.setattr(
         "oa_knowledge.parsers.mineru_parser._transport_for_settings",
@@ -354,19 +396,28 @@ def test_parse_with_mineru_rejects_html_response(tmp_path: Path, monkeypatch: py
         parse_with_mineru(pdf, settings, tmp_path / "parse")
 
 
-def test_parse_with_mineru_extracts_zip_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parse_with_mineru_extracts_zip_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import httpx
 
     pdf = _make_synthetic_pdf(tmp_path)
     settings = Settings(mineru={"enabled": True, "api_url": "http://127.0.0.1:58000"})
-    payload = _mineru_zip({"result/document.md": "# Synthetic document\n\nParsed locally.", "result/content_list.json": "[]"})
+    payload = _mineru_zip(
+        {
+            "result/document.md": "# Synthetic document\n\nParsed locally.",
+            "result/content_list.json": "[]",
+        }
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json={"protocol_version": "1"})
         assert request.url.path == "/file_parse"
         assert b'name="files"' in request.read()
-        return httpx.Response(200, content=payload, headers={"content-type": "application/zip"})
+        return httpx.Response(
+            200, content=payload, headers={"content-type": "application/zip"}
+        )
 
     monkeypatch.setattr(
         "oa_knowledge.parsers.mineru_parser._transport_for_settings",
@@ -398,13 +449,17 @@ def test_parse_with_mineru_retries_transient_health_failure(
             if health_calls == 1:
                 raise httpx.ConnectError("busy", request=request)
             return httpx.Response(200, json={"protocol_version": "1"})
-        return httpx.Response(200, content=payload, headers={"content-type": "application/zip"})
+        return httpx.Response(
+            200, content=payload, headers={"content-type": "application/zip"}
+        )
 
     monkeypatch.setattr(
         "oa_knowledge.parsers.mineru_parser._transport_for_settings",
         lambda _settings: httpx.MockTransport(handler),
     )
-    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None
+    )
 
     result = parse_with_mineru(pdf, settings, tmp_path / "parse")
 
@@ -430,13 +485,17 @@ def test_parse_with_mineru_retries_transient_parse_disconnect(
         if parse_calls == 1:
             raise httpx.RemoteProtocolError("server disconnected", request=request)
         request.read()
-        return httpx.Response(200, content=payload, headers={"content-type": "application/zip"})
+        return httpx.Response(
+            200, content=payload, headers={"content-type": "application/zip"}
+        )
 
     monkeypatch.setattr(
         "oa_knowledge.parsers.mineru_parser._transport_for_settings",
         lambda _settings: httpx.MockTransport(handler),
     )
-    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None
+    )
 
     result = parse_with_mineru(pdf, settings, tmp_path / "parse")
 
@@ -470,7 +529,9 @@ def test_pipeline_enqueue_valid_file(tmp_path: Path) -> None:
     pdf_file.write_bytes(b"%PDF-1.4\nfake pdf content\n")
 
     with Session(engine) as session:
-        item = OAItem(oa_item_key="test-1", source_channel="done", title="Test Document")
+        item = OAItem(
+            oa_item_key="test-1", source_channel="done", title="Test Document"
+        )
         session.add(item)
         session.flush()
 
@@ -540,7 +601,9 @@ def test_pipeline_enqueue_idempotent(tmp_path: Path) -> None:
     assert job_id1 == job_id2
 
 
-def test_pipeline_requeues_completed_job_when_active_product_is_missing(tmp_path: Path) -> None:
+def test_pipeline_requeues_completed_job_when_active_product_is_missing(
+    tmp_path: Path,
+) -> None:
     settings = Settings(app={"data_root": str(tmp_path)})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
@@ -549,21 +612,33 @@ def test_pipeline_requeues_completed_job_when_active_product_is_missing(tmp_path
     source_path = raw / "regenerate.txt"
     source_path.write_text("synthetic source", encoding="utf-8")
     with Session(engine) as session:
-        item = OAItem(oa_item_key="done:regenerate", source_channel="done", title="Regenerate")
-        session.add(item); session.flush()
+        item = OAItem(
+            oa_item_key="done:regenerate", source_channel="done", title="Regenerate"
+        )
+        session.add(item)
+        session.flush()
         source = ArchivedFile(
-            oa_item_id=item.id, attachment_key="regenerate", original_name="regenerate.txt",
-            local_relpath="originals/regenerate.txt", file_role="direct_attachment",
-            source_container_key="root", depth=1, download_status="verified",
+            oa_item_id=item.id,
+            attachment_key="regenerate",
+            original_name="regenerate.txt",
+            local_relpath="originals/regenerate.txt",
+            file_role="direct_attachment",
+            source_container_key="root",
+            depth=1,
+            download_status="verified",
             sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
         )
-        session.add(source); session.commit(); source_id = source.id
+        session.add(source)
+        session.commit()
+        source_id = source.id
     pipeline = ParsePipeline(settings, engine)
     job_id = pipeline.enqueue(source_id)
     pipeline.run(job_id)
     with Session(engine) as session:
         source = session.get(ArchivedFile, source_id)
-        artifact_id = session.get(ContentObject, source.content_object_id).active_parse_artifact_id
+        artifact_id = session.get(
+            ContentObject, source.content_object_id
+        ).active_parse_artifact_id
         artifact = session.get(ParseArtifact, artifact_id)
         product = settings.cache_root / artifact.output_relpath
     product.unlink()
@@ -583,7 +658,8 @@ def test_pipeline_requeues_completed_job_when_active_product_is_missing(tmp_path
 
 
 def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A low-quality result is terminal while its derivative remains intact."""
     settings = Settings(app={"data_root": str(tmp_path)})
@@ -594,7 +670,9 @@ def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
     source_path = raw / "low-quality.txt"
     source_path.write_text("x", encoding="utf-8")
     with Session(engine) as session:
-        item = OAItem(oa_item_key="done:low-quality", source_channel="done", title="Synthetic")
+        item = OAItem(
+            oa_item_key="done:low-quality", source_channel="done", title="Synthetic"
+        )
         session.add(item)
         session.flush()
         source = ArchivedFile(
@@ -626,11 +704,15 @@ def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
             quality_score=0.3,
         )
 
-    monkeypatch.setattr("oa_knowledge.pipeline.parse_with_markitdown", low_quality_parse)
+    monkeypatch.setattr(
+        "oa_knowledge.pipeline.parse_with_markitdown", low_quality_parse
+    )
     pipeline.run(job_id)
 
     with Session(engine) as session:
-        artifact = session.scalar(select(ParseArtifact).where(ParseArtifact.parse_job_id == job_id))
+        artifact = session.scalar(
+            select(ParseArtifact).where(ParseArtifact.parse_job_id == job_id)
+        )
         assert artifact is not None
         assert artifact.lifecycle_status == "rejected"
         assert (settings.cache_root / artifact.output_relpath).is_file()
@@ -641,7 +723,8 @@ def test_pipeline_does_not_requeue_intact_rejected_quality_artifact(
 
 
 def test_pipeline_does_not_silently_fallback_when_mineru_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(app={"data_root": str(tmp_path)})
     upgrade_database(settings.database_path)
@@ -652,20 +735,30 @@ def test_pipeline_does_not_silently_fallback_when_mineru_is_unavailable(
     source.write_bytes(b"%PDF-1.4\nsynthetic scan\n")
 
     with Session(engine) as session:
-        item = OAItem(oa_item_key="mineru-required", source_channel="done", title="Synthetic")
+        item = OAItem(
+            oa_item_key="mineru-required", source_channel="done", title="Synthetic"
+        )
         session.add(item)
         session.flush()
         record = ArchivedFile(
-            oa_item_id=item.id, attachment_key="scan.pdf", original_name="scan.pdf",
-            local_relpath="originals/scan.pdf", file_role="direct_attachment",
-            source_container_key="root", depth=1, download_status="verified", sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            oa_item_id=item.id,
+            attachment_key="scan.pdf",
+            original_name="scan.pdf",
+            local_relpath="originals/scan.pdf",
+            file_role="direct_attachment",
+            source_container_key="root",
+            depth=1,
+            download_status="verified",
+            sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         )
         session.add(record)
         session.commit()
         file_id = record.id
 
     job_id = ParsePipeline(settings, engine).enqueue(file_id, engine="mineru")
-    monkeypatch.setattr("oa_knowledge.pipeline.mineru_available", lambda _settings: False)
+    monkeypatch.setattr(
+        "oa_knowledge.pipeline.mineru_available", lambda _settings: False
+    )
 
     with pytest.raises(RuntimeError, match="MinerU is unavailable"):
         ParsePipeline(settings, engine).run(job_id)
@@ -685,9 +778,15 @@ def test_pipeline_does_not_enqueue_oa_technical_metadata(tmp_path: Path) -> None
         session.add(item)
         session.flush()
         record = ArchivedFile(
-            oa_item_id=item.id, attachment_key="metadata", original_name="metadata.json",
-            local_relpath="originals/metadata.json", file_role="metadata", source_container_key="root",
-            depth=1, download_status="verified", sha256=hashlib.sha256(metadata.read_bytes()).hexdigest(),
+            oa_item_id=item.id,
+            attachment_key="metadata",
+            original_name="metadata.json",
+            local_relpath="originals/metadata.json",
+            file_role="metadata",
+            source_container_key="root",
+            depth=1,
+            download_status="verified",
+            sha256=hashlib.sha256(metadata.read_bytes()).hexdigest(),
         )
         session.add(record)
         session.commit()

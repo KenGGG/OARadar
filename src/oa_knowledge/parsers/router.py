@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import tempfile
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,12 +28,33 @@ class ParseResult:
 
     @property
     def config_hash(self) -> str:
-        payload = json.dumps({
-            "engine": self.engine,
-            "engine_version": self.engine_version,
-            "quality_score": self.quality_score,
-        }, sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(
+            {
+                "engine": self.engine,
+                "engine_version": self.engine_version,
+                "quality_score": self.quality_score,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return sha256_text(payload)
+
+
+def resolve_parser_version(engine: str, settings) -> str:
+    """Return a selected parser's implementation identity for a cache key.
+
+    The caller records this value before dispatching a versioned parse request;
+    it prevents a parser upgrade from silently reusing an older derivative.
+    """
+    if engine == "markitdown":
+        from oa_knowledge.parsers.markitdown_parser import markitdown_engine_version
+
+        return markitdown_engine_version()
+    if engine == "mineru":
+        from oa_knowledge.parsers.mineru_parser import mineru_engine_version
+
+        return mineru_engine_version(settings)
+    raise ValueError(f"Unknown engine: {engine}")
 
 
 def preflight(file_path: Path) -> dict:
@@ -101,7 +121,7 @@ def preflight(file_path: Path) -> dict:
                 for img in images:
                     try:
                         rect = page.get_image_rects(img[0])
-                        for r in (rect if isinstance(rect, list) else [rect]):
+                        for r in rect if isinstance(rect, list) else [rect]:
                             if isinstance(r, fitz.Rect):
                                 total_image_area += r.width * r.height
                     except Exception:
@@ -117,7 +137,9 @@ def preflight(file_path: Path) -> dict:
                 info["text_chars_per_page"] = round(total_chars / doc.page_count, 1)
 
             # Heuristic hints
-            info["has_tables_hint"] = total_chars > 100 and _detect_table_pattern(file_path)
+            info["has_tables_hint"] = total_chars > 100 and _detect_table_pattern(
+                file_path
+            )
             info["has_large_images"] = (
                 info["image_area_ratio"] > 0.15 and info["has_embedded_text"] is False
             )
@@ -143,7 +165,8 @@ def _detect_table_pattern(file_path: Path) -> bool:
                     return True
                 # Alternating dash patterns
                 dash_lines = sum(
-                    1 for line in text.split("\n")
+                    1
+                    for line in text.split("\n")
                     if re.search(r"[+-]+\s+\|[+-]+\s+\|", line)
                 )
                 if dash_lines > 0:
@@ -172,7 +195,7 @@ def parse_file(
         - Other -> MarkItDown
     """
     from oa_knowledge.parsers.markitdown_parser import parse_with_markitdown
-    from oa_knowledge.parsers.mineru_parser import parse_with_mineru, mineru_available
+    from oa_knowledge.parsers.mineru_parser import mineru_available, parse_with_mineru
 
     file_path = Path(file_path)
     if not file_path.is_file():
@@ -183,7 +206,9 @@ def parse_file(
         if engine == "markitdown":
             return parse_with_markitdown(file_path, output_dir)
         if engine == "mineru":
-            if file_path.suffix.lower() == ".pdf" and preflight(file_path).get("is_encrypted"):
+            if file_path.suffix.lower() == ".pdf" and preflight(file_path).get(
+                "is_encrypted"
+            ):
                 raise RuntimeError("encrypted_document")
             # An explicit campaign request is authoritative. parse_with_mineru
             # performs its own retried health check; a separate probe here used
@@ -214,7 +239,9 @@ def parse_file(
         has_large_images = info.get("has_large_images", False)
 
         # Scanned / image-heavy PDF -> MinerU preferred
-        if has_large_images or (info.get("has_embedded_text") is False and text_per_page < 20):
+        if has_large_images or (
+            info.get("has_embedded_text") is False and text_per_page < 20
+        ):
             if mineru_available(settings):
                 return parse_with_mineru(file_path, settings, output_dir)
             # Fallback to MarkItDown if MinerU unavailable

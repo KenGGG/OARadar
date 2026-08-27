@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -12,15 +11,19 @@ from oa_knowledge.parsers.quality import assess_quality
 from oa_knowledge.parsers.router import ParseResult
 
 
-def _engine_version() -> str:
+def markitdown_engine_version() -> str:
+    """Return the installed MarkItDown implementation version for cache keys."""
     try:
         import markitdown as md
+
         return getattr(md, "__version__", "unknown")
     except ImportError:
         return "unknown"
 
 
-def parse_with_markitdown(file_path: Path, output_dir: Path | None = None) -> ParseResult:
+def parse_with_markitdown(
+    file_path: Path, output_dir: Path | None = None
+) -> ParseResult:
     """Convert a file to Markdown using MarkItDown.
 
     If output_dir is provided, writes:
@@ -38,7 +41,7 @@ def parse_with_markitdown(file_path: Path, output_dir: Path | None = None) -> Pa
 
     if output_dir is not None:
         safe_name = _safe_name(file_path)
-        engine_ver = _engine_version()
+        engine_ver = markitdown_engine_version()
         parse_dir = output_dir / f"markitdown-v{engine_ver}"
         parse_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,7 +74,7 @@ def parse_with_markitdown(file_path: Path, output_dir: Path | None = None) -> Pa
     return ParseResult(
         output_path=output_path,
         engine="markitdown",
-        engine_version=_engine_version(),
+        engine_version=markitdown_engine_version(),
         quality_score=quality["quality_score"],
         warnings=quality["warnings"],
         text_length=quality["text_length"],
