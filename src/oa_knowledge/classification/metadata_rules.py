@@ -18,10 +18,22 @@ _DATE_WRAPPER = re.compile(
     r"^\s*[【\[]\s*\d{1,2}月\d{1,2}日(?:\s+\d{1,2}时(?:\d{1,2}分)?)?\s*[】\]]\s*"
 )
 _ORDINAL_WRAPPER = re.compile(r"^\s*[（(]\s*第\s*\d+\s*次\s*[）)]\s*")
+_PERSON_ORGANIZATION = re.compile(r"^\s*(?P<person>[^()（）]+?)\s*[()（](?P<organization>[^()（）]+)[)）]\s*$")
+_FILE_TRANSFER = re.compile(r"(?:文件传阅|传阅件|【传阅】|由.+原发)")
+_SELF_ISSUERS = frozenset({"广州凯得融资租赁有限公司"})
 
 
 def _key(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def normalize_person(value: str) -> tuple[str, str | None]:
+    """Return the canonical person token and separately retained OA organization."""
+    normalized = " ".join(unicodedata.normalize("NFKC", value).split())
+    match = _PERSON_ORGANIZATION.fullmatch(normalized)
+    if match is None:
+        return normalized, None
+    return match.group("person").strip(), match.group("organization").strip()
 
 
 def _issuer_selection_key(value: str) -> tuple[str, str, str]:
@@ -65,7 +77,12 @@ def _initiator_index(
     index: dict[str, tuple[str, InitiatorProfile]] = {}
     for identifier, profile in config.initiators.items():
         for name in (identifier, *profile.aliases):
-            index[_key(name)] = (identifier, profile)
+            canonical, organization = normalize_person(name)
+            key = _key(canonical)
+            # A base-name declaration is authoritative over a legacy
+            # organization-suffixed declaration for the same person.
+            if key not in index or organization is None:
+                index[key] = (canonical, profile)
     return index
 
 
@@ -74,7 +91,8 @@ def _is_configured_person(
 ) -> bool:
     if value is None:
         return False
-    return _key(value) in _initiator_index(config)
+    canonical, _organization = normalize_person(value)
+    return _key(canonical) in _initiator_index(config)
 
 
 def _document_evidence(
@@ -89,6 +107,7 @@ def _document_evidence(
     for rule in config.document_number_issuers:
         if re.search(rule.pattern, document_number):
             invalid_issuer = _is_configured_person(rule.canonical_issuer, config)
+            is_self_issuer = rule.canonical_issuer in _SELF_ISSUERS
             entries.append(
                 Evidence(
                     evidence_scope=scope,  # type: ignore[arg-type]
@@ -97,10 +116,10 @@ def _document_evidence(
                     code="document_number",
                     priority=1,
                     confidence=0.99,
-                    content_origin="external",
-                    flow_type="formal_document",
-                    issuer=rule.canonical_issuer,
-                    canonical_issuer=rule.canonical_issuer,
+                    content_origin="internal" if is_self_issuer else "external",
+                    flow_type="approval" if is_self_issuer else "formal_document",
+                    issuer=None if is_self_issuer else rule.canonical_issuer,
+                    canonical_issuer=None if is_self_issuer else rule.canonical_issuer,
                     document_number=document_number,
                     document_type=rule.document_type,
                     issuer_resolution_status="resolved",
@@ -181,6 +200,17 @@ def collect_metadata_evidence(
                 config=config,
             )
         )
+    if _FILE_TRANSFER.search(normalized_title):
+        evidence.append(
+            Evidence(
+                evidence_scope="package",
+                code="file_transfer",
+                priority=2,
+                confidence=0.95,
+                content_origin="external",
+                flow_type="transfer",
+            )
+        )
 
     for template in config.title_templates:
         if not re.search(template.pattern, normalized_title):
@@ -211,7 +241,8 @@ def collect_metadata_evidence(
         )
 
     people = _initiator_index(config)
-    initiator_match = people.get(_key(item.initiator))
+    canonical_person, organization = normalize_person(item.initiator)
+    initiator_match = people.get(_key(canonical_person))
     if initiator_match is not None:
         identifier, profile = initiator_match
         origin = profile.role if profile.role in ("internal", "external") else None
@@ -225,6 +256,7 @@ def collect_metadata_evidence(
                 flow_type="initiated",
                 initiator_role=profile.role,
                 person_identifier=identifier,
+                organization=organization,
             )
         )
     else:
@@ -235,14 +267,16 @@ def collect_metadata_evidence(
                 priority=5,
                 confidence=0.0,
                 initiator_role="unknown",
-                person_identifier=item.initiator,
+                person_identifier=canonical_person,
+                organization=organization,
             )
         )
 
     previous: str | None = None
     for ordinal, raw_person in enumerate(item.transfer_people, start=1):
-        match = people.get(_key(raw_person))
-        identifier = match[0] if match else raw_person
+        canonical_person, organization = normalize_person(raw_person)
+        match = people.get(_key(canonical_person))
+        identifier = match[0] if match else canonical_person
         role = match[1].role if match else "unknown"
         origin = role if role in ("internal", "external") else None
         evidence.append(
@@ -255,6 +289,7 @@ def collect_metadata_evidence(
                 flow_type="transfer",
                 initiator_role=role,
                 person_identifier=identifier,
+                organization=organization,
                 transfer_ordinal=ordinal,
                 transfer_from=previous,
                 transfer_to=identifier,
@@ -362,6 +397,8 @@ def _unresolved(
     *,
     confidence: float,
     conflict_codes: tuple[str, ...] = (),
+    content_origin: str | None = None,
+    flow_type: str | None = None,
 ) -> RuleOutcome:
     chain = _transfer_chain_from_evidence(evidence)
     title = next(
@@ -374,8 +411,8 @@ def _unresolved(
     has_attachment = any(entry.evidence_scope == "attachment" for entry in evidence)
     return RuleOutcome(
         classification_status="needs_review",
-        content_origin=None,
-        flow_type=None,
+        content_origin=content_origin,  # type: ignore[arg-type]
+        flow_type=flow_type,
         initiator_role=initiator_role,
         business_category=None,
         issuer=None,
@@ -440,7 +477,17 @@ def classify_from_metadata(evidence: Sequence[Evidence]) -> RuleOutcome:
     canonical_issuer = next(iter(resolved_values["canonical_issuer"]), None)
     people = {entry.person_identifier for entry in ordered if entry.person_identifier}
     if origin == "external" and (not canonical_issuer or canonical_issuer in people):
-        return _unresolved(ordered, confidence=confidence)
+        transfer_winner = any(entry.code == "file_transfer" for entry in winners)
+        return _unresolved(
+            ordered,
+            confidence=confidence,
+            content_origin="external" if transfer_winner else None,
+            flow_type=(
+                next(iter(resolved_values["flow_type"]), None)
+                if transfer_winner
+                else None
+            ),
+        )
 
     chain = _transfer_chain_from_evidence(ordered)
     normalized_title = next(

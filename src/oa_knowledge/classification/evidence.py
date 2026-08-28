@@ -60,6 +60,7 @@ class Evidence:
     attachment_key: str | None = None
     source_file_id: int | None = None
     person_identifier: str | None = None
+    organization: str | None = None
     transfer_ordinal: int | None = None
     transfer_from: str | None = None
     transfer_to: str | None = None

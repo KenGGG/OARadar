@@ -1083,9 +1083,9 @@ class BackfillMVPService:
         outcome: RuleOutcome,
     ) -> RuleOutcome:
         if (
-            outcome.content_origin != "internal"
-            or outcome.business_category is not None
+            outcome.business_category is not None
             or outcome.classification_status != "needs_review"
+            or outcome.escalation_action != "parse_attachment"
         ):
             return outcome
 
@@ -1129,7 +1129,7 @@ class BackfillMVPService:
             bodies = tuple(parsed_bodies)
             resolved = resolved or classify_by_content(item.title, bodies)
 
-        if resolved is None and bodies:
+        if resolved is None and bodies and outcome.content_origin != "external":
             client = self._qwen_client
             if client is None:
                 client = make_llm_client(
@@ -1146,7 +1146,7 @@ class BackfillMVPService:
                 "accepted" if resolved is not None else classifier.last_rejection_code or "rejected"
             ] += 1
 
-        if resolved is None:
+        if resolved is None or outcome.content_origin == "external":
             return replace(outcome, document_type=document_type)
 
         evidence.append(
