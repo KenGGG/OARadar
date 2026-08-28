@@ -8,6 +8,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from oa_knowledge.candidate_attachment_worker import conversion_config
 from oa_knowledge.classified_candidate_build import (
     ClassifiedCandidateBuildService,
     freeze_publishable_snapshot,
@@ -294,3 +295,10 @@ def test_attachment_worker_timeout_becomes_a_single_terminal_attachment_failure(
     assert outcome == "failed"
     assert filename is None
     assert problem == ("attachment_worker_timeout", "120 seconds")
+
+
+def test_attachment_worker_conversion_config_does_not_depend_on_private_rules() -> None:
+    config = conversion_config()
+
+    assert config.initiators == {}
+    assert config.document_number_issuers == []

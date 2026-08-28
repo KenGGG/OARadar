@@ -9,12 +9,17 @@ from pathlib import Path
 from sqlalchemy.orm import sessionmaker
 
 from oa_knowledge.backfill_mvp import BackfillMVPService, CanonicalAttachment
-from oa_knowledge.classification.private_config import (
-    load_private_classification_config,
-)
+from oa_knowledge.classification.schemas import PrivateClassificationConfig
 from oa_knowledge.config import load_settings
 from oa_knowledge.db import create_db_engine
 from oa_knowledge.db.models import ArchivedFile
+
+
+def conversion_config() -> PrivateClassificationConfig:
+    """Return inert configuration required by the legacy conversion helper."""
+    return PrivateClassificationConfig.model_construct(
+        initiators={}, document_number_issuers=[], issuer_aliases={}, title_templates=[]
+    )
 
 
 def main() -> None:
@@ -26,7 +31,6 @@ def main() -> None:
     parser.add_argument("--ordinal", type=int, required=True)
     args = parser.parse_args()
     settings = load_settings(args.config)
-    loaded = load_private_classification_config(settings.classification_private_dir)
     factory = sessionmaker(create_db_engine(settings.database_path), expire_on_commit=False)
     with factory() as session:
         file = session.get(ArchivedFile, args.file_id)
@@ -41,8 +45,8 @@ def main() -> None:
     service = BackfillMVPService(
         settings,
         factory,
-        loaded.config,
-        private_config_sha256=loaded.config_sha256,
+        conversion_config(),
+        private_config_sha256="candidate-build-no-classification",
     )
     outcome, filename, problem = service._convert_attachment(
         args.package,
