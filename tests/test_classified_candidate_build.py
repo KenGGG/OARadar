@@ -399,3 +399,41 @@ def test_candidate_qa_rejects_attachment_markdown_without_frontmatter(tmp_path: 
         assert any(error.startswith("attachment_frontmatter_missing:") for error in qa.errors)
     finally:
         engine.dispose()
+
+
+def test_candidate_qa_rejects_duplicate_attachment_sha_within_package(tmp_path: Path) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    settings = Settings.model_validate(
+        {
+            "app": {"data_root": str(tmp_path / "data")},
+            "runtime": {"state_root": str(tmp_path / "state"), "cache_root": str(tmp_path / "cache")},
+        }
+    )
+    try:
+        with factory.begin() as session:
+            run = _run(session)
+            _decision(session, run, "done:qa-duplicate", integrity="no_attachment_confirmed")
+            session.add(
+                OAManifestItem(
+                    oa_item_key="done:qa-duplicate",
+                    title="Synthetic duplicate",
+                    list_page=1,
+                    processing_status="no_attachment",
+                    no_attachment_confirmed=True,
+                )
+            )
+        service = ClassifiedCandidateBuildService(settings, factory)
+        result = service.build("synthetic-qa-duplicate")
+        package = result.output_root / "packages" / result.package_relpaths["done:qa-duplicate"]
+        artifact = "---\nsource_sha256: " + "a" * 64 + "\nactual_file_type: pdf\nsource_file_id: 1\n---\n\nbody\n"
+        (package / "附件01_a.md").write_text(artifact, encoding="utf-8")
+        (package / "附件02_a.md").write_text(artifact.replace("source_file_id: 1", "source_file_id: 2"), encoding="utf-8")
+
+        qa = service.validate("synthetic-qa-duplicate")
+
+        assert not qa.passed
+        assert any(error.startswith("duplicate_attachment_sha256:") for error in qa.errors)
+    finally:
+        engine.dispose()

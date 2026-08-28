@@ -576,6 +576,7 @@ class ClassifiedCandidateBuildService:
                 if not target.is_file() or index.parent.resolve() not in target.parents:
                     errors.append(f"broken_or_unsafe_link:{relpath}:{linked}")
         generated_files: list[dict[str, str]] = []
+        attachment_sha_sources: dict[tuple[str, str], str] = {}
         for attachment in packages.rglob("*.md") if packages.is_dir() else ():
             try:
                 relative = attachment.relative_to(root).as_posix()
@@ -602,6 +603,16 @@ class ClassifiedCandidateBuildService:
                 for field in ("source_sha256", "actual_file_type", "source_file_id")
             ):
                 errors.append(f"attachment_frontmatter_incomplete:{relative}")
+            elif isinstance(frontmatter["source_sha256"], str):
+                package_relpath = attachment.parent.relative_to(packages).as_posix()
+                sha_key = (package_relpath, frontmatter["source_sha256"])
+                prior = attachment_sha_sources.get(sha_key)
+                if prior is not None:
+                    errors.append(
+                        f"duplicate_attachment_sha256:{package_relpath}:{frontmatter['source_sha256']}"
+                    )
+                else:
+                    attachment_sha_sources[sha_key] = relative
             if not body[match.end():].strip():
                 errors.append(f"attachment_body_empty:{relative}")
         expected_keys = {
