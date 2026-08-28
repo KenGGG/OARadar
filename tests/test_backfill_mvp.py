@@ -14,6 +14,7 @@ from oa_knowledge.backfill_mvp import (
     BackfillMVPRequest,
     BackfillMVPService,
     SampleItem,
+    canonicalize_attachment_aliases,
     select_representative_items,
 )
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
@@ -161,6 +162,40 @@ def _engine(reverse: bool = False):
                 )
         session.commit()
     return engine
+
+
+def test_canonicalize_attachment_aliases_collapses_same_content_in_same_container() -> None:
+    content_sha = "a" * 64
+    first = ArchivedFile(
+        id=1,
+        original_name="下载副本.pdf",
+        local_relpath="originals/done/synthetic/first.pdf",
+        size_bytes=1,
+        sha256=content_sha,
+        attachment_key="cap4",
+        file_role="direct_attachment",
+        source_container_key="root",
+        depth=1,
+        download_status="verified",
+    )
+    second = ArchivedFile(
+        id=2,
+        original_name="审批附件.pdf",
+        local_relpath="originals/done/synthetic/second.pdf",
+        size_bytes=1,
+        sha256=content_sha,
+        attachment_key="legacy-panel",
+        file_role="official_attachment",
+        source_container_key="root",
+        depth=1,
+        download_status="verified",
+    )
+
+    attachments = canonicalize_attachment_aliases([first, second])
+
+    assert len(attachments) == 1
+    assert attachments[0].file.id == 2
+    assert [alias.id for alias in attachments[0].aliases] == [1, 2]
 
 
 def test_selects_representative_targets_without_building_a_sampling_framework() -> None:
