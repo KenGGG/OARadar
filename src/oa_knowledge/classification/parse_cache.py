@@ -190,6 +190,26 @@ class ParseCacheService:
 
         return self._parse_and_persist(request, source, content.id, job_id)
 
+    def reusable_artifact(self, file_id: int) -> ParseArtifactRef | None:
+        """Return the newest valid cached parse product for a verified file.
+
+        Candidate Markdown building uses this before requesting a new parser
+        profile; parsing is derived data and does not alter classification.
+        """
+        with self._session_factory() as session:
+            file = session.get(ArchivedFile, file_id)
+            if file is None or file.content_object_id is None:
+                return None
+            artifact = session.scalar(
+                select(ParseArtifact)
+                .where(
+                    ParseArtifact.content_object_id == file.content_object_id,
+                    ParseArtifact.lifecycle_status == "valid",
+                )
+                .order_by(ParseArtifact.created_at.desc(), ParseArtifact.id.desc())
+            )
+            return self._ref(artifact) if artifact is not None else None
+
     def _parse_and_persist(
         self,
         request: ParseRequest,

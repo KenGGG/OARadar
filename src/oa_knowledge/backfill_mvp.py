@@ -31,10 +31,10 @@ from oa_knowledge.classification.internal_classification import (
     extract_document_type,
 )
 from oa_knowledge.classification.metadata_rules import (
+    extract_issuer_candidate,
     find_configured_document_number,
     resolve_configured_document_issuer,
     resolve_issuer_from_text,
-    extract_issuer_candidate,
 )
 from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
@@ -914,8 +914,25 @@ class BackfillMVPService:
         if not file.sha256 or source_sha != file.sha256:
             return "failed", None, ("sha256_mismatch", "source hash changed")
 
-        format_decision = detect_format(source)
-        if format_decision.is_direct_text:
+        reusable = self._parse_cache.reusable_artifact(file.id)
+        if reusable is not None and reusable.output_relpath:
+            cached = resolve_cache_path(self._settings, reusable.output_relpath)
+            body = cached.read_text(encoding="utf-8", errors="replace") if cached.is_file() else ""
+            if _parse_quality_reasons(body, reusable.quality_score):
+                body = ""
+            if body:
+                format_decision = detect_format(source)
+                parse_engine = reusable.engine or "cached"
+                parse_engine_version = reusable.engine_version or "cached"
+                parse_quality_score = reusable.quality_score
+                fallback_reasons = ["reused_parse_artifact"]
+            else:
+                reusable = None
+        if reusable is None:
+            format_decision = detect_format(source)
+        if reusable is not None:
+            pass
+        elif format_decision.is_direct_text:
             body = source.read_text(encoding="utf-8", errors="replace")
             parse_engine = "direct-text"
             parse_engine_version = "1"
