@@ -6,7 +6,10 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from test_classification_service import _request, _seed
 
-from oa_knowledge.classification.reporting import build_classification_run_report
+from oa_knowledge.classification.reporting import (
+    build_classification_run_report,
+    classify_needs_review_reason,
+)
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 from oa_knowledge.classification.service import (
     ClassificationService,
@@ -344,6 +347,28 @@ def test_manual_lock_conflicting_with_later_exclusion_is_counted_in_report() -> 
     )
     assert report.conflicts == 1
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("reason", "content_origin", "has_parseable_attachment", "expected"),
+    [
+        ({"escalation_action": "parse_attachment"}, "external", True, "issuer_missing"),
+        ({"escalation_action": "parse_attachment"}, None, False, "no_parseable_content"),
+        ({"qwen_rejection": "schema_invalid"}, "internal", True, "qwen_rejected"),
+        ({"conflict_codes": ["conflicting_origin"]}, None, True, "evidence_conflict"),
+    ],
+)
+def test_review_reason_audit_uses_durable_reason_and_attachment_facts(
+    reason: dict[str, object],
+    content_origin: str | None,
+    has_parseable_attachment: bool,
+    expected: str,
+) -> None:
+    assert classify_needs_review_reason(
+        reason,
+        content_origin=content_origin,
+        has_parseable_attachment=has_parseable_attachment,
+    ) == expected
 
 
 def _config() -> PrivateClassificationConfig:

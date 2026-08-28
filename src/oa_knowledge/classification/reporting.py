@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.db.models import (
@@ -15,9 +15,41 @@ from oa_knowledge.db.models import (
     ClassificationEvidence,
     ClassificationRun,
     ClassificationRunItem,
+    ParseArtifact,
 )
 
 from .schemas import PrivateClassificationConfig
+
+
+def classify_needs_review_reason(
+    reason: dict[str, object],
+    *,
+    content_origin: str | None,
+    has_parseable_attachment: bool,
+    initiator_type: str | None = None,
+    parse_failure_code: str | None = None,
+) -> str:
+    """Return one stable audit bucket for a terminal review decision.
+
+    This is reporting-only: it never changes a frozen classification decision.
+    The precedence makes an explicit blocker more useful than the generic
+    ``parse_attachment`` escalation retained in the original decision reason.
+    """
+    if reason.get("conflict_codes"):
+        return "evidence_conflict"
+    if content_origin == "external":
+        return "issuer_missing"
+    if reason.get("qwen_rejection"):
+        return "qwen_rejected"
+    if parse_failure_code in {"unsupported_file_type", "archive_container_unsupported"}:
+        return "unsupported_format"
+    if not has_parseable_attachment:
+        return "no_parseable_content"
+    if initiator_type == "unknown":
+        return "unknown_initiator"
+    if initiator_type == "mixed":
+        return "mixed_unresolved"
+    return "content_rule_no_match"
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,8 +175,7 @@ class ClassificationRunReport:
 
 def build_classification_run_report(
     session_factory: Callable[[], Session],
-    run_id: str,
-    config: PrivateClassificationConfig,
+    run_id: str, config: PrivateClassificationConfig, *, refresh: bool = False,
 ) -> ClassificationRunReport:
     with session_factory() as session:
         run = session.scalar(
@@ -152,7 +183,7 @@ def build_classification_run_report(
         )
         if run is None:
             raise ValueError("classification run not found")
-        if run.status == "completed":
+        if run.status == "completed" and not refresh:
             try:
                 stored = json.loads(run.summary_json)
             except json.JSONDecodeError as exc:
@@ -241,6 +272,14 @@ def build_classification_run_report(
             if targets
             else []
         )
+        parsed_sha256_count = 0
+        if run.started_at is not None:
+            parsed = select(func.distinct(ParseArtifact.source_sha256)).where(
+                ParseArtifact.created_at >= run.started_at
+            )
+            if run.finished_at is not None:
+                parsed = parsed.where(ParseArtifact.created_at <= run.finished_at)
+            parsed_sha256_count = len(session.scalars(parsed).all())
         documents = [
             (decision.canonical_issuer, decision.document_number)
             for decision in classified
@@ -274,13 +313,7 @@ def build_classification_run_report(
                 reason.get("escalation_action") == "parse_attachment"
                 for reason in reasons
             ),
-            actual_parse_count=len(
-                {
-                    entry.parse_artifact_id
-                    for entry in evidence
-                    if entry.parse_artifact_id is not None
-                }
-            ),
+            actual_parse_count=parsed_sha256_count,
             expected_qwen_calls=0,
             actual_qwen_calls=sum(
                 decision.decision_source == "local_qwen"
