@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from oa_knowledge.candidate_attachment_worker import conversion_config
 from oa_knowledge.classified_candidate_build import (
     ClassifiedCandidateBuildService,
+    _package_relpath,
     freeze_publishable_snapshot,
     run_attachment_worker,
 )
@@ -120,6 +121,25 @@ def test_freeze_publishable_snapshot_includes_only_current_publishable_decisions
         engine.dispose()
 
 
+def test_package_relpath_bounds_cjk_leaf_by_utf8_bytes() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    try:
+        with Session(engine) as session:
+            run = _run(session)
+            decision = _decision(session, run, "done:long-title")
+            item = session.scalar(select(OAItem).where(OAItem.oa_item_key == "done:long-title"))
+            assert item is not None
+            decision.normalized_title = "中" * 180
+
+            relpath = _package_relpath(item, decision)
+
+        assert len(relpath.name.encode("utf-8")) <= 160
+        assert relpath.name.endswith("--oa_" + hashlib.sha256(b"done:long-title").hexdigest()[:12])
+    finally:
+        engine.dispose()
+
+
 def test_candidate_build_renders_confirmed_no_attachment_without_creating_decisions(
     tmp_path: Path,
 ) -> None:
@@ -168,6 +188,47 @@ def test_candidate_build_renders_confirmed_no_attachment_without_creating_decisi
         qa = service.validate("synthetic-candidate")
         assert qa.passed
         assert qa.index_count == 1
+    finally:
+        engine.dispose()
+
+
+def test_candidate_build_requeues_failed_item_with_audit_history(tmp_path: Path) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    settings = Settings.model_validate(
+        {
+            "app": {"data_root": str(tmp_path / "data")},
+            "runtime": {"state_root": str(tmp_path / "state"), "cache_root": str(tmp_path / "cache")},
+        }
+    )
+    try:
+        with factory.begin() as session:
+            run = _run(session)
+            _decision(session, run, "done:retry", integrity="no_attachment_confirmed")
+            session.add(
+                OAManifestItem(
+                    oa_item_key="done:retry",
+                    title="Synthetic retry",
+                    list_page=1,
+                    processing_status="no_attachment",
+                    no_attachment_confirmed=True,
+                )
+            )
+        service = ClassifiedCandidateBuildService(settings, factory)
+        service.start("synthetic-retry")
+        manifest_path = tmp_path / "data" / "markdown" / ".builds" / ".synthetic-retry.work" / "build_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["items"][0].update(status="package_failed", error="OSError: synthetic")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        progress = service.retry_failed("synthetic-retry")
+
+        assert progress.queued == 1
+        retry = json.loads(manifest_path.read_text(encoding="utf-8"))["items"][0]
+        assert retry["status"] == "queued"
+        assert "error" not in retry
+        assert retry["retry_history"] == [{"status": "package_failed", "error": "OSError: synthetic"}]
     finally:
         engine.dispose()
 

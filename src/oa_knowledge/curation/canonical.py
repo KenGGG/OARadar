@@ -3,24 +3,43 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import PurePosixPath
 import re
 import unicodedata
+from pathlib import PurePosixPath
 
 from oa_knowledge.curation.schemas import DocumentDecision
-
 
 _UNSAFE = re.compile(r"[\\/:*?\"<>|\x00-\x1f]+")
 _SPACE = re.compile(r"\s+")
 
 
-def sanitize_component(value: str, *, collision_key: str = "", max_length: int = 80) -> str:
+def sanitize_component(
+    value: str,
+    *,
+    collision_key: str = "",
+    max_length: int = 80,
+    max_bytes: int | None = None,
+) -> str:
     cleaned = unicodedata.normalize("NFKC", value or "").strip()
     cleaned = _UNSAFE.sub("_", cleaned)
     cleaned = _SPACE.sub(" ", cleaned).strip(" ._") or "未识别"
     if len(cleaned) > max_length:
         suffix = (collision_key or hashlib.sha256(cleaned.encode()).hexdigest())[:8]
         cleaned = cleaned[: max_length - 9].rstrip() + "_" + suffix
+    if max_bytes is not None and len(cleaned.encode("utf-8")) > max_bytes:
+        suffix = "_" + (collision_key or hashlib.sha256(cleaned.encode()).hexdigest())[:8]
+        available = max_bytes - len(suffix.encode("utf-8"))
+        if available < 1:
+            raise ValueError("max_bytes must leave room for a component")
+        kept: list[str] = []
+        used = 0
+        for character in cleaned:
+            width = len(character.encode("utf-8"))
+            if used + width > available:
+                break
+            kept.append(character)
+            used += width
+        cleaned = "".join(kept).rstrip() + suffix
     return cleaned
 
 

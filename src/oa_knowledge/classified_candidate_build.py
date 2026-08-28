@@ -131,14 +131,14 @@ def _package_relpath(item: OAItem, decision: ClassificationDecision) -> Path:
     month = f"{completed.month:02d}" if completed else "unknown-month"
     day = completed.strftime("%Y%m%d") if completed else "unknown-date"
     suffix = hashlib.sha256(item.oa_item_key.encode("utf-8")).hexdigest()[:12]
+    fixed_leaf_bytes = len(f"{day}---oa_{suffix}".encode())
     title = sanitize_component(
         decision.normalized_title or item.title,
         collision_key=suffix,
         max_length=100,
+        max_bytes=160 - fixed_leaf_bytes,
     )
-    leaf = sanitize_component(
-        f"{day}-{title}--oa_{suffix}", collision_key=suffix, max_length=140
-    )
+    leaf = f"{day}-{title}--oa_{suffix}"
     if decision.content_origin == "internal":
         parent = sanitize_component(decision.business_category or "")
         return Path("internal", parent, year, month, leaf)
@@ -433,6 +433,28 @@ class ClassifiedCandidateBuildService:
             processed += 1
             if processed >= limit:
                 break
+        return self._progress(manifest)
+
+    def retry_failed(self, run_id: str) -> ClassifiedCandidateBuildProgress:
+        """Return failed frozen inputs to the queue without losing their audit trail."""
+        root, manifest = self._load_manifest(run_id)
+        rows = manifest["items"]
+        assert isinstance(rows, list)
+        for row in rows:
+            if not isinstance(row, dict) or row.get("status") != "package_failed":
+                continue
+            history = row.setdefault("retry_history", [])
+            if not isinstance(history, list):
+                raise TypeError("candidate retry history is invalid")
+            history.append(
+                {
+                    "status": "package_failed",
+                    "error": row.get("error", "unknown package failure"),
+                }
+            )
+            row.pop("error", None)
+            row["status"] = "queued"
+        self._write_json(root / "build_manifest.json", manifest)
         return self._progress(manifest)
 
     def finalize(self, run_id: str) -> ClassifiedCandidateBuildResult:
