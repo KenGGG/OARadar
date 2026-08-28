@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import statistics
 import tempfile
 from collections import Counter
@@ -965,8 +966,7 @@ class BackfillMVPService:
                         },
                     }
                 )
-                parsed = self._parse_cache.get_or_parse(
-                    ParseRequest(
+                request = ParseRequest(
                         file_id=file.id,
                         content_sha256=file.sha256,
                         parser_name=parser_name,
@@ -976,8 +976,22 @@ class BackfillMVPService:
                         metadata_unresolved=False,
                         purpose="candidate_markdown",
                     )
-                )
-                if parsed.status != "parsed" or not parsed.output_relpath:
+                try:
+                    if parser_name == "mineru":
+                        previous = signal.getsignal(signal.SIGALRM)
+                        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("mineru_candidate_timeout")))
+                        signal.setitimer(signal.ITIMER_REAL, 90)
+                    parsed = self._parse_cache.get_or_parse(request)
+                except TimeoutError:
+                    parsed = None
+                    reasons = ("mineru_candidate_timeout",)
+                finally:
+                    if parser_name == "mineru":
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                        signal.signal(signal.SIGALRM, previous)
+                if parsed is None:
+                    pass
+                elif parsed.status != "parsed" or not parsed.output_relpath:
                     reasons = (parsed.error_code or "parse_failed",)
                 else:
                     product = resolve_cache_path(self._settings, parsed.output_relpath)
