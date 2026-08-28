@@ -164,7 +164,7 @@ def _engine(reverse: bool = False):
     return engine
 
 
-def test_canonicalize_attachment_aliases_collapses_same_content_in_same_container() -> None:
+def test_canonicalize_attachment_aliases_collapses_same_content_within_an_oa() -> None:
     content_sha = "a" * 64
     first = ArchivedFile(
         id=1,
@@ -174,7 +174,7 @@ def test_canonicalize_attachment_aliases_collapses_same_content_in_same_containe
         sha256=content_sha,
         attachment_key="cap4",
         file_role="direct_attachment",
-        source_container_key="root",
+        source_container_key="legacy-panel",
         depth=1,
         download_status="verified",
     )

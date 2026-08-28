@@ -260,14 +260,22 @@ def test_candidate_repair_renders_only_selected_finalized_package_without_decisi
             )
         service = ClassifiedCandidateBuildService(settings, factory)
         result = service.build("synthetic-final-repair")
+        package = result.output_root / "packages" / result.package_relpaths["done:repair"]
+        legacy = result.output_root / "packages" / "internal" / "legacy" / "old-package"
+        legacy.parent.mkdir(parents=True)
+        package.rename(legacy)
+        manifest_path = result.output_root / "build_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["items"][0]["package_relpath"] = "internal/legacy/old-package"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         with factory() as session:
             before = session.scalar(select(func.count()).select_from(ClassificationDecision))
 
         progress = service.repair_packages("synthetic-final-repair", {"done:repair"})
 
         assert progress.target_total == progress.package_success == 1
-        package = result.output_root / "packages" / result.package_relpaths["done:repair"]
         assert (package / "_index.md").is_file()
+        assert not legacy.exists()
         assert not list((result.output_root / "packages").glob(".previous.*"))
         with factory() as session:
             after = session.scalar(select(func.count()).select_from(ClassificationDecision))

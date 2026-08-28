@@ -290,25 +290,20 @@ def _attachment_preference(file: ArchivedFile) -> tuple[int, int, int]:
 def canonicalize_attachment_aliases(
     files: list[ArchivedFile],
 ) -> tuple[CanonicalAttachment, ...]:
-    """Collapse same-content attachment aliases within an OA container.
+    """Collapse same-content attachment aliases within one OA Package.
 
     The archive preserves every download record, but an OA Package represents
     one content object once.  UI panels may assign unrelated display names to
-    the same bytes, so filename similarity is only useful for choosing a
-    readable representative, never a prerequisite for deduplication.
+    the same bytes and may expose it through different containers or roles.
+    Filename similarity and source-container identity are therefore useful
+    evidence for audit, never prerequisites for content deduplication.
     """
     groups: list[list[ArchivedFile]] = []
     for file in files:
         for group in groups:
             representative = group[0]
-            compatible_roles = {
-                representative.file_role,
-                file.file_role,
-            } <= {"direct_attachment", "official_attachment"}
             if (
-                compatible_roles
-                and representative.source_container_key == file.source_container_key
-                and representative.sha256
+                representative.sha256
                 and representative.sha256 == file.sha256
             ):
                 group.append(file)

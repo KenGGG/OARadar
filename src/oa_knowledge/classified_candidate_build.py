@@ -506,6 +506,7 @@ class ClassifiedCandidateBuildService:
             if row.get("status") not in {"package_success", "package_partial"}:
                 raise ValueError(f"cannot repair non-package row: {key}")
             prior_status = str(row["status"])
+            prior_relpath = row.get("package_relpath")
             status, error = self._render_item(root, row, replace_existing=True)
             if error is not None:
                 row["status"] = prior_status
@@ -515,6 +516,15 @@ class ClassifiedCandidateBuildService:
                 history.append({"error": error})
             else:
                 row["status"] = status
+                current_relpath = row.get("package_relpath")
+                if (
+                    isinstance(prior_relpath, str)
+                    and isinstance(current_relpath, str)
+                    and prior_relpath != current_relpath
+                ):
+                    prior_package = root / "packages" / prior_relpath
+                    if prior_package.is_dir():
+                        self._remove_tree(prior_package)
         missing = oa_item_keys - found
         if missing:
             raise ValueError(f"candidate repair keys missing from manifest: {sorted(missing)}")
