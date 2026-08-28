@@ -360,6 +360,30 @@ def resolve_configured_document_issuer(
     return None
 
 
+def resolve_issuer_from_text(
+    title: str, bodies: Sequence[str], config: PrivateClassificationConfig
+) -> str | None:
+    """Resolve a known issuer from a title, red-header cue, or signature.
+
+    Only configured aliases are accepted here.  This keeps deterministic
+    extraction auditable and leaves genuinely new organizations for the
+    bounded issuer-extraction fallback rather than inventing a canonical name.
+    """
+    text = "\n".join((title, *bodies))
+    cue = re.search(r"(?:发文机关|发文单位|落款)\s*[:：]\s*([^\n]{2,80})", text)
+    candidates: list[str] = []
+    if cue is not None:
+        candidates.append(cue.group(1).strip(" ：:，,。."))
+    candidates.extend(
+        alias for alias in config.issuer_aliases if alias and alias in text
+    )
+    for raw in sorted(candidates, key=len, reverse=True):
+        normalized = normalize_issuer(raw, config.issuer_aliases)
+        if normalized.status == "resolved":
+            return normalized.canonical_issuer
+    return None
+
+
 def _evidence_sort_key(entry: Evidence) -> tuple[object, ...]:
     return (
         entry.evidence_scope,

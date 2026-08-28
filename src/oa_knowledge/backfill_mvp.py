@@ -32,6 +32,7 @@ from oa_knowledge.classification.internal_classification import (
 from oa_knowledge.classification.metadata_rules import (
     find_configured_document_number,
     resolve_configured_document_issuer,
+    resolve_issuer_from_text,
 )
 from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
@@ -1171,6 +1172,36 @@ class BackfillMVPService:
                 confidence=0.99,
                 escalation_action="resolved",
             )
+
+        if outcome.content_origin == "external":
+            canonical_issuer = resolve_issuer_from_text(item.title, bodies, self._config)
+            if canonical_issuer is not None:
+                evidence.append(
+                    Evidence(
+                        evidence_scope="attachment" if bodies else "package",
+                        code="content_issuer_alias",
+                        priority=1,
+                        confidence=0.97,
+                        decision_source="content_rule",
+                        content_origin="external",
+                        flow_type="formal_document",
+                        issuer=canonical_issuer,
+                        canonical_issuer=canonical_issuer,
+                        evidence_excerpt=canonical_issuer,
+                        source_file_id=source_file_id,
+                        issuer_resolution_status="resolved",
+                    )
+                )
+                return replace(
+                    outcome,
+                    classification_status="classified",
+                    flow_type="formal_document",
+                    issuer=canonical_issuer,
+                    canonical_issuer=canonical_issuer,
+                    decision_source="content_rule",
+                    confidence=0.97,
+                    escalation_action="resolved",
+                )
 
         if resolved is None and bodies and outcome.content_origin != "external":
             client = self._qwen_client

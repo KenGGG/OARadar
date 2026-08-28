@@ -17,6 +17,7 @@ from oa_knowledge.classification.metadata_rules import (
     collect_metadata_evidence,
     normalize_issuer,
     resolve_configured_document_issuer,
+    resolve_issuer_from_text,
 )
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 
@@ -167,6 +168,13 @@ def test_parsed_content_can_resolve_a_configured_external_document_issuer(
         "SYN-AUTH-2026-7", config
     ) == ("SYN-AUTH-2026-7", "Synthetic Records Authority", "notice")
     assert resolve_configured_document_issuer("不含正式文号", config) is None
+
+
+def test_issuer_text_extraction_normalizes_header_and_signature_aliases(
+    config: PrivateClassificationConfig,
+) -> None:
+    body = "发文机关：Synthetic Records Authority\n\n关于开展专项工作的通知\n\nSynthetic Records Authority"
+    assert resolve_issuer_from_text("", (body,), config) == "Synthetic Records Authority"
 
 
 def test_alias_normalization_detects_case_unicode_and_whitespace_collisions() -> None:
