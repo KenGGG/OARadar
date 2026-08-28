@@ -202,7 +202,26 @@ class ClassifiedCandidateBuildService:
         manifest_path = root / "build_manifest.json"
         if not manifest_path.is_file():
             raise ValueError(f"candidate build does not exist: {run_id}")
-        return root, json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # Convert the first pre-checkpoint manifest format without discarding
+        # its already-frozen baseline.  Subsequent package checkpoints should
+        # never rewrite a multi-megabyte originals inventory.
+        legacy_baseline = manifest.pop("originals_baseline", None)
+        if legacy_baseline is not None:
+            self._write_json(root / "originals_baseline.json", legacy_baseline)
+            manifest["originals_baseline_file"] = "originals_baseline.json"
+            self._write_json(manifest_path, manifest)
+        return root, manifest
+
+    @staticmethod
+    def _baseline(root: Path, manifest: dict[str, object]) -> object:
+        filename = manifest.get("originals_baseline_file")
+        if not isinstance(filename, str):
+            raise TypeError("candidate build originals baseline is missing")
+        path = root / filename
+        if not path.is_file():
+            raise RuntimeError("candidate build originals baseline file is missing")
+        return json.loads(path.read_text(encoding="utf-8"))
 
     @staticmethod
     def _progress(manifest: dict[str, object]) -> ClassifiedCandidateBuildProgress:
@@ -226,10 +245,12 @@ class ClassifiedCandidateBuildService:
             snapshot = freeze_publishable_snapshot(session)
             decision_count = session.scalar(select(func.count()).select_from(ClassificationDecision))
         work_root.mkdir(parents=True)
+        baseline = _originals_snapshot(self._settings.data_root / "originals")
+        self._write_json(work_root / "originals_baseline.json", baseline)
         manifest: dict[str, object] = {
             "run_id": run_id,
             "classification_decision_count_before": decision_count,
-            "originals_baseline": _originals_snapshot(self._settings.data_root / "originals"),
+            "originals_baseline_file": "originals_baseline.json",
             "items": [
                 {
                     "oa_item_key": row.oa_item_key,
@@ -370,7 +391,7 @@ class ClassifiedCandidateBuildService:
         progress = self._progress(manifest)
         if progress.queued:
             raise ValueError("candidate build still has queued packages")
-        baseline = manifest.get("originals_baseline")
+        baseline = self._baseline(root, manifest)
         if baseline != _originals_snapshot(self._settings.data_root / "originals"):
             raise RuntimeError("originals changed during candidate build")
         final_root = self._builds_root() / run_id
@@ -492,7 +513,13 @@ class ClassifiedCandidateBuildService:
             errors.append("package_key_mapping_failed")
         if any("needs_review" in path.parts for path in packages.rglob("*") if packages.exists()):
             errors.append("needs_review_package_present")
-        if manifest.get("originals_baseline") != _originals_snapshot(self._settings.data_root / "originals"):
+        baseline_path = root / str(manifest.get("originals_baseline_file", ""))
+        baseline = (
+            json.loads(baseline_path.read_text(encoding="utf-8"))
+            if baseline_path.is_file()
+            else None
+        )
+        if baseline != _originals_snapshot(self._settings.data_root / "originals"):
             errors.append("originals_changed")
         with self._sessions() as session:
             decision_count = session.scalar(select(func.count()).select_from(ClassificationDecision))
