@@ -426,7 +426,7 @@ class ClassificationDecision(Base):
             name="ck_classification_category_requires_internal",
         ),
         CheckConstraint(
-            "content_origin <> 'external' OR "
+            "classification_status <> 'classified' OR content_origin <> 'external' OR "
             "(canonical_issuer IS NOT NULL AND trim(canonical_issuer) <> '')",
             name="ck_classification_external_issuer_required",
         ),

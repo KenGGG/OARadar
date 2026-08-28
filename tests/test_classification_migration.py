@@ -577,7 +577,11 @@ def test_classification_constraints_keep_status_axes_and_package_fields_separate
             "business_category",
         ),
         (
-            {"content_origin": "external", "canonical_issuer": None},
+            {
+                "classification_status": "classified",
+                "content_origin": "external",
+                "canonical_issuer": None,
+            },
             "canonical_issuer",
         ),
         (
