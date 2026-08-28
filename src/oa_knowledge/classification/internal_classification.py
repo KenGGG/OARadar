@@ -213,6 +213,35 @@ class LocalQwenInternalClassifier:
         )
 
 
+class LocalQwenIssuerExtractor:
+    """Bounded local-model fallback that extracts only a sending organization."""
+
+    def __init__(self, client: _ChatClient, *, confidence_threshold: float = 0.75):
+        self._client = client
+        self._threshold = confidence_threshold
+        self.last_rejection_code: str | None = None
+
+    def extract(self, title: str, bodies: tuple[str, ...]) -> tuple[str, str] | None:
+        self.last_rejection_code = None
+        content = "\n\n".join(bodies)[:12_000]
+        response = self._client.chat(
+            "只提取真实发文单位。只输出 JSON，禁止判断内外部、业务分类或任何其他内容。",
+            f"标题：{title[:500]}\n正文：{content}",
+            json_schema={"type":"object","additionalProperties":False,"required":["issuer","confidence","evidence_quote"],"properties":{"issuer":{"type":"string","minLength":2},"confidence":{"type":"number"},"evidence_quote":{"type":"string","minLength":2}}},
+        )
+        raw = response.get("content") if not response.get("error") else None
+        text = _extract_qwen_json(raw) if isinstance(raw, str) else None
+        if text is None:
+            self.last_rejection_code = "json_missing"; return None
+        try:
+            value = json.loads(text); issuer = value["issuer"].strip(); confidence = float(value["confidence"]); evidence = value["evidence_quote"].strip()
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self.last_rejection_code = "schema_invalid"; return None
+        if not issuer or confidence < self._threshold or not evidence:
+            self.last_rejection_code = "confidence_below_threshold"; return None
+        return issuer, evidence
+
+
 def _extract_qwen_json(raw_content: str) -> str | None:
     """Accept one schema object, discarding only a leading Qwen reasoning block."""
     text = raw_content.strip()

@@ -26,6 +26,7 @@ from oa_knowledge.classification.evidence import (
 )
 from oa_knowledge.classification.internal_classification import (
     LocalQwenInternalClassifier,
+    LocalQwenIssuerExtractor,
     classify_by_content,
     extract_document_type,
 )
@@ -33,6 +34,7 @@ from oa_knowledge.classification.metadata_rules import (
     find_configured_document_number,
     resolve_configured_document_issuer,
     resolve_issuer_from_text,
+    extract_issuer_candidate,
 )
 from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
@@ -1202,6 +1204,19 @@ class BackfillMVPService:
                     confidence=0.97,
                     escalation_action="resolved",
                 )
+            candidate = extract_issuer_candidate(item.title, bodies)
+            if candidate is None and bodies:
+                client = self._qwen_client or make_llm_client(self._settings.llm, max_retries=self._settings.llm.max_retries, max_tokens=256)
+                result = LocalQwenIssuerExtractor(client, confidence_threshold=self._settings.curation.confidence_threshold).extract(item.title, bodies)
+                if result is not None:
+                    candidate, quote = result
+                    self._qwen_outcomes["issuer_candidate"] += 1
+                else:
+                    quote = None
+            else:
+                quote = None
+            if candidate is not None:
+                evidence.append(Evidence(evidence_scope="attachment" if bodies else "package", code="issuer_candidate", priority=20, confidence=0.7, content_origin="external", issuer=candidate, evidence_excerpt=quote or candidate, source_file_id=source_file_id, issuer_resolution_status="unrecognized"))
 
         if resolved is None and bodies and outcome.content_origin != "external":
             client = self._qwen_client

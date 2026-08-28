@@ -384,6 +384,22 @@ def resolve_issuer_from_text(
     return None
 
 
+def extract_issuer_candidate(title: str, bodies: Sequence[str]) -> str | None:
+    """Extract a plausible issuing organization without treating it as canonical."""
+    text = "\n".join((title, *bodies))
+    patterns = (
+        r"(?:发文机关|发文单位|落款)\s*[:：]\s*([^\n]{2,80})",
+        r"(?:^|\n)\s*([^\n]{2,60}?(?:有限公司|委员会|人民政府|管理委员会|监督管理局|办公室))\s*(?:关于|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match is not None:
+            candidate = match.group(1).strip(" ：:，,。.")
+            if 2 <= len(candidate) <= 80:
+                return candidate
+    return None
+
+
 def _evidence_sort_key(entry: Evidence) -> tuple[object, ...]:
     return (
         entry.evidence_scope,
