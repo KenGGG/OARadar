@@ -553,6 +553,35 @@ class ClassifiedCandidateBuildService:
                 target = (index.parent / linked).resolve()
                 if not target.is_file() or index.parent.resolve() not in target.parents:
                     errors.append(f"broken_or_unsafe_link:{relpath}:{linked}")
+        generated_files: list[dict[str, str]] = []
+        for attachment in packages.rglob("*.md") if packages.is_dir() else ():
+            try:
+                relative = attachment.relative_to(root).as_posix()
+                body = attachment.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                errors.append(f"markdown_not_utf8:{attachment}")
+                continue
+            generated_files.append(
+                {"relpath": relative, "sha256": hashlib.sha256(attachment.read_bytes()).hexdigest()}
+            )
+            if attachment.name == "_index.md":
+                continue
+            match = re.match(r"\A---\n(.*?)\n---\n", body, flags=re.DOTALL)
+            if match is None:
+                errors.append(f"attachment_frontmatter_missing:{relative}")
+                continue
+            try:
+                frontmatter = yaml.safe_load(match.group(1))
+            except yaml.YAMLError:
+                errors.append(f"attachment_frontmatter_invalid:{relative}")
+                continue
+            if not isinstance(frontmatter, dict) or not all(
+                frontmatter.get(field)
+                for field in ("source_sha256", "actual_file_type", "source_file_id")
+            ):
+                errors.append(f"attachment_frontmatter_incomplete:{relative}")
+            if not body[match.end():].strip():
+                errors.append(f"attachment_body_empty:{relative}")
         expected_keys = {
             str(row["oa_item_key"])
             for row in rows
@@ -582,6 +611,7 @@ class ClassifiedCandidateBuildService:
             "package_partial": partial,
             "package_failed": failed,
             "index_count": len(indexes),
+            "generated_files": generated_files,
             "errors": errors,
         }
         self._write_json(root / "qa_report.json", report)

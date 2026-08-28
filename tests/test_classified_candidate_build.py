@@ -302,3 +302,39 @@ def test_attachment_worker_conversion_config_does_not_depend_on_private_rules() 
 
     assert config.initiators == {}
     assert config.document_number_issuers == []
+
+
+def test_candidate_qa_rejects_attachment_markdown_without_frontmatter(tmp_path: Path) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    settings = Settings.model_validate(
+        {
+            "app": {"data_root": str(tmp_path / "data")},
+            "runtime": {"state_root": str(tmp_path / "state"), "cache_root": str(tmp_path / "cache")},
+        }
+    )
+    try:
+        with factory.begin() as session:
+            run = _run(session)
+            _decision(session, run, "done:qa-empty", integrity="no_attachment_confirmed")
+            session.add(
+                OAManifestItem(
+                    oa_item_key="done:qa-empty",
+                    title="Synthetic confirmed empty",
+                    list_page=1,
+                    processing_status="no_attachment",
+                    no_attachment_confirmed=True,
+                )
+            )
+        service = ClassifiedCandidateBuildService(settings, factory)
+        result = service.build("synthetic-qa-invalid")
+        package = result.output_root / "packages" / result.package_relpaths["done:qa-empty"]
+        (package / "附件01_bad.md").write_text("not a Markdown artifact\n", encoding="utf-8")
+
+        qa = service.validate("synthetic-qa-invalid")
+
+        assert not qa.passed
+        assert any(error.startswith("attachment_frontmatter_missing:") for error in qa.errors)
+    finally:
+        engine.dispose()
