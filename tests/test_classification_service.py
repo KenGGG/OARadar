@@ -172,7 +172,7 @@ def _request(run_id: str) -> CreateClassificationRun:
     )
 
 
-def test_scoped_run_freezes_all_exclusions_and_only_requested_targets(
+def test_scoped_run_freezes_only_requested_targets(
     factory: sessionmaker[Session], config: PrivateClassificationConfig
 ) -> None:
     _seed(factory)
@@ -185,8 +185,8 @@ def test_scoped_run_freezes_all_exclusions_and_only_requested_targets(
     ref = service.create_run(request)
     progress = service.process_next(ref.run_id, limit=100)
 
-    assert (ref.total_count, ref.target_count, ref.excluded_count) == (3, 2, 1)
-    assert progress.decided == 3
+    assert (ref.total_count, ref.target_count, ref.excluded_count) == (2, 2, 0)
+    assert progress.decided == 2
     with factory() as session:
         frozen = set(
             session.scalars(
@@ -195,7 +195,7 @@ def test_scoped_run_freezes_all_exclusions_and_only_requested_targets(
                 )
             )
         )
-    assert frozen == {"done:excluded", "done:external", "done:internal"}
+    assert frozen == {"done:external", "done:internal"}
 
 
 def test_scoped_run_rejects_unknown_duplicate_or_excluded_target_keys(

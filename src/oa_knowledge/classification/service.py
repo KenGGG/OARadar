@@ -147,8 +147,7 @@ class ClassificationService:
                 manifests = [
                     row
                     for row in manifests
-                    if self._inclusion_reason(row) == "excluded"
-                    or row.oa_item_key in target_key_set
+                    if row.oa_item_key in target_key_set
                 ]
             membership = [
                 {
