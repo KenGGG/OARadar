@@ -441,7 +441,7 @@ class ClassificationService:
         return ClassificationDecision(
             classification_run_id=run.id,
             oa_item_key=item.item_key,
-            version=self._next_version_for_current(current),
+            version=self._next_version(session, item.item_key),
             is_current=False,
             decision_input_sha256=input_sha,
             decision_source=outcome.decision_source or "metadata_rule",
@@ -489,7 +489,7 @@ class ClassificationService:
         return ClassificationDecision(
             classification_run_id=run.id,
             oa_item_key=item_key,
-            version=self._next_version_for_current(current),
+            version=self._next_version(session, item_key),
             is_current=False,
             decision_input_sha256=input_sha,
             decision_source="metadata_rule",
@@ -669,10 +669,6 @@ class ClassificationService:
                     source_file_id=entry.source_file_id,
                 )
             )
-
-    @staticmethod
-    def _next_version_for_current(current: ClassificationDecision | None) -> int:
-        return 1 if current is None else current.version + 1
 
     @staticmethod
     def _next_version(session: Session, item_key: str) -> int:
