@@ -233,6 +233,49 @@ def test_candidate_build_requeues_failed_item_with_audit_history(tmp_path: Path)
         engine.dispose()
 
 
+def test_candidate_repair_renders_only_selected_finalized_package_without_decisions(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    settings = Settings.model_validate(
+        {
+            "app": {"data_root": str(tmp_path / "data")},
+            "runtime": {"state_root": str(tmp_path / "state"), "cache_root": str(tmp_path / "cache")},
+        }
+    )
+    try:
+        with factory.begin() as session:
+            run = _run(session)
+            _decision(session, run, "done:repair", integrity="no_attachment_confirmed")
+            session.add(
+                OAManifestItem(
+                    oa_item_key="done:repair",
+                    title="Synthetic repair",
+                    list_page=1,
+                    processing_status="no_attachment",
+                    no_attachment_confirmed=True,
+                )
+            )
+        service = ClassifiedCandidateBuildService(settings, factory)
+        result = service.build("synthetic-final-repair")
+        with factory() as session:
+            before = session.scalar(select(func.count()).select_from(ClassificationDecision))
+
+        progress = service.repair_packages("synthetic-final-repair", {"done:repair"})
+
+        assert progress.target_total == progress.package_success == 1
+        package = result.output_root / "packages" / result.package_relpaths["done:repair"]
+        assert (package / "_index.md").is_file()
+        assert not list((result.output_root / "packages").glob(".previous.*"))
+        with factory() as session:
+            after = session.scalar(select(func.count()).select_from(ClassificationDecision))
+        assert after == before
+    finally:
+        engine.dispose()
+
+
 def test_candidate_build_keeps_package_when_an_attachment_is_unsupported(
     tmp_path: Path, monkeypatch
 ) -> None:

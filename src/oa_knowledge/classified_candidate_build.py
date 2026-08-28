@@ -297,7 +297,18 @@ class ClassifiedCandidateBuildService:
         self._write_json(work_root / "build_manifest.json", manifest)
         return self._progress(manifest)
 
-    def _render_item(self, root: Path, row: dict[str, object]) -> tuple[str, str | None]:
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        for child in sorted(path.rglob("*"), reverse=True):
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                child.rmdir()
+        path.rmdir()
+
+    def _render_item(
+        self, root: Path, row: dict[str, object], *, replace_existing: bool = False
+    ) -> tuple[str, str | None]:
         key = str(row["oa_item_key"])
         decision_id = int(row["decision_id"])
         with self._sessions() as session:
@@ -312,6 +323,7 @@ class ClassifiedCandidateBuildService:
             packages = root / "packages"
             packages.mkdir(exist_ok=True)
             temporary = Path(tempfile.mkdtemp(prefix=".package.", dir=packages))
+            previous: Path | None = None
             try:
                 source_files = list(
                     session.scalars(
@@ -389,6 +401,13 @@ class ClassifiedCandidateBuildService:
                 )
                 destination = packages / relpath
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    if not replace_existing:
+                        raise FileExistsError(f"candidate package already exists: {destination}")
+                    previous = packages / f".previous.{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
+                    if previous.exists():
+                        self._remove_tree(previous)
+                    os.replace(destination, previous)
                 os.replace(temporary, destination)
                 row["package_relpath"] = relpath.as_posix()
                 row["exceptions"] = [
@@ -403,17 +422,19 @@ class ClassifiedCandidateBuildService:
                         if value.file_id is None
                     ),
                 ]
+                if previous is not None:
+                    self._remove_tree(previous)
                 return ("package_partial" if exceptions else "package_success"), None
             except Exception as exc:  # noqa: BLE001 - package failures must be durable
+                if previous is not None and previous.exists():
+                    destination = packages / relpath
+                    if destination.exists():
+                        self._remove_tree(destination)
+                    os.replace(previous, destination)
                 return "package_failed", f"{type(exc).__name__}: {exc}"
             finally:
                 if temporary.exists():
-                    for path in sorted(temporary.rglob("*"), reverse=True):
-                        if path.is_file():
-                            path.unlink()
-                        elif path.is_dir():
-                            path.rmdir()
-                    temporary.rmdir()
+                    self._remove_tree(temporary)
 
     def process(self, run_id: str, *, limit: int = 25) -> ClassifiedCandidateBuildProgress:
         if limit < 1:
@@ -455,6 +476,49 @@ class ClassifiedCandidateBuildService:
             row.pop("error", None)
             row["status"] = "queued"
         self._write_json(root / "build_manifest.json", manifest)
+        return self._progress(manifest)
+
+    def repair_packages(
+        self, run_id: str, oa_item_keys: set[str]
+    ) -> ClassifiedCandidateBuildProgress:
+        """Atomically rebuild selected finalized packages from their frozen decisions.
+
+        This is intentionally limited to deterministic rendering repairs.  It
+        neither creates a run nor reads current classification state: every
+        repaired package is rendered from its already-frozen decision ID.
+        """
+        root = self._builds_root() / run_id
+        manifest_path = root / "build_manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(f"completed candidate build does not exist: {run_id}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        rows = manifest.get("items")
+        if not isinstance(rows, list):
+            raise TypeError("candidate manifest items are invalid")
+        found: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = row.get("oa_item_key")
+            if not isinstance(key, str) or key not in oa_item_keys:
+                continue
+            found.add(key)
+            if row.get("status") not in {"package_success", "package_partial"}:
+                raise ValueError(f"cannot repair non-package row: {key}")
+            prior_status = str(row["status"])
+            status, error = self._render_item(root, row, replace_existing=True)
+            if error is not None:
+                row["status"] = prior_status
+                history = row.setdefault("repair_history", [])
+                if not isinstance(history, list):
+                    raise TypeError("candidate repair history is invalid")
+                history.append({"error": error})
+            else:
+                row["status"] = status
+        missing = oa_item_keys - found
+        if missing:
+            raise ValueError(f"candidate repair keys missing from manifest: {sorted(missing)}")
+        self._write_json(manifest_path, manifest)
         return self._progress(manifest)
 
     def finalize(self, run_id: str) -> ClassifiedCandidateBuildResult:
