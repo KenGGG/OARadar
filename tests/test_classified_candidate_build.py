@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 from sqlalchemy import create_engine, func, select
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from oa_knowledge.classified_candidate_build import (
     ClassifiedCandidateBuildService,
     freeze_publishable_snapshot,
+    run_attachment_worker,
 )
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import (
@@ -169,7 +171,9 @@ def test_candidate_build_renders_confirmed_no_attachment_without_creating_decisi
         engine.dispose()
 
 
-def test_candidate_build_keeps_package_when_an_attachment_is_unsupported(tmp_path: Path) -> None:
+def test_candidate_build_keeps_package_when_an_attachment_is_unsupported(
+    tmp_path: Path, monkeypatch
+) -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
@@ -183,6 +187,10 @@ def test_candidate_build_keeps_package_when_an_attachment_is_unsupported(tmp_pat
     source = settings.data_root / "originals" / "done" / "unsupported" / "clip.mp4"
     source.parent.mkdir(parents=True)
     source.write_bytes(payload)
+    monkeypatch.setattr(
+        "oa_knowledge.classified_candidate_build.run_attachment_worker",
+        lambda *_args, **_kwargs: ("skipped", None, ("metadata_only", "mp4")),
+    )
     try:
         with factory.begin() as session:
             run = _run(session)
@@ -271,3 +279,18 @@ def test_candidate_build_resumes_from_the_frozen_work_snapshot(tmp_path: Path) -
         assert result.target_total == result.package_success == 2
     finally:
         engine.dispose()
+
+
+def test_attachment_worker_timeout_becomes_a_single_terminal_attachment_failure(
+    monkeypatch,
+) -> None:
+    def _timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(["worker"], 120)
+
+    monkeypatch.setattr("oa_knowledge.classified_candidate_build.subprocess.run", _timeout)
+
+    outcome, filename, problem = run_attachment_worker(["worker"], timeout_seconds=120)
+
+    assert outcome == "failed"
+    assert filename is None
+    assert problem == ("attachment_worker_timeout", "120 seconds")

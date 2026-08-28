@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +28,6 @@ from oa_knowledge.backfill_mvp import (
     BackfillMVPService,
     canonicalize_attachment_aliases,
 )
-from oa_knowledge.classification.schemas import PrivateClassificationConfig
 from oa_knowledge.config import Settings
 from oa_knowledge.curation.canonical import sanitize_component
 from oa_knowledge.db.models import (
@@ -165,23 +166,56 @@ def _originals_snapshot(root: Path) -> list[dict[str, object]]:
     return rows
 
 
+def run_attachment_worker(
+    command: list[str], *, timeout_seconds: int
+) -> tuple[str, str | None, tuple[str, str] | None]:
+    """Run exactly one attachment conversion in an independently killable process."""
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return "failed", None, ("attachment_worker_timeout", f"{timeout_seconds} seconds")
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout or "worker exited without detail").strip()
+        return "failed", None, ("attachment_worker_failed", detail[-2000:])
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        outcome = payload["outcome"]
+        filename = payload.get("filename")
+        problem = payload.get("problem")
+        if outcome not in {"converted", "skipped", "failed"}:
+            raise ValueError("invalid outcome")
+        if filename is not None and not isinstance(filename, str):
+            raise ValueError("invalid filename")
+        if problem is not None and (
+            not isinstance(problem, list)
+            or len(problem) != 2
+            or not all(isinstance(value, str) for value in problem)
+        ):
+            raise ValueError("invalid problem")
+        return outcome, filename, tuple(problem) if problem is not None else None
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return "failed", None, ("attachment_worker_protocol_error", "invalid worker response")
+
+
 class ClassifiedCandidateBuildService:
     """Render a candidate strictly from a read-only frozen decision snapshot."""
 
-    def __init__(self, settings: Settings, sessions: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        sessions: sessionmaker[Session],
+        *,
+        config_path: Path = Path("config.yaml"),
+    ) -> None:
         self._settings = settings
         self._sessions = sessions
-        # Conversion only needs the existing ParseCache/FormatRouter helpers;
-        # it never reads these placeholder classification rules.
-        conversion_config = PrivateClassificationConfig.model_construct(
-            initiators={}, document_number_issuers=[], issuer_aliases={}, title_templates=[]
-        )
-        self._converter = BackfillMVPService(
-            settings,
-            sessions,
-            conversion_config,
-            private_config_sha256="candidate-build-no-classification",
-        )
+        self._config_path = config_path.resolve()
 
     def _builds_root(self) -> Path:
         return self._settings.data_root / "markdown" / ".builds"
@@ -295,8 +329,23 @@ class ClassifiedCandidateBuildService:
                 for ordinal, attachment in enumerate(
                     canonicalize_attachment_aliases(source_files), 1
                 ):
-                    outcome, filename, problem = self._converter._convert_attachment(
-                        temporary, attachment, ordinal
+                    outcome, filename, problem = run_attachment_worker(
+                        [
+                            sys.executable,
+                            "-m",
+                            "oa_knowledge.candidate_attachment_worker",
+                            "--config",
+                            str(self._config_path),
+                            "--file-id",
+                            str(attachment.file.id),
+                            "--alias-ids",
+                            json.dumps([value.id for value in attachment.aliases]),
+                            "--package",
+                            str(temporary),
+                            "--ordinal",
+                            str(ordinal),
+                        ],
+                        timeout_seconds=120,
                     )
                     if outcome == "converted" and filename:
                         links.append((filename, attachment.file.original_name))
