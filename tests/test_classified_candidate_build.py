@@ -162,6 +162,9 @@ def test_candidate_build_renders_confirmed_no_attachment_without_creating_decisi
         with factory() as session:
             after = session.scalar(select(func.count()).select_from(ClassificationDecision))
         assert after == before
+        qa = service.validate("synthetic-candidate")
+        assert qa.passed
+        assert qa.index_count == 1
     finally:
         engine.dispose()
 
@@ -222,6 +225,7 @@ def test_candidate_build_keeps_package_when_an_attachment_is_unsupported(tmp_pat
         assert exception["original_name"] == "clip.mp4"
         assert exception["sha256"] == hashlib.sha256(payload).hexdigest()
         assert exception["actual_file_type"] == "mp4"
+        assert (result.output_root / "exceptions.csv").is_file()
     finally:
         engine.dispose()
 

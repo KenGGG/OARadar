@@ -7,16 +7,20 @@ those immutable decision versions.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+import yaml
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.backfill_mvp import (
     BackfillException,
     BackfillMVPService,
@@ -76,6 +80,13 @@ class ClassifiedCandidateBuildProgress:
     package_failed: int
 
 
+@dataclass(frozen=True, slots=True)
+class ClassifiedCandidateBuildQA:
+    passed: bool
+    index_count: int
+    errors: tuple[str, ...]
+
+
 def _has_unresolved_conflict(value: str) -> bool:
     try:
         payload = json.loads(value)
@@ -132,6 +143,26 @@ def _package_relpath(item: OAItem, decision: ClassificationDecision) -> Path:
         return Path("internal", parent, year, month, leaf)
     parent = sanitize_component(decision.canonical_issuer or "")
     return Path("external", parent, year, month, leaf)
+
+
+def _originals_snapshot(root: Path) -> list[dict[str, object]]:
+    if not root.exists():
+        return []
+    rows: list[dict[str, object]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        rows.append(
+            {
+                "relpath": path.relative_to(root).as_posix(),
+                "size_bytes": stat.st_size,
+                "sha256": sha256_file(path),
+                "mtime_ns": stat.st_mtime_ns,
+                "ctime_ns": stat.st_ctime_ns,
+            }
+        )
+    return rows
 
 
 class ClassifiedCandidateBuildService:
@@ -193,9 +224,12 @@ class ClassifiedCandidateBuildService:
             raise ValueError(f"candidate build already exists: {run_id}")
         with self._sessions() as session:
             snapshot = freeze_publishable_snapshot(session)
+            decision_count = session.scalar(select(func.count()).select_from(ClassificationDecision))
         work_root.mkdir(parents=True)
         manifest: dict[str, object] = {
             "run_id": run_id,
+            "classification_decision_count_before": decision_count,
+            "originals_baseline": _originals_snapshot(self._settings.data_root / "originals"),
             "items": [
                 {
                     "oa_item_key": row.oa_item_key,
@@ -336,10 +370,53 @@ class ClassifiedCandidateBuildService:
         progress = self._progress(manifest)
         if progress.queued:
             raise ValueError("candidate build still has queued packages")
+        baseline = manifest.get("originals_baseline")
+        if baseline != _originals_snapshot(self._settings.data_root / "originals"):
+            raise RuntimeError("originals changed during candidate build")
         final_root = self._builds_root() / run_id
         if final_root.exists():
             raise ValueError(f"candidate build already exists: {run_id}")
         os.replace(root, final_root)
+        with (final_root / "exceptions.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=(
+                    "oa_item_key",
+                    "package_status",
+                    "file_id",
+                    "original_name",
+                    "local_relpath",
+                    "sha256",
+                    "actual_file_type",
+                    "conversion_status",
+                    "code",
+                    "detail",
+                    "error",
+                ),
+            )
+            writer.writeheader()
+            for row in manifest["items"]:
+                if not isinstance(row, dict):
+                    continue
+                for exception in row.get("exceptions", []):
+                    if not isinstance(exception, dict):
+                        continue
+                    writer.writerow(
+                        {
+                            "oa_item_key": row.get("oa_item_key"),
+                            "package_status": row.get("status"),
+                            **exception,
+                            "error": row.get("error"),
+                        }
+                    )
+                if row.get("status") == "package_failed":
+                    writer.writerow(
+                        {
+                            "oa_item_key": row.get("oa_item_key"),
+                            "package_status": row.get("status"),
+                            "error": row.get("error"),
+                        }
+                    )
         relpaths = {
             str(row["oa_item_key"]): str(row["package_relpath"])
             for row in manifest["items"]
@@ -353,6 +430,86 @@ class ClassifiedCandidateBuildService:
             package_failed=progress.package_failed,
             package_relpaths=relpaths,
         )
+
+    def validate(self, run_id: str) -> ClassifiedCandidateBuildQA:
+        root = self._builds_root() / run_id
+        manifest_path = root / "build_manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(f"completed candidate build does not exist: {run_id}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        rows = manifest.get("items", [])
+        errors: list[str] = []
+        if not isinstance(rows, list):
+            errors.append("manifest_items_invalid")
+            rows = []
+        statuses = [row.get("status") for row in rows if isinstance(row, dict)]
+        target_total = len(rows)
+        success = statuses.count("package_success")
+        partial = statuses.count("package_partial")
+        failed = statuses.count("package_failed")
+        if target_total != success + partial + failed:
+            errors.append("target_status_equation_failed")
+        packages = root / "packages"
+        indexes = sorted(packages.rglob("_index.md")) if packages.is_dir() else []
+        if len(indexes) != success + partial:
+            errors.append("index_count_equation_failed")
+        observed_relpaths: set[str] = set()
+        observed_keys: set[str] = set()
+        for index in indexes:
+            relpath = index.parent.relative_to(packages).as_posix()
+            if relpath in observed_relpaths:
+                errors.append(f"duplicate_package_path:{relpath}")
+            observed_relpaths.add(relpath)
+            body = index.read_text(encoding="utf-8")
+            match = re.match(r"\A---\n(.*?)\n---\n", body, flags=re.DOTALL)
+            if match is None:
+                errors.append(f"frontmatter_missing:{relpath}")
+                continue
+            try:
+                frontmatter = yaml.safe_load(match.group(1))
+            except yaml.YAMLError:
+                errors.append(f"frontmatter_invalid:{relpath}")
+                continue
+            key = frontmatter.get("oa_item_key") if isinstance(frontmatter, dict) else None
+            if not isinstance(key, str) or not key:
+                errors.append(f"oa_item_key_missing:{relpath}")
+            elif key in observed_keys:
+                errors.append(f"duplicate_oa_item_key:{key}")
+            else:
+                observed_keys.add(key)
+            if not isinstance(frontmatter, dict) or frontmatter.get("classification_status") != "classified":
+                errors.append(f"nonclassified_package:{relpath}")
+            for linked in re.findall(r"\]\(<([^>]+)>\)", body):
+                target = (index.parent / linked).resolve()
+                if not target.is_file() or index.parent.resolve() not in target.parents:
+                    errors.append(f"broken_or_unsafe_link:{relpath}:{linked}")
+        expected_keys = {
+            str(row["oa_item_key"])
+            for row in rows
+            if isinstance(row, dict) and row.get("status") in {"package_success", "package_partial"}
+        }
+        if observed_keys != expected_keys:
+            errors.append("package_key_mapping_failed")
+        if any("needs_review" in path.parts for path in packages.rglob("*") if packages.exists()):
+            errors.append("needs_review_package_present")
+        if manifest.get("originals_baseline") != _originals_snapshot(self._settings.data_root / "originals"):
+            errors.append("originals_changed")
+        with self._sessions() as session:
+            decision_count = session.scalar(select(func.count()).select_from(ClassificationDecision))
+        if decision_count != manifest.get("classification_decision_count_before"):
+            errors.append("classification_decision_count_changed")
+        report = {
+            "run_id": run_id,
+            "passed": not errors,
+            "target_total": target_total,
+            "package_success": success,
+            "package_partial": partial,
+            "package_failed": failed,
+            "index_count": len(indexes),
+            "errors": errors,
+        }
+        self._write_json(root / "qa_report.json", report)
+        return ClassifiedCandidateBuildQA(not errors, len(indexes), tuple(errors))
 
     def build(self, run_id: str) -> ClassifiedCandidateBuildResult:
         self.start(run_id)

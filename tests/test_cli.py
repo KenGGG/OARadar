@@ -53,7 +53,7 @@ def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
     assert {path.name for path in data_root.iterdir()} == {"originals", "markdown"}
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0039_classification_run_adopted_decision"
+    assert json.loads(status.output)["schema"] == "0040_external_review_without_issuer"
 
 
 def test_backfill_mvp_cli_exposes_sample_and_full_modes() -> None:
