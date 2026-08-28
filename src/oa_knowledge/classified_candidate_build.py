@@ -622,8 +622,14 @@ class ClassifiedCandidateBuildService:
         }
         if observed_keys != expected_keys:
             errors.append("package_key_mapping_failed")
-        if any("needs_review" in path.parts for path in packages.rglob("*") if packages.exists()):
-            errors.append("needs_review_package_present")
+        package_top_levels = {
+            path.relative_to(packages).parts[0]
+            for path in packages.rglob("*")
+            if packages.exists() and path.relative_to(packages).parts
+        }
+        for disallowed in ("needs_review", "excluded", "unclassified"):
+            if disallowed in package_top_levels:
+                errors.append(f"{disallowed}_package_present")
         baseline_path = root / str(manifest.get("originals_baseline_file", ""))
         baseline = (
             json.loads(baseline_path.read_text(encoding="utf-8"))

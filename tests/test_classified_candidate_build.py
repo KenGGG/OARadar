@@ -437,3 +437,42 @@ def test_candidate_qa_rejects_duplicate_attachment_sha_within_package(tmp_path: 
         assert any(error.startswith("duplicate_attachment_sha256:") for error in qa.errors)
     finally:
         engine.dispose()
+
+
+def test_candidate_qa_rejects_nonpublishable_directory_names(tmp_path: Path) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    settings = Settings.model_validate(
+        {
+            "app": {"data_root": str(tmp_path / "data")},
+            "runtime": {"state_root": str(tmp_path / "state"), "cache_root": str(tmp_path / "cache")},
+        }
+    )
+    try:
+        with factory.begin() as session:
+            run = _run(session)
+            _decision(session, run, "done:qa-path", integrity="no_attachment_confirmed")
+            session.add(
+                OAManifestItem(
+                    oa_item_key="done:qa-path",
+                    title="Synthetic path validation",
+                    list_page=1,
+                    processing_status="no_attachment",
+                    no_attachment_confirmed=True,
+                )
+            )
+        service = ClassifiedCandidateBuildService(settings, factory)
+        result = service.build("synthetic-qa-path")
+        for top_level in ("excluded", "unclassified"):
+            bad = result.output_root / "packages" / top_level / "synthetic" / "_index.md"
+            bad.parent.mkdir(parents=True)
+            bad.write_text("---\noa_item_key: synthetic\nclassification_status: classified\n---\n", encoding="utf-8")
+
+        qa = service.validate("synthetic-qa-path")
+
+        assert not qa.passed
+        assert "excluded_package_present" in qa.errors
+        assert "unclassified_package_present" in qa.errors
+    finally:
+        engine.dispose()
