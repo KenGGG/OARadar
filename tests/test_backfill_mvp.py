@@ -960,6 +960,7 @@ def test_v2_classifies_an_unresolved_internal_item_from_attachment_content(
     ) as stream:
         row = next(__import__("csv").DictReader(stream))
     assert row["business_category"] == "02_业务项目与投放租后"
+    assert row["content_origin"] == "internal"
     assert row["document_type"] == "立项申请书"
     assert row["decision_source"] == "content_rule"
 

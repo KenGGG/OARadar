@@ -1209,6 +1209,7 @@ class BackfillMVPService:
         return replace(
             outcome,
             classification_status="classified",
+            content_origin="internal",
             business_category=resolved.business_category,
             document_type=resolved.document_type or document_type,
             decision_source=resolved.decision_source,
