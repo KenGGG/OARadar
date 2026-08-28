@@ -16,6 +16,7 @@ from oa_knowledge.classification.metadata_rules import (
     classify_from_metadata,
     collect_metadata_evidence,
     normalize_issuer,
+    resolve_configured_document_issuer,
 )
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 
@@ -157,6 +158,15 @@ def test_internal_package_keeps_attachment_document_evidence_scoped(
     assert attachment_document.canonical_issuer == "Synthetic Records Authority"
     assert outcome.content_origin == "internal"
     assert outcome.canonical_issuer is None
+
+
+def test_parsed_content_can_resolve_a_configured_external_document_issuer(
+    config: PrivateClassificationConfig,
+) -> None:
+    assert resolve_configured_document_issuer(
+        "SYN-AUTH-2026-7", config
+    ) == ("SYN-AUTH-2026-7", "Synthetic Records Authority", "notice")
+    assert resolve_configured_document_issuer("不含正式文号", config) is None
 
 
 def test_alias_normalization_detects_case_unicode_and_whitespace_collisions() -> None:

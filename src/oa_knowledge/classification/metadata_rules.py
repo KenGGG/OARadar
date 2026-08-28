@@ -344,6 +344,22 @@ def find_configured_document_number(
     return None
 
 
+def resolve_configured_document_issuer(
+    text: str, config: PrivateClassificationConfig
+) -> tuple[str, str, str | None] | None:
+    """Resolve a configured formal document number found in parsed content.
+
+    The return value is ``(document_number, canonical_issuer, document_type)``.
+    A self-issued number is deliberately not returned as an external issuer:
+    callers must keep that item on the internal classification path.
+    """
+    for rule in config.document_number_issuers:
+        match = re.search(rule.pattern, text)
+        if match is not None and rule.canonical_issuer not in _SELF_ISSUERS:
+            return match.group(0).strip(), rule.canonical_issuer, rule.document_type
+    return None
+
+
 def _evidence_sort_key(entry: Evidence) -> tuple[object, ...]:
     return (
         entry.evidence_scope,

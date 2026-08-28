@@ -29,7 +29,10 @@ from oa_knowledge.classification.internal_classification import (
     classify_by_content,
     extract_document_type,
 )
-from oa_knowledge.classification.metadata_rules import find_configured_document_number
+from oa_knowledge.classification.metadata_rules import (
+    find_configured_document_number,
+    resolve_configured_document_issuer,
+)
 from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 from oa_knowledge.classification.service import (
@@ -1128,6 +1131,46 @@ class BackfillMVPService:
                             break
             bodies = tuple(parsed_bodies)
             resolved = resolved or classify_by_content(item.title, bodies)
+
+        external_document: tuple[str, str, str | None] | None = None
+        if outcome.content_origin == "external":
+            for body in bodies:
+                external_document = resolve_configured_document_issuer(body, self._config)
+                if external_document is not None:
+                    break
+
+        if external_document is not None:
+            document_number, canonical_issuer, detected_type = external_document
+            evidence.append(
+                Evidence(
+                    evidence_scope="attachment",
+                    code="content_document_number",
+                    priority=1,
+                    confidence=0.99,
+                    decision_source="content_rule",
+                    content_origin="external",
+                    flow_type="formal_document",
+                    issuer=canonical_issuer,
+                    canonical_issuer=canonical_issuer,
+                    document_number=document_number,
+                    document_type=detected_type or document_type,
+                    evidence_excerpt=document_number,
+                    source_file_id=source_file_id,
+                    issuer_resolution_status="resolved",
+                )
+            )
+            return replace(
+                outcome,
+                classification_status="classified",
+                flow_type="formal_document",
+                issuer=canonical_issuer,
+                canonical_issuer=canonical_issuer,
+                document_number=document_number,
+                document_type=detected_type or document_type,
+                decision_source="content_rule",
+                confidence=0.99,
+                escalation_action="resolved",
+            )
 
         if resolved is None and bodies and outcome.content_origin != "external":
             client = self._qwen_client
