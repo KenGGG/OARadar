@@ -34,6 +34,25 @@ def test_latest_schema_allows_agnes_as_a_versioned_decision_source(tmp_path: Pat
     assert "'agnes'" in sql
 
 
+def test_upgrade_recovers_an_empty_interrupted_classification_decision_temp_table(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "interrupted-agnes-migration.db"
+    upgrade_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE _alembic_tmp_classification_decisions (id INTEGER)"
+        )
+
+    upgrade_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='_alembic_tmp_classification_decisions'"
+        ).fetchone() is None
+
+
 def _alembic_config(database_path: Path) -> Config:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
