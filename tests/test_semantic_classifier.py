@@ -5,7 +5,9 @@ from oa_knowledge.classification.semantic_classifier import (
     JsonSemanticCache,
     SemanticClassifier,
     SemanticPackage,
+    _SEMANTIC_ATTACHMENT_CONTEXT_MAX_CHARS,
     _system_prompt,
+    _user_prompt,
 )
 
 
@@ -162,3 +164,29 @@ def test_semantic_prompt_names_every_required_json_key_for_local_qwen() -> None:
     ):
         assert key in prompt
     assert "keep、replace、needs_review 或 classify" in prompt
+
+
+def test_semantic_prompt_bounds_total_attachment_context_but_keeps_each_boundary() -> None:
+    package = SemanticPackage(
+        oa_item_key="done:multi-attachment",
+        title="Synthetic multi attachment OA",
+        document_number=None,
+        attachment_names=tuple(f"附件{number}.pdf" for number in range(1, 6)),
+        parsed_attachments=tuple(
+            (
+                f"附件{number}",
+                f"HEAD-{number}\n" + "正文" * 20_000 + f"\nTAIL-{number}",
+            )
+            for number in range(1, 6)
+        ),
+        parse_artifact_hashes=tuple(str(number) * 64 for number in range(1, 6)),
+        current_classification=None,
+    )
+
+    prompt = _user_prompt(package, public=False)
+
+    assert len(prompt) < _SEMANTIC_ATTACHMENT_CONTEXT_MAX_CHARS + 2_000
+    for number in range(1, 6):
+        assert f"===== 附件{number} =====" in prompt
+        assert f"HEAD-{number}" in prompt
+        assert f"TAIL-{number}" in prompt

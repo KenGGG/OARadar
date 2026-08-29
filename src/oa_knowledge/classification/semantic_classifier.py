@@ -32,6 +32,11 @@ _CATEGORIES = (
     "99_其他内部",
 )
 
+# This is a package-wide character budget, not a per-attachment allowance.
+# A multi-attachment OA must not monopolize the single local Qwen worker by
+# multiplying the context window for every attachment.
+_SEMANTIC_ATTACHMENT_CONTEXT_MAX_CHARS = 16_000
+
 
 class _EvidencePayload(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -265,8 +270,8 @@ def _system_prompt() -> str:
 
 def _user_prompt(package: SemanticPackage, *, public: bool) -> str:
     attachment_blocks = "\n\n".join(
-        f"===== {name} =====\n{_select_text(body)}"
-        for name, body in package.parsed_attachments
+        f"===== {name} =====\n{body}"
+        for name, body in _select_attachment_context(package.parsed_attachments)
     ) or "（没有可用正文）"
     rows = [
         "请判断以下 OA Package。",
@@ -278,6 +283,21 @@ def _user_prompt(package: SemanticPackage, *, public: bool) -> str:
         rows.append("当前分类：" + json.dumps(package.current_classification, ensure_ascii=False))
     rows.extend(("Parsed content：", attachment_blocks))
     return "\n\n".join(rows)
+
+
+def _select_attachment_context(
+    attachments: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    """Bound one OA Package while retaining each attachment's head and tail."""
+    if not attachments:
+        return ()
+    if sum(len(body.strip()) for _, body in attachments) <= _SEMANTIC_ATTACHMENT_CONTEXT_MAX_CHARS:
+        return tuple((name, body.strip()) for name, body in attachments)
+    per_attachment = max(1, _SEMANTIC_ATTACHMENT_CONTEXT_MAX_CHARS // len(attachments))
+    return tuple(
+        (name, _select_text(body, maximum=per_attachment))
+        for name, body in attachments
+    )
 
 
 def _select_text(value: str, *, maximum: int = 24_000) -> str:
