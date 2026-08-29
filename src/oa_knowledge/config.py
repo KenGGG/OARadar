@@ -253,6 +253,38 @@ class LlmConfig(StrictModel):
         return self
 
 
+class AgnesConfig(StrictModel):
+    """Narrowly scoped public-model configuration for public external OA only."""
+
+    enabled: bool = False
+    base_url: str = "https://apihub.agnes-ai.com/v1"
+    api_key_env: str = "AGNES_API_KEY"
+    model: str = "agnes-2.0-flash"
+    timeout_seconds: int = Field(default=180, ge=5, le=600)
+    max_tokens: int = Field(default=4096, ge=256, le=16384)
+    max_retries: int = Field(default=2, ge=0, le=5)
+    max_concurrency: int = Field(default=1, ge=1, le=4)
+
+    @model_validator(mode="after")
+    def approved_public_endpoint(self) -> AgnesConfig:
+        parsed = urlparse(self.base_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "apihub.agnes-ai.com"
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+            or parsed.query
+            or parsed.path.rstrip("/") != "/v1"
+        ):
+            raise ValueError("agnes.base_url must be the approved Agnes API v1 endpoint")
+        if self.api_key_env != "AGNES_API_KEY":
+            raise ValueError("agnes.api_key_env must be AGNES_API_KEY")
+        if self.model != "agnes-2.0-flash":
+            raise ValueError("agnes.model must be agnes-2.0-flash")
+        return self
+
+
 class ProcessingConfig(StrictModel):
     enabled: bool = True
     max_workers: int = 1
@@ -353,6 +385,7 @@ class Settings(StrictModel):
     mineru: MineruConfig = MineruConfig()
     feishu: FeishuConfig = FeishuConfig()
     llm: LlmConfig = LlmConfig()
+    agnes: AgnesConfig = AgnesConfig()
     processing: ProcessingConfig = ProcessingConfig()
     curation: CurationConfig = CurationConfig()
     markdown_export: MarkdownExportConfig = MarkdownExportConfig()
