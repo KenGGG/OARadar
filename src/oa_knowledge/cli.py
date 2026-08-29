@@ -164,6 +164,7 @@ def semantic_review_v2_command(
         ref = service.create_run(
             run_id, target_keys, private_config_sha256=private_config_sha256
         )
+        service.recover_interrupted(run_id)
         progress = service.progress(run_id)
         while progress.queued:
             progress = service.process_next(run_id, limit=batch_size)

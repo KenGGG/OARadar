@@ -121,6 +121,24 @@ class SemanticReviewService:
                 self._fail(item_id, type(exc).__name__)
         return self.progress(run_id)
 
+    def recover_interrupted(self, run_id: str) -> int:
+        """Return in-flight items to the durable queue after a worker dies.
+
+        No decision is created or adopted here: an item in ``content`` has not
+        completed model processing and can therefore be safely retried.
+        """
+        with self._sessions.begin() as session:
+            run = self._run(session, run_id)
+            items = list(session.scalars(select(ClassificationRunItem).where(
+                ClassificationRunItem.classification_run_id == run.id,
+                ClassificationRunItem.stage == "content",
+            )))
+            for item in items:
+                item.stage = "queued"
+                item.last_error_code = "worker_interrupted"
+                item.last_error_detail = "requeued after interrupted semantic worker"
+            return len(items)
+
     def progress(self, run_id: str) -> SemanticRunProgress:
         with self._sessions.begin() as session:
             run = self._run(session, run_id)

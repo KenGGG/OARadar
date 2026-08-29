@@ -163,3 +163,22 @@ def test_semantic_target_keys_excludes_gate_zero_items() -> None:
 
     with factory() as session:
         assert semantic_target_keys(session) == ()
+
+
+def test_semantic_run_recovers_a_worker_interrupted_during_content_stage() -> None:
+    factory = _factory()
+    _seed(factory)
+    service = SemanticReviewService(factory, _Classifier(_result()), _package)
+    service.create_run("semantic-v2", ("done:one",), private_config_sha256="c" * 64)
+    with factory.begin() as session:
+        item = session.scalar(select(ClassificationRunItem))
+        assert item is not None
+        item.stage = "content"
+        item.attempts = 1
+
+    assert service.recover_interrupted("semantic-v2") == 1
+    with factory() as session:
+        item = session.scalar(select(ClassificationRunItem))
+        assert item is not None
+        assert item.stage == "queued"
+        assert item.last_error_code == "worker_interrupted"
