@@ -15,6 +15,7 @@ from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
     BatchItem,
+    ClassificationRun,
     CollectionBatch,
     OAItem,
     OAManifestItem,
@@ -22,6 +23,85 @@ from oa_knowledge.db.models import (
 )
 
 runner = CliRunner()
+
+
+def test_classified_candidate_build_cli_requires_a_completed_semantic_run() -> None:
+    result = runner.invoke(app, ["classified-candidate-build", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--run-id" in result.output
+    assert "--semantic-run-id" in result.output
+
+
+def test_classified_candidate_build_cli_rejects_an_unfinished_semantic_run(
+    config_file: Path,
+) -> None:
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "classified-candidate-build",
+            "--run-id",
+            "synthetic-candidate-v2",
+            "--semantic-run-id",
+            "not-completed",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "requires a completed semantic review run" in result.output
+    assert not (config_file.parent / "data" / "markdown" / ".builds").exists()
+
+
+def test_classified_candidate_build_cli_runs_only_after_completed_semantic_run(
+    config_file: Path,
+) -> None:
+    assert runner.invoke(app, ["init", "--config", str(config_file)]).exit_code == 0
+    settings = load_settings(config_file)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add(
+            ClassificationRun(
+                run_id="synthetic-semantic-completed",
+                run_kind="incremental",
+                status="completed",
+                input_signature="a" * 64,
+                manifest_sha256="b" * 64,
+                exclusion_policy_sha256="c" * 64,
+                rule_version="semantic-v2",
+                schema_version="classification-v1",
+                prompt_version="agnes-classifier-v1.1",
+                model_name="agnes+qwen",
+                private_config_sha256="d" * 64,
+                target_count=0,
+                excluded_count=0,
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+    result = runner.invoke(
+        app,
+        [
+            "classified-candidate-build",
+            "--run-id",
+            "synthetic-candidate-v2",
+            "--semantic-run-id",
+            "synthetic-semantic-completed",
+            "--config",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["target_total"] == 0
+    assert payload["qa_passed"] is True
+    assert payload["classification_decision_new"] == 0
+    assert payload["markdown_published"] is False
 
 
 def test_oa_detail_url_preserves_the_seeyon_application_prefix() -> None:

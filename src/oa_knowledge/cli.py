@@ -187,6 +187,75 @@ def semantic_review_v2_command(
         engine.dispose()
 
 
+@app.command("classified-candidate-build")
+def classified_candidate_build_command(
+    run_id: str = typer.Option(..., "--run-id", help="New isolated candidate build ID"),
+    semantic_run_id: str = typer.Option(
+        ..., "--semantic-run-id", help="Completed semantic review run to freeze from"
+    ),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Build Markdown strictly from a completed semantic snapshot.
+
+    This command is deliberately one-way: it never creates or executes a
+    classification run, calls a model, or mutates classification decisions.
+    """
+    from sqlalchemy.orm import sessionmaker
+
+    from oa_knowledge.classified_candidate_build import ClassifiedCandidateBuildService
+    from oa_knowledge.db.models import ClassificationRun
+
+    settings = settings_option(config)
+    engine = require_engine(settings)
+    try:
+        factory = sessionmaker(engine, expire_on_commit=False)
+        with factory() as session:
+            semantic_run = session.scalar(
+                select(ClassificationRun).where(ClassificationRun.run_id == semantic_run_id)
+            )
+            if semantic_run is None or semantic_run.status != "completed":
+                typer.echo(
+                    "candidate build requires a completed semantic review run", err=True
+                )
+                raise typer.Exit(2)
+            if semantic_run.excluded_count != 0:
+                typer.echo(
+                    "candidate build semantic run must not contain excluded items", err=True
+                )
+                raise typer.Exit(2)
+        service = ClassifiedCandidateBuildService(settings, factory, config_path=config or Path("config.yaml"))
+        service.start(run_id)
+        progress = service.process(run_id, limit=25)
+        while progress.queued:
+            progress = service.process(run_id, limit=25)
+        result = service.finalize(run_id)
+        qa = service.validate(run_id)
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "semantic_run_id": semantic_run_id,
+                    "output_root": str(result.output_root),
+                    "target_total": result.target_total,
+                    "package_success": result.package_success,
+                    "package_partial": result.package_partial,
+                    "package_failed": result.package_failed,
+                    "qa_passed": qa.passed,
+                    "index_count": qa.index_count,
+                    "qa_errors": list(qa.errors),
+                    "classification_decision_new": 0,
+                    "markdown_published": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        if not qa.passed:
+            raise typer.Exit(1)
+    finally:
+        engine.dispose()
+
+
 def settings_option(config: Path | None) -> Settings:
     return load_settings(config)
 
