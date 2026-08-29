@@ -187,6 +187,8 @@ class SemanticReviewService:
             current = self._current(session, key)
             if item is None or current is None or item.stage != "content":
                 raise ValueError("semantic run state changed during classification")
+            item.last_error_code = None
+            item.last_error_detail = self._audit_detail(result)
             if not self._adoptable(current, result):
                 item.adopted_decision_id = current.id
                 item.stage = "decided"
@@ -245,6 +247,26 @@ class SemanticReviewService:
                 classification_decision_id=decision.id, sequence=sequence, evidence_type=entry.type,
                 evidence_scope="attachment", value_json=entry.model_dump_json(), confidence=result.outcome.confidence,
             ))
+
+    @staticmethod
+    def _audit_detail(result: SemanticClassificationResult) -> str:
+        """Persist model-call audit metadata without prompt or OA body content."""
+        return json.dumps(
+            {
+                "provider": result.provider,
+                "model": result.model,
+                "prompt_version": "agnes-classifier-v1",
+                "input_sha256": result.input_sha256,
+                "eligibility_reason": result.eligibility_reason,
+                "confidence": result.outcome.confidence if result.outcome else None,
+                "result": result.outcome.classification_status if result.outcome else "rejected",
+                "rejection_code": result.rejection_code,
+                "cache_hit": result.cache_hit,
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
 
     def _fail(self, item_id: int, detail: str) -> None:
         with self._sessions.begin() as session:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from sqlalchemy import create_engine, select
@@ -100,6 +101,17 @@ def test_semantic_run_adopts_high_confidence_review_resolution() -> None:
         assert current.version == 2
         assert current.decision_source == "agnes"
         assert current.canonical_issuer == "广州市工业和信息化局"
+        item = session.scalar(
+            select(ClassificationRunItem)
+            .join(ClassificationRun)
+            .where(ClassificationRun.run_id == "semantic-v2")
+        )
+        assert item is not None
+        audit = json.loads(item.last_error_detail)
+        assert audit["provider"] == "agnes"
+        assert audit["input_sha256"] == "e" * 64
+        assert audit["eligibility_reason"] == "external_public_formal_document"
+        assert audit["result"] == "classified"
 
 
 def test_semantic_run_preserves_manual_lock_without_calling_model() -> None:
