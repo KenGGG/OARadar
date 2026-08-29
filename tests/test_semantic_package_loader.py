@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 from oa_knowledge.archive import sha256_file
 from oa_knowledge.classification.semantic_package_loader import (
     DatabaseSemanticPackageLoader,
+    parse_with_semantic_timeout,
 )
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import (
@@ -85,3 +86,15 @@ def test_loader_reads_verified_direct_text_only_when_no_parse_artifact_exists(tm
     assert package.parsed_attachments == (("public.txt", "广州市工业和信息化局\n关于公开事项的通知"),)
     assert package.parse_artifact_hashes == (sha256_file(source),)
     assert eligibility.status == "allowed"
+
+
+def test_mineru_semantic_parse_timeout_is_propagated_to_the_fallback_route() -> None:
+    def expired() -> object:
+        raise TimeoutError("synthetic mineru timeout")
+
+    try:
+        parse_with_semantic_timeout("mineru", expired)
+    except TimeoutError as exc:
+        assert "synthetic mineru timeout" in str(exc)
+    else:
+        raise AssertionError("timeout must reach the bounded fallback route")

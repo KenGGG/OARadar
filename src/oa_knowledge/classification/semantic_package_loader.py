@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
 from collections.abc import Callable
 
 from sqlalchemy import select
@@ -155,7 +156,13 @@ class DatabaseSemanticPackageLoader:
                 metadata_unresolved=True,
                 purpose="classification",
             )
-            result = self._parse_cache.get_or_parse(request)
+            try:
+                result = parse_with_semantic_timeout(
+                    parser_name,
+                    lambda request=request: self._parse_cache.get_or_parse(request),
+                )
+            except TimeoutError:
+                continue
             if result.status != "parsed" or not result.output_relpath:
                 continue
             try:
@@ -179,3 +186,20 @@ class DatabaseSemanticPackageLoader:
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+
+def parse_with_semantic_timeout(parser_name: str, operation: Callable[[], object]) -> object:
+    """Bound one MinerU semantic parse so a single attachment cannot stall a run."""
+    if parser_name != "mineru":
+        return operation()
+    previous = signal.getsignal(signal.SIGALRM)
+    signal.signal(
+        signal.SIGALRM,
+        lambda *_: (_ for _ in ()).throw(TimeoutError("mineru_semantic_timeout")),
+    )
+    signal.setitimer(signal.ITIMER_REAL, 90)
+    try:
+        return operation()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
