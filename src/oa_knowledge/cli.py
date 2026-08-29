@@ -143,7 +143,7 @@ def semantic_review_v2_command(
                 api_key_env=settings.llm.api_key_env,
                 model=settings.llm.model,
                 temperature=0.0,
-                max_tokens=settings.llm.max_tokens,
+                max_tokens=_semantic_local_max_tokens(settings.llm.max_tokens),
                 timeout_seconds=settings.llm.timeout_seconds,
                 max_retries=settings.llm.max_retries,
                 provider_mode="local_only",
@@ -185,6 +185,17 @@ def semantic_review_v2_command(
         )
     finally:
         engine.dispose()
+
+
+def _semantic_local_max_tokens(configured_max_tokens: int) -> int:
+    """Keep local semantic JSON responses bounded on the CPU-only model.
+
+    Semantic review requires a conclusion plus concise evidence, not the
+    general-purpose 4k response allowance.  Without this cap a malformed or
+    overly verbose local response can hold the single local-model slot for an
+    hour and prevent the durable run from advancing.
+    """
+    return min(configured_max_tokens, 512)
 
 
 @app.command("classified-candidate-build")

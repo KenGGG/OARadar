@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
-from oa_knowledge.cli import _oa_detail_url, _sanitize_operational_error, app
+from oa_knowledge.cli import (
+    _oa_detail_url,
+    _sanitize_operational_error,
+    _semantic_local_max_tokens,
+    app,
+)
 from oa_knowledge.collector import LoginState
 from oa_knowledge.collector.detail import AuthRequiredError
 from oa_knowledge.collector.done import DiscoveredDoneItem
@@ -23,6 +28,12 @@ from oa_knowledge.db.models import (
 )
 
 runner = CliRunner()
+
+
+def test_semantic_local_response_budget_is_bounded_for_cpu_qwen() -> None:
+    """Semantic JSON needs a short conclusion, never the general 4k LLM budget."""
+    assert _semantic_local_max_tokens(4096) == 512
+    assert _semantic_local_max_tokens(256) == 256
 
 
 def test_classified_candidate_build_cli_requires_a_completed_semantic_run() -> None:
