@@ -48,6 +48,21 @@ class _Classifier(Protocol):
     ) -> SemanticClassificationResult: ...
 
 
+def semantic_target_keys(session: Session) -> tuple[str, ...]:
+    """Freeze only Gate-0-admitted current classifications for semantic review."""
+    rows = session.scalars(
+        select(ClassificationDecision.oa_item_key)
+        .join(OAManifestItem, OAManifestItem.oa_item_key == ClassificationDecision.oa_item_key)
+        .where(
+            ClassificationDecision.is_current.is_(True),
+            ClassificationDecision.classification_status.in_(("classified", "needs_review")),
+            OAManifestItem.matched_exclusion_keyword.is_(None),
+        )
+        .order_by(ClassificationDecision.oa_item_key)
+    )
+    return tuple(rows)
+
+
 class SemanticReviewService:
     """Adopt semantic outcomes only under the freeze-safe confidence thresholds."""
 
@@ -151,6 +166,20 @@ class SemanticReviewService:
                 item.stage = "decided"
                 return
         package, eligibility = self._package_loader(key)
+        # A semantic provider must never receive an OA whose usable content has
+        # not been assembled locally.  The caller may later create a ParseArtifact
+        # through the existing FormatRouter, then resume this scoped run.
+        if not package.parsed_attachments:
+            with self._sessions.begin() as session:
+                item = session.get(ClassificationRunItem, item_id)
+                current = self._current(session, key)
+                if item is None or current is None or item.stage != "content":
+                    raise ValueError("semantic run state changed before content gate")
+                item.adopted_decision_id = current.id
+                item.last_error_code = "no_parseable_content"
+                item.last_error_detail = "no valid local ParseArtifact"
+                item.stage = "decided"
+            return
         result = self._classifier.classify(package, eligibility)
         with self._sessions.begin() as session:
             run = self._run(session, run_id)

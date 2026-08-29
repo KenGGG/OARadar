@@ -12,7 +12,10 @@ from oa_knowledge.classification.semantic_classifier import (
     SemanticOutcome,
     SemanticPackage,
 )
-from oa_knowledge.classification.semantic_run import SemanticReviewService
+from oa_knowledge.classification.semantic_run import (
+    SemanticReviewService,
+    semantic_target_keys,
+)
 from oa_knowledge.db.models import (
     Base,
     ClassificationDecision,
@@ -114,3 +117,37 @@ def test_semantic_run_preserves_manual_lock_without_calling_model() -> None:
         item = session.scalar(select(ClassificationRunItem).join(ClassificationRun).where(ClassificationRun.run_id == "semantic-v2"))
         assert current.version == 1
         assert item.adopted_decision_id == current.id
+
+
+def test_semantic_run_does_not_send_an_item_without_parsed_content_to_a_model() -> None:
+    factory = _factory()
+    _seed(factory)
+    classifier = _Classifier(_result())
+
+    def empty_package(_key: str) -> tuple[SemanticPackage, AgnesEligibility]:
+        return (
+            SemanticPackage("done:one", "公开通知", None, (), (), (), None),
+            AgnesEligibility("local_only", "no_parseable_content"),
+        )
+
+    service = SemanticReviewService(factory, classifier, empty_package)
+    service.create_run("semantic-v2", ("done:one",), private_config_sha256="c" * 64)
+
+    progress = service.process_next("semantic-v2", limit=1)
+
+    assert classifier.calls == 0
+    assert progress.decided == 1
+
+
+def test_semantic_target_keys_excludes_gate_zero_items() -> None:
+    factory = _factory()
+    _seed(factory)
+    with factory.begin() as session:
+        manifest = session.scalar(
+            select(OAManifestItem).where(OAManifestItem.oa_item_key == "done:one")
+        )
+        assert manifest is not None
+        manifest.matched_exclusion_keyword = "旧文件"
+
+    with factory() as session:
+        assert semantic_target_keys(session) == ()

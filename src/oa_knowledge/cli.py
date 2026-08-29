@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import os
+import hashlib
 import sqlite3
 import fcntl
 import signal
@@ -86,6 +87,103 @@ curate_app = typer.Typer(help="Local-only OA Package to curated knowledge docume
 app.add_typer(curate_app, name="curate", hidden=True)
 data_app = typer.Typer(help="本地数据预检、隔离、恢复与清除")
 app.add_typer(data_app, name="data", hidden=True)
+
+
+@app.command("semantic-review-v2")
+def semantic_review_v2_command(
+    run_id: str = typer.Option(..., "--run-id", help="Durable semantic review run ID"),
+    batch_size: int = typer.Option(25, "--batch-size", min=1, max=100),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Run safe semantic review over frozen, Gate-0-admitted classifications.
+
+    The command never reads originals directly.  It only consumes valid local
+    ParseArtifacts, and routes public text to Agnes only after the local gate.
+    """
+    from sqlalchemy.orm import sessionmaker
+
+    from oa_knowledge.classification.agnes_client import AgnesPublicClient
+    from oa_knowledge.classification.semantic_classifier import JsonSemanticCache, SemanticClassifier
+    from oa_knowledge.classification.semantic_package_loader import DatabaseSemanticPackageLoader
+    from oa_knowledge.classification.semantic_run import SemanticReviewService, semantic_target_keys
+    from oa_knowledge.enrich.llm_client import LlmClient
+
+    settings = settings_option(config)
+    if not settings.agnes.enabled:
+        typer.echo("Agnes is disabled in local configuration", err=True)
+        raise typer.Exit(2)
+    engine = require_engine(settings)
+    try:
+        upgrade_database(settings.database_path)
+        factory = sessionmaker(engine, expire_on_commit=False)
+        with factory() as session:
+            target_keys = semantic_target_keys(session)
+        private_config_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "agnes": settings.agnes.model_dump(mode="json"),
+                    "llm": settings.llm.model_dump(mode="json"),
+                    "prompt_version": "agnes-classifier-v1",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        classifier = SemanticClassifier(
+            AgnesPublicClient(
+                settings.agnes.base_url,
+                api_key_env=settings.agnes.api_key_env,
+                model=settings.agnes.model,
+                timeout_seconds=settings.agnes.timeout_seconds,
+                max_tokens=settings.agnes.max_tokens,
+                max_retries=settings.agnes.max_retries,
+            ),
+            LlmClient(
+                base_url=settings.llm.base_url,
+                api_key_env=settings.llm.api_key_env,
+                model=settings.llm.model,
+                temperature=0.0,
+                max_tokens=settings.llm.max_tokens,
+                timeout_seconds=settings.llm.timeout_seconds,
+                max_retries=settings.llm.max_retries,
+                provider_mode="local_only",
+                context_window_fallback=settings.llm.context_window_fallback,
+                context_window_cap=settings.llm.context_window_cap,
+                context_safety_margin=settings.llm.context_safety_margin,
+            ),
+            JsonSemanticCache(settings.cache_root / "semantic-v2"),
+            prompt_version="agnes-classifier-v1",
+            agnes_model=settings.agnes.model,
+            local_model=settings.llm.model,
+        )
+        service = SemanticReviewService(
+            factory,
+            classifier,
+            DatabaseSemanticPackageLoader(factory, settings),
+        )
+        ref = service.create_run(
+            run_id, target_keys, private_config_sha256=private_config_sha256
+        )
+        progress = service.progress(run_id)
+        while progress.queued:
+            progress = service.process_next(run_id, limit=batch_size)
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": ref.run_id,
+                    "target_total": ref.target_count,
+                    "excluded": ref.excluded_count,
+                    "queued": progress.queued,
+                    "decided": progress.decided,
+                    "failed": progress.failed,
+                    "markdown_build_started": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    finally:
+        engine.dispose()
 
 
 def settings_option(config: Path | None) -> Settings:
