@@ -240,7 +240,17 @@ def _system_prompt() -> str:
         "你是 OARadar 的严格 OA 语义分类器。标题只是辅助证据，正文、发文机关、文号和落款优先。"
         "发起人不等于作者；引用机构不等于当前文件 issuer；不确定时返回 needs_review。"
         "公司自行形成的对外报送材料是 internal + outbound_submission。"
-        f"内部业务分类只能是：{categories}。只输出符合 JSON Schema 的对象，禁止思维链、Markdown 或额外键。"
+        f"内部业务分类只能是：{categories}。"
+        "只输出一个 JSON 对象，禁止思维链、Markdown、<think> 或额外键。"
+        "必须且只能包含这些键：classification_status, content_origin, flow_type, "
+        "canonical_issuer, business_category, document_type, confidence, review_current, evidence, reason。"
+        "classification_status 只能是 classified 或 needs_review；content_origin 只能是 internal、external 或 null；"
+        "flow_type 只能是 direct、internal_relay、external_inbound、outbound_submission 或 null。"
+        "review_current 必须是字符串 keep、replace、needs_review 或 classify，绝不是 true/false。"
+        "classified + internal 必须有 business_category 且 canonical_issuer 为 null；"
+        "classified + external 必须有 canonical_issuer 且 business_category 为 null。"
+        "needs_review 不猜测：可将无法确认字段设为 null。"
+        "evidence 必须是数组，元素仅含 source、type、summary。"
     )
 
 

@@ -5,6 +5,7 @@ from oa_knowledge.classification.semantic_classifier import (
     JsonSemanticCache,
     SemanticClassifier,
     SemanticPackage,
+    _system_prompt,
 )
 
 
@@ -101,3 +102,21 @@ def test_identical_input_reuses_local_cache_without_second_model_call(tmp_path: 
     assert second.cache_hit is True
     assert len(agnes.calls) == 1
     assert second.input_sha256 == first.input_sha256
+
+
+def test_semantic_prompt_names_every_required_json_key_for_local_qwen() -> None:
+    prompt = _system_prompt()
+    for key in (
+        "classification_status",
+        "content_origin",
+        "flow_type",
+        "canonical_issuer",
+        "business_category",
+        "document_type",
+        "confidence",
+        "review_current",
+        "evidence",
+        "reason",
+    ):
+        assert key in prompt
+    assert "keep、replace、needs_review 或 classify" in prompt
