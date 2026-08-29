@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from oa_knowledge.archive import sha256_file
+from oa_knowledge.classification.parse_cache import ParseCacheService, ParseRequest
 from oa_knowledge.config import Settings
 from oa_knowledge.db.models import (
     ArchivedFile,
@@ -14,7 +18,9 @@ from oa_knowledge.db.models import (
     OAItem,
     ParseArtifact,
 )
-from oa_knowledge.runtime_paths import resolve_cache_path
+from oa_knowledge.parsers.format_router import detect_format, parser_attempts
+from oa_knowledge.parsers.router import resolve_parser_version
+from oa_knowledge.runtime_paths import resolve_cache_path, resolve_original_path
 
 from .agnes_eligibility import (
     AgnesEligibility,
@@ -30,6 +36,7 @@ class DatabaseSemanticPackageLoader:
     def __init__(self, session_factory: Callable[[], Session], settings: Settings) -> None:
         self._sessions = session_factory
         self._settings = settings
+        self._parse_cache = ParseCacheService(session_factory, settings)
 
     def __call__(self, oa_item_key: str) -> tuple[SemanticPackage, AgnesEligibility]:
         with self._sessions() as session:
@@ -44,21 +51,20 @@ class DatabaseSemanticPackageLoader:
                 ArchivedFile.oa_item_id == item.id,
                 ArchivedFile.download_status == "verified",
             ).order_by(ArchivedFile.id)))
-            parsed: list[tuple[str, str]] = []
+            parsed_attachments: list[tuple[str, str]] = []
             hashes: list[str] = []
             for file in files:
                 artifact = self._artifact(session, file)
-                if artifact is None:
-                    continue
-                try:
-                    path = resolve_cache_path(self._settings, artifact.output_relpath)
-                    body = path.read_text(encoding="utf-8", errors="replace").strip()
-                except (OSError, ValueError):
-                    continue
-                if not body:
-                    continue
-                parsed.append((file.original_name, body))
-                hashes.append(artifact.product_sha256 or artifact.source_sha256)
+                cached = self._read_artifact(artifact)
+                if cached is not None:
+                    body, product_sha = cached
+                else:
+                    parsed_result = self._parse_when_needed(file)
+                    if parsed_result is None:
+                        continue
+                    body, product_sha = parsed_result
+                parsed_attachments.append((file.original_name, body))
+                hashes.append(product_sha)
             current = {
                 "classification_status": decision.classification_status,
                 "content_origin": decision.content_origin,
@@ -73,7 +79,7 @@ class DatabaseSemanticPackageLoader:
                 title=item.title,
                 document_number=decision.document_number or item.document_number,
                 attachment_names=tuple(file.original_name for file in files),
-                parsed_attachments=tuple(parsed),
+                parsed_attachments=tuple(parsed_attachments),
                 parse_artifact_hashes=tuple(hashes),
                 current_classification=current,
             )
@@ -85,7 +91,7 @@ class DatabaseSemanticPackageLoader:
                 canonical_issuer=decision.canonical_issuer,
                 workflow=None,
                 attachment_names=package.attachment_names,
-                parsed_text="\n".join(body for _, body in parsed),
+                parsed_text="\n".join(body for _, body in parsed_attachments),
             ))
             return package, eligibility
 
@@ -97,3 +103,79 @@ class DatabaseSemanticPackageLoader:
             ParseArtifact.content_object_id == file.content_object_id,
             ParseArtifact.lifecycle_status == "valid",
         ).order_by(ParseArtifact.created_at.desc(), ParseArtifact.id.desc()))
+
+    def _read_artifact(self, artifact: ParseArtifact | None) -> tuple[str, str] | None:
+        if artifact is None:
+            return None
+        try:
+            path = resolve_cache_path(self._settings, artifact.output_relpath)
+            body = path.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            return None
+        if not body or artifact.quality_score is not None and artifact.quality_score < 0.5:
+            return None
+        return body, artifact.product_sha256 or artifact.source_sha256
+
+    def _parse_when_needed(self, file: ArchivedFile) -> tuple[str, str] | None:
+        """Use the shared FormatRouter only after usable local text is absent."""
+        if (
+            file.download_status != "verified"
+            or not file.local_relpath
+            or not file.sha256
+        ):
+            return None
+        try:
+            source = resolve_original_path(self._settings, file.local_relpath)
+        except ValueError:
+            return None
+        if not source.is_file() or (
+            file.size_bytes is not None and source.stat().st_size != file.size_bytes
+        ) or sha256_file(source) != file.sha256:
+            return None
+        decision = detect_format(source)
+        if decision.is_direct_text:
+            try:
+                body = source.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                return None
+            return (body, file.sha256) if body else None
+        if decision.status_code != "parseable":
+            return None
+        for parser_name in parser_attempts(
+            decision, mineru_enabled=self._settings.mineru.enabled
+        )[:2]:
+            parser_version = resolve_parser_version(parser_name, self._settings)
+            request = ParseRequest(
+                file_id=file.id,
+                content_sha256=file.sha256,
+                parser_name=parser_name,
+                parser_version=parser_version,
+                parse_profile_version="semantic-v2",
+                parse_config_sha256=self._parse_config_sha(parser_name, decision.actual_file_type),
+                metadata_unresolved=True,
+                purpose="classification",
+            )
+            result = self._parse_cache.get_or_parse(request)
+            if result.status != "parsed" or not result.output_relpath:
+                continue
+            try:
+                body = resolve_cache_path(self._settings, result.output_relpath).read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip()
+            except (OSError, ValueError):
+                continue
+            if body and (result.quality_score is None or result.quality_score >= 0.5):
+                return body, file.sha256
+        return None
+
+    def _parse_config_sha(self, parser_name: str, actual_file_type: str) -> str:
+        payload = {
+            "purpose": "semantic-v2",
+            "engine": parser_name,
+            "actual_file_type": actual_file_type,
+            "parser": self._settings.parser.model_dump(mode="json"),
+            "mineru": self._settings.mineru.model_dump(mode="json"),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
