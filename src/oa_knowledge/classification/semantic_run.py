@@ -139,6 +139,25 @@ class SemanticReviewService:
                 item.last_error_detail = "requeued after interrupted semantic worker"
             return len(items)
 
+    def retry_rejected(self, run_id: str, rejection_code: str) -> int:
+        """Requeue a terminal schema/model rejection without losing its audit."""
+        if not rejection_code:
+            raise ValueError("rejection code is required")
+        with self._sessions.begin() as session:
+            run = self._run(session, run_id)
+            retried = 0
+            for item in session.scalars(select(ClassificationRunItem).where(
+                ClassificationRunItem.classification_run_id == run.id,
+                ClassificationRunItem.stage == "decided",
+            )):
+                detail = _json_object(item.last_error_detail)
+                if detail.get("rejection_code") != rejection_code:
+                    continue
+                item.stage = "queued"
+                item.last_error_code = rejection_code
+                retried += 1
+            return retried
+
     def progress(self, run_id: str) -> SemanticRunProgress:
         with self._sessions.begin() as session:
             run = self._run(session, run_id)
@@ -206,7 +225,9 @@ class SemanticReviewService:
             if item is None or current is None or item.stage != "content":
                 raise ValueError("semantic run state changed during classification")
             item.last_error_code = None
-            item.last_error_detail = self._audit_detail(result)
+            item.last_error_detail = self._audit_detail(
+                result, previous=item.last_error_detail
+            )
             if not self._adoptable(current, result):
                 item.adopted_decision_id = current.id
                 item.stage = "decided"
@@ -267,10 +288,11 @@ class SemanticReviewService:
             ))
 
     @staticmethod
-    def _audit_detail(result: SemanticClassificationResult) -> str:
+    def _audit_detail(
+        result: SemanticClassificationResult, *, previous: str | None = None
+    ) -> str:
         """Persist model-call audit metadata without prompt or OA body content."""
-        return json.dumps(
-            {
+        current: dict[str, object] = {
                 "provider": result.provider,
                 "model": result.model,
                 "prompt_version": "agnes-classifier-v1.1",
@@ -281,10 +303,15 @@ class SemanticReviewService:
                 "rejection_code": result.rejection_code,
                 "cache_hit": result.cache_hit,
                 "timestamp": datetime.now(UTC).isoformat(),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        }
+        prior = _json_object(previous)
+        if prior:
+            attempts = prior.pop("prior_attempts", [])
+            if not isinstance(attempts, list):
+                attempts = []
+            attempts.append(prior)
+            current["prior_attempts"] = attempts
+        return json.dumps(current, ensure_ascii=False, sort_keys=True)
 
     def _fail(self, item_id: int, detail: str) -> None:
         with self._sessions.begin() as session:
@@ -306,3 +333,13 @@ class SemanticReviewService:
         if run is None:
             raise ValueError("semantic run not found")
         return run
+
+
+def _json_object(raw: str | None) -> dict[str, object]:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}

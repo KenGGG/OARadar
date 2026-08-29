@@ -119,6 +119,19 @@ def test_public_agnes_schema_invalid_response_is_retried_once(tmp_path: Path) ->
     assert len(agnes.calls) == 2
 
 
+def test_local_qwen_schema_invalid_response_is_retried_once(tmp_path: Path) -> None:
+    local = _SequenceClient("not-json", _EXTERNAL)
+    classifier = SemanticClassifier(
+        _FakeClient(_EXTERNAL), local, JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1"
+    )
+
+    result = classifier.classify(_package(), AgnesEligibility("local_only", "sensitive_signal"))
+
+    assert result.outcome is not None
+    assert result.provider == "local_qwen"
+    assert len(local.calls) == 2
+
+
 def test_identical_input_reuses_local_cache_without_second_model_call(tmp_path: Path) -> None:
     agnes = _FakeClient(_EXTERNAL)
     classifier = SemanticClassifier(agnes, _FakeClient(_EXTERNAL), JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1")

@@ -183,3 +183,26 @@ def test_semantic_run_recovers_a_worker_interrupted_during_content_stage() -> No
         assert item is not None
         assert item.stage == "queued"
         assert item.last_error_code == "worker_interrupted"
+
+
+def test_semantic_run_requeues_schema_rejection_without_losing_prior_audit() -> None:
+    factory = _factory()
+    _seed(factory)
+    service = SemanticReviewService(factory, _Classifier(_result()), _package)
+    service.create_run("semantic-v2", ("done:one",), private_config_sha256="c" * 64)
+    with factory.begin() as session:
+        item = session.scalar(select(ClassificationRunItem))
+        assert item is not None
+        item.stage = "decided"
+        item.last_error_detail = json.dumps({"provider": "local_qwen", "result": "rejected", "rejection_code": "schema_invalid"})
+
+    assert service.retry_rejected("semantic-v2", "schema_invalid") == 1
+    service.process_next("semantic-v2", limit=1)
+
+    with factory() as session:
+        item = session.scalar(select(ClassificationRunItem))
+        assert item is not None
+        audit = json.loads(item.last_error_detail)
+        assert item.stage == "decided"
+        assert audit["result"] == "classified"
+        assert audit["prior_attempts"][0]["rejection_code"] == "schema_invalid"

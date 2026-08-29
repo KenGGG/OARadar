@@ -174,10 +174,11 @@ class SemanticClassifier:
         client = self._agnes if public else self._local
         response: dict = {}
         outcome: SemanticOutcome | None = None
-        # A schema-invalid Agnes response is safe to retry once with exactly the
-        # same locally approved public payload.  Do not retry local Qwen here:
-        # it never leaves the machine and its terminal rejection is auditable.
-        for attempt in range(2 if public else 1):
+        # A schema-invalid response is safe to retry once with exactly the
+        # same payload.  Agnes receives only its locally approved public
+        # payload; Qwen remains local-only.  Transport failures are handled by
+        # the provider clients' bounded retry policies instead.
+        for attempt in range(2):
             response = client.chat(
                 _system_prompt(),
                 _user_prompt(package, public=public),
@@ -197,7 +198,7 @@ class SemanticClassifier:
                     outcome = None
             if outcome is not None:
                 break
-            if attempt == 1 or not public:
+            if attempt == 1:
                 return SemanticClassificationResult(
                     provider, input_sha256, eligibility.reason, False, None,
                     "schema_invalid", str(response.get("model") or model),
