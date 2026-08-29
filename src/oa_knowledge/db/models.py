@@ -417,7 +417,7 @@ class ClassificationDecision(Base):
             name="ck_classification_integrity_status",
         ),
         CheckConstraint("content_origin IS NULL OR content_origin IN ('internal', 'external')", name="ck_classification_content_origin"),
-        CheckConstraint("decision_source IN ('metadata_rule', 'content_rule', 'local_qwen', 'manual')", name="ck_classification_decision_source"),
+        CheckConstraint("decision_source IN ('metadata_rule', 'content_rule', 'local_qwen', 'agnes', 'manual')", name="ck_classification_decision_source"),
         CheckConstraint("initiator_type IN ('internal', 'external', 'mixed', 'system', 'unknown')", name="ck_classification_initiator_type"),
         CheckConstraint("classification_confidence >= 0 AND classification_confidence <= 1", name="ck_classification_confidence"),
         CheckConstraint(

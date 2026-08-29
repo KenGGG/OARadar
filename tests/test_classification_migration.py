@@ -3,17 +3,16 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
-import pytest
 from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from oa_knowledge.db import models
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db import models
-
 
 CLASSIFICATION_TABLES = {
     "classification_runs",
@@ -21,6 +20,18 @@ CLASSIFICATION_TABLES = {
     "classification_decisions",
     "classification_evidence",
 }
+
+
+def test_latest_schema_allows_agnes_as_a_versioned_decision_source(tmp_path: Path) -> None:
+    database_path = tmp_path / "agnes-source.db"
+    upgrade_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='classification_decisions'"
+        ).fetchone()[0]
+
+    assert "'agnes'" in sql
 
 
 def _alembic_config(database_path: Path) -> Config:
