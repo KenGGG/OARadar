@@ -56,6 +56,24 @@ def test_keeps_project_and_finance_content_local_even_if_sender_looks_public() -
     assert result.reason == "sensitive_signal"
 
 
+def test_keeps_public_looking_metadata_local_when_body_contains_customer_data() -> None:
+    result = determine_agnes_eligibility(
+        AgnesEligibilityInput(
+            title="【文件传阅】广州市工业和信息化局关于服务企业工作的通知",
+            content_origin="external",
+            flow_type="external_inbound",
+            document_number="穗工信函〔2025〕18号",
+            canonical_issuer="广州市工业和信息化局",
+            workflow="文件传阅",
+            attachment_names=("通知.pdf",),
+            parsed_text="附件列示我司客户名称、银行账户及融资租赁项目明细。",
+        )
+    )
+
+    assert result.status == "local_only"
+    assert result.reason == "sensitive_signal"
+
+
 def test_keeps_internal_outbound_material_local() -> None:
     result = determine_agnes_eligibility(
         AgnesEligibilityInput(

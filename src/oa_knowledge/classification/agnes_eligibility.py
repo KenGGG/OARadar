@@ -1,9 +1,8 @@
 """Local-only safety gate for the narrowly permitted Agnes public channel.
 
-The gate is deliberately conservative: it never opens an OA body, asks a
-model, or infers publication status from an initiator.  A caller must provide
-already-local metadata and deterministic evidence; any uncertainty stays on
-the local model path.
+The gate is deliberately conservative: it uses only already-local metadata
+and parsed text, never asks a model, and never infers publication status from
+an initiator. Any uncertainty stays on the local model path.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ class AgnesEligibilityInput:
     canonical_issuer: str | None
     workflow: str | None
     attachment_names: tuple[str, ...] = ()
+    parsed_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +44,7 @@ class AgnesEligibility:
 
 
 def determine_agnes_eligibility(value: AgnesEligibilityInput) -> AgnesEligibility:
-    """Decide egress eligibility entirely from local, non-body metadata."""
+    """Decide egress eligibility entirely from locally available evidence."""
     if value.content_origin != "external":
         return AgnesEligibility("local_only", "non_external_content")
 
@@ -56,6 +56,7 @@ def determine_agnes_eligibility(value: AgnesEligibilityInput) -> AgnesEligibilit
             value.canonical_issuer or "",
             value.workflow or "",
             *value.attachment_names,
+            value.parsed_text,
         )
         if part and part.strip()
     )
