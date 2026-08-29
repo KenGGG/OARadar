@@ -97,7 +97,7 @@ class SemanticReviewService:
             run = ClassificationRun(
                 run_id=run_id, run_kind="incremental", status="created", input_signature=signature,
                 manifest_sha256=signature, exclusion_policy_sha256=signature, rule_version="semantic-v2",
-                schema_version="classification-v1", prompt_version="agnes-classifier-v1",
+                schema_version="classification-v1", prompt_version="agnes-classifier-v1.1",
                 model_name="agnes-2.0-flash+local-qwen", private_config_sha256=private_config_sha256,
                 target_count=len(target_keys), excluded_count=0,
             )
@@ -273,7 +273,7 @@ class SemanticReviewService:
             {
                 "provider": result.provider,
                 "model": result.model,
-                "prompt_version": "agnes-classifier-v1",
+                "prompt_version": "agnes-classifier-v1.1",
                 "input_sha256": result.input_sha256,
                 "eligibility_reason": result.eligibility_reason,
                 "confidence": result.outcome.confidence if result.outcome else None,

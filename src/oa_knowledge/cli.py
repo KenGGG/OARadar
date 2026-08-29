@@ -123,7 +123,7 @@ def semantic_review_v2_command(
                 {
                     "agnes": settings.agnes.model_dump(mode="json"),
                     "llm": settings.llm.model_dump(mode="json"),
-                    "prompt_version": "agnes-classifier-v1",
+                    "prompt_version": "agnes-classifier-v1.1",
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -152,7 +152,7 @@ def semantic_review_v2_command(
                 context_safety_margin=settings.llm.context_safety_margin,
             ),
             JsonSemanticCache(settings.cache_root / "semantic-v2"),
-            prompt_version="agnes-classifier-v1",
+            prompt_version="agnes-classifier-v1.1",
             agnes_model=settings.agnes.model,
             local_model=settings.llm.model,
         )
