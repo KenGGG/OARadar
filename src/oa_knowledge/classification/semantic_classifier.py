@@ -172,30 +172,38 @@ class SemanticClassifier:
                 )
         public = provider == "agnes"
         client = self._agnes if public else self._local
-        response = client.chat(
-            _system_prompt(),
-            _user_prompt(package, public=public),
-            json_schema=SemanticOutcome.model_json_schema(),
-        )
-        if response.get("error"):
-            return SemanticClassificationResult(
-                provider, input_sha256, eligibility.reason, False, None,
-                "model_request_failed", str(response.get("model") or model),
+        response: dict = {}
+        outcome: SemanticOutcome | None = None
+        # A schema-invalid Agnes response is safe to retry once with exactly the
+        # same locally approved public payload.  Do not retry local Qwen here:
+        # it never leaves the machine and its terminal rejection is auditable.
+        for attempt in range(2 if public else 1):
+            response = client.chat(
+                _system_prompt(),
+                _user_prompt(package, public=public),
+                json_schema=SemanticOutcome.model_json_schema(),
             )
-        raw = response.get("content")
-        payload = _extract_qwen_json(raw) if isinstance(raw, str) else None
-        if payload is None:
-            return SemanticClassificationResult(
-                provider, input_sha256, eligibility.reason, False, None,
-                "schema_invalid", str(response.get("model") or model),
-            )
-        try:
-            outcome = SemanticOutcome.model_validate_json(payload)
-        except (ValidationError, ValueError, TypeError, json.JSONDecodeError):
-            return SemanticClassificationResult(
-                provider, input_sha256, eligibility.reason, False, None,
-                "schema_invalid", str(response.get("model") or model),
-            )
+            if response.get("error"):
+                return SemanticClassificationResult(
+                    provider, input_sha256, eligibility.reason, False, None,
+                    "model_request_failed", str(response.get("model") or model),
+                )
+            raw = response.get("content")
+            payload = _extract_qwen_json(raw) if isinstance(raw, str) else None
+            if payload is not None:
+                try:
+                    outcome = SemanticOutcome.model_validate_json(payload)
+                except (ValidationError, ValueError, TypeError, json.JSONDecodeError):
+                    outcome = None
+            if outcome is not None:
+                break
+            if attempt == 1 or not public:
+                return SemanticClassificationResult(
+                    provider, input_sha256, eligibility.reason, False, None,
+                    "schema_invalid", str(response.get("model") or model),
+                )
+        if outcome is None:
+            raise AssertionError("semantic retry loop must return or validate an outcome")
         self._cache.write(
             input_sha256,
             {

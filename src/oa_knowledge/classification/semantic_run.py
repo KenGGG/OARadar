@@ -252,7 +252,7 @@ class SemanticReviewService:
             canonical_issuer=outcome.canonical_issuer, business_category=outcome.business_category,
             document_number=current.document_number, document_type=outcome.document_type,
             normalized_title=current.normalized_title, classification_confidence=outcome.confidence,
-            classification_reason_json=json.dumps({"provider": result.provider, "model": result.model, "prompt_version": "agnes-classifier-v1", "input_sha256": result.input_sha256, "eligibility_reason": result.eligibility_reason, "reason": outcome.reason, "conflict_codes": []}, ensure_ascii=False, sort_keys=True),
+            classification_reason_json=json.dumps({"provider": result.provider, "model": result.model, "prompt_version": run.prompt_version, "input_sha256": result.input_sha256, "eligibility_reason": result.eligibility_reason, "reason": outcome.reason, "conflict_codes": []}, ensure_ascii=False, sort_keys=True),
             rule_version=run.rule_version, private_config_sha256=run.private_config_sha256,
             manual_locked=False, supersedes_decision_id=current.id,
         )

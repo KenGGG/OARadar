@@ -19,6 +19,20 @@ class _FakeClient:
         return {"content": self.content, "model": "synthetic-model", "error": None}
 
 
+class _SequenceClient:
+    def __init__(self, *contents: str) -> None:
+        self.contents = list(contents)
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def chat(self, system_prompt: str, user_prompt: str, *, json_schema: dict) -> dict:
+        self.calls.append((system_prompt, user_prompt, json_schema))
+        return {
+            "content": self.contents.pop(0),
+            "model": "synthetic-model",
+            "error": None,
+        }
+
+
 _EXTERNAL = """{
   "classification_status":"classified",
   "content_origin":"external",
@@ -88,6 +102,21 @@ def test_invalid_model_json_is_not_a_classification_and_is_cached_nowhere(tmp_pa
     assert result.outcome is None
     assert result.rejection_code == "schema_invalid"
     assert list(tmp_path.iterdir()) == []
+
+
+def test_public_agnes_schema_invalid_response_is_retried_once(tmp_path: Path) -> None:
+    agnes = _SequenceClient("not-json", _EXTERNAL)
+    classifier = SemanticClassifier(
+        agnes, _FakeClient(_EXTERNAL), JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1"
+    )
+
+    result = classifier.classify(
+        _package(), AgnesEligibility("allowed", "external_public_formal_document")
+    )
+
+    assert result.outcome is not None
+    assert result.outcome.canonical_issuer == "广州市工业和信息化局"
+    assert len(agnes.calls) == 2
 
 
 def test_identical_input_reuses_local_cache_without_second_model_call(tmp_path: Path) -> None:

@@ -101,6 +101,7 @@ def test_semantic_run_adopts_high_confidence_review_resolution() -> None:
         assert current.version == 2
         assert current.decision_source == "agnes"
         assert current.canonical_issuer == "广州市工业和信息化局"
+        assert json.loads(current.classification_reason_json)["prompt_version"] == "agnes-classifier-v1.1"
         item = session.scalar(
             select(ClassificationRunItem)
             .join(ClassificationRun)
