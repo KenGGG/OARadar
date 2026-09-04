@@ -1,7 +1,7 @@
 # OARadar V2 RC 发布收口设计规格
 
 **日期：** 2026-09-04  
-**状态：** 待用户书面审阅  
+**状态：** 已批准
 **产品范围：** Pending Assistant、Done Archive、Markdown Delivery、轻量 Web 控制台
 
 ## 1. 目的
@@ -90,30 +90,34 @@ verified ArchivedFile → attachment_inventory → parse → source_publish
 
 ### Gate 0：冻结和保护工作区
 
-记录当前分支、HEAD、工作区、最近提交、本地相对 `origin/main` 的提交与 diff、worktree 状态。保留所有非本任务修改，从当前 HEAD 创建 `release/oaradar-v2-rc-closure` 本地分支，并在仓库外创建可验证的 Git bundle。不得 push、合并 main、reset、rebase、clean 或覆盖用户修改。
+记录当前分支、HEAD、工作区、最近提交、本地相对 `origin/main` 的提交与 diff、worktree 状态。若原工作区干净，可以从当前 HEAD 直接创建 `release/oaradar-v2-rc-closure`；若不干净，必须先在仓库外保存 `git diff`、`git diff --cached`、未跟踪文件清单及必要未跟踪文件副本，并优先从当前 HEAD 建立独立收口 worktree，保持原工作区不变。不得把归属不明的修改纳入 RC，也不得默认使用 stash、reset 或 clean。
+
+在仓库外创建可验证的 Git bundle 保护已提交历史；bundle 不保护未提交或未跟踪内容，不能替代上述备份。不得 push、合并 main、rebase 或覆盖用户修改。
 
 ### Gate 1：消除已知阻塞
 
-迁移问题必须验证而不是猜测：列出 revision 图并证明只有一个 Alembic head；核对 `0041_agnes_semantic_decision_source` 的父 revision；分别验证空白数据库升级到 head，以及合成数据库从 `0040_external_review_without_issuer` 升级到 head；确认模型与迁移一致且既有数据保留。只有证据证明测试基线过时，才最小更新断言；除非迁移图确有问题，不新增 `0042`。
+迁移问题必须验证而不是猜测：列出 revision 图并证明只有一个 Alembic head；核对 `0041_agnes_semantic_decision_source` 的父 revision；分别验证空白数据库升级到 head，以及合成数据库从 `0040_external_review_without_issuer` 升级到 head；确认模型与迁移一致且既有数据保留。两条演练只能使用一次性临时数据库或生产数据库的脱敏副本；不得对真实生产数据库执行 downgrade、stamp、回退或破坏性迁移演练。部署授权前，真实数据库只允许读取当前 revision 和执行非破坏性一致性检查。只有证据证明测试基线过时，才最小更新断言；除非迁移图确有问题，不新增 `0042`。
 
 公开发布问题必须删除文档中的本机绝对路径并替换为仓库相对引用或明确的合成占位符。不得修改检查器以豁免发现。
 
 ### Gate 2：完整自动化回归
 
-先运行迁移与三条流程的专项测试，再运行完整发布检查、完整 `pytest`、前端依赖复现安装、TypeScript 检查和生产构建。完整测试不得使用 `-x`、`--maxfail=1`、skip、临时 xfail、删除测试或降低断言。
+先运行迁移与三条流程的专项测试，再运行完整发布检查、完整 `pytest`、前端依赖复现安装、TypeScript 检查和生产构建。完整测试不得使用 `-x` 或 `--maxfail=1`。不得新增、临时使用或扩大 skip、xfail 来掩盖本次发现的失败，也不得删除测试或降低断言。既有且具有明确环境条件的合法 skip 可以保留，但必须统计并说明原因；本次收口不得无合理依据增加 skipped 数量。RC 要求为 0 failed，不机械要求 0 skipped。
 
 每条命令记录完整命令、exit code、passed/failed/skipped 数量和最终汇总。失败必须定位根因、作最小修复并重新运行受影响专项测试；最终必须重新运行完整门禁，不能把发现首个失败后的中间结果当作结论。
 
 ### Gate 3：有界本机真实冒烟
 
-只有 Gate 2 全部通过后才能开始。停止 OARadar timers、OA Worker 和 Markdown Worker，按运维文档在仓库外备份数据库、配置和必要状态；记录原始附件的聚合数量、总大小和抽样 SHA256。不得删除、移动或覆盖业务数据，不发送测试飞书，不创建测试 OA 事项。
+只有 Gate 2 全部通过后才能开始。本规格中的“只读”是指 OA 侧严格只读；允许向隔离的本地数据库、归档目录和 Source Markdown 目录写入候选产物，但不得改变 OA 记录或覆盖生产原件。
 
-- Pending：真实 OA 只执行 baseline 并证明不打开详情、不通知、不创建待发送任务；新增、投递、清理及崩溃恢复使用合成 fixture 或 fake transport 验证。
+停止 OARadar timers、OA Worker 和 Markdown Worker 前，记录各 unit 原始 enabled/disabled 与 active/inactive 状态，并设置 shell trap 或等价 finally 恢复机制。Gate 3 完成或异常退出时，除非已获得部署授权，必须恢复冒烟前状态。RC 收口不得安装、重写或永久改变生产 unit/timer 配置。按运维文档在仓库外备份数据库、配置和必要状态；记录原始附件的聚合数量、总大小和抽样 SHA256。不得删除、移动或覆盖业务数据，不发送测试飞书，不创建测试 OA 事项。
+
+- Pending：真实 OA baseline 使用隔离的临时数据库和临时 `data_root`，复用严格只读的 OA 登录能力并强制关闭真实飞书；不得清除、重置或伪造生产数据库中的既有 baseline。证明 baseline 不打开详情、不通知、不创建待发送任务；新增、投递、清理及崩溃恢复使用合成 fixture 或 fake transport 验证。
 - Done Archive：选择 1–3 个既有事项，其中至少一个有附件；两次执行并比较文件数量、大小、SHA256 和 mtime，证明不重复下载和不覆盖。
-- Markdown Delivery：从已验证归档选择一个有附件事项；完成 ParseArtifact → Source Markdown → `_index.md`，两次执行证明不重解析、不重复发布且 mtime 不变；证明失败不影响 Done Archive。
-- Web：核对五个核心页面、数据库聚合、退役路由、loopback 监听和仅包含核心单元的 healthcheck。
+- Markdown Delivery：从已验证归档选择一个有附件事项；完成 ParseArtifact → Source Markdown → `_index.md`，两次执行证明不重解析、不重复发布且 mtime 不变；证明失败不影响 Done Archive。故障注入只能使用合成测试、fake parser 或可丢弃的数据副本，不得损坏生产原件或真实数据库。
+- Web：优先使用候选进程、隔离配置和临时 loopback 端口，核对五个核心页面、数据库聚合、退役路由、loopback 监听和仅包含核心单元的 healthcheck。
 
-真实内容不得出现在命令记录、提交或最终报告中。
+最终验收台账只记录命令、exit code、聚合数量、脱敏状态和短哈希前缀。含真实 OA 内容的原始 stdout 或日志如确有调试需要，只能保存在仓库外的受限目录中，不得进入 Git、实施计划、提交信息或最终报告。
 
 ### Gate 4：候选提交与结论
 
@@ -128,7 +132,7 @@ verified ArchivedFile → attachment_inventory → parse → source_publish
 1. 首次 baseline 只建立或更新 occurrence，不打开详情、不建通知任务、不发飞书；
 2. baseline 后新增或 `discovery_hash` 变化只创建一个任务；相同 hash 不重复建任务；
 3. `llm.enabled=false` 时模型客户端构造与调用次数均为零；本地模型失败时规则摘要可用；
-4. 同一 `input_hash` 最多一个 NotificationDelivery；
+4. 对同一 `logical_item_id + input_hash` 最多一个有效 NotificationDelivery，投递幂等键为 `feishu:pending:{logical_item_id}:{input_hash}`；
 5. sent 后只进入 cleanup；崩溃恢复不得重发；cleanup 失败重试只继续 cleanup；
 6. `unknown_outcome` 不得自动重发；
 7. Pending 不产生 Done Archive、ParseArtifact 或 Source Markdown。
@@ -139,7 +143,7 @@ verified ArchivedFile → attachment_inventory → parse → source_publish
 2. 本地验证覆盖存在性、大小、SHA256 和允许路径；明确无附件形成 `no_attachment`；
 3. 深度限制、缺失文件、大小不符和哈希不符均阻止归档完成；
 4. manifest 未变化的成功事项不再打开详情或重复下载；已验证文件不覆盖；
-5. `archive_verify` 成功只创建一个 Markdown Delivery 任务；
+5. 对同一 `oa_item_key + content_signature + schema_version`，`archive_verify` 成功最多创建一个 Markdown Delivery 任务；
 6. Markdown 失败不撤销 Done Archive 成功；
 7. Done 路径不调用解析器、LLM、Curated、Online Audit 或 Knowledge 流程。
 
@@ -147,9 +151,9 @@ verified ArchivedFile → attachment_inventory → parse → source_publish
 
 1. 输入只能是本地已验证 ArchivedFile；不得启动浏览器、访问 OA 或发送飞书；
 2. 新附件 Markdown 只能从 active ParseArtifact 发布，不得绕过；
-3. 每个支持的附件生成 Source Markdown；每个 Done 事项只生成一个稳定 `_index.md`，无附件事项也可生成；
+3. 每个支持的附件生成 Source Markdown；每个 Done 事项在当前 `schema_version` 下最多有一个有效 `item_index` 交付记录，历史 schema 记录可保留，但文件系统始终只有一个稳定的当前 `_index.md` 路径；无附件事项也可生成；
 4. `_index.md` 包含最小分类 Frontmatter 和附件链接；分类变化不改变归档或 Markdown 路径；
-5. 成功且哈希一致的输入重跑时不重解析、不重复发布且 mtime 不变；
+5. 成功且哈希一致的输入在正常调度下重跑时不重解析、不重复发布且 mtime 不变；用户明确授权的 `--force`、repair 或 rebuild 操作除外；
 6. 单附件失败不破坏其他附件或 Done Archive；
 7. Source Markdown 不写入 llm_wiki 的 `wiki/` 目录。
 
@@ -166,3 +170,5 @@ verified ArchivedFile → attachment_inventory → parse → source_publish
 用户审阅 `OARADAR_V2_RC_PASS` 后，才可另行授权本地 main 合并、`0.2.0rc1` 版本提交和本地部署。Git push、远程标签和远程分支删除仍需独立授权。
 
 部署后的 24 小时和连续 7 天观察只决定是否达到 `OARADAR_V2_STABLE_PASS`。只有数据丢失、原件覆盖、重复通知、OA 被修改、越权写目录或核心流程持续失败等高风险缺陷，才重新打开核心开发。
+
+稳定门禁观察连续 7 个自然日内实际发生的全部自然 Pending、Done 和 Markdown 事件；业务量低于 100 条不阻止 `OARADAR_V2_STABLE_PASS`，不得为凑样本创建测试 OA 或发送测试飞书。高风险缺陷修复并重新部署后重新计时；一般 UI 或分类准确率问题进入 backlog，不重置观察期；没有自然新增事项不是系统缺陷。

@@ -1,5 +1,7 @@
 # OARadar V2 Phase 6 Rollout Implementation Plan
 
+> **状态：已被取代。** RC 收口部分已由 `docs/superpowers/specs/2026-09-04-oaradar-v2-rc-closure-design.md` 及 `docs/superpowers/plans/2026-09-04-oaradar-v2-rc-closure-implementation.md` 取代；本文仅保留历史设计背景，不再作为活动执行清单。RC 完成以 `OARADAR_V2_RC_PASS` 为准；24 小时和连续 7 天观察只用于 `OARADAR_V2_STABLE_PASS`，实际自然业务量低于 100 条不阻止稳定发布。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
 **Goal:** 完成产品文档、自动化验证、本机只读冒烟、main 合并与发布稳定观察。

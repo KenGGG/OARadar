@@ -31,6 +31,6 @@
 3. `2026-08-19-oaradar-v2-phase-3-archive-markdown-boundary.md`
 4. `2026-08-19-oaradar-v2-phase-4-markdown-delivery.md`
 5. `2026-08-19-oaradar-v2-phase-5-console.md`
-6. `2026-08-19-oaradar-v2-phase-6-rollout.md`
+6. `2026-09-04-oaradar-v2-rc-closure-implementation.md`
 
-后续阶段只能消费前序阶段明确列出的接口。24 小时和 7 天观察不是开发阶段依赖，均在合并 main 后执行。
+后续阶段只能消费前序阶段明确列出的接口。原 Phase 6 仅保留历史背景，不再作为活动执行清单。`OARADAR_V2_RC_PASS` 不等待 main 合并、部署、24 小时或 7 天观察；这些操作须在用户另行授权后执行，并只决定 `OARADAR_V2_STABLE_PASS`。
