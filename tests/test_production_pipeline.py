@@ -54,6 +54,30 @@ def _authorize_history(queue: ProductionQueue, *logical_keys: str) -> None:
         session.commit()
 
 
+def test_scoped_daily_claim_does_not_consume_or_retire_other_tasks(config_file: Path):
+    queue, _ = _queue(config_file)
+    untouched = queue.enqueue('realtime_done', 'done:old', 'done_capture_and_archive', 'old')
+    legacy = queue.enqueue('historical_done_backfill', 'done:legacy', 'curation', 'legacy')
+    target = queue.enqueue('realtime_done', 'done:new', 'done_capture_and_archive', 'new')
+    assert queue.claim('daily', task_ids=()) is None
+    assert queue.claim('daily', task_ids=(target,)).id == target
+    with Session(queue.engine) as session:
+        assert session.get(PipelineTask, untouched).status == 'queued'
+        assert session.get(PipelineTask, legacy).status == 'queued'
+
+
+def test_daily_recovery_only_releases_its_selected_abandoned_tasks(config_file):
+    queue, _ = _queue(config_file)
+    first = queue.enqueue('realtime_done', 'done:a', 'archive_verify', 'a')
+    second = queue.enqueue('realtime_done', 'done:b', 'archive_verify', 'b')
+    queue.claim('old', task_ids=(first,))
+    queue.claim('other', task_ids=(second,))
+    assert queue.recover_abandoned(lambda owner: False, task_ids=(first,)) == 1
+    with Session(queue.engine) as session:
+        assert session.get(PipelineTask, first).status == 'queued'
+        assert session.get(PipelineTask, second).status == 'running'
+
+
 def test_realtime_pending_and_done_are_claimed_before_historical(config_file: Path) -> None:
     queue, _ = _queue(config_file)
     _authorize_history(queue, "item-3")

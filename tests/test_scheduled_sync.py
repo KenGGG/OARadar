@@ -291,6 +291,24 @@ def test_run_nightly_scan_records_run_without_nested_session(tmp_path: Path) -> 
         assert runs[0].status == "completed"
 
 
+def test_daily_scan_can_leave_history_bootstrap_untouched(tmp_path: Path):
+    db = tmp_path / 'oa.db'
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with patch('oa_knowledge.scheduled_sync.ResourceCoordinator') as rc, \
+         patch('oa_knowledge.scheduled_sync.BrowserSession') as bs, \
+         patch('oa_knowledge.scheduled_sync.DoneAdapter') as da, \
+         patch('oa_knowledge.scheduled_sync.ProductionQueue.bootstrap_current_state', side_effect=AssertionError('must not bootstrap history')):
+        rc.return_value.acquire.return_value = 1
+        browser = bs.return_value.__enter__.return_value
+        browser.login_with_saved_credentials.return_value = LoginState.AUTHENTICATED
+        browser.page = MagicMock()
+        browser.base_url = 'http://oa'
+        da.return_value.discover_all_pages.return_value = _EmptyDiscovery()
+        result = run_nightly_scan(engine, MagicMock(), enqueue_history=False)
+    assert result['knowledge_tasks_enqueued'] == 0
+
+
 def test_nightly_scan_excludes_title_before_enqueuing_detail_capture(tmp_path: Path) -> None:
     """A title-only exclusion must prevent any OA detail capture task."""
     db = tmp_path / "oa.db"

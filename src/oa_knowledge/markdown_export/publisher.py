@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote
 
 import yaml
 
@@ -31,7 +32,7 @@ def _validate(content: str, destination: Path, expected_sha256: str, assets_dir:
             if not SAFE_INLINE_IMAGE.fullmatch(link):
                 raise PublicationError("unsafe image URI")
             continue
-        relative = PurePosixPath(link.split("#", 1)[0])
+        relative = PurePosixPath(unquote(link.split("#", 1)[0]))
         if relative.is_absolute() or ".." in relative.parts:
             raise PublicationError("unsafe image link")
         candidate = destination.parent.joinpath(*relative.parts)

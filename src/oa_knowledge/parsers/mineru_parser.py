@@ -124,7 +124,7 @@ def _extract_mineru_zip(payload: bytes, destination: Path) -> Path:
 
 
 def _request_parse(
-    file_path: Path, settings: Settings, *, attempts: int = 3
+    file_path: Path, settings: Settings, *, attempts: int = 3, parse_method: str = "auto"
 ) -> httpx.Response:
     last_error: httpx.HTTPError | None = None
     for attempt in range(attempts):
@@ -137,6 +137,10 @@ def _request_parse(
                     },
                     data={
                         "return_md": "true",
+                        "return_images": "true",
+                        "return_middle_json": "true",
+                        "parse_method": parse_method,
+                        "image_analysis": "false",
                         "return_content_list": str(
                             settings.mineru.output_content_list
                         ).lower(),
@@ -157,6 +161,7 @@ def parse_with_mineru(
     output_dir: Path | None = None,
     *,
     profile_version: str = "legacy",
+    parse_method: str = "auto",
 ) -> ParseResult:
     if not settings.mineru.enabled:
         raise RuntimeError("MinerU is not enabled in configuration")
@@ -175,7 +180,7 @@ def parse_with_mineru(
     shutil.rmtree(staging)
 
     try:
-        response = _request_parse(file_path, settings)
+        response = _request_parse(file_path, settings, parse_method=parse_method)
         if response.status_code >= 400:
             raise MineruResponseError(
                 f"MinerU HTTP {response.status_code}: {response.text[:300]}"

@@ -4,21 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.config import Settings
-from oa_knowledge.db.models import ArchivedFile, ContentObject, MarkdownExport, OAItem, ParseArtifact
-from oa_knowledge.markdown_export.publisher import publish_markdown
+from oa_knowledge.db.models import ArchivedFile, ClassificationDecision, ContentObject, MarkdownExport, OAItem, ParseArtifact
+from oa_knowledge.markdown_export.publisher import IMAGE_LINK, publish_markdown
 from oa_knowledge.markdown_export.render import ExportMetadata, SCHEMA_VERSION, render_markdown
 from oa_knowledge.markdown_export.service import rewrite_parser_asset_links, sanitize_parser_markdown
-from oa_knowledge.runtime_paths import resolve_cache_path
+from oa_knowledge.runtime_paths import resolve_cache_path, resolve_original_path
 
 
 def _active_artifact(session: Session, source: ArchivedFile) -> ParseArtifact | None:
@@ -64,6 +67,9 @@ def _destination(settings: Settings, source: ArchivedFile, item: OAItem | None) 
 
 
 def _existing_is_current(record: MarkdownExport, artifact: ParseArtifact, destination: Path) -> bool:
+    assets = destination.with_name(destination.stem + '.assets')
+    if assets.is_dir() and any(assets.rglob('*.md')):
+        return False  # Older exports copied unrelated sibling cache products.
     return bool(
         record.status == "success"
         and record.parse_artifact_id == artifact.id
@@ -83,6 +89,15 @@ def publish_active_artifact(
     if source is None or source.download_status != "verified" or not source.local_relpath:
         raise FileNotFoundError("verified source unavailable")
     item = session.get(OAItem, source.oa_item_id)
+    if item is not None and item.source_type == "external":
+        from oa_knowledge.markdown_delivery import resolve_external_document_metadata
+        decision = session.scalar(select(ClassificationDecision).where(
+            ClassificationDecision.oa_item_key == item.oa_item_key,
+            ClassificationDecision.is_current.is_(True),
+        ))
+        if decision is not None and decision.classification_status == "classified":
+            metadata = resolve_external_document_metadata(session, settings, item, decision)
+            item.document_number = metadata.document_number
     destination = _destination(settings, source, item)
     markdown_relpath = destination.relative_to(settings.workspace_root).as_posix()
     record = session.scalar(select(MarkdownExport).where(
@@ -151,32 +166,41 @@ def publish_active_artifact(
     try:
         with tempfile.TemporaryDirectory(prefix="oaradar-source-md-") as temp_name:
             assets = Path(temp_name)
-            for child in parsed_path.parent.rglob("*"):
-                if child.is_file() and child != parsed_path and not child.is_symlink():
-                    target = assets / child.relative_to(parsed_path.parent)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(child, target)
+            for link in set(IMAGE_LINK.findall(body)):
+                if link.startswith('data:'):
+                    continue
+                relative = Path(link)
+                if relative.is_absolute() or '..' in relative.parts:
+                    raise ValueError('unsafe parser image path')
+                child = (parsed_path.parent / relative).resolve()
+                child.relative_to(parsed_path.parent.resolve())
+                if child.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.tif', '.tiff'} or not child.is_file():
+                    continue
+                target = assets / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, target)
             has_assets = any(path.is_file() for path in assets.rglob("*"))
-            if has_assets:
-                body = rewrite_parser_asset_links(body, destination, assets)
+            body = rewrite_parser_asset_links(body, destination, assets)
+            missing_images = '[图片未包含在解析结果中]' in body or '[图片未嵌入：' in body
+            if missing_images:
+                metadata = replace(metadata, parse_status='failed', last_error_code='MISSING_IMAGE_ASSET')
             content = render_markdown(metadata, body)
+            original_link = quote(os.path.relpath(resolve_original_path(settings, source.local_relpath), destination.parent), safe="/")
+            content = content.replace("## 文档内容\n", f"[查看原件]({original_link})\n\n## 文档内容\n", 1)
             publish_markdown(destination, content, record.source_sha256, assets if has_assets else None)
-        record.status = "success"
+        record.status = "failed" if missing_images else "success"
         record.markdown_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         record.assets_relpath = (
             destination.with_name(destination.name.removesuffix(".md") + ".assets")
             .relative_to(settings.workspace_root).as_posix()
             if has_assets else None
         )
-        record.last_error_code = None
-        record.last_error = None
+        record.last_error_code = 'MISSING_IMAGE_ASSET' if missing_images else None
+        record.last_error = 'Parser image assets unavailable; delivery incomplete.' if missing_images else None
         record.generated_at = datetime.now(timezone.utc)
         session.flush()
-        work_root = settings.parse_work_root.resolve()
-        artifact_dir = parsed_path.parent.resolve()
-        if work_root not in artifact_dir.parents:
-            raise ValueError("parse artifact directory is outside the parse work root")
-        shutil.rmtree(artifact_dir)
+        # The valid artifact is also classification evidence and the parse
+        # idempotency checkpoint. Publishing must not invalidate that cache.
         return record
     except Exception as exc:
         record.status = "failed"

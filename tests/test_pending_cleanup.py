@@ -101,6 +101,7 @@ def _write_temp_file(settings, relpath="raw/pending/1/tmp.pdf") -> Path:
     (
         "raw/pending/1/tmp.pdf",
         "archive/raw/oa/pending/1/tmp.pdf",
+        "originals/pending/1/tmp.pdf",
     ),
 )
 def test_successful_delivery_cleans_business_data_and_keeps_ledger(

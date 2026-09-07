@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import and_, case, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from oa_knowledge.config import Settings
 from oa_knowledge.archive import atomic_write_bytes
@@ -778,6 +778,7 @@ class OperationWorker:
                     self.production_queue.fail(task.id, self.owner, "PIPELINE_STAGE_NOT_IMPLEMENTED", task.stage, recoverable=False)
             except Exception as exc:
                 code = {
+                    "PrivateConfigError": "CLASSIFICATION_CONFIG_ERROR",
                     "FileNotFoundError": "ATTACHMENT_DOWNLOAD_FAILED",
                     "RuntimeError": "PIPELINE_RESOURCE_BUSY",
                     "DoneKnowledgeError": "OLLAMA_SCHEMA_INVALID",
@@ -791,6 +792,15 @@ class OperationWorker:
     def _pipeline_attachment_inventory(self, task: PipelineTask) -> None:
         from oa_knowledge.pipeline import ParsePipeline
         with Session(self.engine) as session:
+            manifest = session.scalar(select(OAManifestItem).where(
+                OAManifestItem.oa_item_key == task.logical_item_key,
+            ))
+            if manifest is not None and (
+                manifest.processing_status == "skipped"
+                or (manifest.matched_exclusion_keyword or "").strip()
+            ):
+                self.production_queue.complete(task.id, self.owner)
+                return
             item = session.scalar(select(OAItem).where(OAItem.oa_item_key == task.logical_item_key))
             if item is None:
                 raise FileNotFoundError("archived item is missing")
@@ -918,10 +928,22 @@ class OperationWorker:
         )
 
     def _pipeline_classify(self, task: PipelineTask) -> None:
-        from oa_knowledge.markdown_delivery import classify_done_item
+        from oa_knowledge.markdown_delivery import require_current_classified_decision
+        from oa_knowledge.source_markdown.service import publish_active_artifact
 
+        status = self._classify_archived_item(task.logical_item_key)
+        if status in {"excluded", "needs_review"}:
+            self.production_queue.complete(task.id, self.owner)
+            return
         with Session(self.engine) as session:
-            classify_done_item(session, task.logical_item_key)
+            try:
+                require_current_classified_decision(session, task.logical_item_key)
+            except ValueError:
+                self.production_queue.fail(
+                    task.id, self.owner, "CLASSIFICATION_BLOCKED",
+                    "current classification does not permit Markdown delivery", recoverable=False,
+                )
+                return
             item = session.scalar(select(OAItem).where(OAItem.oa_item_key == task.logical_item_key))
             files = [] if item is None else [
                 source for source in self._historical_source_files(session.scalars(select(ArchivedFile).where(
@@ -943,6 +965,61 @@ class OperationWorker:
                 self.production_queue.advance(task.id, self.owner, "attachment_inventory")
                 return
         self.production_queue.advance(task.id, self.owner, "index_publish")
+
+    def _classify_archived_item(self, oa_item_key: str) -> str:
+        """Use the durable classifier for a newly archived Done item once."""
+        from oa_knowledge.classification.private_config import (
+            load_private_classification_config,
+            PrivateConfigError,
+        )
+        from oa_knowledge.classification.service import (
+            ClassificationService,
+            CreateClassificationRun,
+        )
+        from oa_knowledge.db.models import ClassificationDecision
+        from oa_knowledge.classification.per_item_classifier import CLASSIFIER_VERSION
+
+        with Session(self.engine) as session:
+            manifest = session.scalar(select(OAManifestItem).where(
+                OAManifestItem.oa_item_key == oa_item_key,
+            ))
+            if manifest is None:
+                raise FileNotFoundError("archived item is missing its manifest")
+            if manifest.processing_status == "skipped" or (manifest.matched_exclusion_keyword or "").strip():
+                return "excluded"
+            current = session.scalar(select(ClassificationDecision).where(
+                ClassificationDecision.oa_item_key == oa_item_key,
+                ClassificationDecision.is_current.is_(True),
+            ))
+        if self.settings.classification_private_dir is None:
+            raise PrivateConfigError("classification private configuration is unavailable")
+        loaded = load_private_classification_config(self.settings.classification_private_dir)
+        if current is not None and (
+            current.manual_locked or current.classification_status == "classified"
+        ) and current.private_config_sha256 == loaded.config_sha256 and current.rule_version == CLASSIFIER_VERSION:
+            return current.classification_status
+        factory = sessionmaker(self.engine, expire_on_commit=False)
+        service = ClassificationService(factory, loaded.config)
+        if current is None or current.private_config_sha256 != loaded.config_sha256 or current.rule_version != CLASSIFIER_VERSION:
+            run_key = hashlib.sha256(
+                f"{oa_item_key}:{loaded.config_sha256}:{CLASSIFIER_VERSION}".encode("utf-8")
+            ).hexdigest()[:48]
+            request = CreateClassificationRun(
+                run_id=f"pipeline-{run_key}",
+                run_kind="incremental",
+                manifest_sha256=hashlib.sha256(oa_item_key.encode("utf-8")).hexdigest(),
+                exclusion_policy_sha256=hashlib.sha256(b"pipeline-exclusion-v1").hexdigest(),
+                rule_version=CLASSIFIER_VERSION,
+                schema_version="classification-v1",
+                prompt_version="internal-business-v1",
+                model_name=self.settings.llm.model,
+                private_config_sha256=loaded.config_sha256,
+                target_keys=(oa_item_key,),
+            )
+            ref = service.create_run(request)
+            service.process_next(ref.run_id, limit=1)
+        decision = service.refine_current_dossier(oa_item_key, self.settings)
+        return decision.classification_status
 
     def _pipeline_index_publish(self, task: PipelineTask) -> None:
         from oa_knowledge.markdown_delivery import publish_item_index

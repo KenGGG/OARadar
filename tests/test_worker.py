@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, BatchItem, CollectionBatch, ContentObject, ItemOccurrence, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
+from oa_knowledge.db.models import ArchivedFile, BatchItem, ClassificationDecision, CollectionBatch, ContentObject, ItemOccurrence, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
 from oa_knowledge.online_audit import start_audit
 from oa_knowledge.web.worker import OperationWorker, _has_verified_attachment
 from oa_knowledge.production_pipeline import ProductionQueue
@@ -153,6 +153,122 @@ def test_has_verified_attachment_returns_boolean_for_empty_and_existing_sources(
         ))
         session.flush()
         assert _has_verified_attachment(session, item.oa_item_key) is True
+
+
+def test_classification_config_error_keeps_archive_and_creates_no_review(config_file: Path) -> None:
+    import pytest
+    from oa_knowledge.classification.private_config import PrivateConfigError
+
+    settings = load_settings(config_file)
+    settings.classification_private_dir = None
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    key = "done:synthetic-config-error"
+    with Session(engine) as session:
+        session.add(OAManifestItem(oa_item_key=key, title="合成归档事项", list_page=1, list_ordinal=1, processing_status="downloaded"))
+        session.commit()
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        with pytest.raises(PrivateConfigError):
+            worker._classify_archived_item(key)
+        settings.classification_private_dir = config_file.parent / "missing-private-config"
+        with pytest.raises(PrivateConfigError):
+            worker._classify_archived_item(key)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        assert session.scalar(select(OAManifestItem.processing_status).where(OAManifestItem.oa_item_key == key)) == "downloaded"
+        assert session.scalar(select(ClassificationDecision.id).where(ClassificationDecision.oa_item_key == key)) is None
+
+
+def test_classify_stage_creates_and_refines_missing_decision(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    settings.classification_private_dir = config_file.parent
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    key = "done:synthetic-notice-deposit"
+    with Session(engine) as session:
+        session.add_all(
+            [
+                OAManifestItem(
+                    oa_item_key=key, title="内部事项呈批表—通知存款",
+                    sender="synth.internal", list_page=1, list_ordinal=1,
+                    processing_status="downloaded", no_attachment_confirmed=True,
+                ),
+                OAItem(
+                    oa_item_key=key, source_channel="done", title="内部事项呈批表—通知存款",
+                    sender="synth.internal", pipeline_status="files_verified",
+                ),
+            ]
+        )
+        session.commit()
+    from oa_knowledge.classification.private_config import LoadedPrivateConfig
+    from oa_knowledge.classification.schemas import PrivateClassificationConfig
+    config = PrivateClassificationConfig.model_validate(
+        {
+            "initiators": {"synth.internal": {"role": "internal", "aliases": []}},
+            "document_number_issuers": [{"pattern": r"SYN-NEVER", "canonical_issuer": "Synthetic", "document_type": "notice"}],
+            "issuer_aliases": {"Synthetic": "Synthetic"},
+            "title_templates": [{"pattern": r"^Synthetic never$", "content_origin": "internal", "flow_type": "approval"}],
+        }
+    )
+    monkeypatch.setattr(
+        "oa_knowledge.classification.private_config.load_private_classification_config",
+        lambda _root: LoadedPrivateConfig(config, "a" * 64),
+    )
+    queue = ProductionQueue(engine)
+    queue.enqueue("markdown_delivery", key, "classify", "synthetic-classify-stage")
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_classify(task)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        decision = session.scalar(select(ClassificationDecision).where(
+            ClassificationDecision.oa_item_key == key,
+            ClassificationDecision.is_current.is_(True),
+        ))
+        task_row = session.get(PipelineTask, task.id)
+        assert decision is not None
+        assert decision.classification_status == "classified"
+        assert decision.business_category == "04_财务资金与融资"
+        assert task_row.stage == "index_publish"
+
+
+def test_excluded_done_item_stops_before_parse_and_classification(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    key = "done:synthetic-excluded"
+    with Session(engine) as session:
+        session.add_all(
+            [
+                OAManifestItem(
+                    oa_item_key=key, title="Synthetic excluded", sender="synth.internal",
+                    list_page=1, list_ordinal=1, processing_status="skipped",
+                    matched_exclusion_keyword="Synthetic",
+                ),
+                OAItem(oa_item_key=key, source_channel="done", title="Synthetic excluded"),
+            ]
+        )
+        session.commit()
+    queue = ProductionQueue(engine)
+    queue.enqueue("markdown_delivery", key, "attachment_inventory", "synthetic-excluded-stage")
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_attachment_inventory(task)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        task_row = session.get(PipelineTask, task.id)
+        assert task_row.status == "completed"
+        assert session.scalar(select(ClassificationDecision.id).where(
+            ClassificationDecision.oa_item_key == key,
+        )) is None
 
 
 def test_online_audit_browser_start_failure_updates_run_and_job_together(config_file: Path, monkeypatch) -> None:

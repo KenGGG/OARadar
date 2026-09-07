@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from oa_knowledge.config import load_settings
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 from oa_knowledge.classification.service import (
     ClassificationService,
@@ -325,6 +326,38 @@ def test_run_freezes_manifest_membership_and_produces_one_terminal_decision(
         assert _current(session, "done:unknown").content_integrity_status == "ok"
 
 
+def test_excluded_manifest_overrides_an_existing_manual_classification_lock(
+    factory: sessionmaker[Session], config: PrivateClassificationConfig
+) -> None:
+    """The exclusion gate is absolute: no prior decision may bypass it."""
+    _seed(factory)
+    service = ClassificationService(factory, config)
+    first = service.create_run(_request("synthetic-preexisting-manual"))
+    service.process_next(first.run_id, limit=100)
+    service.set_manual_decision(
+        ManualDecisionCommand(
+            run_id=first.run_id,
+            oa_item_key="done:excluded",
+            actor="synthetic-reviewer",
+            reason="synthetic historical lock",
+            classification_status="classified",
+            content_origin="internal",
+            business_category="08_行政采购与信息化",
+            canonical_issuer=None,
+            flow_type="approval",
+            initiator_type="internal",
+        )
+    )
+    second = service.create_run(_request("synthetic-exclusion-wins"))
+    service.process_next(second.run_id, limit=100)
+
+    with factory() as session:
+        decision = _current(session, "done:excluded")
+        assert decision.classification_status == "excluded"
+        assert decision.content_origin is None
+        assert decision.business_category is None
+
+
 def test_idempotent_rerun_reuses_unchanged_decisions_and_recomputes_one_changed_item(
     factory: sessionmaker[Session], config: PrivateClassificationConfig
 ) -> None:
@@ -592,3 +625,45 @@ def test_duplicate_attachment_keys_keep_evidence_linked_to_the_correct_file(
             )
         )
         assert evidence_ids == files
+
+
+def test_refine_current_dossier_reuses_the_same_run_and_is_idempotent(
+    factory: sessionmaker[Session], config: PrivateClassificationConfig, config_file
+) -> None:
+    key = "done:notice-deposit"
+    with factory.begin() as session:
+        session.add_all(
+            [
+                OAManifestItem(
+                    oa_item_key=key,
+                    title="内部事项呈批表—通知存款",
+                    sender="synth.internal",
+                    list_page=1,
+                    list_ordinal=1,
+                    processing_status="downloaded",
+                    no_attachment_confirmed=True,
+                ),
+                OAItem(
+                    oa_item_key=key,
+                    source_channel="done",
+                    title="内部事项呈批表—通知存款",
+                    sender="synth.internal",
+                    pipeline_status="files_verified",
+                ),
+            ]
+        )
+    service = ClassificationService(factory, config)
+    ref = service.create_run(
+        replace(_request("synthetic-dossier-refine"), target_keys=(key,))
+    )
+    service.process_next(ref.run_id)
+
+    settings = load_settings(config_file)
+    first = service.refine_current_dossier(key, settings)
+    second = service.refine_current_dossier(key, settings)
+
+    assert first.id == second.id
+    assert first.classification_run_id == ref.database_id
+    assert first.classification_status == "classified"
+    assert first.content_origin == "internal"
+    assert first.business_category == "04_财务资金与融资"

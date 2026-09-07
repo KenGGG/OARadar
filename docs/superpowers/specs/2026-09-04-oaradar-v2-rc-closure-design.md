@@ -27,12 +27,13 @@ Codex 在本阶段担任“OARadar V2 发布收口负责人”，而不是产品
 5. 有界、只读、无测试飞书的本机冒烟通过；
 6. Web 展示与后台数据库事实一致；
 7. 未发现数据覆盖、重复通知、重复下载、重复解析、越权写目录或 OA 写操作等高风险问题。
+8. 分类业务验收通过：排除总闸门、人工锁定、内外部字段一致性、按需解析/Qwen 与 Markdown 发布门禁均符合第 7.4 节。
 
 24 小时和连续 7 天观察不属于此里程碑的阻塞项。
 
 ### 2.2 `OARADAR_V2_STABLE_PASS`
 
-候选版本获授权合并、部署后，完成 24 小时和连续 7 天稳定性观察，且没有高风险缺陷，才宣布稳定发布。观察期内不得以等待时间为理由继续新增功能；一般展示问题和分类准确率问题进入后续 backlog。
+候选版本获授权合并、部署后，完成 24 小时和连续 7 天稳定性观察，且没有高风险缺陷，才宣布稳定发布。观察期内不得以等待时间为理由继续新增功能；一般展示问题和不影响排除、来源、人工决定、字段一致性或发布门禁的边缘分类优化进入后续 backlog。
 
 ## 3. 唯一事实源与既有合同
 
@@ -53,8 +54,9 @@ OA Done → done_discovery → done_capture_and_archive → archive_verify
         → enqueue_markdown_delivery → completed
 
 Markdown Delivery
-verified ArchivedFile → attachment_inventory → parse → source_publish
-                      → classify → index_publish → completed
+OA Manifest → exclusion gate → manual lock → metadata classification
+            → only-if-unresolved parse/Qwen → accepted classification
+            → source_publish → index_publish → completed
 ```
 
 边界不可放宽：Pending 不产生永久归档和 Source Markdown；Done Archive 不解析、不分类、不发布 Markdown；Markdown Delivery 不启动浏览器、不访问 OA、不发送飞书。一条线失败不得撤销另一条线已成立的事实。
@@ -63,7 +65,7 @@ verified ArchivedFile → attachment_inventory → parse → source_publish
 
 在 `OARADAR_V2_RC_PASS` 前，禁止开展：
 
-- 分类准确率、发文机关、别名、Qwen Prompt 或 Schema 优化；
+- 与排除、内外部判断、人工锁定、发文机关、内部类别、Qwen 严格 schema、needs_review 可行动理由或 Markdown 发布门禁无关的边缘分类优化；
 - Curated、Review、Data Governance、Online Audit、Knowledge Projection、Vault Publish/Rebuild、复杂 Backfill、Advanced Maintenance；
 - 新数据库、新任务表、新队列、新 Worker 框架、新协调器；
 - WebUI 美化、旧代码或旧表物理清理、与三线验收无关的重构；
@@ -156,6 +158,14 @@ verified ArchivedFile → attachment_inventory → parse → source_publish
 5. 成功且哈希一致的输入在正常调度下重跑时不重解析、不重复发布且 mtime 不变；用户明确授权的 `--force`、repair 或 rebuild 操作除外；
 6. 单附件失败不破坏其他附件或 Done Archive；
 7. Source Markdown 不写入 llm_wiki 的 `wiki/` 目录。
+
+### 7.4 Classification business gate
+
+1. `processing_status` 或排除关键词命中的事项先于任何人工规则、解析和 Qwen 处理为 `excluded`，且不得进入 Markdown；
+2. 非排除事项的既有人工单项决定不可被文号、标题规则或模型覆盖；`mixed` 发起人本身不构成来源结论；
+3. `internal` 必有内部类别且无 external issuer；`external` 必有 issuer 且无内部类别；不确定结论保留为带可行动理由的 `needs_review`；
+4. 标题、发起人、workflow、文号、传阅链和已有 metadata 不能确定时，才按单事项、最少附件原则解析并调用本地 Qwen；schema 无效重试一次后进入 `needs_review`；
+5. 只有当前、完整且 `classified` 的分类决定允许正式 Markdown 入队和索引发布；`excluded` 与 `needs_review` 均不得进入正式交付链。
 
 每个验收项必须映射到本地实际存在的测试名称。覆盖不足时优先在既有流程或 E2E 测试文件中增加一个最小测试，不创建新测试框架。
 

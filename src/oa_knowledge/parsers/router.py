@@ -241,7 +241,7 @@ def parse_file(
             from oa_knowledge.parsers.libreoffice_parser import parse_with_libreoffice
 
             return parse_with_libreoffice(
-                file_path, output_dir, profile_version=profile_version
+                file_path, output_dir, profile_version=profile_version, settings=settings
             )
         raise ValueError(f"Unknown engine: {engine}")
 

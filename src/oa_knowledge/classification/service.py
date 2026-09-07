@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from oa_knowledge.config import Settings
 from oa_knowledge.db.models import (
     ClassificationDecision,
     ClassificationEvidence,
@@ -257,6 +258,132 @@ class ClassificationService:
                 failed=stages.get("failed", 0),
             )
 
+    def refine_current_dossier(
+        self, item_key: str, settings: Settings
+    ) -> ClassificationDecision:
+        """Refine one unresolved decision from its own verified local evidence."""
+        from .evidence_dossier import DatabaseEvidenceDossierLoader
+        from .per_item_classifier import CLASSIFIER_VERSION, classify_dossier
+
+        with self._sessions() as session:
+            current = self._current(session, item_key)
+            if current is None:
+                raise ValueError("dossier refinement requires a current decision")
+            if current.manual_locked or current.classification_status == "excluded":
+                return current
+            if json.loads(current.classification_reason_json or "{}").get("classifier") == CLASSIFIER_VERSION:
+                return current
+        loader = DatabaseEvidenceDossierLoader(
+            self._sessions, settings, self._config
+        )
+        dossier = loader(item_key, load_text=False)
+        proposed = classify_dossier(dossier, self._config)
+        if proposed.classification_status == "needs_review":
+            dossier = loader(item_key)
+            proposed = classify_dossier(dossier, self._config)
+        input_sha = _sha256(
+            {
+                "classifier": CLASSIFIER_VERSION,
+                "config": self._config.model_dump(mode="json"),
+                "item_key": item_key,
+                "title": dossier.title,
+                "initiator": dossier.initiator,
+                "document_number": dossier.document_number,
+                "attachments": [
+                    {"id": row.file_id, "sha256": row.content_sha256}
+                    for row in dossier.attachments
+                ],
+            }
+        )
+        with self._sessions.begin() as session:
+            current = self._current(session, item_key)
+            if current is None:
+                raise ValueError("current decision disappeared during dossier refinement")
+            if (
+                current.id != dossier.current_decision_id
+                or current.manual_locked
+                or current.classification_status == "excluded"
+                or current.decision_input_sha256 == input_sha
+            ):
+                return current
+            run = session.get(ClassificationRun, current.classification_run_id)
+            if run is None or run.status == "completed":
+                return current
+            decision = ClassificationDecision(
+                classification_run_id=run.id,
+                oa_item_key=item_key,
+                version=self._next_version(session, item_key),
+                is_current=False,
+                decision_input_sha256=input_sha,
+                decision_source="content_rule",
+                classification_status=proposed.classification_status,
+                content_integrity_status=current.content_integrity_status,
+                content_origin=proposed.content_origin,
+                flow_type=current.flow_type or (
+                    "formal_document" if proposed.content_origin == "external" else "approval"
+                ),
+                initiator=current.initiator,
+                initiator_type=current.initiator_type,
+                relay_from=current.relay_from,
+                transfer_chain_json=current.transfer_chain_json,
+                issuer=proposed.raw_issuer,
+                canonical_issuer=proposed.canonical_issuer,
+                business_category=proposed.business_category,
+                document_number=proposed.document_number,
+                document_type=proposed.document_type,
+                normalized_title=dossier.normalized_title,
+                classification_confidence=proposed.confidence,
+                classification_reason_json=_canonical_json(
+                    {
+                        "classifier": CLASSIFIER_VERSION,
+                        "origin_evidence_source": proposed.origin_evidence_source,
+                        "classification_evidence_source": proposed.classification_evidence_source,
+                        "review_reason": proposed.review_reason,
+                        "origin_conflict": proposed.origin_conflict,
+                    }
+                ),
+                rule_version=run.rule_version,
+                private_config_sha256=run.private_config_sha256,
+                manual_locked=False,
+                supersedes_decision_id=current.id,
+            )
+            self._swap_current(session, current, decision)
+            session.add(
+                ClassificationEvidence(
+                    classification_decision_id=decision.id,
+                    sequence=1,
+                    evidence_type="per_item_dossier",
+                    evidence_scope=(
+                        "attachment" if dossier.primary_attachment is not None else "package"
+                    ),
+                    value_json=_canonical_json(
+                        {
+                            "origin_source": proposed.origin_evidence_source,
+                            "origin_quote": proposed.origin_evidence_quote,
+                            "classification_source": proposed.classification_evidence_source,
+                            "classification_quote": proposed.classification_evidence_quote,
+                            "review_reason": proposed.review_reason,
+                        }
+                    ),
+                    confidence=proposed.confidence,
+                    source_file_id=(
+                        dossier.primary_attachment.file_id
+                        if dossier.primary_attachment is not None
+                        else None
+                    ),
+                )
+            )
+            run_item = session.scalar(
+                select(ClassificationRunItem).where(
+                    ClassificationRunItem.classification_run_id == run.id,
+                    ClassificationRunItem.oa_item_key == item_key,
+                )
+            )
+            if run_item is not None:
+                run_item.adopted_decision_id = decision.id
+            self._mirror_compatibility(session, item_key, decision)
+            return decision
+
     def set_manual_decision(self, command: ManualDecisionCommand) -> DecisionRef:
         if not command.actor.strip() or not command.reason.strip():
             raise ValueError("manual actor and reason are required")
@@ -388,15 +515,6 @@ class ClassificationService:
             if run_item is None or run_item.stage != "metadata":
                 return
             current = self._current(session, item_key)
-            if current is not None and current.manual_locked:
-                run_item.adopted_decision_id = current.id
-                if (
-                    run_item.inclusion_reason == "excluded"
-                    and current.classification_status != "excluded"
-                ):
-                    run_item.last_error_code = "manual_lock_policy_conflict"
-                run_item.stage = "decided"
-                return
             if run_item.inclusion_reason == "excluded":
                 decision = self._excluded_decision(session, run, item_key, current)
                 if decision is not None:
@@ -404,6 +522,10 @@ class ClassificationService:
                     run_item.adopted_decision_id = decision.id
                 elif current is not None:
                     run_item.adopted_decision_id = current.id
+                run_item.stage = "decided"
+                return
+            if current is not None and current.manual_locked:
+                run_item.adopted_decision_id = current.id
                 run_item.stage = "decided"
                 return
 
@@ -730,4 +852,5 @@ class ClassificationService:
         item.source_type = decision.content_origin
         item.internal_category = decision.business_category
         item.external_issuer = decision.canonical_issuer
+        item.document_number = decision.document_number
         item.classification_version = f"decision-v{decision.version}"

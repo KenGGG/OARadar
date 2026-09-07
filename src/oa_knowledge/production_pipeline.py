@@ -420,14 +420,18 @@ class ProductionQueue:
         lease_seconds: int = 300,
         *,
         queue_names: tuple[str, ...] | None = None,
+        task_ids: tuple[int, ...] | None = None,
     ) -> PipelineTask | None:
-        self.retire_non_core_tasks()
+        if task_ids is None:
+            self.retire_non_core_tasks()
         now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
             conditions = [PipelineTask.status == "queued", PipelineTask.idempotency_key != HISTORY_CONTROL_KEY,
                           or_(PipelineTask.next_retry_at.is_(None), PipelineTask.next_retry_at <= now)]
             if queue_names is not None:
                 conditions.append(PipelineTask.queue_name.in_(queue_names))
+            if task_ids is not None:
+                conditions.extend((PipelineTask.id.in_(task_ids), PipelineTask.stage.in_(CORE_PIPELINE_STAGES)))
             if self.historical_paused(session):
                 conditions.append(PipelineTask.queue_name != "historical_done_backfill")
             # Only the newest completed online audit may authorize history. An
@@ -513,10 +517,13 @@ class ProductionQueue:
             session.commit(); session.refresh(row); session.expunge(row)
             return row
 
-    def recover_abandoned(self, owner_alive) -> int:
+    def recover_abandoned(self, owner_alive, *, task_ids: tuple[int, ...] | None = None) -> int:
         now = datetime.now(timezone.utc); recovered = 0
         with Session(self.engine) as session:
-            rows = session.scalars(select(PipelineTask).where(PipelineTask.status == "running")).all()
+            query = select(PipelineTask).where(PipelineTask.status == "running")
+            if task_ids is not None:
+                query = query.where(PipelineTask.id.in_(task_ids))
+            rows = session.scalars(query).all()
             for row in rows:
                 expires = row.lease_expires_at
                 if expires and expires.tzinfo is None: expires = expires.replace(tzinfo=timezone.utc)

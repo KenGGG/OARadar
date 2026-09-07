@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -43,7 +44,7 @@ def rewrite_parser_asset_links(content: str, destination: Path, assets_dir: Path
             return match.group(0)
         if not (assets_dir / link).is_file():
             return "[图片未包含在解析结果中]"
-        return match.group(0).replace(f"({link})", f"({prefix}/{link})")
+        return match.group(0).replace(f"({link})", f"({quote(prefix + '/' + link, safe='/')})")
     return IMAGE_LINK.sub(replace, content)
 
 

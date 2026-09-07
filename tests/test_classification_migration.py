@@ -34,6 +34,38 @@ def test_latest_schema_allows_agnes_as_a_versioned_decision_source(tmp_path: Pat
     assert "'agnes'" in sql
 
 
+def test_0040_upgrades_to_0041_without_losing_existing_rows(tmp_path: Path) -> None:
+    database_path = tmp_path / "upgrade-from-0040.db"
+    config = _alembic_config(database_path)
+    command.upgrade(config, "0040_external_review_without_issuer")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO oa_items (
+                oa_item_key, source_channel, title, pipeline_status,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                "done:synthetic-retained",
+                "done",
+                "Synthetic retained row",
+                "discovered",
+            ),
+        )
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()[0] == "0041_agnes_semantic_decision_source"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM oa_items WHERE oa_item_key = ?",
+            ("done:synthetic-retained",),
+        ).fetchone()[0] == 1
+
+
 def test_upgrade_recovers_an_empty_interrupted_classification_decision_temp_table(
     tmp_path: Path,
 ) -> None:

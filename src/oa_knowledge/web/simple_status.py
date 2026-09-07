@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from typing import Any
 
 from sqlalchemy import func, select
@@ -360,6 +361,37 @@ def _overall_status(done: dict, pending: dict, attention: list[dict]) -> str:
     return "working"
 
 
+def local_delivery_progress(settings: Settings) -> dict[str, Any]:
+    """Read one atomic batch snapshot; never infer success from processing count."""
+    try:
+        paths = list((settings.data_root / 'runs').glob('local-markdown-*/summary.json'))
+        if not paths:
+            return {'available': False, 'message': '尚无本地批量交付台账'}
+        path = max(paths, key=lambda p: p.stat().st_mtime)
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        fields = ('scope_done_items', 'processed', 'excluded', 'complete_new_or_updated',
+                  'complete_reused', 'partial', 'final_needs_review', 'failed_or_missing',
+                  'awaiting_evidence', 'not_processed', 'attachment_markdown', 'item_indexes')
+        result = {key: raw[key] for key in fields}
+        if any(type(value) is not int or value < 0 for value in result.values()):
+            raise ValueError('invalid counts')
+        states = ('excluded', 'complete_new_or_updated', 'complete_reused', 'partial',
+                  'final_needs_review', 'failed_or_missing', 'awaiting_evidence')
+        if sum(result[key] for key in states) != result['processed'] or result['processed'] + result['not_processed'] != result['scope_done_items']:
+            raise ValueError('inconsistent snapshot')
+        updated = datetime.fromisoformat(raw['updated_at'])
+        result.update(available=True, updated_at=updated.isoformat(),
+                      stale=(datetime.now(timezone.utc) - updated).total_seconds() > 900)
+        try:
+            current = json.loads(path.with_name('current.json').read_text(encoding='utf-8'))
+            result['stage'] = str(current.get('stage', 'unknown'))
+        except (OSError, ValueError, TypeError):
+            result['stage'] = 'unknown'
+        return result
+    except (OSError, ValueError, KeyError, TypeError):
+        return {'available': False, 'message': '批量台账暂不可读或统计不一致，请稍后刷新'}
+
+
 def simple_status(settings: Settings) -> dict[str, Any]:
     """聚合极简业务状态。只读数据库与本地调度事实，不触碰任何 OA 内容。"""
     engine = create_db_engine(settings.database_path)
@@ -379,6 +411,7 @@ def simple_status(settings: Settings) -> dict[str, Any]:
                 "pending": pending,
                 "oa_activity": oa_activity,
                 "attention": attention,
+                "local_delivery": local_delivery_progress(settings),
             }
     finally:
         engine.dispose()

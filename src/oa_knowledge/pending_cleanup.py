@@ -103,7 +103,7 @@ def _delete_archived_file(session: Session, settings: Settings, file: ArchivedFi
         target = resolve_data_path(
             settings.data_root,
             local_relpath,
-            allowed_prefixes=("raw/pending", "archive/raw/oa/pending"),
+            allowed_prefixes=("raw/pending", "archive/raw/oa/pending", "originals/pending"),
         )
         if target.exists():
             if not target.is_file():

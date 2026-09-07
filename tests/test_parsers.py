@@ -59,6 +59,78 @@ def _make_synthetic_pdf(
     return pdf_path
 
 
+def test_word_pdf_conversion_normalizes_copy_and_leaves_original(monkeypatch, tmp_path):
+    from oa_knowledge.parsers.libreoffice_parser import word_to_pdf
+    import fitz
+    from types import SimpleNamespace
+    source = tmp_path / 'synthetic without extension'
+    with zipfile.ZipFile(source, 'w') as package:
+        package.writestr('[Content_Types].xml', '<Types/>')
+        package.writestr('word/document.xml', '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Synthetic editable text 12345</w:t></w:r></w:p></w:body></w:document>')
+    original = source.read_bytes()
+    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.shutil.which', lambda _: '/synthetic/soffice')
+    def run(command, **kwargs):
+        copied = Path(command[-1])
+        assert copied.suffix == '.docx' and copied != source
+        assert copied.read_bytes() == original
+        pdf = fitz.open(); page = pdf.new_page(); page.insert_text((72,72),'Synthetic editable text 12345')
+        pdf.save(Path(command[command.index('--outdir')+1])/'document.pdf'); pdf.close()
+        return SimpleNamespace(returncode=0,stdout='',stderr='')
+    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.subprocess.run', run)
+    result = word_to_pdf(source, tmp_path/'derived')
+    assert source.read_bytes() == original
+    with fitz.open(result) as pdf:
+        assert len(pdf) == 1 and '12345' in pdf[0].get_text()
+
+
+def test_libreoffice_version_is_valid_parse_cache_identity(monkeypatch):
+    from types import SimpleNamespace
+    from oa_knowledge.parsers.libreoffice_parser import libreoffice_engine_version
+    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.shutil.which', lambda _: '/synthetic/soffice')
+    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.subprocess.run', lambda *a,**k: SimpleNamespace(stdout='LibreOffice 24.2.7.2 420(Build:2)\n',stderr=''))
+    assert libreoffice_engine_version() == '24.2.7.2'
+
+
+def test_scan_only_word_restores_ordered_images_lost_by_pdf_layout(tmp_path):
+    from oa_knowledge.parsers.libreoffice_parser import restore_scan_pages
+    import fitz
+    from PIL import Image
+    xml='<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><a:blip r:embed="r2"/><a:blip r:embed="r1"/></w:p></w:body></w:document>'
+    docx=tmp_path/'scans.docx'
+    with zipfile.ZipFile(docx,'w')as z:
+        z.writestr('word/document.xml',xml)
+        z.writestr('word/_rels/document.xml.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="r1" Target="media/red.png"/><Relationship Id="r2" Target="media/blue.png"/></Relationships>')
+        for color in ['red','blue']:
+            out=io.BytesIO();Image.new('RGB',(1000,1400),color).save(out,format='PNG');z.writestr(f'word/media/{color}.png',out.getvalue())
+    pdf=tmp_path/'document.pdf';d=fitz.open();d.new_page();d.save(pdf);d.close()
+    assert restore_scan_pages(docx,pdf)==2
+    with fitz.open(pdf)as d:
+        assert len(d)==2
+        assert d[0].get_pixmap().pixel(30,30)==(0,0,255)
+        assert d[1].get_pixmap().pixel(30,30)==(255,0,0)
+
+
+def test_word_ocr_preserves_native_terminal_text_omitted_from_ocr(tmp_path):
+    from oa_knowledge.parsers.libreoffice_parser import restore_terminal_text
+    import fitz,json
+    pdf=tmp_path/'source.pdf';d=fitz.open();d.new_page();p=d.new_page();p.insert_text((50,700),'Synthetic issuing authority printed on 2026-09-06');d.save(pdf);d.close()
+    md=tmp_path/'document.md';md.write_text('Main body\n')
+    (tmp_path/'document_content_list.json').write_text(json.dumps([{'page_idx':0,'type':'text','text':'Main body'}]))
+    assert restore_terminal_text(pdf,md)
+    assert 'Synthetic issuing authority printed on 2026-09-06' in md.read_text()
+    before=md.read_bytes();assert not restore_terminal_text(pdf,md)
+    assert md.read_bytes()==before
+
+
+def test_word_with_embedded_media_requires_pdf_ocr_not_native_office_only(tmp_path):
+    from oa_knowledge.parsers.libreoffice_parser import needs_word_pdf_ocr
+    source=_make_synthetic_docx(tmp_path)
+    assert not needs_word_pdf_ocr(source,'markitdown','editable text')
+    with zipfile.ZipFile(source,'a')as package:package.writestr('word/media/scan.png',b'synthetic')
+    assert needs_word_pdf_ocr(source,'markitdown','editable text')
+    assert not needs_word_pdf_ocr(source,'libreoffice','full OCR text')
+
+
 def _make_synthetic_docx(
     tmp_path: Path, name: str = "test.docx", content: str = ""
 ) -> Path:
@@ -415,6 +487,7 @@ def test_parse_with_mineru_extracts_zip_atomically(
             return httpx.Response(200, json={"protocol_version": "1"})
         assert request.url.path == "/file_parse"
         assert b'name="files"' in request.read()
+        assert b'name="return_images"\r\n\r\ntrue' in request.read()
         return httpx.Response(
             200, content=payload, headers={"content-type": "application/zip"}
         )

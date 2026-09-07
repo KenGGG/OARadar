@@ -39,6 +39,24 @@ class DatabaseSemanticPackageLoader:
         self._settings = settings
         self._parse_cache = ParseCacheService(session_factory, settings)
 
+    def load_file_text(self, file_id: int) -> tuple[str, str] | None:
+        """Read evidence for this verified file, never a cached classification."""
+        with self._sessions() as session:
+            file = session.get(ArchivedFile, file_id)
+            if file is None or file.download_status != "verified" or not file.sha256:
+                return None
+            artifact = self._artifact(session, file)
+            if artifact is not None and artifact.source_sha256 == file.sha256:
+                try:
+                    product = resolve_cache_path(self._settings, artifact.output_relpath)
+                    if artifact.product_sha256 and sha256_file(product) == artifact.product_sha256:
+                        cached = self._read_artifact(artifact)
+                        if cached is not None:
+                            return cached[0], file.sha256
+                except (OSError, ValueError):
+                    pass
+            return self._parse_when_needed(file)
+
     def __call__(self, oa_item_key: str) -> tuple[SemanticPackage, AgnesEligibility]:
         with self._sessions() as session:
             item = session.scalar(select(OAItem).where(OAItem.oa_item_key == oa_item_key))
@@ -55,15 +73,11 @@ class DatabaseSemanticPackageLoader:
             parsed_attachments: list[tuple[str, str]] = []
             hashes: list[str] = []
             for file in files:
-                artifact = self._artifact(session, file)
-                cached = self._read_artifact(artifact)
-                if cached is not None:
-                    body, product_sha = cached
-                else:
-                    parsed_result = self._parse_when_needed(file)
-                    if parsed_result is None:
-                        continue
-                    body, product_sha = parsed_result
+                loaded = self.load_file_text(file.id)
+                if loaded is None:
+                    continue
+                body, _source_sha = loaded
+                product_sha = hashlib.sha256(body.encode('utf-8')).hexdigest()
                 parsed_attachments.append((file.original_name, body))
                 hashes.append(product_sha)
             current = {

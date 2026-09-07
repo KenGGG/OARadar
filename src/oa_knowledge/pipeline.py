@@ -101,6 +101,22 @@ class ParsePipeline:
             if file_path is None:
                 return None
 
+            # Default delivery consumes the verified active product, regardless
+            # of which installed parser produced it. Explicit engine requests
+            # still take the normal engine-specific path below.
+            if engine is None and file_rec.content_object_id is not None:
+                from oa_knowledge.source_markdown.service import _active_artifact
+
+                content = session.get(ContentObject, file_rec.content_object_id)
+                artifact = _active_artifact(session, file_rec)
+                if (artifact is not None and artifact.lifecycle_status == "valid"
+                    and artifact.content_object_id == content.id
+                    and artifact.source_sha256 == content.sha256 == file_rec.sha256
+                    and artifact.product_sha256):
+                    product = resolve_cache_path(self.settings, artifact.output_relpath)
+                    if product.is_file() and sha256_file(product) == artifact.product_sha256:
+                        return artifact.parse_job_id
+
             eligibility = evaluate_eligibility(file_path)
             if not eligibility.eligible:
                 return None
@@ -127,7 +143,7 @@ class ParsePipeline:
                 select(ParseJob).where(
                     ParseJob.file_id == file_id,
                     ParseJob.engine == target_engine,
-                )
+                ).order_by(ParseJob.id.desc()).limit(1)
             ).scalar_one_or_none()
 
             if existing:

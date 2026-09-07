@@ -241,8 +241,12 @@ def test_candidate_markdown_can_reuse_cache_after_metadata_classification(
             payload=b"same",
         )
     calls: list[int] = []
+    def parse_with_image(*args, **kwargs):
+        result = _fake_router(calls)(*args, **kwargs)
+        (result.output_path.parent / 'image.png').write_bytes(b'synthetic-image')
+        return result
     monkeypatch.setattr(
-        "oa_knowledge.classification.parse_cache.parse_file", _fake_router(calls)
+        "oa_knowledge.classification.parse_cache.parse_file", parse_with_image
     )
 
     ref = ParseCacheService(session_factory, settings).get_or_parse(
@@ -255,6 +259,7 @@ def test_candidate_markdown_can_reuse_cache_after_metadata_classification(
 
     assert ref.status == "parsed"
     assert calls == [1]
+    assert (settings.cache_root / ref.output_relpath).with_name('image.png').read_bytes() == b'synthetic-image'
 
 
 def test_parse_cache_rejects_unknown_request_purpose(

@@ -66,6 +66,7 @@ def _seed(tmp_path: Path):
 
 def test_publish_uses_active_artifact_and_never_reparses_original(monkeypatch, tmp_path: Path) -> None:
     settings, engine, source_id, artifact_path = _seed(tmp_path)
+    (artifact_path.parent / 'other-oa.md').write_text('Unrelated synthetic OA', encoding='utf-8')
     monkeypatch.setattr(
         "oa_knowledge.markdown_export.service.parse_file",
         lambda *_args, **_kwargs: pytest.fail("source publication must not call parse_file"),
@@ -81,7 +82,39 @@ def test_publish_uses_active_artifact_and_never_reparses_original(monkeypatch, t
     assert "original-binary-content" not in content
     assert "parse_artifact_id:" in content
     assert "source_relpath: originals/done/" in content
-    assert not artifact_path.parent.exists()
+    assert "[查看原件](" in content
+    assert artifact_path.is_file()  # Classification and reruns share this verified product.
+    assert not destination.with_name(destination.stem + '.assets').exists()
+
+
+def test_default_delivery_reuses_valid_artifact_from_another_engine(tmp_path: Path) -> None:
+    from oa_knowledge.pipeline import ParsePipeline
+
+    settings, engine, source_id, artifact_path = _seed(tmp_path)
+    with Session(engine) as session:
+        artifact = session.query(ParseArtifact).one()
+        job_id = artifact.parse_job_id
+        session.query(ContentObject).one().active_parse_artifact_id = None
+        session.commit()
+    assert ParsePipeline(settings, engine).enqueue(source_id) == job_id
+    with Session(engine) as session:
+        assert session.query(ParseJob).count() == 1
+        assert session.get(ParseJob, job_id).status == "completed"
+
+
+def test_missing_parser_images_are_not_reported_as_success(tmp_path: Path) -> None:
+    settings, engine, source_id, artifact_path = _seed(tmp_path)
+    artifact_path.write_text('Synthetic body ![](StrangeNoGraphicData)', encoding='utf-8')
+    with Session(engine) as session:
+        artifact = session.query(ParseArtifact).one()
+        artifact.product_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        session.commit()
+        record = publish_active_artifact(session, settings, source_id)
+        session.commit()
+        body = (settings.markdown_root / record.markdown_relpath).read_text()
+        assert 'parse_status: failed' in body
+        assert 'MISSING_IMAGE_ASSET' in body
+        assert record.status == 'failed'
 
 
 def test_same_artifact_is_idempotent_and_new_product_atomically_replaces(tmp_path: Path) -> None:

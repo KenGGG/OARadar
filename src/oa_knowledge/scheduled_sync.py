@@ -403,7 +403,7 @@ def run_hourly_scan(engine, settings, *, headed: bool = False) -> dict:
     return {"status": status, "pending": pending_summary, "done": done_summary}
 
 
-def run_nightly_scan(engine, settings, *, headed: bool = False) -> dict:
+def run_nightly_scan(engine, settings, *, headed: bool = False, enqueue_history: bool = True) -> dict:
     """Nightly full sync: complete Done manifest, enqueue downloads, recover tasks."""
     coordinator = ResourceCoordinator(engine)
     owner = f"schedule-nightly:{uuid4().hex}"
@@ -434,7 +434,7 @@ def run_nightly_scan(engine, settings, *, headed: bool = False) -> dict:
                 session.commit()
                 unified_enqueued = ProductionQueue(engine).bootstrap_current_state(
                     session=session,
-                )["historical_done_backfill"]
+                )["historical_done_backfill"] if enqueue_history else 0
                 done_summary = {
                     "source_total": discovery.source_total_count,
                     "pages_scanned": discovery.pages_scanned,

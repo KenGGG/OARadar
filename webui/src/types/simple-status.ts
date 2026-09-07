@@ -77,6 +77,13 @@ export interface SimpleAttentionItem {
 }
 
 export interface SimpleStatusResponse {
+  local_delivery?: {
+    available: boolean; message?: string; updated_at?: string; stale?: boolean; stage?: string
+    scope_done_items?: number; processed?: number; excluded?: number
+    complete_new_or_updated?: number; complete_reused?: number; partial?: number
+    final_needs_review?: number; failed_or_missing?: number; awaiting_evidence?: number
+    not_processed?: number; attachment_markdown?: number; item_indexes?: number
+  }
   generated_at: string
   overall_status: BusinessTone
   done: SimpleDoneSummary

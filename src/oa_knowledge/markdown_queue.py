@@ -5,7 +5,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import ArchivedFile, MarkdownExport, MarkdownQueueControl, MarkdownTask, MarkdownTaskEvent, OAItem
+from oa_knowledge.db.models import ArchivedFile, ClassificationDecision, MarkdownExport, MarkdownQueueControl, MarkdownTask, MarkdownTaskEvent, OAItem
 from oa_knowledge.markdown_export.render import SCHEMA_VERSION
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
@@ -14,6 +14,19 @@ ATTACHMENT_ROLES = MARKDOWN_SOURCE_ROLES
 PDF_CAMPAIGN_ROLES = MARKDOWN_SOURCE_ROLES
 
 def enqueue_file(session: Session, source_file_id: int) -> bool:
+    permitted = session.scalar(
+        select(ClassificationDecision.id)
+        .join(OAItem, OAItem.oa_item_key == ClassificationDecision.oa_item_key)
+        .join(ArchivedFile, ArchivedFile.oa_item_id == OAItem.id)
+        .where(
+            ArchivedFile.id == source_file_id,
+            ClassificationDecision.is_current.is_(True),
+            ClassificationDecision.classification_status == "classified",
+            ClassificationDecision.content_integrity_status.in_(("ok", "no_attachment_confirmed")),
+        )
+    )
+    if permitted is None:
+        return False
     done = session.scalar(select(MarkdownExport.id).where(MarkdownExport.source_file_id == source_file_id, MarkdownExport.schema_version == SCHEMA_VERSION, MarkdownExport.status.in_(("success", "unsupported"))))
     exists = session.scalar(select(MarkdownTask.id).where(MarkdownTask.source_file_id == source_file_id, MarkdownTask.schema_version == SCHEMA_VERSION))
     if done or exists: return False

@@ -96,6 +96,17 @@ def test_missing_parser_asset_becomes_explicit_text(tmp_path: Path) -> None:
     assert "图片未包含在解析结果中" in body
 
 
+def test_published_image_path_encodes_parentheses_and_spaces(tmp_path: Path) -> None:
+    assets = tmp_path / 'parse'
+    assets.mkdir()
+    (assets / 'image.png').write_bytes(b'png')
+    destination = tmp_path / 'synthetic report (2).doc.md'
+    body = rewrite_parser_asset_links('![](image.png)', destination, assets)
+    assert 'synthetic%20report%20%282%29.doc.assets/image.png' in body
+    publish_markdown(destination, '---\nsource_sha256: ' + 'a' * 64 + '\n---\n' + body, 'a' * 64, assets)
+    assert destination.is_file()
+
+
 def test_first_failure_can_publish_explicit_stub(tmp_path: Path) -> None:
     destination = tmp_path / "example.bin.md"
     content = render_markdown(metadata(source_filename="example.bin", source_relpath="done/example.bin", parse_status="unsupported",

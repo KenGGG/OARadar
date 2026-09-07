@@ -50,14 +50,18 @@ def test_loader_reuses_existing_parse_artifact_without_opening_originals(tmp_pat
         job = ParseJob(file_id=file.id, engine="mineru", engine_version="1", config_hash="e" * 64, status="completed", attempts=1)
         session.add(job)
         session.flush()
-        session.add(ParseArtifact(parse_job_id=job.id, content_object_id=content.id, engine="mineru", engine_version="1", profile_version="v", output_relpath="parsed.md", source_sha256="d" * 64, product_sha256="f" * 64, config_hash="e" * 64, lifecycle_status="valid"))
+        session.add(ParseArtifact(parse_job_id=job.id, content_object_id=content.id, engine="mineru", engine_version="1", profile_version="v", output_relpath="parsed.md", source_sha256="d" * 64, product_sha256=sha256_file(artifact_path), config_hash="e" * 64, lifecycle_status="valid"))
         session.add(ClassificationDecision(classification_run_id=run.id, oa_item_key="done:one", version=1, is_current=True, decision_input_sha256="a" * 64, decision_source="metadata_rule", classification_status="needs_review", content_integrity_status="ok", content_origin="external", flow_type="external_inbound", initiator="sender", initiator_type="internal", relay_from=None, transfer_chain_json="[]", issuer=None, canonical_issuer=None, business_category=None, document_number="穗工信函〔2025〕18号", document_type=None, normalized_title="公开通知", classification_confidence=0.5, classification_reason_json="{}", rule_version="r", private_config_sha256="c" * 64))
 
     package, eligibility = DatabaseSemanticPackageLoader(factory, settings)("done:one")
 
     assert package.parsed_attachments == (("公开通知.pdf", "广州市工业和信息化局\n公开通知"),)
-    assert package.parse_artifact_hashes == ("f" * 64,)
+    assert package.parse_artifact_hashes == (sha256_file(artifact_path),)
     assert eligibility.status == "allowed"
+    loader = DatabaseSemanticPackageLoader(factory, settings)
+    assert loader.load_file_text(file.id) == ("广州市工业和信息化局\n公开通知", "d" * 64)
+    artifact_path.write_text("tampered", encoding="utf-8")
+    assert loader.load_file_text(file.id) is None
 
 
 def test_loader_reads_verified_direct_text_only_when_no_parse_artifact_exists(tmp_path: Path) -> None:
@@ -86,6 +90,11 @@ def test_loader_reads_verified_direct_text_only_when_no_parse_artifact_exists(tm
     assert package.parsed_attachments == (("public.txt", "广州市工业和信息化局\n关于公开事项的通知"),)
     assert package.parse_artifact_hashes == (sha256_file(source),)
     assert eligibility.status == "allowed"
+    with factory() as session:
+        file_id = session.query(ArchivedFile).filter_by(original_name="public.txt").one().id
+    assert DatabaseSemanticPackageLoader(factory, settings).load_file_text(file_id) == (
+        "广州市工业和信息化局\n关于公开事项的通知", sha256_file(source)
+    )
 
 
 def test_mineru_semantic_parse_timeout_is_propagated_to_the_fallback_route() -> None:

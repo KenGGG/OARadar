@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, SQLAlchemy/SQLite/Alembic, Pydantic, httpx, existing ParseCacheService/FormatRouter, pytest, Ruff.
 
-**Spec:** `/home/ken/.codex/attachments/859d09b3-8ec2-4f87-8f25-0d1cfc8163ed/pasted-text-1.txt`
+**Spec:** user-approved design input (not stored in this repository)
 
 ## Global Constraints
 

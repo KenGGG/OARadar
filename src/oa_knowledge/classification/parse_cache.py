@@ -239,6 +239,12 @@ class ParseCacheService:
                 self._settings.cache_root,
                 output_relpath,
             )
+            if request.purpose == 'candidate_markdown':
+                for asset in result.output_path.parent.rglob('*'):
+                    if asset.is_file() and not asset.is_symlink() and asset != result.output_path:
+                        target = destination.parent / asset.relative_to(result.output_path.parent)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(asset, target)
             product_sha = sha256_file(destination)
         except _ParserIdentityMismatch:
             self._mark_job_failed(job_id, error_code="parser_identity_mismatch")
@@ -474,6 +480,8 @@ class ParseCacheService:
             separators=(",", ":"),
         )
         artifact_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        if request.purpose == 'candidate_markdown':
+            return f"work/classification-parse/{request.content_sha256[:2]}/{artifact_key}/document.md"
         return (
             f"work/classification-parse/{request.content_sha256[:2]}/{artifact_key}.md"
         )
