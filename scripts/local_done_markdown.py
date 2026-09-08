@@ -208,7 +208,7 @@ def process(worker, key, root):
             if source.download_status != 'verified' or not path.is_file():
                 return {**row, 'reason':'missing_or_unverified_original'}
             if not source.sha256 or sha256_file(path) != source.sha256:
-                raise RuntimeError('STOP:original_hash_mismatch')
+                return {**row, 'reason': 'original_hash_mismatch'}
         prior = current_ledger(root).get(key, {})
         current = session.scalar(select(ClassificationDecision).where(ClassificationDecision.oa_item_key==key, ClassificationDecision.is_current.is_(True)))
         metadata_sha = hashlib.sha256(json.dumps([item.title,item.sender,item.document_number,[(f.id,f.sha256)for f in files]],ensure_ascii=False).encode()).hexdigest()
