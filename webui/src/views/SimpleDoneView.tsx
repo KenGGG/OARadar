@@ -1,16 +1,16 @@
 import { useEffect, useState } from "react"
-import { ChevronRight, CircleAlert, Download, Search, X } from "lucide-react"
+import { ChevronRight, Download, Search } from "lucide-react"
 import type { SimpleDoneFilter, SimpleDoneItem, SimpleDoneState, SimpleDonePage } from "../types/simple-status"
 import { time } from "../App"
+import { WorkflowDrawer } from "./WorkflowDrawer"
 
 type Tone = "good" | "warn" | "bad" | "neutral"
 
 const DONE_FILTERS: { key: SimpleDoneFilter | ""; label: string }[] = [
   { key: "", label: "全部" },
-  { key: "no_attachment", label: "确认无附件（待人工复核）" },
+  { key: "no_attachment", label: "无附件事项" },
   { key: "waiting_download", label: "等待下载" },
   { key: "waiting_markdown", label: "等待 MD 化" },
-  { key: "waiting_classification", label: "等待归类" },
   { key: "completed", label: "已完成" },
   { key: "attention", label: "需要处理" },
   { key: "excluded", label: "已按规则排除" },
@@ -23,72 +23,11 @@ function statusTone(state: SimpleDoneState): Tone {
   return "neutral"
 }
 
-// 由简化状态推导“原件 / Markdown / 归类发布”三件事的口语结论（spec §6.2）。
-function progressFacts(item: SimpleDoneItem): { original: string; markdown: string; publish: string } {
-  const s = item.simple_status
-  const original =
-    item.pipeline_status === "downloaded" || item.pipeline_status === "no_attachment" ? "已验证"
-    : item.pipeline_status === "download_failed" || item.pipeline_status === "partial" ? "不完整"
-    : "等待下载"
-  let markdown = "待生成"
-  let publish = "未开始"
-  if (s === "waiting_classification" || s === "completed" || (s === "attention" && item.attention_reason?.includes("归类"))) {
-    markdown = "已生成"
-    publish = s === "completed" ? "已发布" : "进行中"
-  } else if (s === "attention") {
-    markdown = "需人工确认"
-    publish = "需人工确认"
-  }
-  return { original, markdown, publish }
-}
-
-function SimpleDoneDrawer({ item, close }: {
-  item: SimpleDoneItem
-  close: () => void
-}) {
-  const facts = progressFacts(item)
-  const isAttention = item.simple_status === "attention"
-  return <div className="drawer-layer" role="dialog" aria-modal="true">
-    <button className="drawer-scrim" aria-label="关闭详情" onClick={close}/>
-    <aside className="drawer">
-      <header>
-        <div><small>已办事项</small><h2>{item.title}</h2></div>
-        <button className="icon-button" title="关闭" onClick={close}><X size={19}/></button>
-      </header>
-      <div className="drawer-body">
-        <div className="detail-grid">
-          <div className="info"><span>当前状态</span><strong>{item.simple_status_label}</strong></div>
-          <div className="info"><span>原件</span><strong>{facts.original}</strong></div>
-          <div className="info"><span>Markdown</span><strong>{facts.markdown}</strong></div>
-          <div className="info"><span>归类发布</span><strong>{facts.publish}</strong></div>
-          <div className="info"><span>附件数量</span><strong>{item.attachment_review_label || (item.file_count == null ? "尚未取得" : String(item.file_count))}</strong></div>
-          <div className="info"><span>发起人</span><strong>{item.sender || "-"}</strong></div>
-          <div className="info"><span>发起时间</span><strong>{time(item.initiated_at)}</strong></div>
-          <div className="info"><span>最近成功同步</span><strong>{time(item.updated_at)}</strong></div>
-        </div>
-        <h3>附件名称</h3>
-        {item.attachment_names.length ? <div className="attachment-name-list">
-          {item.attachment_names.map(name => <div key={name}>{name}</div>)}
-        </div> : <p className="settings-help">暂无附件。</p>}
-        {item.pipeline_status === "no_attachment" && (
-          <div className="settings-message no-attachment-review"><CircleAlert size={16}/>系统扫描未发现附件，请人工到 OA 复核。</div>
-        )}
-        {isAttention && item.attention_reason && (
-          <div className="settings-message" role="alert"><CircleAlert size={16}/>{item.attention_reason}</div>
-        )}
-        <details className="advanced"><summary>查看技术详情</summary>
-          <div className="detail-grid">
-            <div className="info"><span>OA 事项 ID</span><strong>{item.item_id || "-"}</strong></div>
-            <div className="info"><span>内部处理状态</span><strong>{item.pipeline_status}</strong></div>
-            <div className="info"><span>本地归档目录</span><strong>{item.archive_relpath || "尚未归档"}</strong></div>
-          </div>
-        </details>
-      </div>
-    </aside>
-  </div>
-}
-
-export function SimpleDoneView({ rows, total, metrics, page, setPage, query, setQuery, filter, setFilter }: {
+export function SimpleDoneView({ rows, total, metrics, page, setPage, query, setQuery, filter, setFilter, selectedId, onSelect, refresh, onMarkdown }: {
+  selectedId: number | null
+  onSelect: (id: number | null) => void
+  refresh: () => Promise<void>
+  onMarkdown: (id: number) => void
   rows: SimpleDoneItem[]
   total: number
   metrics: SimpleDonePage["metrics"]
@@ -100,7 +39,6 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
   setFilter: (v: SimpleDoneFilter | "") => void
 }) {
   const pages = Math.max(1, Math.ceil(total / 50))
-  const [selected, setSelected] = useState<SimpleDoneItem | null>(null)
   const [pageInput, setPageInput] = useState(String(page))
 
   useEffect(() => setPageInput(String(page)), [page])
@@ -131,7 +69,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       <div className="metric"><span>成功下载</span><strong>{metrics.downloaded_items.toLocaleString()}</strong></div>
       <div className="metric"><span>已验证附件</span><strong>{metrics.verified_attachments.toLocaleString()}</strong></div>
     </div>
-    <div className="section-toolbar"><div><h2>已办资料</h2><p>原件、Markdown 与归类发布的当前完成情况。</p></div>
+    <div className="section-toolbar"><div><h2>已办资料</h2><p>查看已办原件的归档与校验结果，Markdown 交付单独追踪。</p></div>
       <button className="export-button" onClick={exportCsv}><Download size={16}/>导出 CSV</button>
     </div>
     <div className="filter-row">
@@ -150,12 +88,12 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       <th aria-label="操作"/>
     </tr></thead><tbody>
       {rows.map(row => (
-        <tr key={row.id} onClick={() => setSelected(row)} tabIndex={0} onKeyDown={e => e.key === "Enter" && setSelected(row)}>
+        <tr key={row.id} onClick={() => onSelect(row.id)} tabIndex={0} onKeyDown={e => e.key === "Enter" && onSelect(row.id)}>
           <td className="title-cell"><strong>{row.title}</strong></td>
           <td>{row.sender || "-"}</td>
           <td className="nowrap">{time(row.initiated_at)}</td>
           <td className={row.pipeline_status === "no_attachment" ? "review-zero" : ""}>{row.attachment_review_label || (row.file_count == null ? "-" : row.file_count)}</td>
-          <td><span className={`status status-${row.pipeline_status === "no_attachment" ? "warn" : statusTone(row.simple_status)}`}>{row.pipeline_status === "no_attachment" ? "确认无附件" : row.simple_status_label}</span></td>
+          <td><span className={`status status-${row.pipeline_status === "no_attachment" ? "warn" : statusTone(row.simple_status)}`}>{row.pipeline_status === "no_attachment" ? row.no_attachment_confirmed ? "已核验无附件" : "未发现附件，待核实" : row.simple_status_label}</span></td>
           <td className="nowrap">{time(row.updated_at)}</td>
           <td><ChevronRight size={17}/></td>
         </tr>
@@ -176,6 +114,6 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       <button disabled={page >= pages} onClick={() => goToPage(pages)}>末页</button>
       <button disabled={page >= pages} onClick={() => goToPage(page + 1)}>下一页</button>
     </div>
-    {selected && <SimpleDoneDrawer item={selected} close={() => setSelected(null)}/>}
+    {selectedId !== null && <WorkflowDrawer key={selectedId} kind="done" id={selectedId} close={() => onSelect(null)} refresh={refresh} onRelated={onMarkdown}/>}
   </section>
 }

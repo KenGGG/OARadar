@@ -6,6 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from test_markdown_queue import _mark_publishable
 
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
@@ -30,6 +31,7 @@ def _make_item(session: Session, oa_item_key: str) -> OAItem:
     item = OAItem(oa_item_key=oa_item_key, source_channel="done", title="合成事项")
     session.add(item)
     session.flush()
+    _mark_publishable(session, item)
     return item
 
 

@@ -3,7 +3,10 @@ from dataclasses import replace
 import pytest
 
 from oa_knowledge.classification.evidence_dossier import OAEvidenceDossier
-from oa_knowledge.classification.per_item_classifier import classify_dossier
+from oa_knowledge.classification.per_item_classifier import (
+    classify_dossier,
+    normalize_canonical_issuer,
+)
 from oa_knowledge.classification.schemas import PrivateClassificationConfig
 
 
@@ -148,6 +151,24 @@ def test_processing_annotation_is_not_part_of_issuer(prefix):
 def test_joint_issuers_remain_separate():
     result = classify_dossier(_dossier("(盖章版)甲市财政局 乙市审计局关于联合检查的通知"), _rules())
     assert result.canonical_issuer == "甲市财政局、乙市审计局"
+
+
+def test_issuer_normalization_removes_display_wrappers_and_stabilizes_joint_members():
+    assert normalize_canonical_issuer(
+        "（请再次以此为准）（盖章后）乙市审计局、甲市财政局",
+        _rules(),
+    ) == "甲市财政局、乙市审计局"
+
+
+@pytest.mark.parametrize("value", [
+    "会议听取了甲市财政局汇报",
+    "传达学习了甲市财政局文件",
+    "为落实甲市财政局通知",
+    "团有限公司",
+    "广东省地方金融监督管理局(或省级监管部门)",
+])
+def test_issuer_normalization_rejects_non_issuer_text(value: str):
+    assert normalize_canonical_issuer(value, _rules()) is None
 
 
 def test_board_procedure_does_not_override_subject():

@@ -1,16 +1,20 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   Archive, Bell, BookOpen, BrainCircuit, Pencil, Save, Trash2, X,
 } from "lucide-react"
 import type { SettingsData } from "../App"
 import {
-  api, postApi, putApi, deleteApi, Field, NumberField, Toggle, SecretState,
+  api, postApi, patchApi, putApi, deleteApi, Field, NumberField, Toggle, SecretState,
 } from "../App"
 
 type TitleExclusionPolicy = { id: number; pattern: string; action: string; scope: string; enabled: boolean; updated_at: string | null }
 
-export function SimpleSettingsView({ initial }: {
-  initial: SettingsData
+function editableSettings(value: SettingsData) {
+  return JSON.stringify([value.summary_model, value.feishu, value.data_cleanup, value.markdown])
+}
+
+export function SimpleSettingsView({ initial, onDirtyChange }: {
+  initial: SettingsData; onDirtyChange?: (dirty: boolean) => void
 }) {
   const [form, setForm] = useState<SettingsData>(initial)
   const [saving, setSaving] = useState(false)
@@ -20,12 +24,33 @@ export function SimpleSettingsView({ initial }: {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editingPattern, setEditingPattern] = useState("")
 
-  useEffect(() => { setForm(initial) }, [initial])
+  const [baseline, setBaseline] = useState(() => editableSettings(initial))
+  const [restartRequired, setRestartRequired] = useState(!!initial.restart_required)
+  const [policyError, setPolicyError] = useState("")
+  const dirty = editableSettings(form) !== baseline || !!titleKeywords.trim()
+    || (editingId !== null && editingPattern !== policies.find(policy => policy.id === editingId)?.pattern)
+  const dirtyRef = useRef(dirty)
+  dirtyRef.current = dirty
+  useEffect(() => {
+    if (!dirtyRef.current && !restartRequired) { setForm(initial); setBaseline(editableSettings(initial)) }
+  }, [initial, restartRequired])
+  useEffect(() => { onDirtyChange?.(dirty) }, [dirty, onDirtyChange])
+  useEffect(() => {
+    const preventDiscard = (event: BeforeUnloadEvent) => {
+      if (!dirtyRef.current) return
+      event.preventDefault(); event.returnValue = ""
+    }
+    window.addEventListener("beforeunload", preventDiscard)
+    return () => window.removeEventListener("beforeunload", preventDiscard)
+  }, [])
   const loadPolicies = async () => {
     const result = await api<TitleExclusionPolicy[]>("/api/policies")
     setPolicies(result.filter(policy => policy.scope === "title"))
+    setPolicyError("")
   }
-  useEffect(() => { void loadPolicies() }, [])
+  useEffect(() => {
+    void loadPolicies().catch(reason => setPolicyError(`关键词读取失败：${reason instanceof Error ? reason.message : "请重试"}`))
+  }, [])
 
   const saveTitleKeywords = async () => {
     if (!titleKeywords.trim()) return
@@ -88,8 +113,11 @@ export function SimpleSettingsView({ initial }: {
       markdown_export: { ...form.markdown },
     }
     try {
-      await postApi("/api/settings", payload)
-      setMessage("设置已保存，需要重启服务后生效")
+      const result = await patchApi<SettingsData & { restart_required?: boolean }>("/api/settings", payload)
+      const saved = result?.summary_model ? result : form
+      setForm(saved); setBaseline(editableSettings(saved))
+      setRestartRequired(result?.restart_required !== false)
+      setMessage(result?.restart_required === false ? "设置已保存并生效。" : "设置已保存到配置文件；当前服务仍使用原配置，需要重启服务后生效。")
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : "保存失败") }
     finally { setSaving(false) }
   }
@@ -102,12 +130,14 @@ export function SimpleSettingsView({ initial }: {
       <div><h2>系统设置</h2><p>调整本地处理与通知规则；修改后统一保存。</p></div>
       <button className="button-primary" onClick={() => void save()} disabled={saving}><Save size={16}/>{saving ? "保存中" : "保存设置"}</button>
     </header>
-    {message && <div className="settings-message settings-page-message">{message}</div>}
+    {message && <div className="settings-message settings-page-message" role="status">{message}</div>}
 
-    <div className="settings-layout">
-    <div className="settings-panel settings-panel-monitor"><header className="settings-panel-header"><span><Bell size={18}/></span><div><h2>待办监控与飞书</h2><p>控制待办扫描、摘要与通知。</p></div></header>
-      <div className="settings-sub settings-sub-card"><h3>扫描计划</h3>
-        <Toggle label="启用待办监控（飞书）" checked={form.feishu.enabled} change={v => toggle("feishu", "enabled", v)}/>
+    {dirty && <p className="settings-help" role="status">有未保存的修改。</p>}
+    {restartRequired && <p className="notice">配置已保存，等待重启服务后生效。</p>}
+    <fieldset className="settings-layout" disabled={saving} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+    <div className="settings-panel settings-panel-monitor"><header className="settings-panel-header"><span><Bell size={18}/></span><div><h2>待办摘要与飞书</h2><p>控制摘要生成与通知；飞书开关不影响待办扫描。</p></div></header>
+      <div className="settings-sub settings-sub-card"><h3>摘要与通知开关</h3>
+        <Toggle label="启用飞书通知" checked={form.feishu.enabled} change={v => toggle("feishu", "enabled", v)}/>
         <Toggle label="启用智能摘要" checked={form.summary_model.enabled} change={v => toggle("summary_model", "enabled", v)}/>
       </div>
       <div className="settings-sub settings-sub-card"><h3>摘要模型</h3>
@@ -154,6 +184,7 @@ export function SimpleSettingsView({ initial }: {
         <p className="settings-help">命中关键词的已办事项不会进入详情页，也不会下载附件。每行一个关键词。</p>
         <textarea className="settings-textarea" value={titleKeywords} onChange={e => setTitleKeywords(e.target.value)} placeholder="例如：会议通知" />
         <div className="policy-actions"><button className="button-primary" onClick={() => void saveTitleKeywords()} disabled={saving || !titleKeywords.trim()}><Save size={16}/>保存关键词</button></div>
+        {policyError && <div className="error-banner" role="alert">{policyError}<button onClick={() => void loadPolicies().catch(reason => setPolicyError(`关键词读取失败：${reason instanceof Error ? reason.message : "请重试"}`))}>重新读取</button></div>}
         <div className="policy-list">
           {policies.map(policy => <div className="policy-row" key={policy.id}>
             {editingId === policy.id ? <input className="policy-edit-input" value={editingPattern} onChange={e => setEditingPattern(e.target.value)} aria-label="编辑标题排除关键词" /> : <span>{policy.pattern}</span>}
@@ -161,7 +192,7 @@ export function SimpleSettingsView({ initial }: {
               {editingId === policy.id ? <><button className="icon-button policy-save" title="保存修改" onClick={() => void saveEditedTitleKeyword(policy)} disabled={saving || !editingPattern.trim()}><Save size={15}/></button><button className="icon-button" title="取消编辑" onClick={() => { setEditingId(null); setEditingPattern("") }} disabled={saving}><X size={15}/></button></> : <><button className="icon-button" title={`编辑 ${policy.pattern}`} onClick={() => startEditingTitleKeyword(policy)} disabled={saving}><Pencil size={15}/></button><button className="icon-button policy-delete" title={`删除 ${policy.pattern}`} onClick={() => void removeTitleKeyword(policy)} disabled={saving}><Trash2 size={15}/></button></>}
             </div>
           </div>)}
-          {!policies.length && <span className="settings-help">尚未设置标题排除关键词。</span>}
+          {!policies.length && !policyError && <span className="settings-help">尚未设置标题排除关键词。</span>}
         </div>
       </div>
     </div>
@@ -187,10 +218,10 @@ export function SimpleSettingsView({ initial }: {
         <div className="info"><span>原子发布</span><strong>{initial.llm_wiki.atomic_publish ? "是" : "否"}</strong></div>
       </div>
     </div>
-    </div>
+    </fieldset>
 
     <div className="settings-page-footer">
-      <span>修改后的可编辑项会在保存后生效。</span>
+      <span>设置保存后需重启服务生效；标题排除关键词单独保存后即生效。</span>
       <button className="button-primary" onClick={() => void save()} disabled={saving}><Save size={16}/>{saving ? "保存中" : "保存设置"}</button>
     </div>
   </section>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
   Bell, BookOpen, CircleAlert, FileText, LayoutDashboard, Menu, RefreshCw, Settings as SettingsIcon, ShieldCheck, X,
 } from "lucide-react"
@@ -10,7 +10,7 @@ import { SimpleSettingsView } from "./views/SimpleSettingsView"
 import { PendingView, type PendingRow } from "./views/PendingView"
 import { MarkdownView, type MarkdownItem } from "./views/MarkdownView"
 
-// 一级导航固定为：总览、已办资料、系统设置（spec §2）。
+// Three workflows share one local console.
 type View = "overview" | "pending" | "done" | "markdown" | "settings"
 
 // ---- 共享类型（供高级维护与设置视图复用，不删除既有能力） ----
@@ -61,6 +61,7 @@ type SourceReview = {
   status: string; created_at: string | null
 }
 type SettingsData = {
+  restart_required?: boolean
   pending_monitor: { feishu_enabled: boolean; llm_enabled: boolean }
   summary_model: Record<string, any>
   feishu: Record<string, any>
@@ -163,8 +164,18 @@ async function postApi<T>(path: string, body?: unknown): Promise<T> {
     body: body ? JSON.stringify(body) : undefined,
   })
   const text = await response.text()
-  if (!response.ok) throw new Error(text || `操作失败 (${response.status})`)
+  if (!response.ok) {
+    let detail = text
+    try { const parsed = JSON.parse(text); detail = typeof parsed.detail === "string" ? parsed.detail : `操作失败 (${response.status})` } catch { /* plain text fallback */ }
+    throw new Error(detail || `操作失败 (${response.status})`)
+  }
   try { return JSON.parse(text) as T } catch { return undefined as unknown as T }
+}
+async function patchApi<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(path, { method: "PATCH", headers: { "x-csrf-token": csrf(), "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  const data = await response.json()
+  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : `保存失败 (${response.status})`)
+  return data as T
 }
 async function putApi<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(path, {
@@ -173,13 +184,21 @@ async function putApi<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   })
   const text = await response.text()
-  if (!response.ok) throw new Error(text || `操作失败 (${response.status})`)
+  if (!response.ok) {
+    let detail = text
+    try { const parsed = JSON.parse(text); detail = typeof parsed.detail === "string" ? parsed.detail : `操作失败 (${response.status})` } catch { /* plain text fallback */ }
+    throw new Error(detail || `操作失败 (${response.status})`)
+  }
   try { return JSON.parse(text) as T } catch { return undefined as unknown as T }
 }
 async function deleteApi<T>(path: string): Promise<T> {
   const response = await fetch(path, { method: "DELETE", headers: { "x-csrf-token": csrf() } })
   const text = await response.text()
-  if (!response.ok) throw new Error(text || `操作失败 (${response.status})`)
+  if (!response.ok) {
+    let detail = text
+    try { const parsed = JSON.parse(text); detail = typeof parsed.detail === "string" ? parsed.detail : `操作失败 (${response.status})` } catch { /* plain text fallback */ }
+    throw new Error(detail || `操作失败 (${response.status})`)
+  }
   try { return JSON.parse(text) as T } catch { return undefined as unknown as T }
 }
 const time = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "-"
@@ -227,7 +246,7 @@ const SERVICE_TITLES: Record<string, string> = {
 
 // 供高级维护视图复用（不删除既有能力，仅折叠到高级维护）。
 export {
-  api, postApi, putApi, deleteApi, csrf, time, size,
+  api, postApi, patchApi, putApi, deleteApi, csrf, time, size,
   Badge, Metric, Info, Progress, SearchBox, Field, NumberField, Toggle, SecretState, ServiceCard,
   SERVICE_TITLES,
 }
@@ -237,93 +256,141 @@ export type {
   GovernanceRun, GovernanceStorage, IntegrityAudit, ArchiveMigration,
 }
 
+type Route = { view: View; page: number; query: string; filter: string; selected: number | null }
+function readRoute(): Route {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ""))
+  const view = params.get("view") as View
+  const positive = (v: string | null) => v && /^\d+$/.test(v) && Number(v) > 0 ? Number(v) : null
+  return { view: NAV.some(n => n.id === view) ? view : "overview", page: positive(params.get("page")) || 1, query: params.get("query") || "", filter: params.get("filter") || "", selected: positive(params.get("item")) }
+}
+function routeHash(route: Route) {
+  const params = new URLSearchParams({ view: route.view })
+  if (route.page > 1) params.set("page", String(route.page))
+  if (route.query) params.set("query", route.query)
+  if (route.filter) params.set("filter", route.filter)
+  if (route.selected) params.set("item", String(route.selected))
+  return `#${params}`
+}
+
 export function App() {
-  const [view, setView] = useState<View>("overview")
+  const [route, setRoute] = useState<Route>(readRoute)
+  const { view, page, query, filter, selected } = route
+  const routeRef = useRef(route); routeRef.current = route
+  const dirty = useRef(false)
+  const onDirtyChange = useCallback((value: boolean) => { dirty.current = value }, [])
   const [mobileNav, setMobileNav] = useState(false)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
+  const [auth, setAuth] = useState<boolean | null>(null)
+  const [token, setToken] = useState("")
   const [simpleStatus, setSimpleStatus] = useState<SimpleStatusResponse | null>(null)
   const [done, setDone] = useState<SimpleDoneItem[]>([])
-  const [doneTotal, setDoneTotal] = useState(0)
+  const [total, setTotal] = useState(0)
   const [doneMetrics, setDoneMetrics] = useState<SimpleDonePage["metrics"]>({ oa_done_total: 0, downloaded_items: 0, verified_attachments: 0 })
-  const [donePage, setDonePage] = useState(1)
-  const [doneQuery, setDoneQuery] = useState("")
-  const [doneFilter, setDoneFilter] = useState<SimpleDoneFilter | "">("")
   const [settings, setSettings] = useState<SettingsData | null>(null)
   const [pending, setPending] = useState<PendingRow[]>([])
   const [markdown, setMarkdown] = useState<MarkdownItem[]>([])
+  const requestSerial = useRef(0)
+  const controller = useRef<AbortController | null>(null)
 
-  const navigate = useCallback((next: View) => {
-    setView(next); setDoneQuery(""); setDoneFilter(""); setDonePage(1)
-    setMobileNav(false)
+  const changeRoute = useCallback((patch: Partial<Route>, replace = false) => {
+    const current = routeRef.current
+    if (patch.view && patch.view !== current.view && dirty.current && !window.confirm("设置尚未保存，离开后将丢失修改。是否离开？")) return
+    const next = { ...current, ...patch }
+    if (patch.view && patch.view !== current.view) dirty.current = false
+    window.history[replace ? "replaceState" : "pushState"](null, "", routeHash(next))
+    routeRef.current = next; setRoute(next); setMobileNav(false); setError("")
   }, [])
-
-  const load = useCallback(async (silent = false) => {
-    if (!silent) { setLoading(true); setError("") }
-    try {
-      if (view === "overview") setSimpleStatus(await api<SimpleStatusResponse>("/api/simple-status"))
-      else if (view === "pending") setPending((await api<{ items: PendingRow[] }>("/api/pending-notifications")).items)
-      else if (view === "done") {
-        const params = new URLSearchParams({ page: String(donePage), page_size: "50" })
-        if (doneQuery) params.set("query", doneQuery)
-        if (doneFilter === "no_attachment") params.set("attachment_review", doneFilter)
-        else if (doneFilter) params.set("simple_status", doneFilter)
-        const result = await api<SimpleDonePage>(`/api/done-archives?${params.toString()}`)
-        setDone(result.items); setDoneTotal(result.total); setDoneMetrics(result.metrics)
-      } else if (view === "markdown") {
-        const result = await api<{ items?: MarkdownItem[] }>("/api/markdown-outputs?page=1&page_size=100")
-        if (!Array.isArray(result.items)) {
-          throw new Error("Markdown 页面需要 V2 Web API；请重启 oaradar-web 服务后重试")
-        }
-        setMarkdown(result.items)
-      }
-      else if (view === "settings") setSettings(await api<SettingsData>("/api/settings"))
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败") }
-    finally { if (!silent) setLoading(false) }
-  }, [view, donePage, doneQuery, doneFilter])
-
-  useEffect(() => { void load() }, [load])
+  const navigate = useCallback((next: View, nextFilter = "", item: number | null = null) => {
+    changeRoute({ view: next, query: "", filter: nextFilter, page: 1, selected: item })
+  }, [changeRoute])
   useEffect(() => {
-    if (view !== "overview" && view !== "pending" && view !== "done" && view !== "markdown") return
-    const timer = window.setInterval(() => void load(true), 5000)
+    const update = () => {
+      const next = readRoute()
+      if (dirty.current && next.view !== routeRef.current.view && !window.confirm("设置尚未保存，是否离开？")) {
+        window.history.pushState(null, "", routeHash(routeRef.current)); return
+      }
+      if (next.view !== routeRef.current.view) dirty.current = false
+      routeRef.current = next; setRoute(next); setError("")
+    }
+    window.addEventListener("popstate", update)
+    window.addEventListener("hashchange", update)
+    return () => { window.removeEventListener("popstate", update); window.removeEventListener("hashchange", update) }
+  }, [])
+  useEffect(() => {
+    void api<{ required: boolean; authenticated: boolean }>("/api/auth/status").then(result => setAuth(!result.required || result.authenticated)).catch(reason => setError(String(reason)))
+  }, [])
+  const load = useCallback(async () => {
+    if (!auth) return
+    const serial = ++requestSerial.current
+    controller.current?.abort()
+    const abort = new AbortController(); controller.current = abort
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({ page: String(page), page_size: "50" })
+      if (query) params.set("query", query)
+      if (filter) params.set(view === "done" ? filter === "no_attachment" ? "attachment_review" : "simple_status" : view === "pending" ? "filter" : "status", filter)
+      const path = view === "overview" ? "/api/simple-status" : view === "settings" ? "/api/settings" : `/api/${view === "done" ? "done-archives" : view === "pending" ? "pending-notifications" : "markdown-outputs"}?${params}`
+      const response = await fetch(path, { signal: abort.signal, headers: { Accept: "application/json" } })
+      if (response.status === 401) { setAuth(false); throw new Error("本地会话已过期，请重新登录") }
+      const result = await response.json()
+      if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : `请求失败 (${response.status})`)
+      if (serial !== requestSerial.current) return
+      if (view === "overview") setSimpleStatus(result)
+      else if (view === "settings") setSettings(result)
+      else {
+        if (!Array.isArray(result.items)) throw new Error(view === "markdown" ? "Markdown 页面需要 V2 Web API；请重启 oaradar-web 服务后重试" : "页面需要 V2 Web API；请重启 oaradar-web 服务后重试")
+        const count = view === "markdown" ? result.item_total : result.total
+        setTotal(count)
+        if (page > Math.max(1, Math.ceil(count / 50))) { changeRoute({ page: Math.max(1, Math.ceil(count / 50)) }, true); return }
+        if (view === "done") { setDone(result.items); setDoneMetrics(result.metrics) }
+        else if (view === "pending") setPending(result.items)
+        else setMarkdown(result.items)
+      }
+      setError("")
+    } catch (reason) {
+      if (!abort.signal.aborted && serial === requestSerial.current) setError(reason instanceof Error ? reason.message : "读取失败")
+    } finally { if (serial === requestSerial.current) setLoading(false) }
+  }, [auth, view, page, query, filter, changeRoute])
+  useEffect(() => { void load(); return () => controller.current?.abort() }, [load])
+  useEffect(() => {
+    if (!auth || view === "settings") return
+    const timer = window.setInterval(() => { if (!document.hidden && !loading) void load() }, 5000)
     return () => window.clearInterval(timer)
-  }, [view, load])
-
-  const topLabel = (id: View) => NAV.find(item => item.id === id)?.label || ""
-  const topHint = (id: View) =>
-    id === "overview" ? "三条自动化业务链路是否正常，以及当前需要人工处理的事项"
-    : id === "pending" ? "待办摘要、飞书投递与清理"
-    : id === "done" ? "已办资料：原件归档与 Markdown 交付状态"
-    : id === "markdown" ? "Source Markdown、分类和事项索引"
-    : "扫描、模型、飞书与本地服务设置"
-
+  }, [auth, view, load, loading])
+  const login = async (event: React.FormEvent) => {
+    event.preventDefault(); setLoading(true); setError("")
+    try { await postApi("/api/auth/login", { token }); setToken(""); setAuth(true) }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "登录失败") }
+    finally { setLoading(false) }
+  }
+  const setPage = (value: number) => changeRoute({ page: value })
+  const setQuery = (value: string) => changeRoute({ query: value, page: 1 }, true)
+  const setFilter = (value: string) => changeRoute({ filter: value, page: 1, selected: null })
+  const onSelect = (id: number | null) => changeRoute({ selected: id })
+  if (auth === false) return <main className="login-page"><form onSubmit={event => void login(event)}><h1>OARadar 本地登录</h1><p>输入本机服务提供的访问令牌。</p><label>访问令牌<input type="password" value={token} onChange={event => setToken(event.target.value)} autoComplete="off" required/></label><button disabled={loading}>登录</button>{error && <p role="alert">{error}</p>}</form></main>
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
       <div className="brand"><span className="brand-mark">OA</span><div><strong>OARadar</strong><small>本地知识工作台</small></div></div>
-      <nav aria-label="一级导航">{NAV.map(item => <button key={item.id} className={`nav-item ${view === item.id ? "nav-active" : ""}`} onClick={() => navigate(item.id)}><item.icon size={18}/><span>{item.label}</span></button>)}</nav>
+      <nav aria-label="一级导航">{NAV.map(item => <button key={item.id} aria-current={view === item.id ? "page" : undefined} className={`nav-item ${view === item.id ? "nav-active" : ""}`} onClick={() => navigate(item.id)}><item.icon size={18}/><span>{item.label}</span></button>)}</nav>
       <div className="privacy"><ShieldCheck size={16}/><span>只读连接<br/><small>OA 内容仅保存在本机</small></span></div>
     </aside>
     <main className="workspace">
       <header className="topbar">
-        <button className="icon-button menu-button" title="打开导航" onClick={() => setMobileNav(!mobileNav)}><Menu size={19}/></button>
-        <div><h1>{topLabel(view)}</h1><p>{topHint(view)}</p></div>
+        <button className="icon-button menu-button" title="打开导航" aria-expanded={mobileNav} onClick={() => setMobileNav(!mobileNav)}><Menu size={19}/></button>
+        <div><h1>{NAV.find(item => item.id === view)?.label}</h1><p>{view === "overview" ? "待办通知、原件归档与 Markdown 交付的独立进展" : view === "settings" ? "本地处理、通知与输出设置" : "查看事项进展、结果和需要处理的问题"}</p></div>
         <button className="icon-button refresh" title="刷新当前页面" onClick={() => void load()} disabled={loading}><RefreshCw size={18} className={loading ? "spin" : ""}/></button>
       </header>
-      {error && <div className="error-banner"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}
-      {loading ? <div className="loading"><RefreshCw className="spin"/><span>正在读取本地状态</span></div> : <>
+      {error && <div className="error-banner" role="alert"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}
+      {auth === null && <p>正在验证本地会话…</p>}
+      {auth && <>
         {view === "overview" && simpleStatus && <SimpleOverviewView data={simpleStatus} onJump={navigate}/>}
-        {view === "pending" && <PendingView rows={pending} refresh={() => void load()}/>}
-        {view === "done" && <SimpleDoneView
-          rows={done} total={doneTotal} metrics={doneMetrics}
-          page={donePage} setPage={setDonePage}
-          query={doneQuery} setQuery={setDoneQuery}
-          filter={doneFilter} setFilter={setDoneFilter}
-        />}
-        {view === "markdown" && <MarkdownView rows={markdown}/>}
-        {view === "settings" && settings && <SimpleSettingsView initial={settings}/>}
+        {view === "pending" && <PendingView rows={pending} total={total} page={page} pageSize={50} setPage={setPage} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} selectedId={selected} onSelect={onSelect} refresh={load}/>}
+        {view === "done" && <SimpleDoneView rows={done} total={total} metrics={doneMetrics} page={page} setPage={setPage} query={query} setQuery={setQuery} filter={filter as SimpleDoneFilter | ""} setFilter={setFilter} selectedId={selected} onSelect={onSelect} refresh={load} onMarkdown={id => navigate("markdown", "", id)}/>}
+        {view === "markdown" && <MarkdownView rows={markdown} total={total} page={page} setPage={setPage} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} selectedId={selected} onSelect={onSelect} refresh={load} onArchive={id => navigate("done", "", id)}/>}
+        {view === "settings" && settings && <SimpleSettingsView initial={settings} onDirtyChange={onDirtyChange}/>}
       </>}
     </main>
   </div>
 }
-
 export default App

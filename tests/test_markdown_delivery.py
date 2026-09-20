@@ -8,8 +8,17 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ClassificationDecision, ClassificationRun, MarkdownExport, OAItem
-from oa_knowledge.markdown_delivery import _classification_directory, classify_done_item, publish_item_index
+from oa_knowledge.db.models import (
+    ClassificationDecision,
+    ClassificationRun,
+    MarkdownExport,
+    OAItem,
+)
+from oa_knowledge.markdown_delivery import (
+    _classification_directory,
+    classify_done_item,
+    publish_item_index,
+)
 
 
 def _item(session, *, title: str, sender: str | None, document_number: str | None = None) -> OAItem:
@@ -126,7 +135,7 @@ def test_legacy_classifier_cannot_bypass_current_classification_decision(tmp_pat
             publish_item_index(session, settings, item.oa_item_key)
 
 
-def test_numbered_internal_category_uses_the_existing_markdown_directory(tmp_path) -> None:
+def test_numbered_internal_category_uses_the_canonical_markdown_directory(tmp_path) -> None:
     settings = Settings(app={"data_root": tmp_path / "data"})
     upgrade_database(settings.database_path)
     engine = create_db_engine(settings.database_path)
@@ -135,7 +144,7 @@ def test_numbered_internal_category_uses_the_existing_markdown_directory(tmp_pat
         item.source_type = "internal"
         item.internal_category = "04_财务资金与融资"
 
-        assert _classification_directory(item).as_posix() == "内部/财务资金"
+        assert _classification_directory(item).as_posix() == "内部/04_财务资金与融资"
 
 
 def test_readable_oa_title_directories_do_not_merge_same_title_items():
@@ -147,6 +156,17 @@ def test_readable_oa_title_directories_do_not_merge_same_title_items():
     assert _item_leaf(a) != _item_leaf(b)
     a.title = '../../危险/标题'
     assert '/' not in _item_leaf(a)
+
+
+def test_external_directory_uses_readable_hash_suffix_instead_of_byte_truncation():
+    issuer = "合成市人民政府办公室、合成市发展和改革局、合成市财政局、合成市工业和信息化局、合成市商务局"
+    item = OAItem(oa_item_key="done:long-issuer", source_type="external", external_issuer=issuer)
+
+    directory = _classification_directory(item).as_posix()
+
+    assert directory.startswith("外部/合成市人民政府办公室")
+    assert "__issuer_" in directory
+    assert directory != f"外部/{issuer[:20]}"
 
 
 def test_external_leaf_prefixes_only_a_normalized_confirmed_document_number():
@@ -175,7 +195,7 @@ def test_external_display_name_is_clean_and_collision_safe(tmp_path):
         a = _item(session, title="【公告】合成发〔2026〕7号-关于事项的通知", sender=None)
         a.source_type = 'external'; a.external_issuer = '合成机关'
         base = _item_leaf(a)
-        assert base == '合成发〔2026〕7号 - 关于事项的通知'
+        assert base.startswith('合成发〔2026〕7号 - 关于事项的通知__')
         session.add(MarkdownExport(
             oa_item_id=a.id, document_kind='item_index', source_sha256='a'*64,
             source_relpath='synthetic', markdown_relpath=f'外部/合成机关/{base}/_index.md',
@@ -186,7 +206,7 @@ def test_external_display_name_is_clean_and_collision_safe(tmp_path):
                    source_type='external', external_issuer=a.external_issuer)
         session.add(b); session.flush()
         assert _item_leaf(a) == base
-        assert _item_leaf(b).startswith(base + '__')
+        assert _item_leaf(b).startswith('合成发〔2026〕7号 - 关于事项的通知__')
 
 
 def test_document_number_selection_rejects_cited_number_and_keeps_current_header():

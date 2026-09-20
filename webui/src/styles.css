@@ -88,3 +88,20 @@
 
 /* V2 overview */
 .simple-overview{display:grid;gap:18px}.simple-banner{display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:#fff;color:#31413b;font-size:13px}.simple-banner small{margin-left:auto;color:var(--muted);font-size:11px}.simple-banner-normal{border-color:#c4ded2;background:#eef6f1}.simple-banner-working{border-color:#c9dce8;background:#f3f8fb}.simple-banner-attention{border-color:#ebd39f;background:var(--warn-soft)}.simple-card-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.simple-card{overflow:hidden;border:1px solid var(--border);border-radius:9px;background:#fff;box-shadow:0 4px 14px #20352a0a}.simple-card header{display:flex;align-items:center;gap:9px;padding:14px 15px 10px;border-bottom:1px solid #edf0ee}.simple-card header svg{color:var(--green)}.simple-card header strong{font-size:14px}.simple-card .simple-status{margin-left:auto}.simple-card-body{padding:13px 15px 15px}.simple-headline{min-height:40px;margin:0 0 12px;color:#31413b;font-size:13px;line-height:1.55}.simple-detail{margin:0;color:var(--muted);font-size:12px;line-height:1.55}.simple-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;border:1px solid #edf0ee;border-radius:6px;overflow:hidden;background:#edf0ee}.simple-metric{min-height:56px;padding:9px 10px;background:#fafcfb}.simple-metric span,.simple-metric strong{display:block}.simple-metric span{color:var(--muted);font-size:10px}.simple-metric strong{margin-top:4px;font-size:17px}.simple-meta{display:flex;flex-wrap:wrap;gap:7px 12px;margin-top:11px;color:var(--muted);font-size:11px}.simple-meta span{display:inline-flex;align-items:center;gap:4px}.simple-link{margin-top:13px;border:0;background:transparent;color:var(--green);padding:0;font-size:12px;font-weight:650}.simple-link:hover{text-decoration:underline}@media(max-width:1000px){.simple-card-grid{grid-template-columns:1fr}.simple-headline{min-height:auto}}@media(max-width:640px){.simple-banner{align-items:flex-start;flex-wrap:wrap}.simple-banner small{width:100%;margin-left:28px}.simple-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+
+/* Workflow pages share compact evidence and recovery controls. */
+.workflow-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.workflow-drawer{width:min(760px,96vw)}
+.workflow-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:12px 0}
+.workflow-actions button,.workflow-actions a{border:1px solid var(--border);background:#fff;border-radius:6px;padding:7px 10px;color:var(--green);font-size:13px;text-decoration:none}
+.workflow-actions button:disabled{opacity:.5;cursor:wait}
+.evidence-row{display:grid;gap:6px;padding:13px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.evidence-row small{color:var(--muted)}
+.evidence-row code{font-size:11px;overflow-wrap:anywhere}
+.markdown-preview{white-space:pre-wrap;overflow-wrap:anywhere;max-height:55vh;overflow:auto;padding:14px;background:#f5f7f4;border:1px solid var(--border);font-size:12px}
+.batch-progress{margin-top:18px;padding:14px}.batch-progress summary{cursor:pointer;font-weight:600}.batch-progress progress{width:100%;height:18px}
+.login-page{display:grid;place-items:center;min-height:100vh;padding:24px}.login-page form{display:grid;gap:16px;background:#fff;padding:28px;border:1px solid var(--border);border-radius:8px;max-width:440px;width:100%}.login-page label{display:grid;gap:8px}.login-page input{min-width:0;padding:8px}.login-page button{padding:8px}
+.table-wrap{overflow-x:auto}.table-wrap table{min-width:680px}.done-table-wrap table{min-width:920px}
+button:focus-visible,a:focus-visible,tr:focus-visible,summary:focus-visible{outline:2px solid var(--green);outline-offset:2px}
+@media(max-width:1200px){.workflow-grid{grid-template-columns:1fr}.workflow-grid .simple-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:600px){.workflow-grid .simple-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.filter-row{flex-wrap:wrap}.filter-row .search{width:100%;max-width:none}.workflow-drawer{width:96vw}}

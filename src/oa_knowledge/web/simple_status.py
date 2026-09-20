@@ -26,6 +26,7 @@ from oa_knowledge.db.models import (
 )
 from oa_knowledge.web.schedule_views import schedule_status
 from oa_knowledge.web.status import dashboard_status
+from oa_knowledge.web.delivery_facts import delivery_facts_map
 
 # 已办事项的简化状态及中文标签（spec §4.1 / §6.2）。
 _SIMPLE_DONE_LABELS: dict[str, str] = {
@@ -74,6 +75,8 @@ def _classify_done_item(
         return "attention", "容器层级超过上限，需人工确认"
     verified = processing_status in {"downloaded", "no_attachment"}
     if not verified:
+        if processing_status == "auth_required":
+            return "attention", "OA 登录失效，需要重新验证"
         if processing_status in {"download_failed", "partial"}:
             return "attention", "原件下载失败"
         return "waiting_download", None
@@ -98,24 +101,23 @@ def _done_simple_status_map(session: Session) -> dict[int, tuple[str, str, str |
         )
     ).all()
 
-    indexed_keys = set(session.scalars(
-        select(OAItem.oa_item_key)
-        .join(MarkdownExport, MarkdownExport.oa_item_id == OAItem.id)
-        .where(MarkdownExport.document_kind == "item_index", MarkdownExport.status == "success")
-    ).all())
-    failed_keys = set(session.scalars(
-        select(OAItem.oa_item_key)
-        .join(MarkdownExport, MarkdownExport.oa_item_id == OAItem.id)
-        .where(MarkdownExport.document_kind == "item_index", MarkdownExport.status == "failed")
-    ).all())
+    items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
+    facts = delivery_facts_map(session, items)
+    facts_by_key = {item.oa_item_key: facts[item.id] for item in items}
 
     result: dict[int, tuple[str, str, str | None]] = {}
     for mid, processing_status, key in manifests:
+        item_facts = facts_by_key.get(key, {})
         state, reason = _classify_done_item(
             processing_status=processing_status,
-            has_success_item_index=key in indexed_keys,
-            markdown_failed=key in failed_keys,
+            has_success_item_index=item_facts.get("status") == "complete",
+            markdown_failed=item_facts.get("status") == "failed" or bool(item_facts.get("unsupported")),
         )
+        if processing_status != "depth_limit_reached":
+            if item_facts.get("status") == "excluded":
+                state, reason = "excluded", None
+            elif item_facts.get("status") == "needs_review":
+                state, reason = "attention", item_facts["reason"]
         result[mid] = (state, _SIMPLE_DONE_LABELS[state], reason)
     return result
 
@@ -123,17 +125,21 @@ def _done_simple_status_map(session: Session) -> dict[int, tuple[str, str, str |
 def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
     """聚合已办知识库业务口径（spec §4.1-§4.2 / §5）。"""
     manifests = session.execute(
-        select(OAManifestItem.id, OAManifestItem.processing_status)
+        select(OAManifestItem.id, OAManifestItem.processing_status, OAManifestItem.no_attachment_confirmed)
     ).all()
 
-    archive_complete = sum(1 for _, ps in manifests if ps in {"downloaded", "no_attachment"})
-    no_attachment = sum(1 for _, ps in manifests if ps == "no_attachment")
-    excluded = sum(1 for _, ps in manifests if ps == "skipped")
+    archive_complete = sum(
+        1 for _, ps, confirmed in manifests
+        if ps == "downloaded" or ps == "no_attachment" and confirmed
+    )
+    no_attachment = sum(1 for _, ps, _ in manifests if ps == "no_attachment")
     waiting_download_items = sum(
-        1 for _, ps in manifests if ps in {"discovered", "pending_download", "processing"}
+        1 for _, ps, _ in manifests if ps in {"discovered", "pending_download", "processing"}
     )
     download_issue_items = sum(
-        1 for _, ps in manifests if ps in {"download_failed", "auth_required", "partial", "depth_limit_reached"}
+        1 for _, ps, confirmed in manifests
+        if ps in {"download_failed", "auth_required", "partial", "depth_limit_reached"}
+        or ps == "no_attachment" and not confirmed
     )
 
     status_map = _done_simple_status_map(session)
@@ -141,25 +147,30 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
     state_counts: dict[str, int] = {state: 0 for state in _SIMPLE_DONE_LABELS}
     failed_items = 0
     review_items = 0
-    for mid, _ in manifests:
+    for mid, _, _ in manifests:
         state, _label, reason = status_map[mid]
         state_counts[state] += 1
         if state == "attention":
-            failed_items += 1
+            if reason and ("复核" in reason or "层级" in reason):
+                review_items += 1
+            else:
+                failed_items += 1
 
     oa_total = len(manifests)
+    excluded = state_counts["excluded"]
     published_items = state_counts["completed"]
     markdown_ready_items = _markdown_ready_count(session)
     queued_items = state_counts["waiting_markdown"]
-    running_items = 0
+    running_items = sum(value["status"] == "working" for value in delivery_facts_map(session).values())
+    queued_items = max(0, queued_items - running_items)
 
     attention_count = failed_items + review_items
 
     if oa_total == 0:
         headline = "已办知识库尚未同步任何事项。"
         status = "working"
-    elif published_items == oa_total and attention_count == 0 and queued_items == 0:
-        headline = f"已办知识库已完成：共 {oa_total} 项，已归档并发布 {published_items} 项。"
+    elif published_items == oa_total - excluded and attention_count == 0 and queued_items == 0:
+        headline = f"已办知识库已完成：共 {oa_total} 项，已归档并发布 {published_items} 项，按规则排除 {excluded} 项。"
         status = "completed"
     else:
         headline = (
@@ -198,6 +209,77 @@ def _markdown_ready_count(session: Session) -> int:
         .join(MarkdownExport, MarkdownExport.source_file_id == ArchivedFile.id)
         .where(MarkdownExport.status == "success")
     ) or 0
+
+
+def _workflow_summaries(session: Session, settings: Settings, schedule: dict) -> dict[str, dict]:
+    """Keep raw archive progress separate from complete Markdown delivery."""
+    manifests = list(session.scalars(select(OAManifestItem)))
+    items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
+    facts = delivery_facts_map(session, items)
+    facts_by_key = {item.oa_item_key: facts[item.id] for item in items}
+    archive_complete = [row for row in manifests if row.processing_status == "downloaded" or row.processing_status == "no_attachment" and row.no_attachment_confirmed]
+    archive_excluded = sum(row.processing_status == "skipped" for row in manifests)
+    archive_failed = sum(row.processing_status in {
+        "download_failed", "auth_required", "partial", "depth_limit_reached",
+    } or row.processing_status == "no_attachment" and not row.no_attachment_confirmed for row in manifests)
+    archive_pending = len(manifests) - len(archive_complete) - archive_excluded - archive_failed
+    archive_enabled = schedule.get("hourly_enabled")
+    archive_last_success = session.scalar(
+        select(func.max(ArchivedFile.verified_at)).join(OAItem).where(OAItem.source_channel == "done")
+    )
+    archive = {
+        "enabled": archive_enabled, "total": len(manifests),
+        "eligible": len(manifests) - archive_excluded,
+        "complete": len(archive_complete), "pending": archive_pending,
+        "failed": archive_failed, "excluded": archive_excluded,
+        "no_attachment": sum(row.processing_status == "no_attachment" for row in manifests),
+        "last_success_at": archive_last_success.isoformat() if archive_last_success else None,
+        "last_scan_at": schedule.get("last_scan_at"), "next_run_at": schedule.get("next_run_at"),
+    }
+    states = {key: 0 for key in ("pending", "working", "partial", "failed", "complete", "needs_review", "excluded")}
+    for manifest in manifests:
+        if manifest.oa_item_key not in facts_by_key:
+            state = "excluded" if manifest.processing_status == "skipped" else (
+                "needs_review" if manifest.processing_status == "depth_limit_reached" else "pending"
+            )
+            states[state] += 1
+    for item_facts in facts.values():
+        states[item_facts["status"]] += 1
+    complete_ids = [item_id for item_id, value in facts.items() if value["status"] == "complete"]
+    markdown_last_success = session.scalar(select(func.max(MarkdownExport.generated_at)).where(
+        MarkdownExport.oa_item_id.in_(complete_ids), MarkdownExport.document_kind == "item_index",
+        MarkdownExport.status == "success",
+    ))
+    markdown = {
+        "enabled": settings.markdown_export.enabled and settings.processing.enabled,
+        "total": sum(states.values()), "eligible": sum(states.values()) - states["excluded"],
+        "complete": states["complete"], "pending": states["pending"],
+        "failed": states["failed"], "excluded": states["excluded"],
+        "working": states["working"], "partial": states["partial"], "review": states["needs_review"],
+        "expected_files": sum(value["expected"] for value in facts.values()),
+        "successful_files": sum(value["successful"] for value in facts.values()),
+        "unsupported_files": sum(value["unsupported"] for value in facts.values()),
+        "last_success_at": markdown_last_success.isoformat() if markdown_last_success else None,
+        "last_scan_at": schedule.get("last_scan_at"), "next_run_at": None,
+    }
+    for label, summary in (("原件归档", archive), ("Markdown 交付", markdown)):
+        issues = summary["failed"] + summary.get("review", 0) + summary.get("unsupported_files", 0)
+        if issues:
+            status = "attention"
+        elif summary["total"] and summary["complete"] == summary["eligible"]:
+            status = "completed"
+        elif summary["enabled"] is False:
+            status = "disabled"
+        elif not summary["total"]:
+            status = "not_run"
+        else:
+            status = "working"
+        summary["status"] = status
+        summary["headline"] = (
+            f"{label}：共 {summary['total']} 项，已完成 {summary['complete']} 项，"
+            f"待处理 {summary['pending']} 项，失败 {summary['failed']} 项，排除 {summary['excluded']} 项。"
+        )
+    return {"archive": archive, "markdown": markdown}
 
 
 def _pending_summary(session: Session, settings: Settings, schedule: dict) -> dict[str, Any]:
@@ -245,13 +327,26 @@ def _pending_summary(session: Session, settings: Settings, schedule: dict) -> di
         status = "attention"
     elif model_fallback > 0:
         status = "fallback_used"
+    elif not settings.feishu.enabled or not settings.llm.enabled:
+        status = "disabled"
+    elif feishu_sent == 0 and model_success == 0:
+        status = "not_run"
+    elif feishu_sent == 0 or model_success == 0:
+        status = "working"
     else:
         status = "normal"
 
     if status == "normal":
         headline = "待办提醒运行正常：飞书发送成功，本地模型正常输出。"
     elif status == "fallback_used":
-        headline = f"待办提醒运行正常：飞书发送成功，模型曾使用 {model_fallback} 次保守兜底。"
+        headline = f"待办摘要使用 {model_fallback} 次保守兜底；飞书已发送 {feishu_sent} 条。"
+    elif status == "disabled":
+        disabled = "、".join(name for name, enabled in (("飞书通知", settings.feishu.enabled), ("本地模型", settings.llm.enabled)) if not enabled)
+        headline = f"待办提醒部分功能未启用：{disabled}。"
+    elif status == "not_run":
+        headline = "待办提醒尚无执行记录，等待下一次扫描。"
+    elif status == "working":
+        headline = f"待办提醒处理中：模型成功 {model_success} 项，飞书已发送 {feishu_sent} 条。"
     else:
         parts: list[str] = []
         if feishu_failed:
@@ -271,6 +366,9 @@ def _pending_summary(session: Session, settings: Settings, schedule: dict) -> di
         "next_scan_at": schedule.get("next_run_at"),
         "oa_pending_count": oa_pending_count,
         "model_name": settings.llm.ollama_model,
+        "model_enabled": settings.llm.enabled,
+        "feishu_enabled": settings.feishu.enabled,
+        "feishu_config_status": validate_feishu_runtime_config(settings),
         "model_success": int(model_success),
         "model_fallback": int(model_fallback),
         "model_failed": int(model_failed),
@@ -335,19 +433,22 @@ def _attention_list(done: dict, pending: dict) -> list[dict[str, Any]]:
         items.append({
             "label": f"{pending['feishu_failed']} 条飞书发送失败",
             "severity": "error",
-            "jump": "settings",
+            "jump": "pending",
+            "filter": "feishu_failed",
         })
     if pending.get("feishu_unknown", 0) > 0:
         items.append({
             "label": f"{pending['feishu_unknown']} 条飞书发送结果未知",
             "severity": "error",
-            "jump": "settings",
+            "jump": "pending",
+            "filter": "feishu_unknown",
         })
     if pending.get("model_failed", 0) > 0:
         items.append({
             "label": f"{pending['model_failed']} 条待办摘要失败",
             "severity": "error",
-            "jump": "settings",
+            "jump": "pending",
+            "filter": "summary_failed",
         })
     return items
 
@@ -402,13 +503,22 @@ def simple_status(settings: Settings) -> dict[str, Any]:
             done = _done_summary(session, schedule)
             pending = _pending_summary(session, settings, schedule)
             oa_activity = _oa_activity_card(base, schedule)
-            attention = _attention_list(done, pending)
+            workflows = _workflow_summaries(session, settings, schedule)
+            attention = _attention_list({"failed_items": workflows["archive"]["failed"]}, pending)
+            for count, status, label in (
+                (workflows["markdown"]["failed"], "failed", "Markdown 交付失败"),
+                (workflows["markdown"]["review"], "needs_review", "Markdown 分类或来源需复核"),
+                (workflows["markdown"]["partial"], "partial", "Markdown 部分交付"),
+            ):
+                if count:
+                    attention.append({"label": f"{count} 项{label}", "severity": "warning" if status == "partial" else "error", "jump": "markdown", "filter": status})
             overall_status = _overall_status(done, pending, attention)
             return {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "overall_status": overall_status,
                 "done": done,
                 "pending": pending,
+                **workflows,
                 "oa_activity": oa_activity,
                 "attention": attention,
                 "local_delivery": local_delivery_progress(settings),

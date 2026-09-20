@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -26,7 +27,7 @@ def test_data_governance_migration_is_current_and_idempotent(tmp_path: Path) -> 
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert version == "0040_external_review_without_issuer"
+    assert version == ScriptDirectory(str(Path(__file__).resolve().parents[1] / "src/oa_knowledge/db/migrations")).get_current_head()
     assert {"cleanup_runs", "cleanup_items"} <= tables
 
 

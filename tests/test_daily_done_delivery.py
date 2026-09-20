@@ -28,6 +28,34 @@ def test_bulk_scope_remains_frozen_until_first_pass_finishes(tmp_path):
         helper.protected_keys(root)
 
 
+def test_worker_handoff_recovers_resource_leases_from_stopped_owner(config_file):
+    from oa_knowledge.config import load_settings
+    from oa_knowledge.db.migrate import upgrade_database
+    from oa_knowledge.resources import ResourceCoordinator
+    from oa_knowledge.web.worker import OperationWorker
+
+    helper = module()
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    worker = OperationWorker(settings, config_file)
+    resources = ResourceCoordinator(worker.engine)
+    stale = resources.acquire(
+        'browser_profile', 'worker-999999:archive', ttl_seconds=3600,
+        uses_local_gpu=False,
+    )
+    assert stale is not None
+
+    helper.recover_worker_handoff(worker)
+
+    replacement = resources.acquire(
+        'browser_profile', worker.owner, ttl_seconds=60,
+        uses_local_gpu=False,
+    )
+    assert replacement is not None
+    resources.release(replacement, worker.owner)
+    worker.engine.dispose()
+
+
 @pytest.mark.parametrize(('outcome', 'task_status'), [('needs_review', 'completed'), ('partial', 'failed')])
 def test_daily_delivery_leaves_bulk_and_excluded_tasks_untouched(config_file, tmp_path, monkeypatch, outcome, task_status):
     from sqlalchemy.orm import Session

@@ -8,38 +8,35 @@ import re
 import tempfile
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm import Session
 
-from oa_knowledge.db.models import ArchivedFile, ClassificationDecision, ContentObject, MarkdownExport, OAItem, ParseArtifact, ParseJob
-from oa_knowledge.markdown_export.render import SCHEMA_VERSION
-from oa_knowledge.source_markdown.service import _source_tree
-from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.archive.naming import safe_filename
+from oa_knowledge.db.models import (
+    ArchivedFile,
+    ClassificationDecision,
+    ContentObject,
+    MarkdownExport,
+    OAItem,
+    ParseArtifact,
+    ParseJob,
+)
+from oa_knowledge.markdown_export.render import SCHEMA_VERSION
 from oa_knowledge.runtime_paths import resolve_cache_path
-
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
 INTERNAL_CATEGORIES = (
-    "公司治理", "经营管理", "业务项目", "风险管理",
-    "财务资金", "人力行政", "信息化", "其他内部",
+    "01_公司治理与决策", "02_业务项目与投放租后",
+    "03_风险合规审计法务", "04_财务资金与融资",
+    "05_经营计划与绩效考核", "06_人力资源",
+    "07_党建纪检与工会", "08_行政采购与信息化",
+    "09_对外报送与监管反馈", "99_其他内部",
 )
-_DECISION_CATEGORY_DIRECTORIES = {
-    "01_公司治理与决策": "公司治理",
-    "02_业务项目与投放租后": "业务项目",
-    "03_风险合规审计法务": "风险管理",
-    "04_财务资金与融资": "财务资金",
-    "05_经营计划与绩效考核": "经营管理",
-    "06_人力资源": "人力行政",
-    "07_党建纪检与工会": "人力行政",
-    "08_行政采购与信息化": "信息化",
-    "09_对外报送与监管反馈": "经营管理",
-    "99_其他内部": "其他内部",
-}
 _CATEGORY_RULES = (
     ("风险管理", ("风险", "合规", "内控", "审计", "授信", "租后")),
     ("财务资金", ("财务", "预算", "资金", "报销", "会计", "税")),
@@ -273,7 +270,7 @@ def publish_item_index(session: Session, settings, oa_item_key: str) -> Path:
     external_metadata = resolve_external_document_metadata(session, settings, item, decision)
     if decision.content_origin == "external" and item.document_number != external_metadata.document_number:
         item.document_number = external_metadata.document_number
-    destination = settings.markdown_root / _classification_directory(item) / _item_leaf(item) / "_index.md"
+    destination = settings.markdown_root / _package_directory(item, decision) / _item_leaf(item) / "_index.md"
     files = session.scalars(select(ArchivedFile).where(
         ArchivedFile.oa_item_id == item.id,
         ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
@@ -376,7 +373,7 @@ def publish_item_index(session: Session, settings, oa_item_key: str) -> Path:
     record.markdown_sha256 = content_hash
     record.last_error_code = None
     record.last_error = None
-    record.generated_at = datetime.now(timezone.utc)
+    record.generated_at = datetime.now(UTC)
     session.flush()
     return destination
 
@@ -394,27 +391,33 @@ def _item_leaf(item: OAItem) -> str:
         number = _normalize_document_number(leading.group("number"))
         title = title[leading.end():].lstrip(" -—_：:")
     base = safe_filename(f"{number} - {title}" if number else title, 240)
-    session = object_session(item)
-    if session is not None:
-        parent = _classification_directory(item)
-        rows = session.execute(select(MarkdownExport.oa_item_id, MarkdownExport.markdown_relpath)).all()
-        own = {Path(path).parent.name for owner, path in rows if owner == item.id}
-        if base + "__" + identity in own:
-            return base + "__" + identity
-        if any(owner != item.id and Path(path).parent == parent / base for owner, path in rows):
-            return base + "__" + identity
-    else:
-        return base + "__" + identity
-    return base
+    return base + "__" + identity
 
 
-def _classification_directory(item: OAItem) -> Path:
-    if item.source_type == "internal":
-        category = _DECISION_CATEGORY_DIRECTORIES.get(
-            item.internal_category or "", item.internal_category
-        )
+def _issuer_directory(issuer: str) -> str:
+    """Use a readable stable suffix for long issuers, never a blind byte cut."""
+    cleaned = safe_filename(issuer, 240)
+    if len(cleaned.encode("utf-8")) <= 100:
+        return cleaned
+    readable = safe_filename(issuer, 54).rstrip("-_ ") or "外部机构"
+    return f"{readable}__issuer_{sha256(issuer.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _classification_directory(item: OAItem, decision: ClassificationDecision | None = None) -> Path:
+    source_type = decision.content_origin if decision is not None else item.source_type
+    if source_type == "internal":
+        category = decision.business_category if decision is not None else item.internal_category
         if category in INTERNAL_CATEGORIES:
             return Path("内部") / category
-    if item.source_type == "external" and item.external_issuer:
-        return Path("外部") / safe_filename(item.external_issuer, 100)
+    if source_type == "external":
+        issuer = decision.canonical_issuer if decision is not None else item.external_issuer
+        if issuer:
+            return Path("外部") / _issuer_directory(issuer)
     return Path("unclassified")
+
+
+def _package_directory(item: OAItem, decision: ClassificationDecision | None = None) -> Path:
+    """Place packages by frozen classification and a reliable OA/archive year."""
+    timestamp = item.completed_at or item.initiated_at or item.received_at
+    year = f"{timestamp.year:04d}" if timestamp else "unknown"
+    return _classification_directory(item, decision) / year

@@ -41,6 +41,12 @@ class AuthLoginRequest(BaseModel):
     token: str = Field(min_length=1, max_length=200)
 
 
+class DeliveryReconciliationRequest(BaseModel):
+    delivery_id: int = Field(gt=0)
+    outcome: str = Field(pattern="^(sent|failed)$")
+    confirmed: bool = False
+
+
 class BulkPolicyRequest(BaseModel):
     text: str = Field(min_length=1, max_length=20000)
     action: str = "metadata_only"
@@ -360,8 +366,10 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     @app.get("/api/pending-notifications")
     def get_pending_notifications(
         filter: str | None = Query(None, description="processing|summary_failed|feishu_failed|awaiting_cleanup|cleanup_failed|recent_success"),
+        page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
+        query: str | None = Query(None),
     ) -> dict:
-        return pending_notifications_list(settings, filter_kind=filter)
+        return pending_notifications_list(settings, filter_kind=filter, page=page, page_size=page_size, query=query)
 
     @app.get("/api/pending-notifications/{occurrence_id}")
     def get_pending_notification_detail(occurrence_id: int) -> dict:
@@ -376,6 +384,8 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return retry_pending_summary(settings, occurrence_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/pending-notifications/{occurrence_id}/retry-delivery", status_code=202)
     def post_pending_retry_delivery(occurrence_id: int) -> dict:
@@ -395,6 +405,16 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/pending-notifications/{occurrence_id}/reconcile-delivery")
+    def post_pending_reconciliation(occurrence_id: int, payload: DeliveryReconciliationRequest) -> dict:
+        from oa_knowledge.web.console_views import reconcile_pending_delivery
+        try:
+            return reconcile_pending_delivery(settings, occurrence_id, **payload.model_dump())
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/pending-notifications/cleanup-eligible", status_code=202)
     def post_pending_cleanup_eligible() -> dict:
@@ -455,8 +475,73 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     def get_markdown_outputs(
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=200),
+        query: str | None = Query(None), status: str | None = Query(None),
     ) -> dict:
-        return markdown_outputs_list(settings, page=page, page_size=page_size)
+        from oa_knowledge.web.workflow_views import DELIVERY_LABELS
+        if status and status not in DELIVERY_LABELS:
+            raise HTTPException(status_code=422, detail="unsupported Markdown status")
+        return markdown_outputs_list(settings, page=page, page_size=page_size, query=query, status=status)
+
+    @app.get("/api/done-archives/{manifest_id}")
+    def get_done_detail(manifest_id: int) -> dict:
+        from oa_knowledge.web.workflow_views import done_archive_detail
+        try:
+            return done_archive_detail(settings, manifest_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/markdown-outputs/items/{item_id}")
+    def get_markdown_item(item_id: int) -> dict:
+        from oa_knowledge.web.workflow_views import markdown_item_detail
+        try:
+            return markdown_item_detail(settings, item_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/markdown-outputs/items/{item_id}/retry", status_code=202)
+    def retry_markdown_item(item_id: int) -> dict:
+        from oa_knowledge.web.workflow_views import retry_markdown_item
+        try:
+            return retry_markdown_item(settings, item_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/markdown-outputs/documents/{export_id}/content")
+    def get_markdown_content(export_id: int) -> dict:
+        from oa_knowledge.web.workflow_views import markdown_document_path
+        try:
+            path = markdown_document_path(settings, export_id)
+            with path.open("r", encoding="utf-8", errors="replace") as stream:
+                text = stream.read(200_001)
+            return {"text": text[:200_000], "truncated": len(text) > 200_000}
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, "无法安全读取该 Markdown 文件") from exc
+
+    @app.get("/api/markdown-outputs/documents/{export_id}/download")
+    def download_markdown(export_id: int):
+        from oa_knowledge.web.workflow_views import markdown_document_path
+        try:
+            path = markdown_document_path(settings, export_id)
+            return FileResponse(path, media_type="text/markdown", filename=path.name)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, "无法安全读取该 Markdown 文件") from exc
+
+    @app.get("/api/done-archives/files/{file_id}/download")
+    def download_original(file_id: int):
+        from oa_knowledge.web.workflow_views import archived_document_path
+        try:
+            path, name = archived_document_path(settings, file_id)
+            return FileResponse(path, media_type="application/octet-stream", filename=name)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, "无法安全读取该原件") from exc
 
     @app.post("/api/done-archives/{manifest_id}/retry-archive", status_code=202)
     def post_done_archive_retry(manifest_id: int) -> dict:
@@ -464,6 +549,8 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return retry_done_archive(settings, manifest_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/markdown-outputs/{export_id}/rebuild", status_code=202)
     def post_markdown_rebuild(export_id: int) -> dict:
@@ -471,10 +558,13 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return rebuild_markdown_export(settings, export_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/settings")
     def get_settings() -> dict:
-        return settings_view(settings)
+        current = load_settings(config_path) if config_path else settings
+        return {**settings_view(current), "restart_required": current != settings}
 
     @app.patch("/api/settings")
     def patch_settings(payload: dict) -> dict:

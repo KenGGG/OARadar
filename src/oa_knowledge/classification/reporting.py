@@ -212,6 +212,20 @@ def build_classification_run_report(
             )
         }
         frozen = [(row, decisions.get(row.adopted_decision_id)) for row in rows]
+        superseded_ids = [
+            decision.supersedes_decision_id
+            for row, decision in frozen
+            if row.inclusion_reason == "excluded" and decision is not None
+            and decision.classification_status == "excluded"
+            and decision.supersedes_decision_id is not None
+        ]
+        superseded_manual_ids = set(session.scalars(
+            select(ClassificationDecision.id).where(
+                ClassificationDecision.id.in_(superseded_ids),
+                ClassificationDecision.manual_locked.is_(True),
+                ClassificationDecision.classification_status != "excluded",
+            )
+        ))
         excluded = sum(row.inclusion_reason == "excluded" for row, _ in frozen)
         targets = [
             (row, decision)
@@ -324,7 +338,12 @@ def build_classification_run_report(
                 sum(bool(reason.get("conflict_codes")) for reason in reasons)
                 + sum(
                     row.last_error_code == "manual_lock_policy_conflict"
-                    for row, _ in frozen
+                    or (
+                        row.inclusion_reason == "excluded" and decision is not None
+                        and decision.classification_status == "excluded"
+                        and decision.supersedes_decision_id in superseded_manual_ids
+                    )
+                    for row, decision in frozen
                 )
             ),
             unrecognized_issuers=sum(

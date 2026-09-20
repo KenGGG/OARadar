@@ -33,6 +33,10 @@ ONLINE_AUDIT_YIELD = timedelta(seconds=5)
 PIPELINE_HEARTBEAT_SECONDS = 60
 
 
+class PipelineResourceBusyError(RuntimeError):
+    """A durable pipeline resource lease is currently held elsewhere."""
+
+
 def _pump_stream(stream, buffer: list[str]) -> None:
     try:
         for line in stream:
@@ -777,14 +781,15 @@ class OperationWorker:
                 else:
                     self.production_queue.fail(task.id, self.owner, "PIPELINE_STAGE_NOT_IMPLEMENTED", task.stage, recoverable=False)
             except Exception as exc:
-                code = {
+                code = "PIPELINE_RESOURCE_BUSY" if isinstance(exc, PipelineResourceBusyError) else {
                     "PrivateConfigError": "CLASSIFICATION_CONFIG_ERROR",
                     "FileNotFoundError": "ATTACHMENT_DOWNLOAD_FAILED",
-                    "RuntimeError": "PIPELINE_RESOURCE_BUSY",
                     "DoneKnowledgeError": "OLLAMA_SCHEMA_INVALID",
                     "PendingSummaryError": "OLLAMA_SCHEMA_INVALID",
                 }.get(type(exc).__name__, "PIPELINE_TASK_FAILED")
-                self.production_queue.fail(task.id, self.owner, code, type(exc).__name__, recoverable=True)
+                self.production_queue.fail(
+                    task.id, self.owner, code, str(exc) or type(exc).__name__, recoverable=True,
+                )
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1)
@@ -1074,7 +1079,7 @@ class OperationWorker:
         coordinator = ResourceCoordinator(self.engine); lease_owner = f"{self.owner}:pending:{task.id}"
         lease = coordinator.acquire("oa_browser", lease_owner, ttl_seconds=600, uses_local_gpu=False)
         if lease is None:
-            raise RuntimeError("OA browser is busy")
+            raise PipelineResourceBusyError("OA browser is busy")
         try:
             with BrowserSession(self.settings, headed=False) as browser:
                 if self._verify_oa_login(browser) != LoginState.AUTHENTICATED:
@@ -1313,7 +1318,7 @@ class OperationWorker:
         coordinator = ResourceCoordinator(self.engine)
         lease = coordinator.acquire("oa_browser", f"{self.owner}:oa-resync:{task.id}", ttl_seconds=600, uses_local_gpu=False)
         if lease is None:
-            raise RuntimeError("OA browser is busy")
+            raise PipelineResourceBusyError("OA browser is busy")
         try:
             found = resync_pending_item_from_oa(self.settings, self.engine, int(occurrence_id))
         finally:
@@ -1356,7 +1361,7 @@ class OperationWorker:
         lease_owner = f"{self.owner}:done:{task.id}"
         lease = coordinator.acquire("oa_browser", lease_owner, ttl_seconds=600, uses_local_gpu=False)
         if lease is None:
-            raise RuntimeError("OA browser is busy")
+            raise PipelineResourceBusyError("OA browser is busy")
         try:
             with BrowserSession(self.settings, headed=False) as browser:
                 if self._verify_oa_login(browser) != LoginState.AUTHENTICATED:

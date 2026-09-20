@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -19,7 +20,7 @@ def test_curated_migration_adds_versioned_run_and_decision_tables(tmp_path: Path
     with sqlite3.connect(db) as connection:
         assert (
             connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-            == "0040_external_review_without_issuer"
+            == ScriptDirectory(str(Path(__file__).resolve().parents[1] / "src/oa_knowledge/db/migrations")).get_current_head()
         )
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 

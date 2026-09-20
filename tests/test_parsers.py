@@ -87,8 +87,8 @@ def test_libreoffice_version_is_valid_parse_cache_identity(monkeypatch):
     from types import SimpleNamespace
     from oa_knowledge.parsers.libreoffice_parser import libreoffice_engine_version
     monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.shutil.which', lambda _: '/synthetic/soffice')
-    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.subprocess.run', lambda *a,**k: SimpleNamespace(stdout='LibreOffice 24.2.7.2 420(Build:2)\n',stderr=''))
-    assert libreoffice_engine_version() == '24.2.7.2'
+    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.subprocess.run', lambda *a,**k: SimpleNamespace(stdout='LibreOffice 24.2.7.2 420(Build:2)\n',stderr=''))  # public-release: synthetic software version, not an IP address
+    assert libreoffice_engine_version() == '24.2.7.2'  # public-release: synthetic software version, not an IP address
 
 
 def test_scan_only_word_restores_ordered_images_lost_by_pdf_layout(tmp_path):

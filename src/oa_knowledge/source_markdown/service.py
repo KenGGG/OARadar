@@ -7,20 +7,34 @@ import json
 import os
 import shutil
 import tempfile
-from datetime import datetime, timezone
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from oa_knowledge.archive.integrity import sha256_file
 from oa_knowledge.config import Settings
-from oa_knowledge.db.models import ArchivedFile, ClassificationDecision, ContentObject, MarkdownExport, OAItem, ParseArtifact
+from oa_knowledge.db.models import (
+    ArchivedFile,
+    ClassificationDecision,
+    ContentObject,
+    MarkdownExport,
+    OAItem,
+    ParseArtifact,
+)
 from oa_knowledge.markdown_export.publisher import IMAGE_LINK, publish_markdown
-from oa_knowledge.markdown_export.render import ExportMetadata, SCHEMA_VERSION, render_markdown
-from oa_knowledge.markdown_export.service import rewrite_parser_asset_links, sanitize_parser_markdown
+from oa_knowledge.markdown_export.render import (
+    SCHEMA_VERSION,
+    ExportMetadata,
+    render_markdown,
+)
+from oa_knowledge.markdown_export.service import (
+    rewrite_parser_asset_links,
+    sanitize_parser_markdown,
+)
 from oa_knowledge.runtime_paths import resolve_cache_path, resolve_original_path
 
 
@@ -60,9 +74,26 @@ def _destination(settings: Settings, source: ArchivedFile, item: OAItem | None) 
     if not source.local_relpath:
         raise FileNotFoundError("verified source path unavailable")
     tree = _source_tree(settings, source.local_relpath)
-    from oa_knowledge.markdown_delivery import _classification_directory, _item_leaf
+    from oa_knowledge.markdown_delivery import (
+        _classification_directory,
+        _item_leaf,
+        _package_directory,
+    )
     if item is None:
         raise FileNotFoundError("source OA item unavailable")
+    session = object_session(item)
+    decision = session.scalar(select(ClassificationDecision).where(
+        ClassificationDecision.oa_item_key == item.oa_item_key,
+        ClassificationDecision.is_current.is_(True),
+    )) if session else None
+    if (
+        decision is not None
+        and decision.classification_status == "classified"
+        and decision.content_origin in {"internal", "external"}
+    ):
+        return settings.markdown_root / _package_directory(item, decision) / _item_leaf(item) / f"{tree.name}.md"
+    # Legacy/local utilities can publish pre-classification artifacts; normal
+    # classified delivery always takes the frozen-decision path above.
     return settings.markdown_root / _classification_directory(item) / _item_leaf(item) / f"{tree.name}.md"
 
 
@@ -197,7 +228,7 @@ def publish_active_artifact(
         )
         record.last_error_code = 'MISSING_IMAGE_ASSET' if missing_images else None
         record.last_error = 'Parser image assets unavailable; delivery incomplete.' if missing_images else None
-        record.generated_at = datetime.now(timezone.utc)
+        record.generated_at = datetime.now(UTC)
         session.flush()
         # The valid artifact is also classification evidence and the parse
         # idempotency checkpoint. Publishing must not invalidate that cache.

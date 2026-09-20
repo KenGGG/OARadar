@@ -2,7 +2,7 @@
 // 严格按后端聚合口径声明，前端只渲染这些业务字段，不拼接原始技术状态。
 // 禁止 any。
 
-export type BusinessTone = "normal" | "working" | "attention" | "fallback_used" | "completed" | "unknown"
+export type BusinessTone = "normal" | "working" | "attention" | "fallback_used" | "completed" | "unknown" | "disabled" | "not_run"
 
 export type SimpleDoneState =
   | "waiting_download"
@@ -16,7 +16,7 @@ export type SimpleDoneFilter = SimpleDoneState | "no_attachment"
 
 export type AttentionSeverity = "error" | "warning"
 
-export type AttentionJump = "done" | "settings"
+export type AttentionJump = "done" | "pending" | "markdown" | "settings"
 
 export interface SimpleDoneSummary {
   status: BusinessTone
@@ -76,7 +76,15 @@ export interface SimpleAttentionItem {
   filter?: string
 }
 
+export interface WorkflowSummary {
+  status: BusinessTone; headline: string; enabled: boolean | null; total: number; eligible: number
+  complete: number; pending: number; failed: number; excluded: number
+  last_success_at: string | null; last_scan_at: string | null; next_run_at: string | null
+  partial?: number; review?: number; expected_files?: number; successful_files?: number; unsupported_files?: number
+}
 export interface SimpleStatusResponse {
+  archive: WorkflowSummary
+  markdown: WorkflowSummary
   local_delivery?: {
     available: boolean; message?: string; updated_at?: string; stale?: boolean; stage?: string
     scope_done_items?: number; processed?: number; excluded?: number
@@ -104,6 +112,7 @@ export interface SimpleDoneItem {
   file_count: number | null
   attachment_names: string[]
   attachment_review_label: string | null
+  no_attachment_confirmed?: boolean
   simple_status: SimpleDoneState
   simple_status_label: string
   attention_reason: string | null

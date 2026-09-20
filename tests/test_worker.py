@@ -14,7 +14,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, BatchItem, ClassificationDecision, CollectionBatch, ContentObject, ItemOccurrence, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
 from oa_knowledge.online_audit import start_audit
-from oa_knowledge.web.worker import OperationWorker, _has_verified_attachment
+from oa_knowledge.web.worker import OperationWorker, PipelineResourceBusyError, _has_verified_attachment
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.notifications.models import DeliveryResult
 from oa_knowledge.archive_migration_campaign import ensure_verified_archive_migration
@@ -136,6 +136,50 @@ def test_long_pipeline_stage_refreshes_its_database_lease(config_file: Path, mon
         worker.close()
 
     assert observed["refreshed"] is True
+
+
+def test_runtime_failure_is_not_mislabeled_as_resource_contention(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    worker = OperationWorker(settings, config_path=config_file)
+    task_id = worker.production_queue.enqueue(
+        "realtime_pending", "synthetic-runtime", "pending_parse", "synthetic-runtime",
+    )
+    task = worker.production_queue.claim(worker.owner, task_ids=(task_id,))
+    monkeypatch.setattr(
+        worker, "_pipeline_pending_parse",
+        lambda _task: (_ for _ in ()).throw(RuntimeError("synthetic capture failure")),
+    )
+
+    worker._execute_pipeline_task(task)
+
+    with Session(worker.engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.error_code == "PIPELINE_TASK_FAILED"
+        assert row.last_error == "synthetic capture failure"
+    worker.close()
+
+
+def test_resource_contention_keeps_specific_retry_code(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    worker = OperationWorker(settings, config_path=config_file)
+    task_id = worker.production_queue.enqueue(
+        "realtime_pending", "synthetic-busy", "pending_parse", "synthetic-busy",
+    )
+    task = worker.production_queue.claim(worker.owner, task_ids=(task_id,))
+    monkeypatch.setattr(
+        worker, "_pipeline_pending_parse",
+        lambda _task: (_ for _ in ()).throw(PipelineResourceBusyError("OA browser is busy")),
+    )
+
+    worker._execute_pipeline_task(task)
+
+    with Session(worker.engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.error_code == "PIPELINE_RESOURCE_BUSY"
+        assert row.last_error == "OA browser is busy"
+    worker.close()
 
 
 def test_has_verified_attachment_returns_boolean_for_empty_and_existing_sources(config_file: Path) -> None:

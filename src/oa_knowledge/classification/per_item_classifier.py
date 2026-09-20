@@ -44,6 +44,12 @@ _SIGNATURE_ISSUER = re.compile(
 _INTERNAL_DEPARTMENT = re.compile(
     r"(?:业务|综合(?:管理)?|财务(?:资金)?|人力资源|风险合规|行政|编研)[一二三四五六七八九十\d]*(?:部|中心)$"
 )
+_ISSUER_WRAPPER = re.compile(
+    r"^(?:【(?:以此为准|请再次以此为准|文件传阅|传阅)】|[（(](?:以此为准|请再次以此为准|盖章(?:后|版)?|正文|明电|文件处理表)[）)])\s*"
+)
+_NOT_AN_ISSUER = re.compile(
+    r"(?:会议(?:听取|传达)|传达学习|为落实|根据.{0,40}文件|贯彻.{0,40}通知|或省级监管部门)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +200,7 @@ def _clean_issuer(value: str) -> str:
     value = value.strip()
     while True:
         cleaned = re.sub(r"^(?:【[^】]+】|[（(](?:新增|[一二三四五\d]+次办理)[^）)]*[）)]|[（(](?:盖章版|扫描件|原件|复印件|定稿|正式稿|最终版)[）)])\s*", "", value)
+        cleaned = _ISSUER_WRAPPER.sub("", cleaned)
         if cleaned == value:
             break
         value = cleaned
@@ -207,6 +214,8 @@ def _outer_issuer(value: str) -> str:
 
 
 def _is_formal_issuer(value: str) -> bool:
+    if (len(value) < 4 and value != "国务院") or _NOT_AN_ISSUER.search(value):
+        return False
     if "、" in value:
         return all(_is_formal_issuer(part) for part in value.split("、"))
     if re.search(r"批示|办理|收件|路演厅|会议室", value):
@@ -214,6 +223,8 @@ def _is_formal_issuer(value: str) -> bool:
     if value.startswith(("根据", "贯彻", "转发", "落实", "参照", "按照")):
         return False
     if _INTERNAL_DEPARTMENT.fullmatch(value):
+        return False
+    if value in {"团有限公司", "化广电旅游局"}:
         return False
     return re.fullmatch(
         rf"(?:{_ISSUER_END}|[\u4e00-\u9fff、，,（）()]+{_ISSUER_END})", value
@@ -226,7 +237,7 @@ def _canonical_issuer(
     """Aliases normalize spelling; a formal name is self-canonical evidence."""
     if "、" in raw_issuer:
         parts = [_canonical_issuer(part, config) for part in raw_issuer.split("、")]
-        return "、".join(parts) if all(parts) else None
+        return "、".join(sorted(set(parts), reverse=True)) if all(parts) else None
     if raw_issuer == _SELF_ISSUER:
         return _SELF_ISSUER
     resolved = resolve_issuer_from_text(raw_issuer, (), config)
@@ -235,6 +246,16 @@ def _canonical_issuer(
     if _is_formal_issuer(raw_issuer):
         return raw_issuer
     return None
+
+
+def normalize_canonical_issuer(
+    raw_issuer: str | None, config: PrivateClassificationConfig
+) -> str | None:
+    """Normalize only a direct, formal issuer; never turn prose into one."""
+    if not raw_issuer:
+        return None
+    candidate = _outer_issuer(_clean_issuer(raw_issuer))
+    return _canonical_issuer(candidate, config) if _is_formal_issuer(candidate) else None
 
 
 def _direct_document_match(

@@ -24,7 +24,7 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
     ArchivedFile, ContentObject, ItemOccurrence, KnowledgeDocument, LogicalItem,
     MarkdownExport, NotificationDelivery, OAItem, OAManifestItem, ParseArtifact,
-    PipelineTask, SourceAttachment, SummaryVersion,
+    PipelineTask, SourceAttachment, SummaryVersion, SummaryJob,
 )
 from oa_knowledge.notifications.feishu_service import retry_pending_summary_delivery
 from oa_knowledge.pending_cleanup import delivery_for_occurrence, perform_cleanup, cleanup_eligibility
@@ -155,9 +155,13 @@ def _summary_status(session: Session, occurrence: ItemOccurrence) -> str:
         SummaryVersion.logical_item_id == occurrence.logical_item_id,
         SummaryVersion.summary_kind == "pending",
     ).order_by(SummaryVersion.id.desc()).limit(1))
-    if version is None:
-        return "pending"
-    return version.status
+    job = session.scalar(select(SummaryJob).where(
+        SummaryJob.logical_item_id == occurrence.logical_item_id,
+        SummaryJob.summary_kind == "pending",
+    ).order_by(SummaryJob.id.desc()).limit(1))
+    if job and (version is None or job.snapshot_id == version.snapshot_id and job.status == "failed"):
+        return job.status
+    return version.status if version else "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +279,7 @@ _PENDING_FILTERS: dict[str, set[str]] = {
 }
 
 
-def pending_notifications_list(settings: Settings, filter_kind: str | None = None) -> dict:
+def pending_notifications_list(settings: Settings, filter_kind: str | None = None, *, page: int = 1, page_size: int = 50, query: str | None = None) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
@@ -284,17 +288,21 @@ def pending_notifications_list(settings: Settings, filter_kind: str | None = Non
                 stmt = stmt.where(ItemOccurrence.occurrence_status == "active")
             elif filter_kind == "recent_success":
                 stmt = stmt.where(ItemOccurrence.occurrence_status == "cleaned")
+            if query:
+                pattern = f"%{query.strip()}%"
+                stmt = stmt.where(ItemOccurrence.title.ilike(pattern) | ItemOccurrence.sender.ilike(pattern) | ItemOccurrence.current_node.ilike(pattern))
             rows = session.scalars(stmt.order_by(ItemOccurrence.received_at.desc(), ItemOccurrence.id)).all()
             items = []
             for row in rows:
                 delivery = _delivery_status(session, row)
+                cleaned = row.cleanup_status == "cleaned" or row.occurrence_status == "cleaned"
                 items.append({
                     "id": row.id,
                     "logical_item_id": row.logical_item_id,
                     "occurrence_key": row.occurrence_key,
-                    "title": row.title,
-                    "sender": row.sender,
-                    "current_node": row.current_node,
+                    "title": None if cleaned else row.title,
+                    "sender": None if cleaned else row.sender,
+                    "current_node": None if cleaned else row.current_node,
                     "received_at": row.received_at.isoformat() if row.received_at else None,
                     "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
                     "summary_status": _summary_status(session, row),
@@ -305,15 +313,19 @@ def pending_notifications_list(settings: Settings, filter_kind: str | None = Non
                     "notify_fingerprint": row.notify_fingerprint,
                     "allow_renotify": row.allow_renotify,
                 })
-            if filter_kind in _PENDING_FILTERS:
-                wanted = _PENDING_FILTERS[filter_kind]
-                items = [
-                    it for it in items
-                    if (it["cleanup_status"] in wanted)
-                    or (filter_kind == "feishu_failed" and it["feishu_status"] in wanted)
-                    or (filter_kind == "summary_failed" and it["summary_status"] in wanted)
-                ]
-            return {"items": items, "total": len(items)}
+            predicates = {
+                "processing": lambda it: it["occurrence_status"] == "active" and it["feishu_status"] not in {"sent", "failed", "unknown", "unknown_outcome"},
+                "summary_failed": lambda it: it["summary_status"] == "failed",
+                "feishu_failed": lambda it: it["feishu_status"] in {"failed", "rejected", "misconfigured"},
+                "feishu_unknown": lambda it: it["feishu_status"] in {"unknown", "unknown_outcome"},
+                "awaiting_cleanup": lambda it: it["feishu_status"] == "sent" and it["cleanup_status"] not in {"cleaned", "cleaning"},
+                "cleanup_failed": lambda it: it["cleanup_status"] == "cleanup_failed",
+                "recent_success": lambda it: it["cleanup_status"] == "cleaned",
+            }
+            if filter_kind in predicates:
+                items = [it for it in items if predicates[filter_kind](it)]
+            total = len(items)
+            return {"items": items[(page - 1) * page_size:page * page_size], "total": total, "page": page, "page_size": page_size}
     finally:
         engine.dispose()
 
@@ -334,15 +346,19 @@ def pending_notification_detail(settings: Settings, occurrence_id: int) -> dict:
                 detail["discovery_hash"] = occurrence.discovery_hash
                 detail["occurrence_status"] = occurrence.occurrence_status
                 detail["feishu_status"] = delivery_status
+                detail["delivery_id"] = delivery.id if delivery else None
                 detail["can_retry_delivery"] = delivery_status == "failed"
-                detail["requires_delivery_reconciliation"] = delivery_status == "unknown"
-                detail["can_cleanup"] = (
-                    delivery_status == "sent"
-                    and settings.pending_cleanup.auto_cleanup_after_success
-                    and detail["cleanup_status"] not in {"cleaned", "cleaning"}
+                detail["requires_delivery_reconciliation"] = delivery_status in {"unknown", "unknown_outcome"}
+                detail["can_retry_summary"] = occurrence.occurrence_status == "active" and occurrence.cleanup_status not in {"cleaned", "cleaning"} and _summary_status(session, occurrence) == "failed" and delivery_status not in {"sent", "unknown", "unknown_outcome"}
+                detail["can_cleanup"], detail["cleanup_reason"] = cleanup_eligibility(
+                    occurrence, delivery, settings, datetime.now(timezone.utc), retry_failed=True,
                 )
                 detail["oa_gone_at"] = occurrence.oa_gone_at.isoformat() if occurrence.oa_gone_at else None
                 detail["stages"] = _pending_pipeline_stages(session, occurrence, detail)
+                if occurrence.cleanup_status == "cleaned" or occurrence.occurrence_status == "cleaned":
+                    detail.update(title=None, sender=None, current_node=None, snapshot=None,
+                                  evidence_files=[], attachments=[], ollama_summary=None,
+                                  can_retry_summary=False, can_retry_delivery=False, can_cleanup=False)
     finally:
         engine.dispose()
     return detail
@@ -416,17 +432,31 @@ def retry_pending_summary(settings: Settings, occurrence_id: int) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             occurrence = session.get(ItemOccurrence, occurrence_id)
             if occurrence is None or occurrence.logical_item_id is None:
                 raise LookupError("pending occurrence not found")
-            from oa_knowledge.production_pipeline import ProductionQueue
-            queue = ProductionQueue(engine)
-            task_id = queue.enqueue(
-                "realtime_pending", str(occurrence.logical_item_id), "pending_summary",
-                f"retry-summary:{occurrence.logical_item_id}:{int(datetime.now(timezone.utc).timestamp())}",
-                payload={"occurrence_id": occurrence_id, "force": True},
-            )
-            return {"task_id": task_id, "stage": "pending_summary", "status": "queued"}
+            delivery = delivery_for_occurrence(session, occurrence)
+            if occurrence.channel != "pending" or occurrence.occurrence_status != "active" or occurrence.cleanup_status in {"cleaned", "cleaning"}:
+                raise ValueError("已清理或已结束的待办不能重新生成摘要")
+            if delivery and delivery.status in {"sent", "unknown", "unknown_outcome"}:
+                raise ValueError("投递已成功或结果待核对，不能通过重试摘要重复通知")
+            active = session.scalar(select(PipelineTask).where(
+                PipelineTask.queue_name == "realtime_pending",
+                PipelineTask.logical_item_key == str(occurrence.logical_item_id),
+                PipelineTask.status.in_(("queued", "running")),
+            ).order_by(PipelineTask.id.desc()).limit(1))
+            if active:
+                return {"task_id": active.id, "stage": active.stage, "status": active.status}
+            if _summary_status(session, occurrence) != "failed":
+                raise ValueError("只有失败的摘要可以重试")
+            from uuid import uuid4
+            task = PipelineTask(queue_name="realtime_pending", priority=0,
+                logical_item_key=str(occurrence.logical_item_id), logical_item_id=occurrence.logical_item_id,
+                stage="pending_summary", idempotency_key=f"retry-summary:{occurrence.id}:{uuid4().hex}",
+                payload_json=__import__("json").dumps({"occurrence_id": occurrence_id, "force": True}))
+            session.add(task); session.commit()
+            return {"task_id": task.id, "stage": task.stage, "status": task.status}
     finally:
         engine.dispose()
 
@@ -463,9 +493,44 @@ def cleanup_pending(settings: Settings, occurrence_id: int, *, force: bool = Fal
             if force and not settings.pending_cleanup.allow_force_cleanup:
                 raise ValueError("force cleanup is disabled")
             now = datetime.now(timezone.utc)
-            result = perform_cleanup(session, occurrence, settings, now, force=force)
+            result = perform_cleanup(session, occurrence, settings, now, force=force, retry_failed=True)
             session.commit()
             return result
+    finally:
+        engine.dispose()
+
+
+def reconcile_pending_delivery(settings: Settings, occurrence_id: int, *, delivery_id: int, outcome: str, confirmed: bool) -> dict:
+    """Record the operator's observation locally; never send or clean implicitly."""
+    if confirmed is not True or outcome not in {"sent", "failed"}:
+        raise ValueError("请先在飞书核对投递结果并明确确认")
+    from oa_knowledge.db.models import PipelineEvent
+    import json
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            occurrence = session.get(ItemOccurrence, occurrence_id)
+            if occurrence is None or occurrence.channel != "pending":
+                raise LookupError("待办记录不存在")
+            delivery = delivery_for_occurrence(session, occurrence)
+            if not delivery or delivery.id != delivery_id or delivery.status not in {"unknown", "unknown_outcome"}:
+                raise ValueError("投递记录已变化，请刷新后重新核对")
+            delivery.status = outcome
+            delivery.error_code = "MANUAL_CONFIRMED_SENT" if outcome == "sent" else "MANUAL_CONFIRMED_FAILED"
+            delivery.last_error = "用户已在飞书核对投递结果"
+            delivery.next_retry_at = None
+            if outcome == "sent":
+                delivery.sent_at = datetime.now(timezone.utc)
+            task_id = session.scalar(select(PipelineTask.id).where(
+                PipelineTask.queue_name == "realtime_pending",
+                PipelineTask.logical_item_key == str(occurrence.logical_item_id),
+            ).order_by(PipelineTask.id.desc()).limit(1))
+            if task_id is not None:
+                session.add(PipelineEvent(task_id=task_id, event_type="manual_delivery_reconciliation", stage="notify_feishu", status=outcome,
+                    details_json=json.dumps({"delivery_id": delivery_id, "occurrence_id": occurrence_id})))
+            session.commit()
+            return {"delivery_id": delivery_id, "status": outcome}
     finally:
         engine.dispose()
 
@@ -583,6 +648,7 @@ def done_archives_list(
                         "initiated_at": row.initiated_at.isoformat() if row.initiated_at else None,
                         "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                         "pipeline_status": row.processing_status,
+                        "no_attachment_confirmed": row.no_attachment_confirmed,
                         "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
                         "file_count": file_count,
                         "attachment_review_label": (
@@ -625,6 +691,7 @@ def done_archives_list(
                     continue
                 enriched.append({
                     **it,
+                    "no_attachment_confirmed": manifest.no_attachment_confirmed if manifest else False,
                     "file_count": 0 if manifest and manifest.processing_status == "no_attachment" else it.get("file_count"),
                     "attachment_review_label": (
                         "0（待人工复核）" if manifest and manifest.processing_status == "no_attachment" else None
@@ -734,15 +801,17 @@ def _simple_done_state(
 ) -> dict[str, str | None]:
     """为单个已办事项计算简化状态（spec §4.1）。"""
     processing_status = manifest.processing_status if manifest is not None else "discovered"
-    index = session.scalar(select(MarkdownExport).where(
-        MarkdownExport.oa_item_id == (archived.id if archived is not None else None),
-        MarkdownExport.document_kind == "item_index",
-    ).order_by(MarkdownExport.id.desc()).limit(1))
+    from oa_knowledge.web.delivery_facts import delivery_facts
+    facts = delivery_facts(session, archived) if archived else None
     state, reason = _classify_done_item(
         processing_status=processing_status,
-        has_success_item_index=bool(index and index.status == "success"),
-        markdown_failed=bool(index and index.status == "failed"),
+        has_success_item_index=bool(facts and facts["status"] == "complete"),
+        markdown_failed=bool(facts and (facts["status"] in {"failed", "needs_review"} or facts["unsupported"])),
     )
+    if facts and facts["status"] == "excluded" and processing_status != "depth_limit_reached":
+        state, reason = "excluded", None
+    if facts and state == "attention" and facts.get("reason"):
+        reason = facts["reason"]
     return {"state": state, "label": _SIMPLE_DONE_LABELS[state], "reason": reason}
 
 
@@ -878,7 +947,7 @@ def _handoff_status_for_item(settings: Settings, md: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def markdown_outputs_list(
-    settings: Settings, *, page: int = 1, page_size: int = 50,
+    settings: Settings, *, page: int = 1, page_size: int = 50, query: str | None = None, status: str | None = None,
 ) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
@@ -914,15 +983,18 @@ def markdown_outputs_list(
             # V2 consumes Markdown by Done item, while retaining the legacy
             # attachment ledger payload above for existing clients during the
             # compatibility window.  No paths are made absolute or user supplied.
-            item_total = session.scalar(select(func.count()).select_from(OAItem).where(
-                OAItem.source_channel == "done",
-            )) or 0
+            from oa_knowledge.web.delivery_facts import delivery_facts_map
+            from oa_knowledge.web.workflow_views import DELIVERY_LABELS
+            stmt = select(OAItem).where(OAItem.source_channel == "done")
+            if query:
+                stmt = stmt.where(OAItem.title.ilike(f"%{query.strip()}%"))
+            candidates = session.scalars(stmt.order_by(OAItem.completed_at.desc(), OAItem.id.desc())).all()
+            facts_map = delivery_facts_map(session, candidates)
+            if status:
+                candidates = [item for item in candidates if facts_map[item.id]["status"] == status]
+            item_total = len(candidates)
+            archived_items = candidates[(page - 1) * page_size:page * page_size]
             items = []
-            archived_items = session.scalars(select(OAItem).where(
-                OAItem.source_channel == "done",
-            ).order_by(OAItem.completed_at.desc(), OAItem.id.desc()).offset(
-                (page - 1) * page_size
-            ).limit(page_size)).all()
             for item in archived_items:
                 item_exports = session.scalars(select(MarkdownExport).where(
                     MarkdownExport.oa_item_id == item.id,
@@ -935,14 +1007,8 @@ def markdown_outputs_list(
                     ).where(ArchivedFile.oa_item_id == item.id)).all()
                 index = next((row for row in item_exports if row.document_kind == "item_index"), None)
                 attachments = [row for row in item_exports if row.document_kind != "item_index"]
-                if index and index.status == "success":
-                    delivery_status = "已交付"
-                elif any(row.status == "failed" for row in attachments) or (index and index.status == "failed"):
-                    delivery_status = "交付失败"
-                elif any(row.status == "success" for row in attachments):
-                    delivery_status = "部分交付"
-                else:
-                    delivery_status = "待处理"
+                facts = facts_map[item.id]
+                delivery_status = DELIVERY_LABELS[facts["status"]]
                 items.append({
                     "id": item.id,
                     "title": item.title,
@@ -951,6 +1017,8 @@ def markdown_outputs_list(
                     "external_issuer": item.external_issuer,
                     "markdown_count": sum(row.status == "success" for row in attachments),
                     "delivery_status": delivery_status,
+                    "delivery": facts,
+                    "status": facts["status"],
                     "index_relpath": index.markdown_relpath if index else None,
                     "source_relpath": item.archive_relpath,
                     "updated_at": (index.generated_at.isoformat() if index and index.generated_at else None),
@@ -1069,17 +1137,45 @@ def maintenance_action(settings: Settings, config_path: Path | None, action: str
 # ---------------------------------------------------------------------------
 
 def retry_done_archive(settings: Settings, manifest_id: int) -> dict:
-    return retry_manifest_failed_items(settings, manifest_id=manifest_id)
+    from uuid import uuid4
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            manifest = session.get(OAManifestItem, manifest_id)
+            if manifest is None:
+                raise LookupError("已办事项不存在")
+            if manifest.processing_status not in {"download_failed", "partial", "auth_required"} and not (manifest.processing_status == "no_attachment" and not manifest.no_attachment_confirmed):
+                raise ValueError("当前事项无需重试归档；深度受限事项请先人工核对")
+            task = session.scalar(select(PipelineTask).where(
+                PipelineTask.logical_item_key == manifest.oa_item_key,
+                PipelineTask.queue_name == "realtime_done",
+                PipelineTask.stage.in_(("done_capture_and_archive", "archive_verify")),
+                PipelineTask.status.in_(("queued", "running")),
+            ).order_by(PipelineTask.id.desc()).limit(1))
+            if task:
+                return {"task_id": task.id, "status": task.status, "enqueued": False}
+            task = PipelineTask(queue_name="realtime_done", priority=10,
+                logical_item_key=manifest.oa_item_key, stage="done_capture_and_archive",
+                idempotency_key=f"ui-archive:{manifest.id}:{uuid4().hex}")
+            session.add(task); session.commit()
+            return {"task_id": task.id, "status": task.status, "enqueued": True}
+    finally:
+        engine.dispose()
 
 
 def rebuild_markdown_export(settings: Settings, export_id: int) -> dict:
+    from oa_knowledge.web.workflow_views import retry_markdown_item
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
             export = session.get(MarkdownExport, export_id)
-            if export is None or export.source_file_id is None:
+            if export is None:
                 raise LookupError("markdown export not found")
-            enqueued = enqueue_file(session, export.source_file_id)
-            return {"export_id": export_id, "enqueued": enqueued}
+            source = session.get(ArchivedFile, export.source_file_id) if export.source_file_id else None
+            item_id = export.oa_item_id or (source.oa_item_id if source else None)
+            if item_id is None:
+                raise LookupError("done item not found")
+        return {"export_id": export_id, **retry_markdown_item(settings, item_id)}
     finally:
         engine.dispose()

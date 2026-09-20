@@ -363,5 +363,7 @@ def test_markdown_outputs_exposes_v2_item_aggregation(config_file: Path) -> None
     row = next(row for row in payload["items"] if row["title"] == "事项级输出")
     assert row["source_type"] == "internal"
     assert row["internal_category"] == "经营管理"
-    assert row["delivery_status"] == "已交付"
+    # An index alone is not evidence that all attachments were delivered.
+    assert row["delivery_status"] == "待处理"
+    assert row["delivery"]["expected"] == 0
     assert row["index_relpath"].endswith("/_index.md")

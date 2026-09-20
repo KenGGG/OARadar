@@ -39,6 +39,11 @@ def lock_file(path: Path, *, blocking: bool = True):
         yield
 
 
+def recover_worker_handoff(worker: OperationWorker) -> int:
+    """Recover durable work and resource leases left by the stopped worker."""
+    return worker.recover_expired()
+
+
 def drain(worker, root: Path, bulk_root: Path, queue_name: str) -> int:
     """Archive first; GPU/publication waits for the existing batch lock."""
     with Session(worker.engine) as session:
@@ -122,6 +127,7 @@ def main():
     # Existing OA-worker lock prevents any second browser-owning dispatcher.
     with lock_file(settings.runtime_root / 'operation-worker.lock', blocking=False):
         worker = OperationWorker(settings, args.config)
+        recover_worker_handoff(worker)
         summary = {'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
         write_json(root / 'summary.json', summary)
         try:

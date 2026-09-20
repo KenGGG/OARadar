@@ -131,7 +131,10 @@ def test_simple_status_returns_plain_language_business_results_without_oa_conten
 
     payload = client.get("/api/simple-status").json()
 
-    assert set(payload) == {"generated_at", "overall_status", "done", "pending", "oa_activity", "attention"}
+    assert set(payload) == {
+        "generated_at", "overall_status", "done", "pending", "archive", "markdown",
+        "oa_activity", "attention", "local_delivery",
+    }
     assert set(payload["done"]) >= {
         "status", "headline", "oa_total", "archive_complete", "excluded",
         "no_attachment", "markdown_ready_items", "published_items",
