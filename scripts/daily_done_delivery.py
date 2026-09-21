@@ -10,12 +10,14 @@ import json
 import os
 from pathlib import Path
 import threading
+from dataclasses import asdict
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 from oa_knowledge.classification.private_config import load_private_classification_config
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.models import OAManifestItem, PipelineTask
+from oa_knowledge.done_convergence import DoneConvergencePlanner
 from oa_knowledge.scheduled_sync import run_nightly_scan
 from oa_knowledge.web.worker import OperationWorker
 from scripts.local_done_markdown import process, write_json
@@ -109,6 +111,15 @@ def drain(worker, root: Path, bulk_root: Path, queue_name: str) -> int:
     return completed
 
 
+def run_daily(worker, settings, root: Path, bulk_root: Path) -> dict:
+    """Run discovery, converge durable work, then consume the resulting queues."""
+    result = {'scan': run_nightly_scan(worker.engine, settings, enqueue_history=False)}
+    result['convergence'] = asdict(DoneConvergencePlanner(worker.engine, settings).plan(apply=True))
+    result['archive_steps'] = drain(worker, root, bulk_root, 'realtime_done')
+    result['delivery_items'] = drain(worker, root, bulk_root, 'markdown_delivery')
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
@@ -131,9 +142,7 @@ def main():
         summary = {'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'running'}
         write_json(root / 'summary.json', summary)
         try:
-            summary['scan'] = run_nightly_scan(worker.engine, settings, enqueue_history=False)
-            summary['archive_steps'] = drain(worker, root, args.bulk_run_dir, 'realtime_done')
-            summary['delivery_items'] = drain(worker, root, args.bulk_run_dir, 'markdown_delivery')
+            summary.update(run_daily(worker, settings, root, args.bulk_run_dir))
             summary['status'] = 'finished'
         except Exception as exc:
             summary.update(status='failed', error=type(exc).__name__)

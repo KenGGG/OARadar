@@ -56,6 +56,31 @@ def test_worker_handoff_recovers_resource_leases_from_stopped_owner(config_file)
     worker.engine.dispose()
 
 
+def test_daily_converges_after_scan_before_queue_draining(monkeypatch, tmp_path):
+    helper = module()
+    calls = []
+
+    class Planner:
+        def __init__(self, engine, settings):
+            calls.append('planner_init')
+
+        def plan(self, *, apply):
+            from oa_knowledge.done_convergence import DoneConvergenceReport
+            assert apply is True
+            calls.append('converge')
+            return DoneConvergenceReport(1, 0, 1, 0, 0, 0, 0)
+
+    worker = type('Worker', (), {'engine': object()})()
+    monkeypatch.setattr(helper, 'run_nightly_scan', lambda *a, **kw: calls.append('scan') or {'status': 'ok'})
+    monkeypatch.setattr(helper, 'DoneConvergencePlanner', Planner)
+    monkeypatch.setattr(helper, 'drain', lambda *a, **kw: calls.append(f'drain:{a[3]}') or 0)
+
+    summary = helper.run_daily(worker, object(), tmp_path, tmp_path)
+
+    assert calls == ['scan', 'planner_init', 'converge', 'drain:realtime_done', 'drain:markdown_delivery']
+    assert summary['convergence']['download_created'] == 1
+
+
 @pytest.mark.parametrize(('outcome', 'task_status'), [('needs_review', 'completed'), ('partial', 'failed')])
 def test_daily_delivery_leaves_bulk_and_excluded_tasks_untouched(config_file, tmp_path, monkeypatch, outcome, task_status):
     from sqlalchemy.orm import Session

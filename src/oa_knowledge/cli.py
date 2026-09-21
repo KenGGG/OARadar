@@ -52,6 +52,7 @@ from oa_knowledge.scheduled_sync import (
 from oa_knowledge.reconcile import reconcile_done_occurrence
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.markdown_export.service import convert_archive, markdown_status as get_markdown_status
+from oa_knowledge.done_convergence import DoneConvergencePlanner
 
 app = typer.Typer(help="OARadar V2 local read-only OA workspace")
 db_app = typer.Typer(help="Database migration commands")
@@ -87,6 +88,22 @@ curate_app = typer.Typer(help="Local-only OA Package to curated knowledge docume
 app.add_typer(curate_app, name="curate", hidden=True)
 data_app = typer.Typer(help="本地数据预检、隔离、恢复与清除")
 app.add_typer(data_app, name="data", hidden=True)
+
+
+@app.command("done-converge")
+def done_converge_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report required repairs without changing queue state"),
+    config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
+) -> None:
+    """Create or revive durable work for every eligible Done item."""
+    settings = settings_option(config)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    try:
+        report = DoneConvergencePlanner(engine, settings).plan(apply=not dry_run)
+        typer.echo(json.dumps({**asdict(report), "applied": not dry_run}, ensure_ascii=False))
+    finally:
+        engine.dispose()
 
 
 @app.command("semantic-review-v2")
