@@ -39,6 +39,7 @@ from oa_knowledge.web.provider_settings import provider_settings_view
 from oa_knowledge.web.simple_status import (
     _classify_done_item,
     _done_simple_status_map,
+    _latest_done_task_facts,
     _SIMPLE_DONE_LABELS,
 )
 from oa_knowledge.web.status import dashboard_status, maintenance_status, retry_manifest_failed_items
@@ -803,10 +804,14 @@ def _simple_done_state(
     processing_status = manifest.processing_status if manifest is not None else "discovered"
     from oa_knowledge.web.delivery_facts import delivery_facts
     facts = delivery_facts(session, archived) if archived else None
+    phase = "markdown" if processing_status in {"downloaded", "no_attachment"} else "download"
+    task = _latest_done_task_facts(session, [manifest.oa_item_key]).get(manifest.oa_item_key, {}).get(phase) if manifest else None
     state, reason = _classify_done_item(
         processing_status=processing_status,
         has_success_item_index=bool(facts and facts["status"] == "complete"),
         markdown_failed=bool(facts and (facts["status"] in {"failed", "needs_review"} or facts["unsupported"])),
+        task_status=task[0] if task else None,
+        task_phase=phase if task else None,
     )
     if facts and facts["status"] == "excluded" and processing_status != "depth_limit_reached":
         state, reason = "excluded", None

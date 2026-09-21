@@ -22,7 +22,7 @@ from oa_knowledge.config import Settings, validate_feishu_runtime_config
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.models import (
     ArchivedFile, ItemOccurrence, MarkdownExport, OAItem, OAManifestItem,
-    SummaryJob, SummaryVersion,
+    PipelineTask, SummaryJob, SummaryVersion,
 )
 from oa_knowledge.web.schedule_views import schedule_status
 from oa_knowledge.web.status import dashboard_status
@@ -62,6 +62,8 @@ def _classify_done_item(
     processing_status: str,
     has_success_item_index: bool,
     markdown_failed: bool,
+    task_status: str | None = None,
+    task_phase: str | None = None,
 ) -> tuple[str, str | None]:
     """按 spec §4.1 优先级计算单个已办事项的主状态。
 
@@ -79,16 +81,43 @@ def _classify_done_item(
             return "attention", "OA 登录失效，需要重新验证"
         if processing_status in {"download_failed", "partial"}:
             return "attention", "原件下载失败"
-        return "waiting_download", None
+        if task_phase == "download" and task_status in {"queued", "running"}:
+            return "waiting_download", None
+        if task_phase == "download" and task_status == "failed":
+            return "attention", "原件下载失败"
+        return "attention", "缺少原件下载任务"
     # 原件已验证。
     if markdown_failed:
         return "attention", "Markdown 交付失败"
+    if task_phase == "markdown" and task_status == "failed":
+        return "attention", "Markdown 交付失败"
     if not has_success_item_index:
-        return "waiting_markdown", None
+        if task_phase == "markdown" and task_status in {"queued", "running"}:
+            return "waiting_markdown", None
+        return "attention", "缺少 Markdown 任务"
     return "completed", None
 
 
-def _done_simple_status_map(session: Session) -> dict[int, tuple[str, str, str | None]]:
+def _latest_done_task_facts(session: Session, keys: list[str]) -> dict[str, dict[str, tuple[str, bool]]]:
+    """Load the newest download and Markdown task per item in one query."""
+    if not keys:
+        return {}
+    download_stages = ("done_capture_and_archive", "archive_verify")
+    markdown_stages = ("attachment_inventory", "parse", "source_publish", "classify", "index_publish")
+    result: dict[str, dict[str, tuple[str, bool]]] = {}
+    rows = session.execute(select(
+        PipelineTask.logical_item_key, PipelineTask.stage, PipelineTask.status, PipelineTask.recoverable,
+    ).where(
+        PipelineTask.logical_item_key.in_(keys),
+        PipelineTask.stage.in_((*download_stages, *markdown_stages)),
+    ).order_by(PipelineTask.logical_item_key, PipelineTask.created_at.desc(), PipelineTask.id.desc()))
+    for key, stage, status, recoverable in rows:
+        phase = "download" if stage in download_stages else "markdown"
+        result.setdefault(key, {}).setdefault(phase, (status, recoverable))
+    return result
+
+
+def _done_simple_status_map(session: Session, *, items=None, facts=None) -> dict[int, tuple[str, str, str | None]]:
     """为全部已办事项计算简化状态，返回 ``{manifest_id: (state, label, reason)}``。
 
     用于已办列表的服务端状态筛选，保证 total / 页数基于完整筛选结果（plan Task 2）。
@@ -101,17 +130,24 @@ def _done_simple_status_map(session: Session) -> dict[int, tuple[str, str, str |
         )
     ).all()
 
-    items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
-    facts = delivery_facts_map(session, items)
+    if items is None:
+        items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
+    if facts is None:
+        facts = delivery_facts_map(session, items)
     facts_by_key = {item.oa_item_key: facts[item.id] for item in items}
+    task_facts = _latest_done_task_facts(session, [row.oa_item_key for row in manifests])
 
     result: dict[int, tuple[str, str, str | None]] = {}
     for mid, processing_status, key in manifests:
         item_facts = facts_by_key.get(key, {})
+        phase = "markdown" if processing_status in {"downloaded", "no_attachment"} else "download"
+        task = task_facts.get(key, {}).get(phase)
         state, reason = _classify_done_item(
             processing_status=processing_status,
             has_success_item_index=item_facts.get("status") == "complete",
             markdown_failed=item_facts.get("status") == "failed" or bool(item_facts.get("unsupported")),
+            task_status=task[0] if task else None,
+            task_phase=phase if task else None,
         )
         if processing_status != "depth_limit_reached":
             if item_facts.get("status") == "excluded":
@@ -122,7 +158,7 @@ def _done_simple_status_map(session: Session) -> dict[int, tuple[str, str, str |
     return result
 
 
-def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
+def _done_summary(session: Session, schedule: dict, *, items=None, facts=None) -> dict[str, Any]:
     """聚合已办知识库业务口径（spec §4.1-§4.2 / §5）。"""
     manifests = session.execute(
         select(OAManifestItem.id, OAManifestItem.processing_status, OAManifestItem.no_attachment_confirmed)
@@ -142,7 +178,11 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
         or ps == "no_attachment" and not confirmed
     )
 
-    status_map = _done_simple_status_map(session)
+    if items is None:
+        items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
+    if facts is None:
+        facts = delivery_facts_map(session, items)
+    status_map = _done_simple_status_map(session, items=items, facts=facts)
 
     state_counts: dict[str, int] = {state: 0 for state in _SIMPLE_DONE_LABELS}
     failed_items = 0
@@ -161,7 +201,7 @@ def _done_summary(session: Session, schedule: dict) -> dict[str, Any]:
     published_items = state_counts["completed"]
     markdown_ready_items = _markdown_ready_count(session)
     queued_items = state_counts["waiting_markdown"]
-    running_items = sum(value["status"] == "working" for value in delivery_facts_map(session).values())
+    running_items = sum(value["status"] == "working" for value in facts.values())
     queued_items = max(0, queued_items - running_items)
 
     attention_count = failed_items + review_items
@@ -211,11 +251,13 @@ def _markdown_ready_count(session: Session) -> int:
     ) or 0
 
 
-def _workflow_summaries(session: Session, settings: Settings, schedule: dict) -> dict[str, dict]:
+def _workflow_summaries(session: Session, settings: Settings, schedule: dict, *, items=None, facts=None) -> dict[str, dict]:
     """Keep raw archive progress separate from complete Markdown delivery."""
     manifests = list(session.scalars(select(OAManifestItem)))
-    items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
-    facts = delivery_facts_map(session, items)
+    if items is None:
+        items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
+    if facts is None:
+        facts = delivery_facts_map(session, items)
     facts_by_key = {item.oa_item_key: facts[item.id] for item in items}
     archive_complete = [row for row in manifests if row.processing_status == "downloaded" or row.processing_status == "no_attachment" and row.no_attachment_confirmed]
     archive_excluded = sum(row.processing_status == "skipped" for row in manifests)
@@ -500,10 +542,12 @@ def simple_status(settings: Settings) -> dict[str, Any]:
         with Session(engine) as session:
             schedule = schedule_status(settings)
             base = dashboard_status(settings)
-            done = _done_summary(session, schedule)
+            items = list(session.scalars(select(OAItem).where(OAItem.source_channel == "done")))
+            facts = delivery_facts_map(session, items)
+            done = _done_summary(session, schedule, items=items, facts=facts)
             pending = _pending_summary(session, settings, schedule)
             oa_activity = _oa_activity_card(base, schedule)
-            workflows = _workflow_summaries(session, settings, schedule)
+            workflows = _workflow_summaries(session, settings, schedule, items=items, facts=facts)
             attention = _attention_list({"failed_items": workflows["archive"]["failed"]}, pending)
             for count, status, label in (
                 (workflows["markdown"]["failed"], "failed", "Markdown 交付失败"),

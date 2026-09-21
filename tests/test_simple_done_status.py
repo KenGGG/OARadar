@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem
+from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem, PipelineTask
 from oa_knowledge.web import create_web_app
 from oa_knowledge.web.console_views import _simple_done_state, _markdown_status_for_item
 
@@ -45,6 +45,16 @@ def _seed_fact(session: Session, key: str, facts: dict) -> OAManifestItem:
     )
     session.add(manifest)
     session.flush()
+
+    if facts.get("task"):
+        phase = facts["task"]
+        session.add(PipelineTask(
+            queue_name="realtime_done" if phase == "download" else "markdown_delivery",
+            priority=10 if phase == "download" else 50,
+            logical_item_key=key,
+            stage="done_capture_and_archive" if phase == "download" else "attachment_inventory",
+            status="queued", idempotency_key=f"synthetic-task:{key}:{phase}",
+        ))
 
     if facts.get("markdown") == "success" and oa_item is not None:
         archived = ArchivedFile(
@@ -73,9 +83,9 @@ def _seed_fact(session: Session, key: str, facts: dict) -> OAManifestItem:
 
 
 @pytest.mark.parametrize(("facts", "expected"), [
-    ({"manifest": "discovered"}, "waiting_download"),
-    ({"manifest": "downloaded", "markdown": "pending"}, "waiting_markdown"),
-    ({"manifest": "downloaded", "markdown": "success"}, "waiting_markdown"),
+    ({"manifest": "discovered"}, "attention"),
+    ({"manifest": "downloaded", "markdown": "pending"}, "attention"),
+    ({"manifest": "downloaded", "markdown": "success"}, "attention"),
     ({"manifest": "downloaded", "markdown": "success", "index": "success"}, "completed"),
     ({"manifest": "downloaded", "markdown": "success", "index": "failed"}, "attention"),
     ({"manifest": "skipped"}, "excluded"),
@@ -142,7 +152,7 @@ def test_done_archives_keeps_online_oa_page_and_row_order_and_exposes_initiator_
         ])
         session.commit()
 
-    payload = client.get("/api/done-archives?page=1&page_size=50&simple_status=waiting_download").json()
+    payload = client.get("/api/done-archives?page=1&page_size=50&simple_status=attention").json()
     assert [item["title"] for item in payload["items"]] == ["第一页第一条", "第一页第二条", "第二页第一条"]
     assert payload["items"][0]["sender"] == "发起人甲一"
     assert payload["items"][0]["initiated_at"] == "2026-08-01T10:00:00"
@@ -201,7 +211,7 @@ def test_done_archives_filters_by_simple_status_server_side(config_file: Path) -
     with Session(engine) as session:
         # 60 个待下载 + 60 个已完成。
         for i in range(60):
-            _seed_fact(session, f"oa:dl-{i}", {"manifest": "discovered"})
+            _seed_fact(session, f"oa:dl-{i}", {"manifest": "discovered", "task": "download"})
         for i in range(60):
             _seed_fact(session, f"oa:cp-{i}", {
                 "manifest": "downloaded", "markdown": "success",

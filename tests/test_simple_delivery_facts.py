@@ -9,6 +9,7 @@ from oa_knowledge.config import load_settings
 from oa_knowledge.db.models import (
     ArchivedFile, Base, ClassificationDecision, ClassificationRun,
     MarkdownExport, MarkdownTask, OAItem, OAManifestItem, ParseJob,
+    PipelineTask,
 )
 from oa_knowledge.web.simple_status import (
     _attention_list, _done_simple_status_map, _done_summary, _pending_summary,
@@ -59,6 +60,54 @@ def _export(session, item, file=None, status="success", legacy=False):
     return export
 
 
+def _pipeline_task(session, key, queue, stage, status, *, recoverable=True):
+    task = PipelineTask(
+        queue_name=queue, priority=10 if queue == "realtime_done" else 50,
+        logical_item_key=key, stage=stage, status=status,
+        idempotency_key=f"synthetic:{key}:{queue}:{stage}:{status}",
+        recoverable=recoverable,
+    )
+    session.add(task)
+    session.flush()
+    return task
+
+
+def test_failed_download_task_is_attention_not_waiting(session):
+    _, manifest = _item(session, processing_status="pending_download")
+    _pipeline_task(session, manifest.oa_item_key, "realtime_done", "done_capture_and_archive", "failed")
+    state, _, reason = _done_simple_status_map(session)[manifest.id]
+    assert state == "attention"
+    assert reason == "原件下载失败"
+
+
+def test_missing_download_task_is_attention_not_waiting(session):
+    _, manifest = _item(session, processing_status="pending_download")
+    state, _, reason = _done_simple_status_map(session)[manifest.id]
+    assert state == "attention"
+    assert reason == "缺少原件下载任务"
+
+
+def test_active_download_and_markdown_tasks_are_the_only_waiting_states(session):
+    _, downloading = _item(session, key="synthetic-download", processing_status="pending_download")
+    _pipeline_task(session, downloading.oa_item_key, "realtime_done", "done_capture_and_archive", "queued")
+    _, markdown = _item(session, key="synthetic-markdown", processing_status="downloaded")
+    _pipeline_task(session, markdown.oa_item_key, "markdown_delivery", "attachment_inventory", "running")
+    states = _done_simple_status_map(session)
+    assert states[downloading.id][0] == "waiting_download"
+    assert states[markdown.id][0] == "waiting_markdown"
+
+
+def test_terminal_markdown_failure_and_excluded_stale_task(session):
+    _, failed = _item(session, key="synthetic-failed", processing_status="downloaded")
+    _pipeline_task(session, failed.oa_item_key, "markdown_delivery", "parse", "failed", recoverable=False)
+    _, excluded = _item(session, key="synthetic-excluded", processing_status="skipped")
+    _pipeline_task(session, excluded.oa_item_key, "markdown_delivery", "parse", "failed", recoverable=False)
+    states = _done_simple_status_map(session)
+    assert states[failed.id][0] == "attention"
+    assert states[failed.id][2] == "Markdown 交付失败"
+    assert states[excluded.id][0] == "excluded"
+
+
 @pytest.mark.parametrize("failure", ["missing", "export", "parse", "task", "unsupported"])
 def test_successful_index_cannot_hide_missing_or_failed_source(session, failure):
     item, manifest = _item(session)
@@ -74,14 +123,14 @@ def test_successful_index_cannot_hide_missing_or_failed_source(session, failure)
     session.flush()
 
     state = _done_simple_status_map(session)[manifest.id][0]
-    assert state == ("waiting_markdown" if failure == "missing" else "attention")
+    assert state == "attention"
     assert _done_summary(session, {})["published_items"] == 0
 
 
 def test_index_without_attachment_evidence_does_not_claim_completion(session):
     item, manifest = _item(session)
     _export(session, item)
-    assert _done_simple_status_map(session)[manifest.id][0] == "waiting_markdown"
+    assert _done_simple_status_map(session)[manifest.id][0] == "attention"
 
 
 def test_legacy_attachment_export_and_index_can_complete(session):
