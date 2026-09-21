@@ -98,6 +98,19 @@ def test_active_download_and_markdown_tasks_are_the_only_waiting_states(session)
     assert states[markdown.id][:2] == ("waiting_markdown", "后台 MD 处理中")
 
 
+def test_active_download_repair_overrides_stale_manifest_failure(session, config_file):
+    _, manifest = _item(session, key="synthetic-download-repair", processing_status="download_failed")
+    _pipeline_task(session, manifest.oa_item_key, "realtime_done", "done_capture_and_archive", "queued")
+
+    state, _, reason = _done_simple_status_map(session)[manifest.id]
+    archive = _workflow_summaries(session, load_settings(config_file), {})["archive"]
+
+    assert state == "waiting_download"
+    assert reason is None
+    assert archive["failed"] == 0
+    assert archive["pending"] == 1
+
+
 def test_terminal_markdown_failure_and_excluded_stale_task(session):
     _, failed = _item(session, key="synthetic-failed", processing_status="downloaded")
     _pipeline_task(session, failed.oa_item_key, "markdown_delivery", "parse", "failed", recoverable=False)

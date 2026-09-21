@@ -77,12 +77,14 @@ def _classify_done_item(
         return "attention", "容器层级超过上限，需人工确认"
     verified = processing_status in {"downloaded", "no_attachment"}
     if not verified:
+        # A queued/running repair is the current fact; the manifest retains the
+        # previous failure until that repair completes.
+        if task_phase == "download" and task_status in {"queued", "running"}:
+            return "waiting_download", None
         if processing_status == "auth_required":
             return "attention", "OA 登录失效，需要重新验证"
         if processing_status in {"download_failed", "partial"}:
             return "attention", "原件下载失败"
-        if task_phase == "download" and task_status in {"queued", "running"}:
-            return "waiting_download", None
         if task_phase == "download" and task_status == "failed":
             return "attention", "原件下载失败"
         return "attention", "缺少原件下载任务"
@@ -259,12 +261,18 @@ def _workflow_summaries(session: Session, settings: Settings, schedule: dict, *,
     if facts is None:
         facts = delivery_facts_map(session, items)
     facts_by_key = {item.oa_item_key: facts[item.id] for item in items}
-    task_facts = _latest_done_task_facts(session, [item.oa_item_key for item in items])
+    task_facts = _latest_done_task_facts(session, [row.oa_item_key for row in manifests])
     archive_complete = [row for row in manifests if row.processing_status == "downloaded" or row.processing_status == "no_attachment" and row.no_attachment_confirmed]
     archive_excluded = sum(row.processing_status == "skipped" for row in manifests)
-    archive_failed = sum(row.processing_status in {
-        "download_failed", "auth_required", "partial", "depth_limit_reached",
-    } or row.processing_status == "no_attachment" and not row.no_attachment_confirmed for row in manifests)
+    archive_failed = sum(
+        (row.processing_status in {"download_failed", "auth_required", "partial", "depth_limit_reached"}
+         or row.processing_status == "no_attachment" and not row.no_attachment_confirmed)
+        and not (
+            row.processing_status != "depth_limit_reached"
+            and (task_facts.get(row.oa_item_key, {}).get("download") or (None,))[0] in {"queued", "running"}
+        )
+        for row in manifests
+    )
     archive_pending = len(manifests) - len(archive_complete) - archive_excluded - archive_failed
     archive_enabled = schedule.get("hourly_enabled")
     archive_last_success = session.scalar(
