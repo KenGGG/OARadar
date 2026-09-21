@@ -2,7 +2,7 @@
 Description=Run OARadar nightly full reconciliation
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 23:30:00 {{TIMEZONE}}
+OnCalendar=*-*-* 23:30:00 {{TIMEZONE}}
 AccuracySec=5min
 Persistent=false
 Unit=oaradar-nightly.service

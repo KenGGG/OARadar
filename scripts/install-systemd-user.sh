@@ -149,6 +149,12 @@ echo "Rendering systemd units..."
   --uv-bin "$UV_BIN" \
   --output-dir "$SYSTEMD_DIR"
 
+# A previous local deployment overrode the committed nightly timer with a
+# 06:00 weekday-only schedule. Remove that one known stale drop-in so the
+# rendered daily 23:30 calendar is the single source of truth.
+OBSOLETE_NIGHTLY_OVERRIDE="$SYSTEMD_DIR/oaradar-nightly.timer.d/daily-0600.conf"
+rm -f "$OBSOLETE_NIGHTLY_OVERRIDE"
+
 systemctl --user daemon-reload
 
 systemctl --user enable --now \

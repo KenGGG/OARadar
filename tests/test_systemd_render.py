@@ -47,7 +47,8 @@ def test_render_uses_configured_timezone_and_schedule(tmp_path: Path) -> None:
     assert "Asia/Shanghai" in hourly_timer
     assert "Mon..Fri *-*-* 09..17:05:00 Asia/Shanghai" in hourly_timer
     assert "Asia/Shanghai" in nightly_timer
-    assert "Mon..Fri *-*-* 23:30:00 Asia/Shanghai" in nightly_timer
+    assert "*-*-* 23:30:00 Asia/Shanghai" in nightly_timer
+    assert "Mon..Fri" not in nightly_timer
     assert "TZ=Asia/Shanghai" not in hourly_timer
 
 
@@ -133,3 +134,9 @@ def test_render_passes_systemd_analyze_verify(tmp_path: Path) -> None:
 def test_template_files_exist() -> None:
     for name in UNIT_FILES:
         assert (REPO_ROOT / "scripts" / "systemd" / "templates" / f"{name}.in").exists()
+
+
+def test_installer_removes_only_the_obsolete_nightly_override() -> None:
+    installer = (REPO_ROOT / "scripts" / "install-systemd-user.sh").read_text(encoding="utf-8")
+    assert 'oaradar-nightly.timer.d/daily-0600.conf' in installer
+    assert 'rm -f "$OBSOLETE_NIGHTLY_OVERRIDE"' in installer
