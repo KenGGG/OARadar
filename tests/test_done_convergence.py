@@ -96,7 +96,7 @@ def test_successful_item_index_needs_no_markdown_task(config_file: Path) -> None
     planner, engine = _planner(config_file)
     with Session(engine) as session:
         item = OAItem(oa_item_key="done:complete", source_channel="done", title="synthetic", archive_relpath="originals/synthetic/complete")
-        session.add_all([_manifest("done:complete", "downloaded"), item])
+        session.add_all([_manifest("done:complete", "no_attachment", no_attachment=True), item])
         session.flush()
         session.add(MarkdownExport(
             oa_item_id=item.id, document_kind="item_index", source_sha256="0" * 64,
@@ -110,6 +110,34 @@ def test_successful_item_index_needs_no_markdown_task(config_file: Path) -> None
 
     assert report.markdown_created == 0
     assert report.attention == 0
+
+
+def test_item_index_without_attachment_markdown_is_not_complete(config_file: Path) -> None:
+    planner, engine = _planner(config_file)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:partial-index", source_channel="done", title="synthetic",
+            archive_relpath="originals/synthetic/partial-index",
+        )
+        session.add_all([_manifest("done:partial-index", "downloaded"), item])
+        session.flush()
+        session.add(ArchivedFile(
+            oa_item_id=item.id, original_name="synthetic.pdf", attachment_key="source",
+            file_role="direct_attachment", source_container_key="synthetic",
+            download_status="verified", local_relpath="originals/synthetic/partial-index/synthetic.pdf",
+            sha256="1" * 64,
+        ))
+        session.add(MarkdownExport(
+            oa_item_id=item.id, document_kind="item_index", source_sha256="0" * 64,
+            source_relpath="originals/synthetic/partial-index", markdown_relpath="knowledge/synthetic/partial-index.md",
+            parse_engine="item_index", parse_engine_version="1", parse_config_hash="0" * 64,
+            schema_version="1", status="success",
+        ))
+        session.commit()
+
+    report = planner.plan(apply=True)
+
+    assert report.markdown_created == 1
 
 
 def test_requeued_markdown_task_revives_failed_source_parse_jobs(config_file: Path) -> None:

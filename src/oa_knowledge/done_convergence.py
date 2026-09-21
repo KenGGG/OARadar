@@ -9,9 +9,10 @@ import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
+from oa_knowledge.db.models import ArchivedFile, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
 from oa_knowledge.production_pipeline import QUEUE_PRIORITY
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
+from oa_knowledge.web.delivery_facts import delivery_facts_map
 
 
 _DOWNLOAD_STAGES = frozenset({"done_capture_and_archive", "archive_verify"})
@@ -50,12 +51,11 @@ class DoneConvergencePlanner:
                     select(OAItem).where(OAItem.source_channel == "done", OAItem.oa_item_key.in_(keys))
                 )
             } if keys else {}
-            complete_indexes = set(session.scalars(
-                select(OAItem.oa_item_key).join(MarkdownExport, MarkdownExport.oa_item_id == OAItem.id).where(
-                    OAItem.oa_item_key.in_(keys), MarkdownExport.document_kind == "item_index",
-                    MarkdownExport.status == "success",
-                )
-            )) if keys else set()
+            delivery = delivery_facts_map(session, list(items.values()))
+            complete_items = {
+                item.oa_item_key for item in items.values()
+                if delivery[item.id]["status"] == "complete"
+            }
             tasks_by_key: dict[str, list[PipelineTask]] = {}
             if keys:
                 for task in session.scalars(
@@ -75,7 +75,7 @@ class DoneConvergencePlanner:
                     or manifest.processing_status == "downloaded" and item and item.archive_relpath
                 )
                 phase = "markdown" if archive_ready else "download"
-                if phase == "markdown" and manifest.oa_item_key in complete_indexes:
+                if phase == "markdown" and manifest.oa_item_key in complete_items:
                     continue
                 stages = _MARKDOWN_STAGES if phase == "markdown" else _DOWNLOAD_STAGES
                 relevant = next((task for task in tasks_by_key.get(manifest.oa_item_key, ()) if task.stage in stages), None)
