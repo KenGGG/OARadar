@@ -87,13 +87,13 @@ def _classify_done_item(
             return "attention", "原件下载失败"
         return "attention", "缺少原件下载任务"
     # 原件已验证。
+    if task_phase == "markdown" and task_status in {"queued", "running"}:
+        return "waiting_markdown", None
     if markdown_failed:
         return "attention", "Markdown 交付失败"
     if task_phase == "markdown" and task_status == "failed":
         return "attention", "Markdown 交付失败"
     if not has_success_item_index:
-        if task_phase == "markdown" and task_status in {"queued", "running"}:
-            return "waiting_markdown", None
         return "attention", "缺少 Markdown 任务"
     return "completed", None
 
@@ -152,7 +152,7 @@ def _done_simple_status_map(session: Session, *, items=None, facts=None) -> dict
         if processing_status != "depth_limit_reached":
             if item_facts.get("status") == "excluded":
                 state, reason = "excluded", None
-            elif item_facts.get("status") == "needs_review":
+            elif item_facts.get("status") == "needs_review" and state != "waiting_markdown":
                 state, reason = "attention", item_facts["reason"]
         result[mid] = (state, _SIMPLE_DONE_LABELS[state], reason)
     return result

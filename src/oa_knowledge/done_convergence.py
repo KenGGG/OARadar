@@ -9,8 +9,9 @@ import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from oa_knowledge.db.models import MarkdownExport, OAItem, OAManifestItem, PipelineEvent, PipelineTask
+from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
 from oa_knowledge.production_pipeline import QUEUE_PRIORITY
+from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 
 
 _DOWNLOAD_STAGES = frozenset({"done_capture_and_archive", "archive_verify"})
@@ -84,7 +85,7 @@ class DoneConvergencePlanner:
                     if relevant.recoverable:
                         counts[f"{phase}_requeued"] += 1
                         if apply:
-                            self._requeue(session, relevant)
+                            self._requeue(session, relevant, item=item if phase == "markdown" else None)
                     else:
                         counts["attention"] += 1
                     continue
@@ -96,7 +97,7 @@ class DoneConvergencePlanner:
                     if existing.status == "failed" and existing.recoverable:
                         counts[f"{phase}_requeued"] += 1
                         if apply:
-                            self._requeue(session, existing)
+                            self._requeue(session, existing, item=item if phase == "markdown" else None)
                     elif existing.status == "failed":
                         counts["attention"] += 1
                     continue
@@ -125,7 +126,7 @@ class DoneConvergencePlanner:
         return f"converge-markdown:{manifest.oa_item_key}:{signature}:v1"
 
     @staticmethod
-    def _requeue(session: Session, task: PipelineTask) -> None:
+    def _requeue(session: Session, task: PipelineTask, *, item: OAItem | None = None) -> None:
         task.status = "queued"
         task.attempts = 0
         task.progress_current = 0
@@ -137,6 +138,17 @@ class DoneConvergencePlanner:
         task.finished_at = None
         task.lease_owner = None
         task.lease_expires_at = None
+        if item is not None:
+            source_ids = select(ArchivedFile.id).where(
+                ArchivedFile.oa_item_id == item.id,
+                ArchivedFile.file_role.in_(MARKDOWN_SOURCE_ROLES),
+            )
+            for job in session.scalars(select(ParseJob).where(
+                ParseJob.file_id.in_(source_ids), ParseJob.status == "failed",
+            )):
+                job.status = "queued"
+                job.attempts = 0
+                job.error_code = None
         session.add(PipelineEvent(
             task_id=task.id, event_type="convergence_requeued", stage=task.stage,
             status="queued", details_json=json.dumps({"reason": "done_convergence"}),

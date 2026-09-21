@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import MarkdownExport, OAItem, OAManifestItem, PipelineEvent, PipelineTask
+from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
 from oa_knowledge.done_convergence import DoneConvergencePlanner
 
 
@@ -110,3 +110,38 @@ def test_successful_item_index_needs_no_markdown_task(config_file: Path) -> None
 
     assert report.markdown_created == 0
     assert report.attention == 0
+
+
+def test_requeued_markdown_task_revives_failed_source_parse_jobs(config_file: Path) -> None:
+    planner, engine = _planner(config_file)
+    with Session(engine) as session:
+        item = OAItem(
+            oa_item_key="done:retry-markdown", source_channel="done", title="synthetic",
+            archive_relpath="originals/synthetic/retry-markdown",
+        )
+        session.add_all([_manifest("done:retry-markdown", "downloaded"), item])
+        session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, original_name="synthetic.pdf", attachment_key="source",
+            file_role="direct_attachment", source_container_key="synthetic",
+            download_status="verified", local_relpath="originals/synthetic/retry-markdown/synthetic.pdf",
+        )
+        session.add(source)
+        session.flush()
+        job = ParseJob(
+            file_id=source.id, engine="synthetic", engine_version="1", config_hash="synthetic",
+            status="failed", attempts=3, error_code="parse_failed",
+        )
+        task = _task("done:retry-markdown", "markdown_delivery", "parse", "failed")
+        session.add_all([job, task])
+        session.commit()
+        job_id = job.id
+
+    report = planner.plan(apply=True)
+
+    assert report.markdown_requeued == 1
+    with Session(engine) as session:
+        job = session.get(ParseJob, job_id)
+        assert job.status == "queued"
+        assert job.attempts == 0
+        assert job.error_code is None

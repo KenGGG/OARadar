@@ -108,6 +108,18 @@ def test_terminal_markdown_failure_and_excluded_stale_task(session):
     assert states[excluded.id][0] == "excluded"
 
 
+def test_active_markdown_task_overrides_stale_delivery_failure(session):
+    item, manifest = _item(session, key="synthetic-active-repair", processing_status="downloaded")
+    _pipeline_task(session, item.oa_item_key, "markdown_delivery", "parse", "queued")
+
+    state, _, reason = _done_simple_status_map(
+        session, items=[item], facts={item.id: {"status": "failed", "unsupported": 0}},
+    )[manifest.id]
+
+    assert state == "waiting_markdown"
+    assert reason is None
+
+
 @pytest.mark.parametrize("failure", ["missing", "export", "parse", "task", "unsupported"])
 def test_successful_index_cannot_hide_missing_or_failed_source(session, failure):
     item, manifest = _item(session)
