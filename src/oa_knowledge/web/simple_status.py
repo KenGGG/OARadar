@@ -259,6 +259,7 @@ def _workflow_summaries(session: Session, settings: Settings, schedule: dict, *,
     if facts is None:
         facts = delivery_facts_map(session, items)
     facts_by_key = {item.oa_item_key: facts[item.id] for item in items}
+    task_facts = _latest_done_task_facts(session, [item.oa_item_key for item in items])
     archive_complete = [row for row in manifests if row.processing_status == "downloaded" or row.processing_status == "no_attachment" and row.no_attachment_confirmed]
     archive_excluded = sum(row.processing_status == "skipped" for row in manifests)
     archive_failed = sum(row.processing_status in {
@@ -285,8 +286,15 @@ def _workflow_summaries(session: Session, settings: Settings, schedule: dict, *,
                 "needs_review" if manifest.processing_status == "depth_limit_reached" else "pending"
             )
             states[state] += 1
-    for item_facts in facts.values():
-        states[item_facts["status"]] += 1
+    for item in items:
+        item_facts = facts[item.id]
+        active = task_facts.get(item.oa_item_key, {}).get("markdown")
+        state = (
+            "working" if active and active[0] in {"queued", "running"}
+            and item_facts["status"] not in {"complete", "excluded"}
+            else item_facts["status"]
+        )
+        states[state] += 1
     complete_ids = [item_id for item_id, value in facts.items() if value["status"] == "complete"]
     markdown_last_success = session.scalar(select(func.max(MarkdownExport.generated_at)).where(
         MarkdownExport.oa_item_id.in_(complete_ids), MarkdownExport.document_kind == "item_index",

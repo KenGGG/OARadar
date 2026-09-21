@@ -13,6 +13,7 @@ from oa_knowledge.db.models import (
 )
 from oa_knowledge.web.simple_status import (
     _attention_list, _done_simple_status_map, _done_summary, _pending_summary,
+    _workflow_summaries,
 )
 from oa_knowledge.web.delivery_facts import delivery_facts
 
@@ -118,6 +119,18 @@ def test_active_markdown_task_overrides_stale_delivery_failure(session):
 
     assert state == "waiting_markdown"
     assert reason is None
+
+
+def test_workflow_summary_counts_active_repair_as_working_not_failed(session, config_file):
+    item, _ = _item(session, key="synthetic-workflow-repair", processing_status="downloaded")
+    file = _file(session, item)
+    _export(session, item, file, status="failed")
+    _pipeline_task(session, item.oa_item_key, "markdown_delivery", "parse", "queued")
+
+    summary = _workflow_summaries(session, load_settings(config_file), {})["markdown"]
+
+    assert summary["working"] == 1
+    assert summary["failed"] == 0
 
 
 @pytest.mark.parametrize("failure", ["missing", "export", "parse", "task", "unsupported"])
