@@ -1,6 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 import os, time
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from oa_knowledge.config import Settings
 from oa_knowledge.db.engine import create_db_engine
@@ -12,7 +13,12 @@ class MarkdownWorker:
     def __init__(self, settings: Settings): self.settings=settings; self.engine=create_db_engine(settings.database_path); self.owner=f"markdown-worker-{os.getpid()}"
     def close(self): self.engine.dispose()
     def run_once(self):
-        with Session(self.engine) as s: task_id=claim(s,self.owner)
+        try:
+            with Session(self.engine) as s: task_id=claim(s,self.owner)
+        except OperationalError as exc:
+            if "database is locked" in str(exc).lower():
+                return False
+            raise
         if not task_id: return False
         started=time.monotonic()
         try:

@@ -1161,6 +1161,42 @@ def test_done_parse_advances_to_source_publish_before_curation(config_file: Path
         assert row.stage == "source_publish"
 
 
+def test_done_parse_ignores_superseded_failure_when_newer_job_completed(config_file: Path) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:recovered-parse", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, original_name="source.pdf", attachment_key="recovered-parse",
+            file_role="direct_attachment", source_container_key="root", depth=1,
+            local_relpath="originals/unknown/source.pdf", download_status="verified",
+        )
+        session.add(source)
+        session.flush()
+        session.add_all([
+            ParseJob(file_id=source.id, engine="old", engine_version="1", config_hash="old", status="failed"),
+            ParseJob(file_id=source.id, engine="current", engine_version="2", config_hash="new", status="completed"),
+        ])
+        session.commit()
+    task_id = queue.enqueue("realtime_done", "done:recovered-parse", "parse", "recovered-parse-task")
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_parse(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "queued"
+        assert row.stage == "source_publish"
+
+
 def test_source_publish_advances_to_classify_and_missing_artifact_stops(config_file: Path, monkeypatch) -> None:
     settings = load_settings(config_file)
     upgrade_database(settings.database_path)

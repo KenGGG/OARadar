@@ -837,7 +837,13 @@ class OperationWorker:
                 raise FileNotFoundError("archived item is missing")
             files = session.scalars(select(ArchivedFile).where(ArchivedFile.oa_item_id == item.id).order_by(ArchivedFile.id)).all()
             source_ids = [file.id for file in self._historical_source_files(files)]
-            jobs = session.scalars(select(ParseJob).where(ParseJob.file_id.in_(source_ids)).order_by(ParseJob.id)).all() if source_ids else []
+            all_jobs = session.scalars(
+                select(ParseJob).where(ParseJob.file_id.in_(source_ids)).order_by(ParseJob.id.desc())
+            ).all() if source_ids else []
+            latest_by_file = {}
+            for job in all_jobs:
+                latest_by_file.setdefault(job.file_id, job)
+            jobs = list(latest_by_file.values())
             queued = next((job for job in jobs if job.status == "queued"), None)
             completed = sum(job.status == "completed" for job in jobs)
             failed = sum(job.status == "failed" for job in jobs)
