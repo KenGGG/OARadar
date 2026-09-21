@@ -284,7 +284,11 @@ def test_run_nightly_scan_records_run_without_nested_session(tmp_path: Path) -> 
 
     assert result["source_total"] == 0
     assert result["knowledge_tasks_enqueued"] == 0
-    assert "markdown_tasks_enqueued" not in result
+    assert result["convergence"] == {
+        "eligible": 0, "excluded": 0, "download_created": 0,
+        "download_requeued": 0, "markdown_created": 0,
+        "markdown_requeued": 0, "attention": 0,
+    }
     with Session(engine) as session:
         runs = session.scalars(select(Run).where(Run.stage == "scheduled_nightly")).all()
         assert len(runs) == 1

@@ -10,7 +10,7 @@ functions; the pure helpers are unit-tested without any OA access.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol, Sequence
 from uuid import uuid4
@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.collector import BrowserSession, DoneAdapter, LoginState
 from oa_knowledge.collector.pending import PENDING_LIST_PATH, PendingAdapter
 from oa_knowledge.db.models import OAManifestItem, PipelineTask, Run
+from oa_knowledge.done_convergence import DoneConvergencePlanner
 from oa_knowledge.full_manifest import (
     classify_manifest_rows,
     effective_exclusion_keywords,
@@ -442,6 +443,10 @@ def run_nightly_scan(engine, settings, *, headed: bool = False, enqueue_history:
                     "manifest_sync_id": sync.id,
                     **version_summary,
                 }
+                session.commit()
+                done_summary["convergence"] = asdict(
+                    DoneConvergencePlanner(engine, settings).plan(apply=True)
+                )
                 run = session.get(Run, run_id)
                 close_scheduled_run(session, run, "completed", done=done_summary)
                 session.commit()
