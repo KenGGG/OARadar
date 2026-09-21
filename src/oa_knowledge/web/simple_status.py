@@ -30,8 +30,8 @@ from oa_knowledge.web.delivery_facts import delivery_facts_map
 
 # 已办事项的简化状态及中文标签（spec §4.1 / §6.2）。
 _SIMPLE_DONE_LABELS: dict[str, str] = {
-    "waiting_download": "等待下载",
-    "waiting_markdown": "等待 MD 化",
+    "waiting_download": "后台下载中",
+    "waiting_markdown": "后台 MD 处理中",
     "completed": "已完成",
     "attention": "需要处理",
     "excluded": "已按规则排除",

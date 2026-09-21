@@ -94,8 +94,8 @@ def test_active_download_and_markdown_tasks_are_the_only_waiting_states(session)
     _, markdown = _item(session, key="synthetic-markdown", processing_status="downloaded")
     _pipeline_task(session, markdown.oa_item_key, "markdown_delivery", "attachment_inventory", "running")
     states = _done_simple_status_map(session)
-    assert states[downloading.id][0] == "waiting_download"
-    assert states[markdown.id][0] == "waiting_markdown"
+    assert states[downloading.id][:2] == ("waiting_download", "后台下载中")
+    assert states[markdown.id][:2] == ("waiting_markdown", "后台 MD 处理中")
 
 
 def test_terminal_markdown_failure_and_excluded_stale_task(session):
