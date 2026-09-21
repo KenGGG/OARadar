@@ -598,6 +598,24 @@ def test_explicit_retry_resets_failed_production_task(config_file: Path) -> None
         assert task.error_code is None
 
 
+def test_oa_auth_failure_keeps_retrying_after_normal_attempt_limit(config_file: Path) -> None:
+    queue, _ = _queue(config_file)
+    task_id = queue.enqueue("realtime_done", "done:auth", "done_capture_and_archive", "auth-retry")
+    assert queue.claim("worker-a").id == task_id
+    with Session(queue.engine) as session:
+        task = session.get(PipelineTask, task_id)
+        task.attempts = task.max_attempts
+        session.commit()
+
+    queue.fail(task_id, "worker-a", "OA_AUTH_EXPIRED", "sanitized", recoverable=True)
+
+    with Session(queue.engine) as session:
+        task = session.get(PipelineTask, task_id)
+        assert task.status == "queued"
+        assert task.next_retry_at is not None
+        assert task.finished_at is None
+
+
 def test_explicit_retry_keeps_nonrecoverable_review_failure_parked(config_file: Path) -> None:
     queue, _ = _queue(config_file)
     task_id = queue.enqueue("realtime_done", "done:review", "source_publish", "review-me")
