@@ -154,6 +154,7 @@ echo "Rendering systemd units..."
 # rendered daily 23:30 calendar is the single source of truth.
 OBSOLETE_NIGHTLY_OVERRIDE="$SYSTEMD_DIR/oaradar-nightly.timer.d/daily-0600.conf"
 rm -f "$OBSOLETE_NIGHTLY_OVERRIDE"
+rmdir "$SYSTEMD_DIR/oaradar-nightly.timer.d" 2>/dev/null || true
 
 systemctl --user daemon-reload
 

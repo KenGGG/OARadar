@@ -141,7 +141,7 @@ def _main(argv: list[str] | None = None) -> int:
     print("Next triggers (Asia/Shanghai):")
     for cal in (
         f"Mon..Fri *-*-* 09..17:05:00 {ctx.timezone}",
-        f"Mon..Fri *-*-* 23:30:00 {ctx.timezone}",
+        f"*-*-* 23:30:00 {ctx.timezone}",
     ):
         print(f"  {cal} -> {next_trigger(cal) or '(systemd-analyze unavailable)'}")
     return 0
