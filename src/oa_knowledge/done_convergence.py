@@ -17,6 +17,9 @@ from oa_knowledge.web.delivery_facts import delivery_facts_map
 
 _DOWNLOAD_STAGES = frozenset({"done_capture_and_archive", "archive_verify"})
 _MARKDOWN_STAGES = frozenset({"attachment_inventory", "parse", "source_publish", "classify", "index_publish"})
+_LEGACY_RETRYABLE_ERRORS = frozenset({
+    "DAILY_DELIVERY_PARTIAL", "DAILY_DELIVERY_FAILED", "DAILY_DELIVERY_ERROR",
+})
 
 
 @dataclass(frozen=True)
@@ -82,7 +85,7 @@ class DoneConvergencePlanner:
                 if relevant and relevant.status in {"queued", "running"}:
                     continue
                 if relevant and relevant.status == "failed":
-                    if relevant.recoverable:
+                    if relevant.recoverable or relevant.error_code in _LEGACY_RETRYABLE_ERRORS:
                         counts[f"{phase}_requeued"] += 1
                         if apply:
                             self._requeue(session, relevant, item=item if phase == "markdown" else None)
@@ -128,6 +131,7 @@ class DoneConvergencePlanner:
     @staticmethod
     def _requeue(session: Session, task: PipelineTask, *, item: OAItem | None = None) -> None:
         task.status = "queued"
+        task.recoverable = True
         task.attempts = 0
         task.progress_current = 0
         task.progress_total = None

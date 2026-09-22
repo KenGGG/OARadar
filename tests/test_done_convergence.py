@@ -92,6 +92,40 @@ def test_planner_dry_run_reports_without_writing(config_file: Path) -> None:
         assert session.scalar(select(func.count(PipelineTask.id))) == 0
 
 
+def test_planner_requeues_legacy_daily_delivery_terminal_failure(config_file: Path) -> None:
+    planner, engine = _planner(config_file)
+    with Session(engine) as session:
+        session.add_all([
+            _manifest("done:legacy-partial", "downloaded"),
+            OAItem(
+                oa_item_key="done:legacy-partial", source_channel="done", title="synthetic",
+                archive_relpath="originals/synthetic/legacy-partial",
+            ),
+            _task(
+                "done:legacy-partial", "markdown_delivery", "source_publish", "failed",
+                recoverable=False,
+            ),
+        ])
+        session.flush()
+        task = session.scalar(select(PipelineTask).where(
+            PipelineTask.logical_item_key == "done:legacy-partial"
+        ))
+        task.error_code = "DAILY_DELIVERY_PARTIAL"
+        session.commit()
+
+    report = planner.plan(apply=True)
+
+    assert report.markdown_requeued == 1
+    assert report.attention == 0
+    with Session(engine) as session:
+        task = session.scalar(select(PipelineTask).where(
+            PipelineTask.logical_item_key == "done:legacy-partial"
+        ))
+        assert task.status == "queued"
+        assert task.recoverable is True
+        assert task.error_code is None
+
+
 def test_successful_item_index_needs_no_markdown_task(config_file: Path) -> None:
     planner, engine = _planner(config_file)
     with Session(engine) as session:
