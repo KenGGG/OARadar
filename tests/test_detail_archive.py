@@ -334,3 +334,28 @@ def test_successful_archive_does_not_enqueue_legacy_markdown_task(tmp_path: Path
         archive_collaboration_detail(session, session.get(BatchItem, item_id), capture, tmp_path)
         session.commit()
         assert session.scalar(select(func.count()).select_from(MarkdownTask)) == 0
+
+def test_zero_byte_attachment_sets_actionable_archive_error(tmp_path: Path) -> None:
+    db = tmp_path / "state" / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        batch = CollectionBatch(
+            batch_key="empty-payload", source_channel="done", window_field="completed_at",
+            planned_limit=1, status="running", plan_hash="e" * 64,
+        )
+        session.add(batch)
+        session.flush()
+        item = BatchItem(
+            batch_id=batch.id, oa_item_key="done:empty-payload", workitem_id_text="empty-payload",
+            title="Synthetic empty attachment", ordinal=1,
+        )
+        session.add(item)
+        session.flush()
+        capture = DetailCapture(
+            detail_url="https://oa.invalid/detail", page_family="collaboration", body=(), workflow=(),
+            attachments=(DirectAttachment("att-1", "empty.pdf", None, 0, "application/pdf", "direct_attachment", b"", "downloaded"),),
+        )
+        archive_collaboration_detail(session, item, capture, tmp_path)
+        assert item.archive_status == "download_failed"
+        assert item.last_error == "attachment_rejected_zero_byte"

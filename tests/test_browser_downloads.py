@@ -249,6 +249,89 @@ def test_direct_attachment_prefers_completed_browser_download_over_api() -> None
     assert files[0].download_status == "downloaded"
 
 
+def test_direct_attachment_rejects_empty_api_body_after_browser_download_fails() -> None:
+    descriptor = {"file_url": "/seeyon/fileDownload.do?id=1", "key": "file-1", "filename": "empty.pdf", "role": "direct_attachment"}
+
+    class Candidate:
+        def get_attribute(self, name): return descriptor["file_url"] if name == "_temp" else None
+        def evaluate(self, _script): pass
+
+    class Locator:
+        def __init__(self, candidates=False): self.candidates = candidates
+        def evaluate_all(self, *_args): return [descriptor]
+        def count(self): return 1 if self.candidates else 0
+        def nth(self, _index): return Candidate()
+
+    class Frame:
+        def locator(self, selector): return Locator(candidates=selector == "a[_temp]")
+
+    class Response:
+        ok = True
+        headers = {"content-type": "application/pdf"}
+        def body(self): return b""
+
+    class Request:
+        def get(self, *_args, **_kwargs): return Response()
+
+    class Page:
+        frames = [Frame()]
+        url = "https://oa.invalid/seeyon/detail"
+        context = type("Context", (), {"request": Request()})()
+
+    adapter = CollaborationDetailAdapter(None)  # type: ignore[arg-type]
+    adapter._browser_download_payload = lambda *_args: None  # type: ignore[method-assign]
+    files = adapter._download_files(Page(), "direct_attachment", download_timeout_seconds=10)
+    assert len(files) == 1
+    assert files[0].content is None
+    assert files[0].download_status == "download_failed"
+
+
+def test_legacy_panel_rejects_empty_api_body_when_browser_has_no_download() -> None:
+    class Opener:
+        first = None
+        def count(self): return 1
+        def click(self, **_kwargs): pass
+
+    opener = Opener()
+    opener.first = opener
+
+    class Link:
+        def get_attribute(self, name):
+            return "findAttachment('file-1','2026-01-01','empty','pdf','1')" if name == "onclick" else None
+        def click(self, **_kwargs): pass
+
+    class Links:
+        def count(self): return 1
+        def nth(self, _index): return Link()
+
+    class Empty:
+        def count(self): return 0
+
+    class Frame:
+        def locator(self, selector): return opener if "查看附件列表" in selector else Links()
+        def get_by_text(self, *_args, **_kwargs): return Empty()
+
+    class Response:
+        ok = True
+        headers = {"content-type": "application/pdf"}
+        def body(self): return b""
+
+    class Request:
+        def get(self, *_args, **_kwargs): return Response()
+
+    class Page:
+        frames = [Frame()]
+        url = "https://oa.invalid/seeyon/detail"
+        context = type("Context", (), {"request": Request()})()
+
+    adapter = CollaborationDetailAdapter(None)  # type: ignore[arg-type]
+    adapter._browser_download_payload = lambda *_args: None  # type: ignore[method-assign]
+    files, _ = adapter._download_attachment_panel(Page(), "direct_attachment", set(), None, 10)
+    assert len(files) == 1
+    assert files[0].content is None
+    assert files[0].download_status == "download_failed"
+
+
 def test_inventory_only_lists_attachment_without_downloading() -> None:
     descriptor = {"file_url": "/seeyon/fileDownload.do?id=1", "key": "file-1", "filename": "large.zip", "role": "direct_attachment"}
     class Locator:

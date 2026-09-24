@@ -105,7 +105,11 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     else:
         item.archive_status = "download_failed"
     item.archived_at = datetime.now(timezone.utc)
-    item.last_error = None
+    item.last_error = (
+        next((f"attachment_{file.download_status}" for file in attachment_files
+              if file.download_status != "verified"), "attachment_download_failed")
+        if item.archive_status == "download_failed" else None
+    )
     if manifest.depth_limit_reached:
         existing_review = session.scalar(select(ReviewEntry).where(
             ReviewEntry.kind == "depth_limit_reached", ReviewEntry.item_id == oa_item.id,

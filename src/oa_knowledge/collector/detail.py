@@ -641,6 +641,8 @@ class CollaborationDetailAdapter:
                         content_type = "text/html"
                     except PlaywrightError:
                         pass
+                if not content:
+                    content = None
                 if content is None:
                     self._capture_issues.append({
                         "kind": "attachment_download_failed", "attachment_key": key,
@@ -856,6 +858,8 @@ class CollaborationDetailAdapter:
                         )
                         if payload is not None:
                             content = payload
+                if not content:
+                    content = None
                 status = "downloaded" if content is not None else "download_failed"
                 if content is None:
                     self._capture_issues.append({
