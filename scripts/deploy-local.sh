@@ -114,7 +114,7 @@ fi
 # 5. Run tests.
 if [[ "$SKIP_TESTS" -eq 0 ]]; then
   step "5/8 运行测试"
-  "$UV_BIN" run pytest -q || { echo "测试失败，部署中止。" >&2; exit 1; }
+  "$UV_BIN" run python -m pytest -q || { echo "测试失败，部署中止。" >&2; exit 1; }
 else
   step "5/8 运行测试（已跳过）"
 fi
