@@ -945,8 +945,15 @@ class OperationWorker:
         from oa_knowledge.source_markdown.service import publish_active_artifact
 
         status = self._classify_archived_item(task.logical_item_key)
-        if status in {"excluded", "needs_review"}:
+        if status == "excluded":
             self.production_queue.complete(task.id, self.owner)
+            return
+        if status == "needs_review":
+            self.production_queue.fail(
+                task.id, self.owner, "CLASSIFICATION_NEEDS_REVIEW",
+                "classification requires confirmation before Markdown publication",
+                recoverable=False,
+            )
             return
         with Session(self.engine) as session:
             try:
@@ -991,6 +998,7 @@ class OperationWorker:
         )
         from oa_knowledge.db.models import ClassificationDecision
         from oa_knowledge.classification.per_item_classifier import CLASSIFIER_VERSION
+        from oa_knowledge.classification.evidence_dossier import DatabaseEvidenceDossierLoader, dossier_material_signature
 
         with Session(self.engine) as session:
             manifest = session.scalar(select(OAManifestItem).where(
@@ -1007,15 +1015,23 @@ class OperationWorker:
         if self.settings.classification_private_dir is None:
             raise PrivateConfigError("classification private configuration is unavailable")
         loaded = load_private_classification_config(self.settings.classification_private_dir)
-        if current is not None and (
-            current.manual_locked or current.classification_status == "classified"
-        ) and current.private_config_sha256 == loaded.config_sha256 and current.rule_version == CLASSIFIER_VERSION:
+        if current is not None and current.manual_locked:
             return current.classification_status
         factory = sessionmaker(self.engine, expire_on_commit=False)
         service = ClassificationService(factory, loaded.config)
-        if current is None or current.private_config_sha256 != loaded.config_sha256 or current.rule_version != CLASSIFIER_VERSION:
+        material_signature = (
+            dossier_material_signature(DatabaseEvidenceDossierLoader(factory, self.settings, loaded.config)(oa_item_key, load_text=False))
+            if current is not None else "initial"
+        )
+        reason = json.loads(current.classification_reason_json or "{}") if current is not None else {}
+        if current is not None and current.classification_status == "classified" and (
+            current.private_config_sha256 == loaded.config_sha256 and current.rule_version == CLASSIFIER_VERSION
+            and reason.get("material_signature") == material_signature
+        ):
+            return current.classification_status
+        if current is None or current.private_config_sha256 != loaded.config_sha256 or current.rule_version != CLASSIFIER_VERSION or reason.get("material_signature") != material_signature:
             run_key = hashlib.sha256(
-                f"{oa_item_key}:{loaded.config_sha256}:{CLASSIFIER_VERSION}".encode("utf-8")
+                f"{oa_item_key}:{loaded.config_sha256}:{CLASSIFIER_VERSION}:{material_signature}".encode("utf-8")
             ).hexdigest()[:48]
             request = CreateClassificationRun(
                 run_id=f"pipeline-{run_key}",
@@ -1123,18 +1139,30 @@ class OperationWorker:
                 pipeline.enqueue(file_id, session=session)
             session.commit()
             jobs = session.scalars(select(ParseJob).where(ParseJob.file_id.in_(source_ids)).order_by(ParseJob.id)).all() if source_ids else []
+            retry_limit = min(task.max_attempts, 3)
+            if task.attempts < retry_limit:
+                for job in jobs:
+                    if job.status == "failed" and job.attempts < retry_limit:
+                        job.status = "queued"
+                        job.error_code = None
+                session.commit()
             queued = next((job for job in jobs if job.status == "queued"), None)
-            failed = sum(job.status == "failed" for job in jobs)
         if queued is not None:
             try:
                 ParsePipeline(self.settings, self.engine).run(queued.id)
             except Exception as exc:
-                if not self._handle_nonfatal_parse_error(queued.id, exc):
+                if self._handle_nonfatal_parse_error(queued.id, exc):
+                    pass
+                elif task.attempts < retry_limit:
                     raise
+                else:
+                    with Session(self.engine) as session:
+                        job = session.get(ParseJob, queued.id)
+                        if job is not None:
+                            job.status = "failed"
+                            job.error_code = "parse_unavailable"
+                            session.commit()
             self.production_queue.advance(task.id, self.owner, "pending_parse")
-            return
-        if failed:
-            self.production_queue.fail(task.id, self.owner, "PARSE_FAILED", f"{failed} pending parse jobs failed", recoverable=True)
             return
         self.production_queue.advance(task.id, self.owner, "pending_summary")
 
@@ -1217,6 +1245,19 @@ class OperationWorker:
             if existing is not None and existing.status == "sent":
                 session.expunge(existing)
                 self.production_queue.advance(task.id, self.owner, "pending_cleanup")
+                return
+            if existing is not None and existing.status in {"sending", "unknown"}:
+                if existing.status == "sending":
+                    existing.status = "unknown"
+                    existing.error_code = "delivery_outcome_unknown"
+                    existing.last_error = "worker stopped while Feishu delivery was in progress"
+                    existing.next_retry_at = None
+                    session.commit()
+                self.production_queue.fail(
+                    task.id, self.owner, "FEISHU_OUTCOME_UNKNOWN",
+                    "Feishu delivery may have succeeded; verify before retrying",
+                    recoverable=False,
+                )
                 return
             delivery = existing or NotificationDelivery(
                 logical_item_id=logical_item_id,

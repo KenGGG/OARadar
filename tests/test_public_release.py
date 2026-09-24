@@ -177,6 +177,6 @@ def test_ci_enforces_release_checks() -> None:
     assert {"push", "pull_request"}.issubset(triggers)
     assert "uv sync --locked --extra dev" in commands
     assert "uv run python scripts/check_public_release.py" in commands
-    assert "uv run pytest" in commands
+    assert "uv run python -m pytest" in commands
     assert "npm ci" in commands
     assert "npm run build" in commands

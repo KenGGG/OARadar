@@ -114,6 +114,7 @@ export interface SimpleDoneItem {
   attachment_review_label: string | null
   no_attachment_confirmed?: boolean
   simple_status: SimpleDoneState
+  delivery?: { status: string; index_status: string; classification_status: string; expected: number; successful: number; reason: string | null } | null
   simple_status_label: string
   attention_reason: string | null
   updated_at: string | null

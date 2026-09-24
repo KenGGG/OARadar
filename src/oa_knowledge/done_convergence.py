@@ -9,8 +9,9 @@ import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from oa_knowledge.db.models import ArchivedFile, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
+from oa_knowledge.db.models import ArchivedFile, ClassificationDecision, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
 from oa_knowledge.production_pipeline import QUEUE_PRIORITY
+from oa_knowledge.storage_paths import resolve_data_path
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
 from oa_knowledge.web.delivery_facts import delivery_facts_map
 
@@ -54,11 +55,27 @@ class DoneConvergencePlanner:
                     select(OAItem).where(OAItem.source_channel == "done", OAItem.oa_item_key.in_(keys))
                 )
             } if keys else {}
-            delivery = delivery_facts_map(session, list(items.values()))
+            def published_file_exists(relpath: str) -> bool:
+                try:
+                    return resolve_data_path(
+                        self.settings.workspace_root, relpath,
+                        allowed_prefixes=(relpath.split("/", 1)[0],),
+                    ).is_file()
+                except ValueError:
+                    return False
+
+            delivery = delivery_facts_map(session, list(items.values()), file_exists=published_file_exists)
             complete_items = {
                 item.oa_item_key for item in items.values()
                 if delivery[item.id]["status"] == "complete"
             }
+            classifications = {
+                row.oa_item_key: row.classification_status
+                for row in session.scalars(select(ClassificationDecision).where(
+                    ClassificationDecision.oa_item_key.in_(keys),
+                    ClassificationDecision.is_current.is_(True),
+                ))
+            } if keys else {}
             tasks_by_key: dict[str, list[PipelineTask]] = {}
             if keys:
                 for task in session.scalars(
@@ -84,6 +101,16 @@ class DoneConvergencePlanner:
                 relevant = next((task for task in tasks_by_key.get(manifest.oa_item_key, ()) if task.stage in stages), None)
                 if relevant and relevant.status in {"queued", "running"}:
                     continue
+                if phase == "markdown" and relevant and relevant.stage == "classify":
+                    classification = classifications.get(manifest.oa_item_key)
+                    if classification == "needs_review":
+                        counts["attention"] += 1
+                        continue
+                    if classification == "classified" and relevant.status in {"completed", "failed"}:
+                        counts["markdown_requeued"] += 1
+                        if apply:
+                            self._requeue(session, relevant, item=item)
+                        continue
                 if relevant and relevant.status == "failed":
                     if relevant.recoverable or relevant.error_code in _LEGACY_RETRYABLE_ERRORS:
                         counts[f"{phase}_requeued"] += 1

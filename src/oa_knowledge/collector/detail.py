@@ -605,18 +605,8 @@ class CollaborationDetailAdapter:
                 absolute = page.url.split("/seeyon/")[0] + file_url if file_url.startswith("/seeyon/") else file_url
                 content = None
                 content_type = ""
-                # Prefer the authenticated file endpoint: legacy popup download
-                # handlers can close the detail page while starting a download.
-                try:
-                    response = page.context.request.get(absolute, timeout=download_timeout_seconds * 1000)
-                    content_type = self._response_content_type(response)
-                    payload = response.body() if response.ok else None
-                    if payload and "text/html" not in content_type and not payload.lstrip().lower().startswith((b"<!doctype", b"<html", b"<head", b"<body")):
-                        content = payload
-                except PlaywrightError:
-                    pass
                 candidates = frame.locator("a[_temp]")
-                for candidate_index in range(candidates.count() if content is None else 0):
+                for candidate_index in range(candidates.count()):
                     candidate = candidates.nth(candidate_index)
                     if candidate.get_attribute("_temp") == file_url:
                         content = self._browser_download_payload(

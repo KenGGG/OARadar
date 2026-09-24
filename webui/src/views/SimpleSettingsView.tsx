@@ -145,19 +145,19 @@ export function SimpleSettingsView({ initial, onDirtyChange }: {
           <Field label="API 地址" value={form.summary_model.ollama_base_url} change={v => toggle("summary_model", "ollama_base_url", v)}/>
           <Field label="模型" value={form.summary_model.ollama_model} change={v => toggle("summary_model", "ollama_model", v)}/>
         </div>
-        <div className="field-pair field-pair-4">
+        <details className="settings-advanced"><summary>高级参数</summary><div className="field-pair field-pair-4">
           <NumberField label="超时（秒）" value={form.summary_model.timeout_seconds} change={v => toggle("summary_model", "timeout_seconds", v)}/>
           <NumberField label="最大输出" value={form.summary_model.max_tokens} change={v => toggle("summary_model", "max_tokens", v)}/>
           <NumberField label="温度" value={form.summary_model.temperature} step="0.1" change={v => toggle("summary_model", "temperature", v)}/>
           <NumberField label="最大并发" value={form.summary_model.max_concurrency} change={v => toggle("summary_model", "max_concurrency", v)}/>
-        </div>
+        </div></details>
         <SecretState label={form.feishu.webhook_env || "FEISHU_WEBHOOK"} configured={!!form.feishu.webhook_configured}/>
         <SecretState label={form.feishu.secret_env || "FEISHU_SECRET"} configured={!!form.feishu.secret_configured}/>
       </div>
       <div className="settings-sub settings-sub-card"><h3>飞书通知</h3>
         <div className="field-pair">
           <NumberField label="单次最大事项数" value={form.feishu.max_items_per_section} change={v => toggle("feishu", "max_items_per_section", v)}/>
-          <NumberField label="重试次数" value={form.feishu.retry_attempts} change={v => toggle("feishu", "retry_attempts", v)}/>
+          <details className="settings-advanced"><summary>高级参数</summary><NumberField label="重试次数" value={form.feishu.retry_attempts} change={v => toggle("feishu", "retry_attempts", v)}/></details>
         </div>
         <Toggle label="通知内容脱敏" checked={form.feishu.redact_confidential} change={v => toggle("feishu", "redact_confidential", v)}/>
       </div>

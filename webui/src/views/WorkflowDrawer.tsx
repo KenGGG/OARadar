@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react"
 import { X } from "lucide-react"
 import { api, postApi, time, size } from "../App"
+import { MarkdownPreview } from "./MarkdownPreview"
+import { ClassificationEditor } from "./ClassificationEditor"
 
 type Delivery = { status: string; expected: number; successful: number; unsupported: number; failed: number; index_status: string; classification_status: string; reason: string | null }
 type Detail = {
+  source_type?: string; internal_category?: string | null; external_issuer?: string | null
   id: number | null; manifest_id: number | null; title: string; archive_status?: string; archive_error?: string | null; failure_stage?: string | null
   no_attachment_confirmed?: boolean; delivery: Delivery | null; delivery_status?: string; can_retry?: boolean; can_retry_archive?: boolean; retry_blocked_reason?: string | null
   files: { id: number; name: string; role: string; status: string; size_bytes: number | null; sha256: string | null; verified_at: string | null; download_url: string | null }[]
@@ -22,6 +25,7 @@ export function WorkflowDrawer({ kind, id, close, refresh, onRelated }: { kind: 
   const ref = useRef<HTMLElement>(null)
   const closeRef = useRef(close); closeRef.current = close
   const serial = useRef(0)
+  const [showSource, setShowSource] = useState(false)
   async function load() {
     const version = ++serial.current
     try {
@@ -30,7 +34,7 @@ export function WorkflowDrawer({ kind, id, close, refresh, onRelated }: { kind: 
     } catch (reason) { if (version === serial.current) setError(reason instanceof Error ? reason.message : "读取详情失败") }
   }
   useEffect(() => {
-    void load(); const timer = window.setInterval(() => void load(), 5000)
+    void load(); const timer = window.setInterval(() => { if (!document.hidden) void load() }, 5000)
     return () => { serial.current++; window.clearInterval(timer) }
   }, [kind, id])
   useEffect(() => {
@@ -60,6 +64,7 @@ export function WorkflowDrawer({ kind, id, close, refresh, onRelated }: { kind: 
   }
   async function showPreview(exportId: number) {
     setPreview(null)
+    setShowSource(false)
     try { setPreview(await api(`/api/markdown-outputs/documents/${exportId}/content`)) }
     catch (reason) { setMessage(reason instanceof Error ? reason.message : "预览失败") }
   }
@@ -80,8 +85,9 @@ export function WorkflowDrawer({ kind, id, close, refresh, onRelated }: { kind: 
             {(kind === "done" ? detail.can_retry_archive : detail.can_retry) && <button disabled={busy || !!error} onClick={() => void retry()}>{busy ? "正在提交…" : kind === "done" ? "重试归档" : detail.delivery?.status === "complete" ? "重新生成本地交付" : "重试本地交付"}</button>}
             {(kind === "done" ? detail.id : detail.manifest_id) != null && <button onClick={() => onRelated((kind === "done" ? detail.id : detail.manifest_id)!)}>{kind === "done" ? "查看 Markdown 交付" : "查看原件归档"}</button>}
           </div>
+          {kind === "markdown" && detail.id !== null && detail.delivery?.classification_status !== "excluded" && <ClassificationEditor itemId={detail.id} sourceType={detail.source_type || "unknown"} category={detail.internal_category || null} issuer={detail.external_issuer || null} onSaved={async () => { await load(); await refresh() }}/>}
           {kind === "markdown" && detail.retry_blocked_reason && <p>{detail.retry_blocked_reason}</p>}
-          {kind === "done" ? <><h3>原件清单</h3>{detail.files.map(file => <div className="evidence-row" key={file.id}><strong>{file.name}</strong><span>{workflowLabel(file.status)} · {size(file.size_bytes)}</span><small>校验时间：{time(file.verified_at)}</small>{file.download_url && <a href={file.download_url}>下载原件</a>}<details><summary>校验摘要</summary><code>{file.sha256 || "尚无校验记录"}</code></details></div>)}{!detail.files.length && <p>尚无已登记的原件。</p>}</> : <><h3>输出文件</h3>{detail.documents.map(doc => <div className="evidence-row" key={doc.id}><strong>{doc.name}</strong><span>{workflowLabel(doc.status)} · {doc.engine}</span><small>{doc.relpath}</small>{doc.error && <p>{doc.error}</p>}{doc.status === "success" && <div className="workflow-actions"><button onClick={() => void showPreview(doc.id)}>预览 {doc.kind === "item_index" ? "索引" : "正文"}</button><a href={`/api/markdown-outputs/documents/${doc.id}/download`}>下载 Markdown</a></div>}</div>)}{!detail.documents.length && <p>尚未生成输出文件。</p>}{preview && <section><h3>Markdown 预览</h3>{preview.truncated && <p>仅显示前 200,000 字符，可下载完整文件。</p>}<pre className="markdown-preview">{preview.text}</pre></section>}</>}
+          {kind === "done" ? <><h3>原件清单</h3>{detail.files.map(file => <div className="evidence-row" key={file.id}><strong>{file.name}</strong><span>{workflowLabel(file.status)} · {size(file.size_bytes)}</span><small>校验时间：{time(file.verified_at)}</small>{file.download_url && <a href={file.download_url}>下载原件</a>}<details><summary>校验摘要</summary><code>{file.sha256 || "尚无校验记录"}</code></details></div>)}{!detail.files.length && <p>尚无已登记的原件。</p>}</> : <><h3>输出文件</h3>{detail.documents.map(doc => <div className="evidence-row" key={doc.id}><strong>{doc.name}</strong><span>{workflowLabel(doc.status)} · {doc.engine}</span><small>{doc.relpath}</small>{doc.error && <p>{doc.error}</p>}{doc.status === "success" && <div className="workflow-actions"><button onClick={() => void showPreview(doc.id)}>预览 {doc.kind === "item_index" ? "索引" : "正文"}</button><a href={`/api/markdown-outputs/documents/${doc.id}/download`}>下载 Markdown</a></div>}</div>)}{!detail.documents.length && <p>尚未生成输出文件。</p>}{preview && <section><h3>Markdown 预览</h3><button onClick={() => setShowSource(value => !value)}>{showSource ? "阅读视图" : "查看源码"}</button>{preview.truncated && <p>仅显示前 200,000 字符，可下载完整文件。</p>}{showSource ? <pre className="markdown-preview">{preview.text}</pre> : <MarkdownPreview text={preview.text}/>}</section>}</>}
           <h3>最近处理记录</h3>{detail.tasks.map(task => <div className="evidence-row" key={task.id}><strong>{workflowLabel(task.stage)} · {workflowLabel(task.status)}</strong><small>最近更新：{time(task.updated_at)} · 已尝试 {task.attempts} 次</small>{task.error && <p>{task.error}</p>}{task.next_retry_at && <small>下次重试：{time(task.next_retry_at)}</small>}</div>)}{!detail.tasks.length && <p>暂无处理任务。</p>}
         </>}
       </div>

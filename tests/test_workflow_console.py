@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
-from oa_knowledge.db.models import Base, ArchivedFile, ItemOccurrence, LogicalItem, MarkdownExport, OAItem, OAManifestItem, PipelineTask
+from oa_knowledge.db.models import Base, ArchivedFile, ClassificationDecision, ItemOccurrence, LogicalItem, MarkdownExport, OAItem, OAManifestItem, PipelineTask
 from oa_knowledge.web import console_views
+from oa_knowledge.web import workflow_views
 
 
 @pytest.fixture
@@ -236,3 +237,45 @@ def test_archive_retry_rejects_complete_and_deduplicates_active_task(local_db):
     with Session(engine) as session:
         tasks = list(session.scalars(select(PipelineTask)))
         assert len(tasks) == 1 and tasks[0].stage == "done_capture_and_archive"
+
+def test_manual_item_classification_queues_only_local_delivery(local_db, monkeypatch):
+    from oa_knowledge.classification.private_config import LoadedPrivateConfig
+    from oa_knowledge.classification.schemas import PrivateClassificationConfig
+    settings, engine = local_db
+    settings.classification_private_dir = settings.state_root
+    config = PrivateClassificationConfig.model_validate({
+        "initiators": {"synthetic.user": {"role": "internal", "aliases": []}},
+        "document_number_issuers": [{"pattern": r"SYN-NEVER", "canonical_issuer": "Synthetic", "document_type": "notice"}],
+        "issuer_aliases": {"Synthetic": "Synthetic"},
+        "title_templates": [{"pattern": r"^Synthetic never$", "content_origin": "internal", "flow_type": "approval"}],
+    })
+    monkeypatch.setattr(
+        "oa_knowledge.classification.private_config.load_private_classification_config",
+        lambda _root: LoadedPrivateConfig(config, "a" * 64),
+    )
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:manual-category", source_channel="done", title="Synthetic plan",
+                      archive_relpath="originals/done/manual")
+        session.add_all([item, OAManifestItem(
+            oa_item_key=item.oa_item_key, title=item.title, list_page=1,
+            processing_status="no_attachment", no_attachment_confirmed=True,
+        )])
+        session.commit()
+        item_id = item.id
+
+    result = workflow_views.update_item_classification(
+        settings, item_id, content_origin="internal", business_category="04_财务资金与融资",
+        canonical_issuer=None, reason="人工核对合成材料后确认",
+    )
+
+    assert result["status"] == "classified"
+    with Session(engine) as session:
+        decision = session.scalar(select(ClassificationDecision).where(
+            ClassificationDecision.oa_item_key == "done:manual-category",
+            ClassificationDecision.is_current.is_(True),
+        ))
+        task = session.scalar(select(PipelineTask).where(PipelineTask.logical_item_key == "done:manual-category"))
+        assert decision.manual_locked is True
+        assert decision.business_category == "04_财务资金与融资"
+        assert task.stage == "classify" and task.status == "queued"
+        assert session.query(ArchivedFile).count() == 0

@@ -105,3 +105,11 @@
 button:focus-visible,a:focus-visible,tr:focus-visible,summary:focus-visible{outline:2px solid var(--green);outline-offset:2px}
 @media(max-width:1200px){.workflow-grid{grid-template-columns:1fr}.workflow-grid .simple-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:600px){.workflow-grid .simple-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.filter-row{flex-wrap:wrap}.filter-row .search{width:100%;max-width:none}.workflow-drawer{width:96vw}}
+
+.markdown-document{line-height:1.7;overflow-wrap:anywhere;color:#24332d}
+.markdown-document h1,.markdown-document h2,.markdown-document h3{line-height:1.35;margin:1.1em 0 .45em;color:#183c31}
+.markdown-document h1{font-size:1.5rem}.markdown-document h2{font-size:1.25rem}.markdown-document h3{font-size:1.1rem}
+.markdown-document p{margin:.6em 0}.markdown-document ul,.markdown-document ol{padding-left:1.6em;margin:.6em 0}
+.markdown-document table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%;margin:1em 0}
+.markdown-document th,.markdown-document td{border:1px solid var(--border);padding:.45em .7em;text-align:left}
+.markdown-document th{background:#eef4ef}.markdown-document pre{overflow-x:auto;background:#f5f7f5;padding:12px;border-radius:6px}

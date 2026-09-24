@@ -7,6 +7,8 @@ classification label between OA items.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -58,6 +60,22 @@ class OAEvidenceDossier:
     primary_attachment: AttachmentEvidence | None
     primary_attachment_reason: str
     primary_attachment_conflict: bool
+
+def dossier_material_signature(dossier: OAEvidenceDossier) -> str:
+    """Fingerprint verified source material without caching a classification label."""
+    payload = {
+        "item_key": dossier.oa_item_key,
+        "title": dossier.title,
+        "initiator": dossier.initiator,
+        "document_number": dossier.document_number,
+        "no_attachment_confirmed": dossier.no_attachment_confirmed,
+        "attachments": [
+            (file.file_id, file.name, file.role, file.content_sha256)
+            for file in dossier.attachments
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
 
 
 @dataclass(frozen=True, slots=True)

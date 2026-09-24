@@ -123,6 +123,9 @@ def test_done_archives_exposes_simple_status_fields(config_file: Path) -> None:
     assert item["simple_status_label"] == "已完成"
     assert item["attention_reason"] is None
     assert item["updated_at"] is not None
+    assert item["delivery"]["status"] == "complete"
+    assert item["delivery"]["index_status"] == "success"
+    assert item["delivery"]["classification_status"] == "unknown"
 
 
 def test_done_archives_keeps_online_oa_page_and_row_order_and_exposes_initiator_fields(config_file: Path) -> None:

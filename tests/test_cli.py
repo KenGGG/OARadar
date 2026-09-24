@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,10 @@ from oa_knowledge.db.models import (
     OperationJob,
 )
 
+def _plain_help(output: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", output)
+
+
 runner = CliRunner()
 
 
@@ -40,8 +45,8 @@ def test_classified_candidate_build_cli_requires_a_completed_semantic_run() -> N
     result = runner.invoke(app, ["classified-candidate-build", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "--run-id" in result.output
-    assert "--semantic-run-id" in result.output
+    assert "--run-id" in _plain_help(result.output)
+    assert "--semantic-run-id" in _plain_help(result.output)
 
 
 def test_classified_candidate_build_cli_rejects_an_unfinished_semantic_run(
@@ -151,9 +156,9 @@ def test_backfill_mvp_cli_exposes_sample_and_full_modes() -> None:
     result = runner.invoke(app, ["backfill-mvp", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "--run-id" in result.output
-    assert "--sample-size" in result.output
-    assert "--all-targets" in result.output
+    assert "--run-id" in _plain_help(result.output)
+    assert "--sample-size" in _plain_help(result.output)
+    assert "--all-targets" in _plain_help(result.output)
 
 
 def test_backfill_mvp_cli_builds_a_reconciled_candidate(
@@ -261,8 +266,8 @@ def test_manifest_run_exposes_bounded_first_page_options_without_a_separate_pilo
     assert "pilot" not in result.output
     run_help = runner.invoke(app, ["manifest", "run", "--help"])
     assert run_help.exit_code == 0, run_help.output
-    assert "--max-pages" in run_help.output
-    assert "--max-items" in run_help.output
+    assert "--max-pages" in _plain_help(run_help.output)
+    assert "--max-items" in _plain_help(run_help.output)
 
 
 def test_bounded_manifest_run_falls_back_to_current_list_row_when_direct_detail_is_blank(config_file: Path, monkeypatch) -> None:

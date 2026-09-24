@@ -91,6 +91,23 @@ def test_business_subject_beats_incidental_risk_finance_or_document_form(
     assert result.business_category == category
 
 
+@pytest.mark.parametrize(
+    ("title", "category"),
+    [
+        ("报送集团年度融资计划", "04_财务资金与融资"),
+        ("企业年金方案用印申请", "06_人力资源"),
+        ("某租赁项目租后检查报告", "02_业务项目与投放租后"),
+        ("工会员工活动方案", "07_党建纪检与工会"),
+    ],
+)
+def test_specific_business_subject_outranks_process_and_generic_words(title: str, category: str) -> None:
+    result = _module().classify_by_content(title, ("合成正文。",))
+
+    assert result is not None
+    assert result.business_category == category
+
+
+
 class _FakeClient:
     def __init__(self, payload: dict | None = None, *, error: str | None = None, raw_content: str | None = None):
         self.payload = payload

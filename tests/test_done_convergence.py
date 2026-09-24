@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
+from oa_knowledge.db.models import ClassificationDecision, ClassificationRun
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, MarkdownExport, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
 from oa_knowledge.done_convergence import DoneConvergencePlanner
@@ -139,6 +140,9 @@ def test_successful_item_index_needs_no_markdown_task(config_file: Path) -> None
             schema_version="1", status="success",
         ))
         session.commit()
+    target = planner.settings.workspace_root / "knowledge/synthetic/complete.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("# synthetic", encoding="utf-8")
 
     report = planner.plan(apply=True)
 
@@ -207,3 +211,67 @@ def test_requeued_markdown_task_revives_failed_source_parse_jobs(config_file: Pa
         assert job.status == "queued"
         assert job.attempts == 0
         assert job.error_code is None
+
+
+def test_confirmed_classification_resumes_completed_review_task(config_file: Path) -> None:
+    planner, engine = _planner(config_file)
+    with Session(engine) as session:
+        session.add_all([
+            _manifest("done:reviewed", "downloaded"),
+            OAItem(
+                oa_item_key="done:reviewed", source_channel="done", title="synthetic",
+                archive_relpath="originals/synthetic/reviewed",
+            ),
+            _task("done:reviewed", "markdown_delivery", "classify", "completed"),
+        ])
+        run = ClassificationRun(
+            run_id="synthetic-review", run_kind="incremental", status="completed",
+            input_signature="a" * 64, manifest_sha256="b" * 64,
+            exclusion_policy_sha256="c" * 64, rule_version="synthetic",
+            schema_version="synthetic", prompt_version="synthetic",
+            model_name="synthetic", private_config_sha256="d" * 64,
+        )
+        session.add(run)
+        session.flush()
+        session.add(ClassificationDecision(
+            classification_run_id=run.id, oa_item_key="done:reviewed",
+            version=1, is_current=True, decision_input_sha256="e" * 64,
+            decision_source="manual", classification_status="classified",
+            content_integrity_status="ok", content_origin="internal",
+            initiator_type="internal", business_category="04_财务资金与融资",
+            normalized_title="synthetic", classification_confidence=1.0,
+            rule_version="synthetic", private_config_sha256="d" * 64,
+            manual_locked=True, actor="synthetic-tester",
+        ))
+        session.commit()
+
+    report = planner.plan(apply=True)
+
+    assert report.markdown_requeued == 1
+    with Session(engine) as session:
+        task = session.scalar(select(PipelineTask).where(
+            PipelineTask.logical_item_key == "done:reviewed"
+        ))
+        assert task.status == "queued"
+        assert task.stage == "classify"
+
+def test_missing_published_markdown_is_requeued_without_redownload(config_file: Path) -> None:
+    planner, engine = _planner(config_file)
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:missing-output", source_channel="done", title="synthetic",
+                      archive_relpath="originals/synthetic/missing-output")
+        session.add_all([_manifest("done:missing-output", "no_attachment", no_attachment=True), item])
+        session.flush()
+        session.add(MarkdownExport(
+            oa_item_id=item.id, document_kind="item_index", source_sha256="0" * 64,
+            source_relpath="originals/synthetic/missing-output",
+            markdown_relpath="knowledge/synthetic/missing-output.md",
+            parse_engine="item_index", parse_engine_version="1", parse_config_hash="0" * 64,
+            schema_version="1", status="success",
+        ))
+        session.commit()
+
+    report = planner.plan(apply=True)
+
+    assert report.markdown_created == 1
+    assert report.download_created == 0

@@ -15,6 +15,7 @@ from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import ArchivedFile, BatchItem, ClassificationDecision, CollectionBatch, ContentObject, ItemOccurrence, MarkdownQueueControl, MarkdownTask, NotificationDelivery, OAItem, OAManifestItem, OAManifestSync, OnlineAuditItem, OnlineAuditRun, OperationJob, ParseArtifact, ParseJob, PipelineTask, ReviewEntry
 from oa_knowledge.online_audit import start_audit
 from oa_knowledge.web.worker import OperationWorker, PipelineResourceBusyError, _has_verified_attachment
+from oa_knowledge.db.models import ItemSnapshot, LogicalItem, SourceAttachment
 from oa_knowledge.production_pipeline import ProductionQueue
 from oa_knowledge.notifications.models import DeliveryResult
 from oa_knowledge.archive_migration_campaign import ensure_verified_archive_migration
@@ -279,6 +280,23 @@ def test_classify_stage_creates_and_refines_missing_decision(config_file: Path, 
         assert decision.classification_status == "classified"
         assert decision.business_category == "04_财务资金与融资"
         assert task_row.stage == "index_publish"
+        first_decision_id = decision.id
+
+    with Session(engine) as session:
+        item = session.scalar(select(OAItem).where(OAItem.oa_item_key == key))
+        item.title = "内部事项呈批表—企业年金方案"
+        session.commit()
+    worker = OperationWorker(settings, config_path=config_file)
+    try:
+        worker._classify_archived_item(key)
+    finally:
+        worker.close()
+    with Session(engine) as session:
+        changed = session.scalar(select(ClassificationDecision).where(
+            ClassificationDecision.oa_item_key == key,
+            ClassificationDecision.is_current.is_(True),
+        ))
+        assert changed.id != first_decision_id
 
 
 def test_excluded_done_item_stops_before_parse_and_classification(config_file: Path) -> None:
@@ -2001,3 +2019,123 @@ def test_notify_feishu_unknown_outcome_parks_for_manual_retry(config_file: Path,
             NotificationDelivery.idempotency_key == f"feishu:pending:{logical_id}:abc123"))
         assert delivery.status == "unknown"
         assert delivery.next_retry_at is None
+
+
+def test_notify_feishu_parked_sending_is_not_resent_after_restart(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    settings.feishu.enabled = True
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    logical_id, occurrence_id = _seed_pending_summary(engine, monkeypatch)
+    with Session(engine) as session:
+        session.add(NotificationDelivery(
+            logical_item_id=logical_id, channel="feishu",
+            notification_type="pending_summary",
+            idempotency_key=f"feishu:pending:{logical_id}:abc123",
+            status="sending", attempts=1,
+        ))
+        session.commit()
+
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "realtime_pending", str(logical_id), "notify_feishu", "notify-feishu-interrupted",
+        payload={"occurrence_id": occurrence_id, "notify": True},
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr(
+        "oa_knowledge.notifications.feishu_service.FeishuService.send_pending_summary",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(AssertionError("duplicate send")),
+    )
+    try:
+        worker._pipeline_notify_feishu(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        delivery = session.scalar(select(NotificationDelivery).where(
+            NotificationDelivery.idempotency_key == f"feishu:pending:{logical_id}:abc123"
+        ))
+        assert delivery.status == "unknown"
+        assert delivery.attempts == 1
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "failed"
+        assert row.recoverable is False
+
+
+def test_classification_review_parks_markdown_task_without_marking_complete(config_file: Path, monkeypatch) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue(
+        "markdown_delivery", "done:review", "classify", "synthetic-review-stage",
+    )
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    monkeypatch.setattr(worker, "_classify_archived_item", lambda _key: "needs_review")
+    try:
+        worker._pipeline_classify(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "failed"
+        assert row.error_code == "CLASSIFICATION_NEEDS_REVIEW"
+        assert row.recoverable is False
+
+
+def test_failed_pending_parse_does_not_block_basic_summary(config_file) -> None:
+    settings = load_settings(config_file)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="pending:parse-failed", title="合成待办")
+        session.add(logical)
+        session.flush()
+        snapshot = ItemSnapshot(
+            logical_item_id=logical.id, snapshot_kind="pending_initial",
+            version=1, content_hash="a" * 64, payload_json='{"title":"合成待办"}',
+        )
+        session.add(snapshot)
+        item = OAItem(oa_item_key="pending:parse-failed", source_channel="pending", title="合成待办")
+        session.add(item)
+        session.flush()
+        original = ArchivedFile(
+            oa_item_id=item.id, original_name="synthetic.pdf", attachment_key="synthetic",
+            file_role="direct_attachment", source_container_key="root", download_status="verified",
+        )
+        session.add(original)
+        session.flush()
+        session.add(SourceAttachment(
+            snapshot_id=snapshot.id, source_file_id=original.id, source_key="synthetic",
+            ordinal=1, role="attachment", original_name="synthetic.pdf",
+            download_status="verified",
+        ))
+        session.add(ParseJob(
+            file_id=original.id, engine="synthetic", engine_version="1",
+            config_hash="c" * 64, status="failed", attempts=3,
+        ))
+        session.commit()
+        logical_id = logical.id
+
+    queue = ProductionQueue(engine)
+    task_id = queue.enqueue("realtime_pending", str(logical_id), "pending_parse", "synthetic-parse-failed")
+    with Session(engine) as session:
+        session.get(PipelineTask, task_id).logical_item_id = logical_id
+        session.commit()
+    task = queue.claim("worker-test")
+    worker = OperationWorker(settings, config_path=config_file)
+    worker.owner = "worker-test"
+    try:
+        worker._pipeline_pending_parse(task)
+    finally:
+        worker.close()
+
+    with Session(engine) as session:
+        row = session.get(PipelineTask, task_id)
+        assert row.status == "queued"
+        assert row.stage == "pending_summary"

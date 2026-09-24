@@ -23,7 +23,7 @@ jobs:
       - name: Check public release boundary
         run: uv run python scripts/check_public_release.py
       - name: Run Python tests
-        run: uv run pytest
+        run: uv run python -m pytest
       - uses: actions/setup-node@v4
         with:
           node-version: "20"

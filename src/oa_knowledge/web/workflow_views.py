@@ -167,3 +167,90 @@ def archived_document_path(settings, file_id):
             return path, file.original_name
     finally:
         engine.dispose()
+
+def update_item_classification(
+    settings, item_id: int, *, content_origin: str,
+    business_category: str | None, canonical_issuer: str | None, reason: str,
+) -> dict:
+    """Record a locked human decision and republish this item without OA access."""
+    import hashlib
+    from sqlalchemy.orm import sessionmaker
+    from typing import get_args
+
+    from oa_knowledge.classification.internal_classification import BusinessCategory
+    from oa_knowledge.classification.per_item_classifier import CLASSIFIER_VERSION
+    from oa_knowledge.classification.private_config import load_private_classification_config
+    from oa_knowledge.classification.service import (
+        ClassificationService, CreateClassificationRun, ManualDecisionCommand,
+    )
+    from oa_knowledge.production_pipeline import ProductionQueue
+
+    reason = reason.strip()
+    issuer = (canonical_issuer or "").strip()
+    if not 3 <= len(reason) <= 400:
+        raise ValueError("请填写 3 至 400 字的分类依据")
+    if content_origin == "internal":
+        if business_category not in get_args(BusinessCategory) or issuer:
+            raise ValueError("内部事项必须选择一个业务分类，不能填写发文单位")
+    elif content_origin == "external":
+        if business_category or not 2 <= len(issuer) <= 80:
+            raise ValueError("外部文件必须填写实际发文单位，不能选择内部业务分类")
+    else:
+        raise ValueError("请选择内部事项或外部文件")
+    if settings.classification_private_dir is None:
+        raise ValueError("分类私有配置不可用")
+    loaded = load_private_classification_config(settings.classification_private_dir)
+    engine = create_db_engine(settings.database_path)
+    try:
+        with Session(engine) as session:
+            item = session.get(OAItem, item_id)
+            if item is None or item.source_channel != "done":
+                raise LookupError("已办事项不存在")
+            manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == item.oa_item_key))
+            if manifest is None or manifest.processing_status == "skipped" or (manifest.matched_exclusion_keyword or "").strip():
+                raise ValueError("排除事项不能修改分类")
+            if manifest.processing_status not in {"downloaded", "no_attachment"} or (
+                manifest.processing_status == "no_attachment" and not manifest.no_attachment_confirmed
+            ):
+                raise ValueError("请先完成原件归档核验")
+            current = session.scalar(select(ClassificationDecision).where(
+                ClassificationDecision.oa_item_key == item.oa_item_key,
+                ClassificationDecision.is_current.is_(True),
+            ))
+            item_key = item.oa_item_key
+            initiator_type = current.initiator_type if current else "unknown"
+            document_number = current.document_number if current else item.document_number
+            document_type = current.document_type if current else None
+        service = ClassificationService(sessionmaker(engine, expire_on_commit=False), loaded.config)
+        run_id = f"manual-web-{uuid4().hex}"
+        service.create_run(CreateClassificationRun(
+            run_id=run_id, run_kind="incremental",
+            manifest_sha256=hashlib.sha256(item_key.encode()).hexdigest(),
+            exclusion_policy_sha256=hashlib.sha256(b"pipeline-exclusion-v1").hexdigest(),
+            rule_version=CLASSIFIER_VERSION, schema_version="classification-v1",
+            prompt_version="manual-web-v1", model_name=settings.llm.model,
+            private_config_sha256=loaded.config_sha256, target_keys=(item_key,),
+        ))
+        decision = service.set_manual_decision(ManualDecisionCommand(
+            run_id=run_id, oa_item_key=item_key, actor="local_web", reason=reason,
+            classification_status="classified", content_origin=content_origin,
+            business_category=business_category if content_origin == "internal" else None,
+            canonical_issuer=issuer if content_origin == "external" else None,
+            flow_type="formal_document" if content_origin == "external" else "approval",
+            initiator_type=initiator_type, issuer=issuer if content_origin == "external" else None,
+            document_number=document_number, document_type=document_type,
+        ))
+        with Session(engine) as session:
+            active = session.scalar(select(PipelineTask).where(
+                PipelineTask.logical_item_key == item_key,
+                PipelineTask.stage.in_(LOCAL_STAGES),
+                PipelineTask.status.in_(("queued", "running")),
+            ).order_by(PipelineTask.id.desc()))
+        task_id = active.id if active else ProductionQueue(engine).enqueue(
+            "markdown_delivery", item_key, "classify",
+            f"manual-classification:{decision.decision_id}",
+            payload={"reason": "manual_classification"},
+        )
+        return {"status": "classified", "decision_id": decision.decision_id, "task_id": task_id}
+    finally:
+        engine.dispose()

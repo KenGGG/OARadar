@@ -330,7 +330,10 @@ export function App() {
     try {
       const params = new URLSearchParams({ page: String(page), page_size: "50" })
       if (query) params.set("query", query)
-      if (filter) params.set(view === "done" ? filter === "no_attachment" ? "attachment_review" : "simple_status" : view === "pending" ? "filter" : "status", filter)
+      if (filter) {
+        if (view === "markdown" && filter.startsWith("category:")) params.set("category", filter.slice(9))
+        else params.set(view === "done" ? filter === "no_attachment" ? "attachment_review" : "simple_status" : view === "pending" ? "filter" : "status", filter)
+      }
       const path = view === "overview" ? "/api/simple-status" : view === "settings" ? "/api/settings" : `/api/${view === "done" ? "done-archives" : view === "pending" ? "pending-notifications" : "markdown-outputs"}?${params}`
       const response = await fetch(path, { signal: abort.signal, headers: { Accept: "application/json" } })
       if (response.status === 401) { setAuth(false); throw new Error("本地会话已过期，请重新登录") }
@@ -385,7 +388,7 @@ export function App() {
       </header>
       {error && <div className="error-banner" role="alert"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}
       {auth === null && <p>正在验证本地会话…</p>}
-      {auth && loading && <p role="status" aria-live="polite">正在读取 OA 同步数据，请稍候…</p>}
+      {auth && loading && loadedView !== view && <p role="status" aria-live="polite">正在读取 OA 同步数据，请稍候…</p>}
       {auth && loadedView === view && <>
         {view === "overview" && simpleStatus && <SimpleOverviewView data={simpleStatus} onJump={navigate}/>}
         {view === "pending" && <PendingView rows={pending} total={total} page={page} pageSize={50} setPage={setPage} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} selectedId={selected} onSelect={onSelect} refresh={load}/>}

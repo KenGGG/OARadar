@@ -262,7 +262,7 @@ class ClassificationService:
         self, item_key: str, settings: Settings
     ) -> ClassificationDecision:
         """Refine one unresolved decision from its own verified local evidence."""
-        from .evidence_dossier import DatabaseEvidenceDossierLoader
+        from .evidence_dossier import DatabaseEvidenceDossierLoader, dossier_material_signature
         from .per_item_classifier import CLASSIFIER_VERSION, classify_dossier
 
         with self._sessions() as session:
@@ -271,12 +271,15 @@ class ClassificationService:
                 raise ValueError("dossier refinement requires a current decision")
             if current.manual_locked or current.classification_status == "excluded":
                 return current
-            if current.classification_status == "classified" and json.loads(current.classification_reason_json or "{}").get("classifier") == CLASSIFIER_VERSION:
-                return current
         loader = DatabaseEvidenceDossierLoader(
             self._sessions, settings, self._config
         )
         dossier = loader(item_key, load_text=False)
+        material_signature = dossier_material_signature(dossier)
+        reason = json.loads(current.classification_reason_json or "{}")
+        if current.classification_status == "classified" and reason.get("classifier") == CLASSIFIER_VERSION and reason.get("material_signature") == material_signature:
+            return current
+
         proposed = classify_dossier(dossier, self._config)
         if proposed.classification_status == "needs_review":
             dossier = loader(item_key)
@@ -337,6 +340,7 @@ class ClassificationService:
                 classification_reason_json=_canonical_json(
                     {
                         "classifier": CLASSIFIER_VERSION,
+                        "material_signature": material_signature,
                         "origin_evidence_source": proposed.origin_evidence_source,
                         "classification_evidence_source": proposed.classification_evidence_source,
                         "review_reason": proposed.review_reason,

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.archive_paths import count_original_files, original_file_names
@@ -36,6 +36,7 @@ from oa_knowledge.web.lifecycle_views import (
     pending_list as lifecycle_pending_list,
 )
 from oa_knowledge.web.provider_settings import provider_settings_view
+from oa_knowledge.web.delivery_facts import delivery_facts
 from oa_knowledge.web.simple_status import (
     _classify_done_item,
     _done_simple_status_map,
@@ -657,6 +658,7 @@ def done_archives_list(
                         ),
                         "attachment_names": original_file_names(settings.data_root, archive_relpath),
                         "simple_status": simple["state"],
+                        "delivery": delivery_facts(session, archived) if archived else None,
                         "simple_status_label": simple["label"],
                         "attention_reason": simple["reason"],
                         "updated_at": simple["updated_at"],
@@ -703,6 +705,7 @@ def done_archives_list(
                     "stages": stages,
                     "local_dir": str(settings.archive_root / manifest.archive_relpath) if manifest and manifest.archive_relpath else None,
                     "simple_status": single["state"],
+                    "delivery": delivery_facts(session, archived) if archived else None,
                     "simple_status_label": single["label"],
                     "attention_reason": single["reason"],
                     "updated_at": manifest.last_synced_at.isoformat() if manifest and manifest.last_synced_at else None,
@@ -953,6 +956,7 @@ def _handoff_status_for_item(settings: Settings, md: dict) -> dict:
 
 def markdown_outputs_list(
     settings: Settings, *, page: int = 1, page_size: int = 50, query: str | None = None, status: str | None = None,
+    category: str | None = None, issuer: str | None = None,
 ) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
@@ -991,8 +995,13 @@ def markdown_outputs_list(
             from oa_knowledge.web.delivery_facts import delivery_facts_map
             from oa_knowledge.web.workflow_views import DELIVERY_LABELS
             stmt = select(OAItem).where(OAItem.source_channel == "done")
-            if query:
-                stmt = stmt.where(OAItem.title.ilike(f"%{query.strip()}%"))
+            if query and query.strip():
+                pattern = f"%{query.strip()}%"
+                stmt = stmt.where(or_(OAItem.title.ilike(pattern), OAItem.external_issuer.ilike(pattern)))
+            if category:
+                stmt = stmt.where(OAItem.internal_category == category)
+            if issuer and issuer.strip():
+                stmt = stmt.where(OAItem.external_issuer.ilike(f"%{issuer.strip()}%"))
             candidates = session.scalars(stmt.order_by(OAItem.completed_at.desc(), OAItem.id.desc())).all()
             facts_map = delivery_facts_map(session, candidates)
             if status:

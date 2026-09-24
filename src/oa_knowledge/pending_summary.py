@@ -16,6 +16,7 @@ from oa_knowledge.enrich.extractor import validate_json_response
 from oa_knowledge.enrich.provider import make_llm_client
 from oa_knowledge.enrich.context_budget import ContextBudget, chunk_text, discover_ollama_profile, estimate_tokens
 from oa_knowledge.resources import ResourceCoordinator
+from oa_knowledge.runtime_paths import resolve_cache_path
 
 
 class Amount(BaseModel):
@@ -183,6 +184,45 @@ def summarize_evidence(client, payload: str, *, max_input_tokens: int) -> Pendin
         raise PendingSummaryError(response.get("error"))
     return normalize_pending_content(response.get("content"))
 
+MISSING_ATTACHMENT_NOTICE = "部分附件尚未解析，请进入 OA 核对原文。"
+
+
+def pending_attachment_evidence(settings: Settings, artifact_paths: list[str | None]) -> tuple[str, bool]:
+    """Read active parse products from the private cache and disclose gaps."""
+    markdown_parts: list[str] = []
+    missing = False
+    for relpath in artifact_paths:
+        if not relpath:
+            missing = True
+            continue
+        try:
+            product = resolve_cache_path(settings, relpath)
+            content = product.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            missing = True
+            continue
+        if content.strip():
+            markdown_parts.append(content)
+        else:
+            missing = True
+    evidence = "\n\n附件 Markdown：\n" + "\n\n---\n\n".join(markdown_parts) if markdown_parts else ""
+    if missing:
+        evidence += "\n\n" + MISSING_ATTACHMENT_NOTICE
+    return evidence, missing
+
+def mark_missing_attachment_notice(summary: PendingSummary) -> PendingSummary:
+    """Keep the evidence gap visible in the card's 200-character brief."""
+    if MISSING_ATTACHMENT_NOTICE not in summary.summary:
+        summary.summary = summary.summary.rstrip() + " " + MISSING_ATTACHMENT_NOTICE
+    brief = summary.brief_content.replace(MISSING_ATTACHMENT_NOTICE, "").strip()
+    prefix_limit = max(0, 200 - len(MISSING_ATTACHMENT_NOTICE) - 1)
+    summary.brief_content = (brief[:prefix_limit].rstrip() + " " + MISSING_ATTACHMENT_NOTICE).strip()
+    return summary
+
+
+
+
+
 
 def summarize_pending(settings: Settings, engine, logical_item_id: int) -> SummaryVersion:
     with Session(engine) as session:
@@ -193,23 +233,18 @@ def summarize_pending(settings: Settings, engine, logical_item_id: int) -> Summa
         if snapshot is None:
             raise LookupError("pending snapshot not found")
         payload = snapshot.payload_json
-        artifact_paths = session.scalars(
-            select(ParseArtifact.output_relpath)
-            .join(ContentObject, ContentObject.active_parse_artifact_id == ParseArtifact.id)
-            .join(SourceAttachment, SourceAttachment.content_object_id == ContentObject.id)
-            .where(
-                SourceAttachment.snapshot_id == snapshot.id,
-                ParseArtifact.lifecycle_status == "valid",
-            )
+        artifacts = session.execute(
+            select(SourceAttachment.download_status, ParseArtifact.output_relpath,
+                   ParseArtifact.lifecycle_status)
+            .outerjoin(ContentObject, SourceAttachment.content_object_id == ContentObject.id)
+            .outerjoin(ParseArtifact, ContentObject.active_parse_artifact_id == ParseArtifact.id)
+            .where(SourceAttachment.snapshot_id == snapshot.id)
             .order_by(SourceAttachment.ordinal)
         ).all()
-        markdown_parts = []
-        for relpath in artifact_paths:
-            path = settings.data_root / relpath
-            if path.is_file():
-                markdown_parts.append(path.read_text(encoding="utf-8", errors="replace"))
-        if markdown_parts:
-            payload += "\n\n附件 Markdown：\n" + "\n\n---\n\n".join(markdown_parts)
+        artifact_paths = [relpath if status == "verified" and lifecycle == "valid" else None
+                          for status, relpath, lifecycle in artifacts]
+        attachment_evidence, missing_attachment = pending_attachment_evidence(settings, artifact_paths)
+        payload += attachment_evidence
         input_hash = hashlib.sha256(payload.encode()).hexdigest()
         existing = session.scalar(select(SummaryVersion).where(
             SummaryVersion.logical_item_id == logical_item_id, SummaryVersion.summary_kind == "pending",
@@ -262,6 +297,9 @@ def summarize_pending(settings: Settings, engine, logical_item_id: int) -> Summa
                 result = {"model": "deterministic-fallback", "provider": "deterministic-fallback", "elapsed_seconds": None, "fallback": True}
         finally:
             coordinator.release(lease, owner)
+
+    if missing_attachment:
+        summary = mark_missing_attachment_notice(summary)
 
     with Session(engine) as session:
         job = session.get(SummaryJob, job_id); assert job is not None

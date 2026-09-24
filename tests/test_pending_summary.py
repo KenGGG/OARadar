@@ -1,14 +1,17 @@
 import pytest
+import hashlib
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import ItemSnapshot, LogicalItem
+from oa_knowledge.db.models import ArchivedFile, ContentObject, ItemSnapshot, LogicalItem, OAItem, ParseArtifact, ParseJob, SourceAttachment
 from oa_knowledge.pending_summary import (
     PendingSummary, PendingSummaryError, normalize_pending_content, normalize_pending_response,
     deterministic_pending_fallback, pending_evidence, summarize_evidence, summarize_pending,
+    pending_attachment_evidence,
+    mark_missing_attachment_notice,
 )
 from oa_knowledge.enrich.context_budget import estimate_tokens
 
@@ -119,3 +122,72 @@ def test_llm_disabled_uses_rule_summary_without_client(config_file, monkeypatch)
 
     assert version.provider_name == "deterministic-fallback"
     assert version.model_name == "deterministic-fallback"
+
+def test_pending_attachment_evidence_reads_cache_and_reports_missing(config_file) -> None:
+    settings = load_settings(config_file)
+    product = settings.cache_root / "synthetic" / "attachment.md"
+    product.parent.mkdir(parents=True, exist_ok=True)
+    product.write_text("合成附件的事实", encoding="utf-8")
+
+    evidence, missing = pending_attachment_evidence(
+        settings, ["synthetic/attachment.md", "synthetic/missing.md"]
+    )
+
+    assert "合成附件的事实" in evidence
+    assert missing is True
+    assert "部分附件尚未解析，请进入 OA 核对原文。" in evidence
+    assert str(settings.data_root) not in evidence
+
+    evidence, missing = pending_attachment_evidence(settings, ["synthetic/attachment.md"])
+    assert missing is False
+    assert "部分附件尚未解析" not in evidence
+
+
+def test_missing_attachment_notice_survives_full_brief() -> None:
+    summary = PendingSummary(summary="合成待办", brief_content="甲" * 200, confidence=0.5)
+
+    marked = mark_missing_attachment_notice(summary)
+
+    assert marked.brief_content.endswith("部分附件尚未解析，请进入 OA 核对原文。")
+    assert len(marked.brief_content) <= 200
+
+def test_pending_summary_input_includes_cache_root_attachment(config_file) -> None:
+    settings = load_settings(config_file)
+    settings.llm.enabled = False
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    payload = '{"title":"合成待办"}'
+    content = "合成附件写明需要核对期限。"
+    product = settings.cache_root / "synthetic" / "attachment.md"
+    product.parent.mkdir(parents=True, exist_ok=True)
+    product.write_text(content, encoding="utf-8")
+    with Session(engine) as session:
+        logical = LogicalItem(logical_key="pending:cache-evidence", title="合成待办")
+        session.add(logical); session.flush()
+        snapshot = ItemSnapshot(logical_item_id=logical.id, snapshot_kind="pending_initial",
+                                version=1, content_hash="a" * 64, payload_json=payload)
+        item = OAItem(oa_item_key="pending:cache-evidence", source_channel="pending", title="合成待办")
+        session.add_all([snapshot, item]); session.flush()
+        source = ArchivedFile(oa_item_id=item.id, original_name="synthetic.txt", attachment_key="synthetic",
+                              file_role="direct_attachment", source_container_key="root", download_status="verified")
+        content_object = ContentObject(sha256="b" * 64)
+        session.add_all([source, content_object]); session.flush()
+        job = ParseJob(file_id=source.id, engine="synthetic", engine_version="1", config_hash="c" * 64, status="completed")
+        session.add(job); session.flush()
+        artifact = ParseArtifact(parse_job_id=job.id, content_object_id=content_object.id,
+                                 engine="synthetic", engine_version="1", output_relpath="synthetic/attachment.md",
+                                 source_sha256="b" * 64, config_hash="c" * 64)
+        session.add(artifact); session.flush()
+        content_object.active_parse_artifact_id = artifact.id
+        session.add(SourceAttachment(snapshot_id=snapshot.id, source_file_id=source.id,
+                                     source_key="synthetic", ordinal=1, role="attachment",
+                                     original_name="synthetic.txt", download_status="verified",
+                                     content_object_id=content_object.id))
+        session.commit()
+        logical_id = logical.id
+
+    version = summarize_pending(settings, engine, logical_id)
+
+    expected_input = payload + "\n\n附件 Markdown：\n" + content
+    assert version.input_hash == hashlib.sha256(expected_input.encode()).hexdigest()
+    assert version.provider_name == "deterministic-fallback"

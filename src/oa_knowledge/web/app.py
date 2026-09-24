@@ -81,6 +81,13 @@ class DataGovernanceActionRequest(BaseModel):
     confirmation: str | None = Field(default=None, max_length=100)
 
 
+class ManualClassificationRequest(BaseModel):
+    content_origin: str = Field(pattern="^(internal|external)$")
+    business_category: str | None = Field(default=None, max_length=80)
+    canonical_issuer: str | None = Field(default=None, max_length=80)
+    reason: str = Field(min_length=3, max_length=400)
+
+
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 RETIRED_API_PREFIXES = (
     "/api/audits", "/api/lifecycle", "/api/knowledge", "/api/data-governance",
@@ -476,11 +483,12 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=200),
         query: str | None = Query(None), status: str | None = Query(None),
+        category: str | None = Query(None, max_length=80), issuer: str | None = Query(None, max_length=80),
     ) -> dict:
         from oa_knowledge.web.workflow_views import DELIVERY_LABELS
         if status and status not in DELIVERY_LABELS:
             raise HTTPException(status_code=422, detail="unsupported Markdown status")
-        return markdown_outputs_list(settings, page=page, page_size=page_size, query=query, status=status)
+        return markdown_outputs_list(settings, page=page, page_size=page_size, query=query, status=status, category=category, issuer=issuer)
 
     @app.get("/api/done-archives/{manifest_id}")
     def get_done_detail(manifest_id: int) -> dict:
@@ -497,6 +505,17 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return markdown_item_detail(settings, item_id)
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+
+    @app.post("/api/markdown-outputs/items/{item_id}/classification", status_code=202)
+    def set_item_classification(item_id: int, body: ManualClassificationRequest) -> dict:
+        from oa_knowledge.web.workflow_views import update_item_classification
+        try:
+            return update_item_classification(settings, item_id, **body.model_dump())
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/markdown-outputs/items/{item_id}/retry", status_code=202)
     def retry_markdown_item(item_id: int) -> dict:

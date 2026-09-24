@@ -12,7 +12,7 @@ from .metadata_rules import resolve_configured_document_issuer, resolve_issuer_f
 from .schemas import PrivateClassificationConfig
 
 _SELF_ISSUER = "广州凯得融资租赁有限公司"
-CLASSIFIER_VERSION = "per-item-v2"
+CLASSIFIER_VERSION = "per-item-v3"
 _FILE_TRANSFER = re.compile(r"文件传阅|传阅件|【传阅】")
 _STRONG_INTERNAL = re.compile(
     r"内部事项呈批|印鉴(?:使用)?申请|印章使用申请|用印申请|部门章使用申请|"

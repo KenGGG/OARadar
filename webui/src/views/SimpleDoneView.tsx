@@ -23,6 +23,20 @@ function statusTone(state: SimpleDoneState): Tone {
   return "neutral"
 }
 
+const MARKDOWN_LABELS: Record<string, string> = {
+  complete: "已交付", partial: "部分交付", failed: "失败", working: "处理中",
+  pending: "待处理", needs_review: "待复核", excluded: "已排除",
+}
+
+const CLASSIFICATION_LABELS: Record<string, string> = {
+  classified: "已分类", needs_review: "待确认", excluded: "已排除", unknown: "待分类",
+}
+
+function originalLabel(row: SimpleDoneItem): string {
+  if (row.pipeline_status === "downloaded") return "已验证"
+  if (row.pipeline_status === "no_attachment") return row.no_attachment_confirmed ? "已核验无附件" : "待核验无附件"
+  return row.pipeline_status === "skipped" ? "已排除" : "待下载或核验"
+}
 export function SimpleDoneView({ rows, total, metrics, page, setPage, query, setQuery, filter, setFilter, selectedId, onSelect, refresh, onMarkdown }: {
   selectedId: number | null
   onSelect: (id: number | null) => void
@@ -93,7 +107,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
           <td>{row.sender || "-"}</td>
           <td className="nowrap">{time(row.initiated_at)}</td>
           <td className={row.pipeline_status === "no_attachment" ? "review-zero" : ""}>{row.attachment_review_label || (row.file_count == null ? "-" : row.file_count)}</td>
-          <td><span className={`status status-${row.pipeline_status === "no_attachment" ? "warn" : statusTone(row.simple_status)}`}>{row.pipeline_status === "no_attachment" ? row.no_attachment_confirmed ? "已核验无附件" : "未发现附件，待核实" : row.simple_status_label}</span></td>
+          <td><div style={{ display: "grid", gap: 4 }}><span className={`status status-${statusTone(row.simple_status)}`}>{row.simple_status_label}</span><small>原件：{originalLabel(row)} · Markdown：{MARKDOWN_LABELS[row.delivery?.status || "pending"] || "待处理"} · 分类：{CLASSIFICATION_LABELS[row.delivery?.classification_status || "unknown"] || "待确认"}</small></div></td>
           <td className="nowrap">{time(row.updated_at)}</td>
           <td><ChevronRight size={17}/></td>
         </tr>

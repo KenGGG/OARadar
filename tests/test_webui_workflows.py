@@ -59,8 +59,13 @@ def ui(config_file):
         elif path == "/api/markdown-outputs":
             page = int(parse_qs(url.query).get("page", [1])[0])
             data = {"items": [{"id": page, "title": f"Synthetic page {page}", "source_type": "internal", "internal_category": "Synthetic", "markdown_count": 1, "delivery_status": "部分交付", "delivery": {"successful": 1, "expected": 2, "unsupported": 0, "failed": 1, "status": "partial"}}], "item_total": 105}
+        elif path == "/api/markdown-outputs/documents/17/content":
+            data = {"text": "# Synthetic heading\n\nSynthetic paragraph\n\n- First\n- Second\n\n| Name | Value |\n| --- | --- |\n| Safe | 1 |\n\n<img src=x>", "truncated": False}
+        elif path == "/api/markdown-outputs/items/2/classification":
+            state["classification_request"] = route.request.post_data_json
+            data = {"status": "classified", "task_id": 91}
         elif path.startswith("/api/markdown-outputs/items/"):
-            data = {"id": 2, "manifest_id": 42, "title": "Synthetic detail", "delivery_status": "部分交付", "delivery": {"status": "partial", "successful": 1, "expected": 2, "index_status": "success", "classification_status": "classified"}, "files": [], "documents": [], "tasks": [], "can_retry": True}
+            data = {"id": 2, "manifest_id": 42, "title": "Synthetic detail", "delivery_status": "部分交付", "delivery": {"status": "partial", "successful": 1, "expected": 2, "index_status": "success", "classification_status": "classified"}, "files": [], "documents": [{"id": 17, "name": "synthetic.md", "kind": "attachment", "relpath": "synthetic/synthetic.md", "status": "success", "engine": "synthetic", "error": None}], "tasks": [], "can_retry": True}
         elif path == "/api/done-archives/42":
             data = {"id": 2, "manifest_id": 42, "title": "Synthetic archive", "archive_status": "downloaded", "files": [], "documents": [], "tasks": [], "delivery": None}
         elif path == "/api/pending-notifications":
@@ -188,3 +193,44 @@ def test_mobile_navigation_and_table_scroll_stay_within_viewport(ui):
     page.get_by_title("打开导航").click()
     page.get_by_role("button", name="待办通知", exact=True).click()
     expect(page.get_by_text("Synthetic pending")).to_be_visible()
+
+def test_markdown_preview_renders_document_safely_and_can_show_source(ui):
+    page, url, _, _ = ui
+    page.goto(url + "#view=markdown&item=2")
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_role("button", name="预览 正文").click()
+    expect(dialog.get_by_role("heading", name="Synthetic heading")).to_be_visible()
+    expect(dialog.get_by_text("Synthetic paragraph")).to_be_visible()
+    expect(dialog.get_by_role("listitem").filter(has_text="First")).to_be_visible()
+    expect(dialog.get_by_role("cell", name="Safe")).to_be_visible()
+    expect(dialog.locator("img")).to_have_count(0)
+    dialog.get_by_role("button", name="查看源码").click()
+    expect(dialog.locator("pre.markdown-preview")).to_contain_text("# Synthetic heading")
+
+def test_markdown_category_filter_is_sent_to_server(ui):
+    page, url, requests, _ = ui
+    page.goto(url + "#view=markdown")
+    page.get_by_role("combobox", name="Markdown 状态或业务分类").select_option("category:04_财务资金与融资")
+    expect(page.get_by_text("Synthetic page 1")).to_be_visible()
+    assert any(q.get("category") == ["04_财务资金与融资"] for _, path, q, _ in requests if path == "/api/markdown-outputs")
+
+def test_manual_classification_submits_only_this_item_without_oa_access(ui):
+    page, url, requests, state = ui
+    page.goto(url + "#view=markdown&item=2")
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_text("调整本条分类").click()
+    dialog.get_by_label("业务分类").select_option("04_财务资金与融资")
+    dialog.get_by_label("分类依据").fill("人工核对合成材料后确认")
+    dialog.get_by_role("button", name="保存分类").click()
+    expect(dialog.get_by_text("分类已保存")).to_be_visible()
+    assert state["classification_request"]["business_category"] == "04_财务资金与融资"
+    assert state["classification_request"]["content_origin"] == "internal"
+    assert any(path == "/api/markdown-outputs/items/2/classification" for _, path, _, _ in requests)
+    assert not any(path.startswith("/api/done-archives/") and method == "POST" for method, path, _, _ in requests)
+
+def test_model_advanced_parameters_are_collapsed_by_default(ui):
+    page, url, _, _ = ui
+    page.goto(url + "#view=settings")
+    expect(page.get_by_text("最大输出")).not_to_be_visible()
+    page.get_by_text("高级参数").first.click()
+    expect(page.get_by_text("最大输出")).to_be_visible()

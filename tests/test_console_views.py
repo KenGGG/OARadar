@@ -367,3 +367,43 @@ def test_markdown_outputs_exposes_v2_item_aggregation(config_file: Path) -> None
     assert row["delivery_status"] == "待处理"
     assert row["delivery"]["expected"] == 0
     assert row["index_relpath"].endswith("/_index.md")
+
+def test_markdown_list_filters_category_and_issuer_before_pagination(config_file: Path) -> None:
+    client = _client(config_file)
+    settings = load_settings(config_file)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        session.add_all([
+            OAItem(oa_item_key="done:finance", source_channel="done", title="Synthetic finance",
+                   source_type="internal", internal_category="04_财务资金与融资"),
+            OAItem(oa_item_key="done:human", source_channel="done", title="Synthetic human",
+                   source_type="internal", internal_category="06_人力资源"),
+            OAItem(oa_item_key="done:external", source_channel="done", title="Synthetic external",
+                   source_type="external", external_issuer="Synthetic Authority"),
+        ])
+        session.commit()
+
+    category = client.get("/api/markdown-outputs?category=04_财务资金与融资&page_size=1").json()
+    issuer = client.get("/api/markdown-outputs?issuer=Synthetic Authority&page_size=1").json()
+    assert category["item_total"] == 1 and category["items"][0]["title"] == "Synthetic finance"
+    assert issuer["item_total"] == 1 and issuer["items"][0]["title"] == "Synthetic external"
+
+def test_manual_classification_api_is_csrf_protected_and_item_scoped(config_file: Path, monkeypatch) -> None:
+    from oa_knowledge.web import workflow_views
+    client = _client(config_file)
+    client.get("/api/auth/status")
+    captured = {}
+    def fake_update(_settings, item_id, **body):
+        captured.update({"item_id": item_id, **body})
+        return {"status": "classified", "task_id": 7}
+    monkeypatch.setattr(workflow_views, "update_item_classification", fake_update)
+    payload = {"content_origin": "internal", "business_category": "04_财务资金与融资",
+               "canonical_issuer": None, "reason": "人工核对合成材料后确认"}
+
+    blocked = client.post("/api/markdown-outputs/items/7/classification", json=payload)
+    accepted = client.post("/api/markdown-outputs/items/7/classification", json=payload,
+                           headers={"x-csrf-token": dict(client.cookies)["oa_csrf"]})
+
+    assert blocked.status_code == 403
+    assert accepted.status_code == 202
+    assert captured["item_id"] == 7 and captured["business_category"] == "04_财务资金与融资"

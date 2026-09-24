@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any
+from collections.abc import Callable
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ def delivery_facts(session: Session, item: OAItem) -> dict[str, Any]:
 
 def delivery_facts_map(
     session: Session, items: list[OAItem] | None = None,
+    *, file_exists: Callable[[str], bool] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Load facts in batches; legacy exports may identify only their source file."""
     if items is None:
@@ -77,7 +79,8 @@ def delivery_facts_map(
         for file in sources:
             exports = exports_by_file[file.id]
             current_export = exports[0] if exports else None
-            if current_export and current_export.status == "success" and (not file.sha256 or current_export.source_sha256 == file.sha256):
+            if current_export and current_export.status == "success" and (not file.sha256 or current_export.source_sha256 == file.sha256) and (
+                file_exists is None or file_exists(current_export.markdown_relpath)):
                 successful += 1
                 continue  # A repaired delivery supersedes previous parser attempts.
             statuses = {row.status for row in jobs_by_file[file.id]}
@@ -87,6 +90,8 @@ def delivery_facts_map(
             failed += "failed" in statuses
             running += "running" in statuses
         index_status = index.status if index else "pending"
+        if index and index_status == "success" and file_exists is not None and not file_exists(index.markdown_relpath):
+            index_status = "pending"
         index_failed = index_status == "failed"
         has_index = index_status == "success"
         no_attachment = bool(manifest and processing == "no_attachment" and manifest.no_attachment_confirmed)

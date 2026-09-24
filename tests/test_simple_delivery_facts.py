@@ -15,7 +15,7 @@ from oa_knowledge.web.simple_status import (
     _attention_list, _done_simple_status_map, _done_summary, _pending_summary,
     _workflow_summaries,
 )
-from oa_knowledge.web.delivery_facts import delivery_facts
+from oa_knowledge.web.delivery_facts import delivery_facts, delivery_facts_map
 
 
 @pytest.fixture
@@ -80,6 +80,18 @@ def test_failed_download_task_is_attention_not_waiting(session):
     assert state == "attention"
     assert reason == "原件下载失败"
 
+
+def test_nightly_file_check_downgrades_missing_source_markdown(session):
+    item, _ = _item(session)
+    source = _file(session, item)
+    _export(session, item)
+    _export(session, item, source)
+
+    facts = delivery_facts_map(session, [item], file_exists=lambda path: path.endswith("index.md"))[item.id]
+
+    assert facts["status"] == "partial"
+    assert facts["successful"] == 0
+    assert facts["index_status"] == "success"
 
 def test_missing_download_task_is_attention_not_waiting(session):
     _, manifest = _item(session, processing_status="pending_download")
