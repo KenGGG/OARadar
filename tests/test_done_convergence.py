@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from oa_knowledge.config import load_settings
@@ -275,3 +275,45 @@ def test_missing_published_markdown_is_requeued_without_redownload(config_file: 
 
     assert report.markdown_created == 1
     assert report.download_created == 0
+
+
+def test_apply_survives_writer_between_planning_snapshot_and_queue_write(config_file: Path, monkeypatch) -> None:
+    planner, engine = _planner(config_file)
+    with Session(engine) as session:
+        session.add_all([
+            _manifest("done:1-create", "pending_download"),
+            _manifest("done:2-create", "pending_download"),
+        ])
+        session.commit()
+
+    created_sessions = 0
+
+    def planner_session(bind):
+        nonlocal created_sessions
+        created_sessions += 1
+        session = Session(bind)
+        if created_sessions == 1:
+            session.execute(text("BEGIN"))
+        return session
+
+    monkeypatch.setattr("oa_knowledge.done_convergence.Session", planner_session)
+    class ConcurrentWritePlanner(DoneConvergencePlanner):
+
+        injected = False
+
+        def _idempotency_key(self, manifest, item, phase):
+            if manifest.oa_item_key == "done:2-create" and not self.injected:
+                self.injected = True
+                with Session(engine) as writer:
+                    writer.add(_manifest("done:concurrent", "skipped", excluded="synthetic"))
+                    writer.commit()
+            return DoneConvergencePlanner._idempotency_key(manifest, item, phase)
+
+    report = ConcurrentWritePlanner(engine, planner.settings).plan(apply=True)
+
+    assert report.download_created == 2
+    assert report.download_requeued == 0
+    with Session(engine) as session:
+        tasks = session.scalars(select(PipelineTask).where(PipelineTask.logical_item_key.in_(["done:1-create", "done:2-create"]))).all()
+        assert len(tasks) == 2
+        assert all(task.status == "queued" for task in tasks)

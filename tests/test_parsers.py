@@ -59,6 +59,21 @@ def _make_synthetic_pdf(
     return pdf_path
 
 
+
+def test_office_timeout_kills_spawned_child(tmp_path):
+    import subprocess
+    import sys
+    import time
+    from oa_knowledge.parsers.libreoffice_parser import _run_office_process
+
+    marker = tmp_path / "orphan-ran"
+    child = "import time; from pathlib import Path; time.sleep(0.5); Path(%r).write_text('orphan')" % str(marker)
+    launcher = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',%r]); time.sleep(30)" % child
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_office_process([sys.executable, "-c", launcher], timeout=0.1)
+    time.sleep(0.7)
+    assert not marker.exists()
+
 def test_word_pdf_conversion_normalizes_copy_and_leaves_original(monkeypatch, tmp_path):
     from oa_knowledge.parsers.libreoffice_parser import word_to_pdf
     import fitz
@@ -76,7 +91,7 @@ def test_word_pdf_conversion_normalizes_copy_and_leaves_original(monkeypatch, tm
         pdf = fitz.open(); page = pdf.new_page(); page.insert_text((72,72),'Synthetic editable text 12345')
         pdf.save(Path(command[command.index('--outdir')+1])/'document.pdf'); pdf.close()
         return SimpleNamespace(returncode=0,stdout='',stderr='')
-    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser.subprocess.run', run)
+    monkeypatch.setattr('oa_knowledge.parsers.libreoffice_parser._run_office_process', run)
     result = word_to_pdf(source, tmp_path/'derived')
     assert source.read_bytes() == original
     with fitz.open(result) as pdf:

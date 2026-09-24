@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from oa_knowledge.db.models import ArchivedFile, ClassificationDecision, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
@@ -47,6 +47,7 @@ class DoneConvergencePlanner:
             "download_requeued": 0, "markdown_created": 0,
             "markdown_requeued": 0, "attention": 0,
         }
+        actions: list[tuple[str, str, str, int | None, int | None, str | None, str | None]] = []
         with Session(self.engine) as session:
             manifests = list(session.scalars(select(OAManifestItem).order_by(OAManifestItem.id)))
             keys = [row.oa_item_key for row in manifests]
@@ -109,13 +110,13 @@ class DoneConvergencePlanner:
                     if classification == "classified" and relevant.status in {"completed", "failed"}:
                         counts["markdown_requeued"] += 1
                         if apply:
-                            self._requeue(session, relevant, item=item)
+                            actions.append(("requeue", phase, manifest.oa_item_key, relevant.id, item.id if item else None, None, None))
                         continue
                 if relevant and relevant.status == "failed":
                     if relevant.recoverable or relevant.error_code in _LEGACY_RETRYABLE_ERRORS:
                         counts[f"{phase}_requeued"] += 1
                         if apply:
-                            self._requeue(session, relevant, item=item if phase == "markdown" else None)
+                            actions.append(("requeue", phase, manifest.oa_item_key, relevant.id, item.id if phase == "markdown" and item else None, None, None))
                     else:
                         counts["attention"] += 1
                     continue
@@ -127,25 +128,49 @@ class DoneConvergencePlanner:
                     if existing.status == "failed" and existing.recoverable:
                         counts[f"{phase}_requeued"] += 1
                         if apply:
-                            self._requeue(session, existing, item=item if phase == "markdown" else None)
+                            actions.append(("requeue", phase, manifest.oa_item_key, existing.id, item.id if phase == "markdown" and item else None, None, None))
                     elif existing.status == "failed":
                         counts["attention"] += 1
                     continue
                 counts[f"{phase}_created"] += 1
                 if apply:
-                    session.add(PipelineTask(
-                        queue_name="markdown_delivery" if phase == "markdown" else "realtime_done",
-                        priority=QUEUE_PRIORITY["markdown_delivery" if phase == "markdown" else "realtime_done"],
-                        logical_item_key=manifest.oa_item_key,
-                        stage=stage,
-                        idempotency_key=key,
-                        payload_json=json.dumps({"reason": "done_convergence"}),
-                    ))
-            if apply:
-                session.commit()
-            else:
-                session.rollback()
+                    actions.append(("create", phase, manifest.oa_item_key, None, None, stage, key))
+            session.rollback()
+        if apply:
+            self._apply_actions(actions, counts)
         return DoneConvergenceReport(**counts)
+
+    def _apply_actions(self, actions, counts: dict[str, int]) -> None:
+        # The read snapshot is closed before this method starts. Each batch owns
+        # a fresh, short SQLite write transaction, so workers can keep progressing.
+        for offset in range(0, len(actions), 50):
+            with Session(self.engine) as session:
+                session.execute(text("BEGIN IMMEDIATE"))
+                for kind, phase, oa_key, task_id, item_id, stage, idempotency_key in actions[offset:offset + 50]:
+                    count_name = f"{phase}_{'created' if kind == 'create' else 'requeued'}"
+                    manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == oa_key))
+                    if manifest is None or manifest.processing_status == "skipped" or (manifest.matched_exclusion_keyword or "").strip():
+                        counts[count_name] -= 1
+                        continue
+                    if kind == "requeue":
+                        task = session.get(PipelineTask, task_id)
+                        if task is None or task.status in {"queued", "running"}:
+                            counts[count_name] -= 1
+                            continue
+                        item = session.get(OAItem, item_id) if item_id is not None else None
+                        self._requeue(session, task, item=item)
+                    else:
+                        if session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == idempotency_key)) is not None:
+                            counts[count_name] -= 1
+                            continue
+                        queue = "markdown_delivery" if phase == "markdown" else "realtime_done"
+                        session.add(PipelineTask(
+                            queue_name=queue, priority=QUEUE_PRIORITY[queue],
+                            logical_item_key=oa_key, stage=stage,
+                            idempotency_key=idempotency_key,
+                            payload_json=json.dumps({"reason": "done_convergence"}),
+                        ))
+                session.commit()
 
     @staticmethod
     def _idempotency_key(manifest: OAManifestItem, item: OAItem | None, phase: str) -> str:

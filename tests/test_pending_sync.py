@@ -217,6 +217,17 @@ def test_unchanged_pending_creates_no_second_task(tmp_path) -> None:
         assert session.query(PipelineTask).filter_by(stage="detail_sync").count() == 1
 
 
+
+
+def test_disabled_baseline_then_unchanged_normal_scan_does_not_enqueue(tmp_path) -> None:
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    engine = create_db_engine(db)
+    with Session(engine) as session:
+        sync_pending_discovery(session, [_item("affair-1")], notification_mode="disabled")
+        result = sync_pending_discovery(session, [_item("affair-1")], notification_mode="normal")
+        assert result.unchanged == 1
+        assert session.query(PipelineTask).count() == 0
 def test_changed_pending_creates_new_task_with_notify(tmp_path) -> None:
     db = tmp_path / "oa.db"
     upgrade_database(db)

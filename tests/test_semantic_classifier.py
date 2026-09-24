@@ -61,7 +61,19 @@ def _package() -> SemanticPackage:
     )
 
 
-def test_allowed_public_package_uses_agnes_with_minimal_payload(tmp_path: Path) -> None:
+
+def test_allowed_package_stays_local_and_never_calls_remote(tmp_path: Path) -> None:
+    remote = _FakeClient(_EXTERNAL)
+    local = _FakeClient(_EXTERNAL)
+    classifier = SemanticClassifier(remote, local, JsonSemanticCache(tmp_path), prompt_version="local-v2")
+
+    result = classifier.classify(_package(), AgnesEligibility("allowed", "synthetic_public"))
+
+    assert result.provider == "local_qwen"
+    assert result.outcome is not None
+    assert remote.calls == []
+    assert len(local.calls) == 1
+def test_allowed_public_package_uses_local_model_with_minimal_payload(tmp_path: Path) -> None:
     agnes = _FakeClient(_EXTERNAL)
     local = _FakeClient(_EXTERNAL)
     classifier = SemanticClassifier(agnes, local, JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1")
@@ -70,11 +82,11 @@ def test_allowed_public_package_uses_agnes_with_minimal_payload(tmp_path: Path) 
         _package(), AgnesEligibility("allowed", "external_public_formal_document")
     )
 
-    assert result.provider == "agnes"
+    assert result.provider == "local_qwen"
     assert result.outcome.canonical_issuer == "广州市工业和信息化局"
-    assert len(agnes.calls) == 1
-    assert local.calls == []
-    payload = agnes.calls[0][1]
+    assert agnes.calls == []
+    assert len(local.calls) == 1
+    payload = local.calls[0][1]
     assert "/data/" not in payload
     assert "done:synthetic" not in payload
 
@@ -94,8 +106,8 @@ def test_local_only_package_never_calls_agnes(tmp_path: Path) -> None:
 
 
 def test_invalid_model_json_is_not_a_classification_and_is_cached_nowhere(tmp_path: Path) -> None:
-    agnes = _FakeClient("not-json")
-    classifier = SemanticClassifier(agnes, _FakeClient(_EXTERNAL), JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1")
+    local = _FakeClient("not-json")
+    classifier = SemanticClassifier(_FakeClient(_EXTERNAL), local, JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1")
 
     result = classifier.classify(
         _package(), AgnesEligibility("allowed", "external_public_formal_document")
@@ -106,10 +118,11 @@ def test_invalid_model_json_is_not_a_classification_and_is_cached_nowhere(tmp_pa
     assert list(tmp_path.iterdir()) == []
 
 
-def test_public_agnes_schema_invalid_response_is_retried_once(tmp_path: Path) -> None:
-    agnes = _SequenceClient("not-json", _EXTERNAL)
+def test_public_package_local_schema_invalid_response_is_retried_once(tmp_path: Path) -> None:
+    agnes = _FakeClient(_EXTERNAL)
+    local = _SequenceClient("not-json", _EXTERNAL)
     classifier = SemanticClassifier(
-        agnes, _FakeClient(_EXTERNAL), JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1"
+        agnes, local, JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1"
     )
 
     result = classifier.classify(
@@ -118,7 +131,8 @@ def test_public_agnes_schema_invalid_response_is_retried_once(tmp_path: Path) ->
 
     assert result.outcome is not None
     assert result.outcome.canonical_issuer == "广州市工业和信息化局"
-    assert len(agnes.calls) == 2
+    assert len(local.calls) == 2
+    assert agnes.calls == []
 
 
 def test_local_qwen_schema_invalid_response_is_retried_once(tmp_path: Path) -> None:
@@ -136,7 +150,8 @@ def test_local_qwen_schema_invalid_response_is_retried_once(tmp_path: Path) -> N
 
 def test_identical_input_reuses_local_cache_without_second_model_call(tmp_path: Path) -> None:
     agnes = _FakeClient(_EXTERNAL)
-    classifier = SemanticClassifier(agnes, _FakeClient(_EXTERNAL), JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1")
+    local = _FakeClient(_EXTERNAL)
+    classifier = SemanticClassifier(agnes, local, JsonSemanticCache(tmp_path), prompt_version="agnes-classifier-v1")
     eligibility = AgnesEligibility("allowed", "external_public_formal_document")
 
     first = classifier.classify(_package(), eligibility)
@@ -144,7 +159,8 @@ def test_identical_input_reuses_local_cache_without_second_model_call(tmp_path: 
 
     assert first.cache_hit is False
     assert second.cache_hit is True
-    assert len(agnes.calls) == 1
+    assert len(local.calls) == 1
+    assert agnes.calls == []
     assert second.input_sha256 == first.input_sha256
 
 

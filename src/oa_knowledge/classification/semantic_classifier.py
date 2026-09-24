@@ -140,7 +140,7 @@ class JsonSemanticCache:
 
 
 class SemanticClassifier:
-    """Route one OA package to Agnes only after the local safety gate."""
+    """Classify OA packages locally, regardless of public-document eligibility."""
 
     def __init__(
         self,
@@ -162,10 +162,8 @@ class SemanticClassifier:
     def classify(
         self, package: SemanticPackage, eligibility: AgnesEligibility
     ) -> SemanticClassificationResult:
-        provider: Literal["agnes", "local_qwen"] = (
-            "agnes" if eligibility.status == "allowed" else "local_qwen"
-        )
-        model = self._agnes_model if provider == "agnes" else self._local_model
+        provider: Literal["agnes", "local_qwen"] = "local_qwen"
+        model = self._local_model
         input_sha256 = self._input_sha(package, provider, model)
         cached = self._cache.read(input_sha256)
         if cached is not None:
@@ -175,14 +173,12 @@ class SemanticClassifier:
                     provider, input_sha256, eligibility.reason, True, outcome, None,
                     str(cached.get("model") or model),
                 )
-        public = provider == "agnes"
-        client = self._agnes if public else self._local
+        public = False
+        client = self._local
         response: dict = {}
         outcome: SemanticOutcome | None = None
-        # A schema-invalid response is safe to retry once with exactly the
-        # same payload.  Agnes receives only its locally approved public
-        # payload; Qwen remains local-only.  Transport failures are handled by
-        # the provider clients' bounded retry policies instead.
+        # Retry a schema-invalid response once with the same local payload.
+        # Transport failures use the local client's bounded retry policy.
         for attempt in range(2):
             response = client.chat(
                 _system_prompt(),

@@ -108,11 +108,10 @@ def sync_pending_discovery(
         occurrence.discovery_hash = discovery_hash
         occurrence.last_seen_at = utcnow()
         session.flush()
-        if notification_mode == "disabled":
+        if notification_mode == "disabled" or not enqueue_pipeline:
             # Sync occurrence state only; do not enqueue capture/summary/notify.
             continue
-        if enqueue_pipeline:
-            notify = notification_mode == "normal"
+        notify = notification_mode == "normal"
         task_key = f"pending:{occurrence.occurrence_key}:{discovery_hash}:v2"
         if session.scalar(select(PipelineTask.id).where(PipelineTask.idempotency_key == task_key)) is None:
             session.add(PipelineTask(

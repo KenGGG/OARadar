@@ -16,6 +16,28 @@ from dataclasses import replace
 from oa_knowledge.parsers.router import ParseResult
 
 
+import os
+import signal
+
+
+def _run_office_process(command: list[str], *, timeout: int | float) -> subprocess.CompletedProcess[str]:
+    """Run Office in its own process group so a timeout also stops children."""
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def needs_word_pdf_ocr(source: Path, engine: str | None, body: str) -> bool:
     """Native Office extraction alone does not recognize embedded scan text."""
     from oa_knowledge.parsers.format_router import detect_format
@@ -108,7 +130,7 @@ def word_to_pdf(file_path: Path, output_dir: Path) -> Path:
         command = [executable, f'-env:UserInstallation={(temporary / "profile").as_uri()}',
                    '--headless', '--norestore', '--convert-to', 'pdf:writer_pdf_Export',
                    '--outdir', str(output_dir), str(source)]
-        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=180)
+        completed = _run_office_process(command, timeout=180)
         pdf = output_dir / 'document.pdf'
         if completed.returncode or not pdf.is_file():
             raise RuntimeError('word_pdf_conversion_failed:' + (completed.stderr or completed.stdout)[-500:])
@@ -116,9 +138,9 @@ def word_to_pdf(file_path: Path, output_dir: Path) -> Path:
             if not len(document) or document.is_encrypted:
                 raise RuntimeError('word_pdf_empty_or_encrypted')
         if kind == 'doc':
-            converted = subprocess.run([executable, command[1], '--headless', '--norestore',
+            converted = _run_office_process([executable, command[1], '--headless', '--norestore',
                 '--convert-to', 'docx', '--outdir', str(temporary), str(source)],
-                check=False, capture_output=True, text=True, timeout=180)
+                timeout=180)
             normalized = temporary / 'document.docx'
             if converted.returncode or not normalized.is_file():
                 raise RuntimeError('word_scan_inventory_unavailable')
@@ -180,9 +202,7 @@ def parse_with_libreoffice(
             str(temporary),
             str(file_path),
         ]
-        completed = subprocess.run(
-            command, check=False, capture_output=True, text=True, timeout=120
-        )
+        completed = _run_office_process(command, timeout=120)
         converted = temporary / f"{file_path.stem}.xlsx"
         if completed.returncode != 0 or not converted.is_file():
             raise RuntimeError("libreoffice_conversion_failed")
