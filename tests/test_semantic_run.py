@@ -166,6 +166,32 @@ def test_semantic_target_keys_excludes_gate_zero_items() -> None:
         assert semantic_target_keys(session) == ()
 
 
+
+
+def test_semantic_target_keys_only_selects_unlocked_review_items_up_to_limit() -> None:
+    factory = _factory()
+    _seed(factory, locked=True)
+    with factory.begin() as session:
+        first = session.scalar(select(ClassificationDecision).where(ClassificationDecision.oa_item_key == "done:one"))
+        for index in range(30):
+            key = f"done:{index:02d}"
+            session.add(OAManifestItem(oa_item_key=key, title=key, sender="sender", list_page=1, list_ordinal=index + 2, processing_status="downloaded"))
+            session.add(ClassificationDecision(
+                classification_run_id=first.classification_run_id, oa_item_key=key, version=1,
+                is_current=True, decision_input_sha256="d" * 64, decision_source="metadata_rule",
+                classification_status="classified" if index == 0 else "needs_review",
+                content_integrity_status="ok", content_origin="external", flow_type="external_inbound",
+                initiator="sender", initiator_type="internal", transfer_chain_json="[]",
+                issuer="sender" if index == 0 else None, canonical_issuer="sender" if index == 0 else None,
+                normalized_title=key, classification_confidence=0.5, classification_reason_json="{}",
+                rule_version="r", private_config_sha256="c" * 64, manual_locked=False,
+            ))
+
+    with factory() as session:
+        keys = semantic_target_keys(session)
+
+    assert keys == tuple(f"done:{index:02d}" for index in range(1, 26))
+
 def test_semantic_run_recovers_a_worker_interrupted_during_content_stage() -> None:
     factory = _factory()
     _seed(factory)

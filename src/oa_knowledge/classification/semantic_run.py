@@ -49,16 +49,18 @@ class _Classifier(Protocol):
 
 
 def semantic_target_keys(session: Session) -> tuple[str, ...]:
-    """Freeze only Gate-0-admitted current classifications for semantic review."""
+    """Freeze at most 25 unlocked, nonexcluded current review decisions."""
     rows = session.scalars(
         select(ClassificationDecision.oa_item_key)
         .join(OAManifestItem, OAManifestItem.oa_item_key == ClassificationDecision.oa_item_key)
         .where(
             ClassificationDecision.is_current.is_(True),
-            ClassificationDecision.classification_status.in_(("classified", "needs_review")),
+            ClassificationDecision.classification_status == "needs_review",
+            ClassificationDecision.manual_locked.is_(False),
             OAManifestItem.matched_exclusion_keyword.is_(None),
         )
         .order_by(ClassificationDecision.oa_item_key)
+        .limit(25)
     )
     return tuple(rows)
 
