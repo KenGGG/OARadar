@@ -251,20 +251,24 @@ class ParsePipeline:
             if content is None:
                 raise RuntimeError(f"File {file_rec.id} has no content object")
             output_dir = output_base / str(content.id) / f"artifact-{job.id}"
+            # Never hold the SQLite writer while Office/OCR runs. A conversion
+            # may take minutes; persist the attempt before invoking it.
+            engine_name = job.engine
+            session.commit()
 
             # Execute parse
             try:
-                if job.engine == "markitdown":
+                if engine_name == "markitdown":
                     result = parse_with_markitdown(file_path, output_dir=output_dir)
-                elif job.engine == "mineru":
+                elif engine_name == "mineru":
                     if not mineru_available(self.settings):
                         raise RuntimeError("MinerU is unavailable; refusing to use a fallback parser")
                     result = parse_with_mineru(file_path, self.settings, output_dir=output_dir)
-                elif job.engine == "libreoffice":
+                elif engine_name == "libreoffice":
                     from oa_knowledge.parsers.libreoffice_parser import parse_with_libreoffice
                     result = parse_with_libreoffice(file_path, output_dir, settings=self.settings)
                 else:
-                    raise ValueError(f"Unsupported parser engine: {job.engine}")
+                    raise ValueError(f"Unsupported parser engine: {engine_name}")
             except RuntimeError as exc:
                 if "encrypted" in str(exc):
                     job.status = "failed"

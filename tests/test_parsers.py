@@ -651,6 +651,51 @@ def test_pipeline_enqueue_valid_file(tmp_path: Path) -> None:
         assert file_rec.content_object_id is not None
 
 
+
+def test_parse_does_not_hold_sqlite_writer_during_conversion(tmp_path: Path, monkeypatch) -> None:
+    from oa_knowledge.pipeline import ParsePipeline
+    from oa_knowledge.parsers.router import ParseResult
+    from oa_knowledge.resources import ResourceCoordinator
+
+    settings = Settings(app={"data_root": str(tmp_path)})
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    original = tmp_path / "originals" / "synthetic.txt"
+    original.parent.mkdir()
+    original.write_text("synthetic source", encoding="utf-8")
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:synthetic-no-long-lock", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        source = ArchivedFile(
+            oa_item_id=item.id, attachment_key="synthetic", original_name="synthetic.txt",
+            local_relpath="originals/synthetic.txt", file_role="direct_attachment",
+            source_container_key="root", depth=1, download_status="verified",
+            sha256=hashlib.sha256(original.read_bytes()).hexdigest(),
+        )
+        session.add(source)
+        session.commit()
+        source_id = source.id
+    pipeline = ParsePipeline(settings, engine)
+    job_id = pipeline.enqueue(source_id)
+    coordinator = ResourceCoordinator(engine)
+
+    def conversion(_source: Path, output_dir: Path) -> ParseResult:
+        lease = coordinator.acquire("synthetic-concurrent-write", "test", ttl_seconds=30, uses_local_gpu=False)
+        assert lease is not None
+        coordinator.release(lease, "test")
+        product = output_dir / "synthetic.md"
+        product.parent.mkdir(parents=True, exist_ok=True)
+        product.write_text("synthetic parsed text", encoding="utf-8")
+        return ParseResult(output_path=product, engine="markitdown", engine_version="test", quality_score=0.9)
+
+    monkeypatch.setattr("oa_knowledge.pipeline.parse_with_markitdown", conversion)
+    pipeline.run(job_id)
+
+    with Session(engine) as session:
+        assert session.get(ParseJob, job_id).status == "completed"
+        assert session.get(ParseJob, job_id).attempts == 1
+
 def test_pipeline_enqueue_idempotent(tmp_path: Path) -> None:
     """Enqueue should return existing job_id for same file."""
     settings = Settings(app={"data_root": str(tmp_path)})
