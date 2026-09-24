@@ -162,8 +162,9 @@ if command -v curl >/dev/null 2>&1; then
     emit WARN "simple-status" "web API not reachable on :$port (skip)"
   else
     verdict="$(printf '%s' "$ss_body" | python3 -c 'import sys,json
+raw = sys.stdin.read()
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(raw)
 except Exception:
     print("invalid-json"); sys.exit(0)
 for k in ("generated_at","overall_status","done","pending","oa_activity","attention"):
@@ -173,7 +174,7 @@ h = d.get("done",{}).get("headline","")+d.get("pending",{}).get("headline","")
 if not h.strip():
     print("empty-headline"); sys.exit(0)
 for bad in ("payload_json","structured_json","webhook","secret"):
-    if bad in ss_body:
+    if bad in raw:
         print("leak:"+bad); sys.exit(0)
 print("ok")' 2>/dev/null || echo "check-error")"
     case "$verdict" in
