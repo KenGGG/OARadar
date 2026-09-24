@@ -880,3 +880,52 @@ def test_pipeline_run_all_pending_empty(tmp_path: Path) -> None:
     assert summary["processed"] == 0
     assert summary["succeeded"] == 0
     assert summary["failed"] == 0
+
+
+def test_pipeline_runs_queued_libreoffice_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(app={"data_root": str(tmp_path)})
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    raw = tmp_path / "originals"
+    raw.mkdir()
+    source = raw / "synthetic.docx"
+    with zipfile.ZipFile(source, "w") as package:
+        package.writestr("[Content_Types].xml", "<Types/>")
+        package.writestr("word/document.xml", "<document>synthetic content</document>")
+    with Session(engine) as session:
+        item = OAItem(oa_item_key="done:synthetic-word", source_channel="done", title="Synthetic")
+        session.add(item)
+        session.flush()
+        record = ArchivedFile(
+            oa_item_id=item.id,
+            attachment_key="synthetic.docx",
+            original_name="synthetic.docx",
+            local_relpath="originals/synthetic.docx",
+            file_role="direct_attachment",
+            source_container_key="root",
+            depth=1,
+            download_status="verified",
+            sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            size_bytes=source.stat().st_size,
+        )
+        session.add(record)
+        session.commit()
+        file_id = record.id
+
+    def fake_parse(_source: Path, output_dir: Path, settings: Settings) -> ParseResult:
+        assert _source == source
+        product = output_dir / "synthetic.md"
+        product.parent.mkdir(parents=True)
+        product.write_text("synthetic converted content", encoding="utf-8")
+        return ParseResult(output_path=product, engine="libreoffice", engine_version="test", quality_score=1.0)
+
+    monkeypatch.setattr("oa_knowledge.parsers.libreoffice_parser.parse_with_libreoffice", fake_parse)
+    pipeline = ParsePipeline(settings, engine)
+    job_id = pipeline.enqueue(file_id, engine="libreoffice")
+    pipeline.run(job_id)
+
+    with Session(engine) as session:
+        assert session.get(ParseJob, job_id).status == "completed"
+        artifact = session.scalar(select(ParseArtifact).where(ParseArtifact.parse_job_id == job_id))
+        assert artifact.engine == "libreoffice"
+        assert (settings.cache_root / artifact.output_relpath).read_text() == "synthetic converted content"

@@ -308,3 +308,13 @@ def test_done_archives_csv_without_filters_exports_every_row(config_file: Path) 
 
     assert len(rows) == 2
     assert {row["标题"] for row in rows} == {"oa:all-one 标题", "oa:all-two 标题"}
+
+
+def test_manual_zero_byte_exclusion_message_is_not_title_rule() -> None:
+    from oa_knowledge.web.status import _manifest_status_message
+
+    row = OAManifestItem(oa_item_key="done:synthetic-empty", title="Synthetic", list_page=1,
+                         list_ordinal=1, processing_status="skipped",
+                         matched_exclusion_keyword="manual:source_zero_byte")
+    message = _manifest_status_message(row)
+    assert "人工确认 OA 源附件为 0 字节" in message

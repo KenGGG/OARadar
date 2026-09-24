@@ -260,6 +260,9 @@ class ParsePipeline:
                     if not mineru_available(self.settings):
                         raise RuntimeError("MinerU is unavailable; refusing to use a fallback parser")
                     result = parse_with_mineru(file_path, self.settings, output_dir=output_dir)
+                elif job.engine == "libreoffice":
+                    from oa_knowledge.parsers.libreoffice_parser import parse_with_libreoffice
+                    result = parse_with_libreoffice(file_path, output_dir, settings=self.settings)
                 else:
                     raise ValueError(f"Unsupported parser engine: {job.engine}")
             except RuntimeError as exc:

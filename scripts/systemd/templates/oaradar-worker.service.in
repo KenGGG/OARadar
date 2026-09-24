@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory={{PROJECT_ROOT}}
+Environment="PATH={{LIBREOFFICE_BIN}}:{{PROJECT_ROOT}}/.venv/bin:{{UV_BIN_DIR}}:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile={{ENV_FILE}}
 ExecStart={{UV_BIN}} run oa worker --poll-seconds 2 --config {{CONFIG_PATH}}
 Restart=always

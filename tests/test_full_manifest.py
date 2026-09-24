@@ -112,3 +112,21 @@ def test_full_audit_reopens_every_status_except_latest_rule_skip() -> None:
     assert _audit_opens_detail("download_failed") is True
     assert _audit_opens_detail("pending_download") is True
     assert _audit_opens_detail("skipped") is False
+
+
+def test_manual_single_item_exclusion_survives_next_scan(tmp_path: Path) -> None:
+    db = tmp_path / "oa.db"; upgrade_database(db); engine = create_db_engine(db)
+    discovery = DoneDiscovery((
+        _item("empty", "合成零字节来源", 1),
+        _item("other", "合成正常事项", 2),
+    ), 1, 2, 2, 2, 1)
+    with Session(engine) as session:
+        synchronize_manifest(session, discovery)
+        rows = session.query(OAManifestItem).order_by(OAManifestItem.id).all()
+        rows[0].processing_status = "skipped"
+        rows[0].matched_exclusion_keyword = "manual:source_zero_byte"
+        session.commit()
+        classify_manifest(session, (), tmp_path)
+        session.commit()
+        assert [row.processing_status for row in rows] == ["skipped", "pending_download"]
+        assert rows[0].matched_exclusion_keyword == "manual:source_zero_byte"

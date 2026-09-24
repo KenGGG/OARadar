@@ -29,7 +29,7 @@ UNIT_FILES = (
     "oaradar-nightly.timer",
 )
 
-PLACEHOLDERS = ("{{PROJECT_ROOT}}", "{{UV_BIN}}", "{{CONFIG_PATH}}", "{{ENV_FILE}}", "{{TIMEZONE}}")
+PLACEHOLDERS = ("{{PROJECT_ROOT}}", "{{UV_BIN}}", "{{CONFIG_PATH}}", "{{ENV_FILE}}", "{{TIMEZONE}}", "{{LIBREOFFICE_BIN}}", "{{UV_BIN_DIR}}")
 
 
 @dataclass
@@ -67,13 +67,17 @@ def detect_context(
     ef = Path(env_file).resolve() if env_file else (Path.home() / ".config" / "oaradar" / "env")
     return SystemdContext(project_root, uv, config_path, ef, timezone, systemd_dir)
 
-
 def _substitutions(ctx: SystemdContext) -> dict[str, str]:
+    from oa_knowledge.config import load_settings
+
+    libreoffice_bin = load_settings(ctx.config_path).data_root / "tools" / "libreoffice" / "bin"
     return {
         "{{PROJECT_ROOT}}": str(ctx.project_root),
         "{{UV_BIN}}": str(ctx.uv_bin),
         "{{CONFIG_PATH}}": str(ctx.config_path),
         "{{ENV_FILE}}": str(ctx.env_file),
+        "{{LIBREOFFICE_BIN}}": str(libreoffice_bin),
+        "{{UV_BIN_DIR}}": str(ctx.uv_bin.parent),
         "{{TIMEZONE}}": ctx.timezone,
     }
 

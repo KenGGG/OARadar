@@ -26,6 +26,14 @@ def _ctx(tmp_path: Path):
     return detect_context(project, config, "Asia/Shanghai", uv_bin=Path(uv))
 
 
+
+def test_workers_can_find_bundled_libreoffice(tmp_path: Path) -> None:
+    rendered = render_units(_ctx(tmp_path))
+    expected = "/data/oaradar/tools/libreoffice/bin"
+    for name in ("oaradar-worker.service", "oaradar-markdown-worker.service"):
+        assert expected in rendered[name]
+
+
 def test_render_replaces_all_placeholders_with_absolute_paths(tmp_path: Path) -> None:
     # Render using the committed templates under scripts/systemd/templates.
     ctx = _ctx(tmp_path)

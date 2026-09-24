@@ -109,6 +109,8 @@ def classify_manifest(session: Session, keywords: tuple[str, ...], data_root: Pa
 def classify_manifest_rows(session: Session, rows: list[OAManifestItem], keywords: tuple[str, ...], data_root: Path) -> None:
     """Classify a persisted page and verify reuse without requiring final reconciliation."""
     for row in rows:
+        if row.processing_status == "skipped" and (row.matched_exclusion_keyword or "").startswith("manual:"):
+            continue
         keyword = next((word for word in keywords if word and word in row.title), None)
         if keyword:
             row.processing_status = "skipped"

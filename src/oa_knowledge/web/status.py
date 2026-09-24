@@ -398,6 +398,8 @@ def _manifest_status_message(row: OAManifestItem) -> str | None:
         return "已检查OA详情页，确认没有附件"
     if row.processing_status == "skipped":
         keyword = row.matched_exclusion_keyword or "未知"
+        if row.matched_exclusion_keyword == "manual:source_zero_byte":
+            return "人工确认 OA 源附件为 0 字节；此事项已忽略，未将空文件计作下载成功。"
         return f"该事项命中排除关键词“{keyword}”，未进入详情页，因此没有下载正文和附件。"
     return None
 
