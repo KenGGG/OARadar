@@ -100,7 +100,11 @@ def original_file_names(data_root: Path, archive_relpath: str | None) -> list[st
 
 def count_original_files(data_root: Path, archive_relpath: str | None) -> int:
     """Count files actually present in one current originals directory safely."""
-    return len(original_file_names(data_root, archive_relpath))
+    archive_dir = _original_archive_directory(data_root, archive_relpath)
+    if archive_dir is None:
+        return 0
+    # Aggregate counts do not need to build, relativize and sort every filename.
+    return sum(1 for path in archive_dir.rglob("*") if path.is_file())
 
 
 def replace_archive_prefix(value: str | None, old: str, new: str) -> str | None:

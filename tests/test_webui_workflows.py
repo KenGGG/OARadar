@@ -99,6 +99,20 @@ def test_settings_save_uses_patch_and_warns_about_restart(ui):
     assert not any(entry[:2] == ("POST", "/api/settings") for entry in requests)
 
 
+@pytest.mark.parametrize("view", ["overview", "done"])
+def test_slow_initial_response_shows_loading_instead_of_empty_data(ui, view):
+    page, url, _, _ = ui
+    waiting = []
+    endpoint = "simple-status" if view == "overview" else "done-archives"
+    page.route(f"**/api/{endpoint}*", lambda route: waiting.append(route))
+    page.goto(url + f"#view={view}")
+    expect(page.get_by_role("status")).to_contain_text("正在读取")
+    expect(page.get_by_text("没有符合条件的已办资料")).to_have_count(0)
+    assert waiting
+    waiting.pop().fallback()
+    expect(page.locator(".workflow-grid" if view == "overview" else ".done-page")).to_be_visible()
+
+
 def test_markdown_paginates_resets_search_and_restores_url(ui):
     page, url, requests, _ = ui
     page.goto(url + "#view=markdown")

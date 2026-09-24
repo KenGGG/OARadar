@@ -183,6 +183,9 @@ def _strong_external_issuer(
 
 def _issuer_from_source(source: str, value: str) -> str | None:
     """Extract only a direct issuer position, never an organization merely cited."""
+    # Parser products are Markdown. Formatting is not part of an issuer name.
+    value = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", value)
+    value = value.replace("**", "").replace("__", "")
     patterns = (_EXPLICIT_ISSUER, _FORMAL_ISSUER_TITLE)
     if source == "document_header":
         patterns += (_HEADER_ISSUER,)

@@ -271,7 +271,7 @@ class ClassificationService:
                 raise ValueError("dossier refinement requires a current decision")
             if current.manual_locked or current.classification_status == "excluded":
                 return current
-            if json.loads(current.classification_reason_json or "{}").get("classifier") == CLASSIFIER_VERSION:
+            if current.classification_status == "classified" and json.loads(current.classification_reason_json or "{}").get("classifier") == CLASSIFIER_VERSION:
                 return current
         loader = DatabaseEvidenceDossierLoader(
             self._sessions, settings, self._config
@@ -290,7 +290,8 @@ class ClassificationService:
                 "initiator": dossier.initiator,
                 "document_number": dossier.document_number,
                 "attachments": [
-                    {"id": row.file_id, "sha256": row.content_sha256}
+                    {"id": row.file_id, "sha256": row.content_sha256,
+                     "text_sha256": _sha256(row.text) if row.text else None}
                     for row in dossier.attachments
                 ],
             }

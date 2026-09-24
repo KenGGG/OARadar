@@ -152,6 +152,59 @@ def test_done_adapter_returns_oa_structured_detail_link_for_hidden_columns() -> 
     assert link == "/govdoc/govdoc.do?method=summary&affairId=target-1"
 
 
+def test_locate_item_uses_id_across_pages_without_title_search():
+    html = """
+    <table><tbody id='rows'><tr><td><input name='workitemId' value='other'></td>
+    <td>与目标完全同名</td></tr></tbody></table>
+    <a class='pNext' onclick="document.querySelector('#rows').innerHTML=
+    `<tr><td><input name='workitemId' value='target'></td><td>已修改的标题</td></tr>`;
+    this.className='pNext disabled'">next</a>
+    """
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path="/usr/bin/google-chrome", headless=True)
+        page = browser.new_page()
+        page.set_content(html)
+        adapter = DoneAdapter(page)
+        adapter.open_list = lambda: page.main_frame
+        adapter.search_for_item = lambda *args: pytest.fail("must not search by title")
+        assert adapter.locate_item(1, "（二次办理）旧标题", "target") == "target"
+        browser.close()
+
+
+def test_detail_click_finds_workitem_inside_iframe():
+    from oa_knowledge.collector.detail import CollaborationDetailAdapter
+
+    html = """<table><tr><td><input name='workitemId' value='target'></td>
+    <td abbr='subject' onclick='parent.clicked=true'>二次办理合成事项</td></tr></table>"""
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path="/usr/bin/google-chrome", headless=True)
+        page = browser.new_page()
+        page.set_content(f'<iframe srcdoc="{html}"></iframe>')
+        adapter = CollaborationDetailAdapter(page)
+        def stop_after_click(before):
+            assert page.evaluate("window.clicked") is True
+            raise RuntimeError("synthetic click verified")
+        adapter._wait_new_page = stop_after_click
+        with pytest.raises(RuntimeError, match="synthetic click verified"):
+            adapter.capture("target")
+        browser.close()
+
+
+def test_legacy_associated_edoc_without_assdoc_wrapper_is_discovered():
+    from oa_knowledge.collector.detail import CollaborationDetailAdapter
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path="/usr/bin/google-chrome", headless=True)
+        page = browser.new_page()
+        page.set_content('''<div id="attachment2AreaDoc1"><div id="attachmentDiv_1234567890123456789">
+        <a onclick="openDetailURL('/seeyon/edocController.do?method=detailIFrame')">合成公文</a>
+        </div></div>''')
+        assert CollaborationDetailAdapter._associated_documents(page) == [
+            {"key": "1234567890123456789", "frame_index": 0,
+             "href": "/seeyon/edocController.do?method=detailIFrame"}
+        ]
+        browser.close()
+
+
 def test_navigation_uses_actual_page_number_after_list_reopens() -> None:
     html = """
     <input id='x_page_number' value='1'>

@@ -667,3 +667,26 @@ def test_refine_current_dossier_reuses_the_same_run_and_is_idempotent(
     assert first.classification_status == "classified"
     assert first.content_origin == "internal"
     assert first.business_category == "04_财务资金与融资"
+
+
+def test_review_decision_is_reconsidered_when_evidence_changes(factory, config, config_file):
+    key = "done:changed-evidence"
+    with factory.begin() as session:
+        session.add_all([
+            OAManifestItem(oa_item_key=key, title="合成材料", list_page=1,
+                           processing_status="downloaded"),
+            OAItem(oa_item_key=key, source_channel="done", title="合成材料"),
+        ])
+    service = ClassificationService(factory, config)
+    ref = service.create_run(replace(_request("changed-evidence"), target_keys=(key,)))
+    service.process_next(ref.run_id)
+    settings = load_settings(config_file)
+    first = service.refine_current_dossier(key, settings)
+    assert first.classification_status == "needs_review"
+    with factory.begin() as session:
+        item = session.scalar(select(OAItem).where(OAItem.oa_item_key == key))
+        item.title = "内部事项呈批表—通知存款"
+    second = service.refine_current_dossier(key, settings)
+    assert second.classification_status == "classified"
+    assert second.id != first.id
+    assert second.business_category == "04_财务资金与融资"

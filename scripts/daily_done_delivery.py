@@ -112,11 +112,14 @@ def drain(worker, root: Path, bulk_root: Path, queue_name: str) -> int:
 
 
 def run_daily(worker, settings, root: Path, bulk_root: Path) -> dict:
-    """Run discovery, converge durable work, then consume the resulting queues."""
+    """Discover and enqueue; the regular worker owns all subsequent stages.
+
+    Do not run the legacy batch converter here: it bypasses stage recovery and
+    overwrites retryable work with DAILY_DELIVERY_* terminal failures.
+    """
     result = {'scan': run_nightly_scan(worker.engine, settings, enqueue_history=False)}
     result['convergence'] = asdict(DoneConvergencePlanner(worker.engine, settings).plan(apply=True))
-    result['archive_steps'] = drain(worker, root, bulk_root, 'realtime_done')
-    result['delivery_items'] = drain(worker, root, bulk_root, 'markdown_delivery')
+    result['processing'] = 'durable_worker'
     return result
 
 
@@ -127,9 +130,9 @@ def main():
     parser.add_argument('--check', action='store_true', help='Validate local configuration only; no OA or database writes')
     args = parser.parse_args()
     settings = load_settings(args.config)
-    private = load_private_classification_config(settings.classification_private_dir)
-    protected = protected_keys(args.bulk_run_dir)
     if args.check:
+        private = load_private_classification_config(settings.classification_private_dir)
+        protected = protected_keys(args.bulk_run_dir)
         print(json.dumps({'config_sha256': private.config_sha256, 'protected_bulk_items': len(protected),
                           'markdown_root': str(settings.markdown_root)}, ensure_ascii=False))
         return

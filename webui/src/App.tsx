@@ -280,6 +280,7 @@ export function App() {
   const onDirtyChange = useCallback((value: boolean) => { dirty.current = value }, [])
   const [mobileNav, setMobileNav] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [loadedView, setLoadedView] = useState<View | null>(null)
   const [error, setError] = useState("")
   const [auth, setAuth] = useState<boolean | null>(null)
   const [token, setToken] = useState("")
@@ -347,6 +348,7 @@ export function App() {
         else if (view === "pending") setPending(result.items)
         else setMarkdown(result.items)
       }
+      setLoadedView(view)
       setError("")
     } catch (reason) {
       if (!abort.signal.aborted && serial === requestSerial.current) setError(reason instanceof Error ? reason.message : "读取失败")
@@ -383,7 +385,8 @@ export function App() {
       </header>
       {error && <div className="error-banner" role="alert"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}
       {auth === null && <p>正在验证本地会话…</p>}
-      {auth && <>
+      {auth && loading && <p role="status" aria-live="polite">正在读取 OA 同步数据，请稍候…</p>}
+      {auth && loadedView === view && <>
         {view === "overview" && simpleStatus && <SimpleOverviewView data={simpleStatus} onJump={navigate}/>}
         {view === "pending" && <PendingView rows={pending} total={total} page={page} pageSize={50} setPage={setPage} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} selectedId={selected} onSelect={onSelect} refresh={load}/>}
         {view === "done" && <SimpleDoneView rows={done} total={total} metrics={doneMetrics} page={page} setPage={setPage} query={query} setQuery={setQuery} filter={filter as SimpleDoneFilter | ""} setFilter={setFilter} selectedId={selected} onSelect={onSelect} refresh={load} onMarkdown={id => navigate("markdown", "", id)}/>}

@@ -22,6 +22,21 @@ def _queue(config_file: Path) -> tuple[ProductionQueue, object]:
     return ProductionQueue(engine), settings
 
 
+def test_temporary_resource_failure_keeps_retrying_after_attempt_limit(config_file):
+    queue, _ = _queue(config_file)
+    task_id = queue.enqueue('realtime_done', 'done:temporary', 'done_capture_and_archive', 'temporary')
+    queue.claim('synthetic-worker', task_ids=(task_id,))
+    with Session(queue.engine) as session:
+        task = session.get(PipelineTask, task_id)
+        task.attempts = 100
+        session.commit()
+    queue.fail(task_id, 'synthetic-worker', 'BROWSER_CLOSED', 'synthetic')
+    with Session(queue.engine) as session:
+        task = session.get(PipelineTask, task_id)
+        assert task.status == 'queued'
+        assert task.next_retry_at is not None
+
+
 def _authorize_history(queue: ProductionQueue, *logical_keys: str) -> None:
     with Session(queue.engine) as session:
         session.add_all([

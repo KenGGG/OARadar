@@ -162,11 +162,12 @@ class CollaborationDetailAdapter:
             detail = self.list_page.context.new_page()
             detail.goto(direct_url, wait_until="domcontentloaded")
         else:
-            checkbox = self.list_page.locator(
-                f"input[name='workitemId'][value='{workitem_id_text}']"
-            )
-            if checkbox.count() != 1:
+            selector = f"input[name='workitemId'][value='{workitem_id_text}']"
+            matches = [frame.locator(selector) for frame in self.list_page.frames
+                       if frame.locator(selector).count() == 1]
+            if len(matches) != 1:
                 raise LookupError(f"workitem is not present on the current list page: {workitem_id_text}")
+            checkbox = matches[0]
             before = set(self.list_page.context.pages)
             subject_cell = checkbox.locator("xpath=ancestor::tr").locator("td[abbr='subject']")
             subject_cell.click(force=True)
@@ -462,6 +463,25 @@ class CollaborationDetailAdapter:
         result: list[dict[str, object]] = []
         seen: set[str] = set()
         for frame_index, frame in enumerate(page.frames):
+            # Legacy collaboration pages render associated edocs without an
+            # assdoc/attsdata wrapper. Follow their existing read-only links.
+            try:
+                keys = frame.locator("[id^='attachment2Area'] [id^='attachmentDiv_']").evaluate_all(
+                    """nodes => nodes.filter(node => node.querySelector('a[onclick*="openDetailURL"]'))
+                    .map(node => node.id.slice('attachmentDiv_'.length))"""
+                )
+                for key in keys:
+                    if key and key not in seen:
+                        anchor = frame.locator(f"[id='attachmentDiv_{key}'] a[onclick*='openDetailURL']").first
+                        onclick = html.unescape(anchor.get_attribute("onclick") or "")
+                        match = re.search(r"openDetailURL\(\s*['\"](/seeyon/[^'\"]+)['\"]", onclick)
+                        association = {"key": key, "frame_index": frame_index}
+                        if match:
+                            association["href"] = urljoin(page.url, match.group(1))
+                        result.append(association)
+                        seen.add(key)
+            except Exception:
+                logger.debug("collector detail: failed to extract legacy associations", exc_info=True)
             try:
                 count = frame.locator("[comptype='assdoc'][attsdata]").count()
             except Exception:
@@ -585,8 +605,18 @@ class CollaborationDetailAdapter:
                 absolute = page.url.split("/seeyon/")[0] + file_url if file_url.startswith("/seeyon/") else file_url
                 content = None
                 content_type = ""
+                # Prefer the authenticated file endpoint: legacy popup download
+                # handlers can close the detail page while starting a download.
+                try:
+                    response = page.context.request.get(absolute, timeout=download_timeout_seconds * 1000)
+                    content_type = self._response_content_type(response)
+                    payload = response.body() if response.ok else None
+                    if payload and "text/html" not in content_type and not payload.lstrip().lower().startswith((b"<!doctype", b"<html", b"<head", b"<body")):
+                        content = payload
+                except PlaywrightError:
+                    pass
                 candidates = frame.locator("a[_temp]")
-                for candidate_index in range(candidates.count()):
+                for candidate_index in range(candidates.count() if content is None else 0):
                     candidate = candidates.nth(candidate_index)
                     if candidate.get_attribute("_temp") == file_url:
                         content = self._browser_download_payload(
@@ -826,6 +856,16 @@ class CollaborationDetailAdapter:
                     ):
                         self._last_download_failure = "file download API returned HTML"
                         content = None
+                    if not content:
+                        # Some legacy OA links return HTTP 200 with an empty body
+                        # from fileDownload.do, while their page control still
+                        # starts a valid browser download.
+                        payload = self._browser_download_payload(
+                            page, lambda: link.click(force=True),
+                            min(download_timeout_seconds * 1000, 30_000),
+                        )
+                        if payload is not None:
+                            content = payload
                 status = "downloaded" if content is not None else "download_failed"
                 if content is None:
                     self._capture_issues.append({

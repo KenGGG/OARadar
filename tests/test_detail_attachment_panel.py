@@ -35,13 +35,14 @@ def test_blank_direct_collaboration_detail_is_rejected_for_list_fallback() -> No
         playwright.stop()
 
 
-def test_attachment_panel_uses_file_download_api_instead_of_preview_click() -> None:
+@pytest.mark.parametrize("empty_api", [False, True])
+def test_attachment_panel_uses_file_download_api_instead_of_preview_click(empty_api: bool) -> None:
     observed_query = {}
     panel = """
         <html><body>
           <script>
             function findAttachment(fileId, createDate, fileName, fileType, version) {
-              document.getElementById(fileId).href = '/seeyon/officeTrans.do?method=view&fileId=' + fileId;
+              window.location.href = '/synthetic-download';
             }
           </script>
           <a id="file-1" target="downloadFileFrame" onclick="findAttachment('file-1','2026-08-24','synthetic-document','docx','hash-1')">synthetic-document.docx</a>
@@ -60,9 +61,18 @@ def test_attachment_panel_uses_file_download_api_instead_of_preview_click() -> N
         def do_GET(self) -> None:
             if self.path.startswith("/seeyon/fileDownload.do?"):
                 observed_query.update(parse_qs(urlsplit(self.path).query))
+                payload = b"" if empty_api else b"synthetic attachment bytes"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if self.path == "/synthetic-download":
                 payload = b"synthetic attachment bytes"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", 'attachment; filename="synthetic-document.docx"')
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)

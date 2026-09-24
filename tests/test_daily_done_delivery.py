@@ -77,8 +77,9 @@ def test_daily_converges_after_scan_before_queue_draining(monkeypatch, tmp_path)
 
     summary = helper.run_daily(worker, object(), tmp_path, tmp_path)
 
-    assert calls == ['scan', 'planner_init', 'converge', 'drain:realtime_done', 'drain:markdown_delivery']
+    assert calls == ['scan', 'planner_init', 'converge']
     assert summary['convergence']['download_created'] == 1
+    assert summary['processing'] == 'durable_worker'
 
 
 @pytest.mark.parametrize(('outcome', 'task_status'), [('needs_review', 'completed'), ('partial', 'failed')])

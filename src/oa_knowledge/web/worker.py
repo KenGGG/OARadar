@@ -782,6 +782,8 @@ class OperationWorker:
                     self.production_queue.fail(task.id, self.owner, "PIPELINE_STAGE_NOT_IMPLEMENTED", task.stage, recoverable=False)
             except Exception as exc:
                 code = "PIPELINE_RESOURCE_BUSY" if isinstance(exc, PipelineResourceBusyError) else {
+                    "TargetClosedError": "BROWSER_CLOSED",
+                    "TimeoutError": "OA_TIMEOUT",
                     "PrivateConfigError": "CLASSIFICATION_CONFIG_ERROR",
                     "FileNotFoundError": "ATTACHMENT_DOWNLOAD_FAILED",
                     "DoneKnowledgeError": "OLLAMA_SCHEMA_INVALID",
@@ -1355,6 +1357,9 @@ class OperationWorker:
             if manifest is None:
                 self.production_queue.fail(task.id, self.owner, "MANIFEST_MISSING", "manifest item disappeared", recoverable=False)
                 return
+            if manifest.processing_status == "skipped" or (manifest.matched_exclusion_keyword or "").strip():
+                self.production_queue.complete(task.id, self.owner)
+                return
             workitem_id = manifest.workitem_id_text
             manifest_id = manifest.id
             manifest_page = manifest.list_page
@@ -1410,6 +1415,8 @@ class OperationWorker:
                         self.production_queue.fail(task.id, self.owner, "OA_AUTH_EXPIRED", "auth required during detail fallback", recoverable=True)
                         return
                     except Exception as fallback_exc:
+                        if type(fallback_exc).__name__ in {"TargetClosedError", "TimeoutError"}:
+                            raise
                         raise RuntimeError(
                             f"direct detail failed: {type(direct_exc).__name__}; "
                             f"list fallback failed: {type(fallback_exc).__name__}"

@@ -4,7 +4,7 @@ Description=Run OARadar nightly full reconciliation
 [Timer]
 OnCalendar=*-*-* 23:30:00 {{TIMEZONE}}
 AccuracySec=5min
-Persistent=false
+Persistent=true
 Unit=oaradar-nightly.service
 
 [Install]

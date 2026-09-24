@@ -228,7 +228,19 @@ class DoneAdapter:
                 return workitem_id_text
         except Exception:
             pass
-        return self.search_for_item(title, workitem_id_text)
+        # Titles can change after another round of handling. Search the live,
+        # unfiltered list by identity, never substitute a same-title affair.
+        if self.direct_list_url:
+            self.page.goto(self.direct_list_url, wait_until="domcontentloaded")
+            self._current_list_page = 1
+        frame = self.navigate_to_page(1, page_delay_seconds)
+        while True:
+            if frame.locator(f"input[name='workitemId'][value='{workitem_id_text}']").count() == 1:
+                return workitem_id_text
+            if not self._next_page(frame, page_delay_seconds):
+                break
+            self._current_list_page += 1
+        raise LookupError("OA workitem not found in current Done list")
 
     def detail_link_for_item(self, workitem_id_text: str) -> str | None:
         """Return the OA-provided detail URL even when the subject column is hidden."""
@@ -289,10 +301,6 @@ class DoneAdapter:
                 current = frame.locator("input[name='workitemId']").first
                 if current.count() and current.get_attribute("value") != previous:
                     previous = current.get_attribute("value")
-            rows = self._discover_frame(frame, 2, 1, 0)
-            if len(rows) == 1 and _normalized_title(rows[0].title) == _normalized_title(search_title):
-                self._current_list_page = 1
-                return rows[0].workitem_id_text
         raise LookupError(f"workitem is not present after title search: {workitem_id_text}")
 
     @staticmethod

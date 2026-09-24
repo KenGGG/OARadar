@@ -86,6 +86,16 @@ def test_bare_original_sender_marker_stays_unresolved() -> None:
     assert result.review_reason == "origin_unresolved"
 
 
+@pytest.mark.parametrize("title", [
+    "## 甲市财政局关于资金管理的通知",
+    "**甲市财政局**关于资金管理的通知",
+])
+def test_markdown_formatting_does_not_hide_explicit_issuer(title):
+    result = classify_dossier(_dossier(title), _rules())
+    assert result.classification_status == "classified"
+    assert result.canonical_issuer == "甲市财政局"
+
+
 def test_current_outer_issuer_is_kept_without_inventing_an_alias() -> None:
     result = classify_dossier(
         _dossier("甲区财政局转发乙市财政局转发国务院关于资金管理的通知"),

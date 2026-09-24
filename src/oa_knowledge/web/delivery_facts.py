@@ -28,26 +28,30 @@ def delivery_facts_map(
         return {}
     item_ids = [item.id for item in items]
     keys = [item.oa_item_key for item in items]
-    manifests = {row.oa_item_key: row for row in session.scalars(
-        select(OAManifestItem).where(OAManifestItem.oa_item_key.in_(keys))
+    manifests = {row.oa_item_key: row for row in session.execute(
+        select(OAManifestItem.oa_item_key, OAManifestItem.processing_status,
+               OAManifestItem.no_attachment_confirmed).where(OAManifestItem.oa_item_key.in_(keys))
     )}
-    decisions = {row.oa_item_key: row for row in session.scalars(
-        select(ClassificationDecision).where(
+    decisions = {row.oa_item_key: row for row in session.execute(
+        select(ClassificationDecision.oa_item_key, ClassificationDecision.classification_status).where(
             ClassificationDecision.oa_item_key.in_(keys), ClassificationDecision.is_current.is_(True),
         )
     )}
     # "primary" is the pre-role-migration source attachment role.
-    files = list(session.scalars(select(ArchivedFile).where(
+    files = list(session.execute(select(ArchivedFile.id, ArchivedFile.oa_item_id, ArchivedFile.sha256).where(
         ArchivedFile.oa_item_id.in_(item_ids),
         ArchivedFile.file_role.in_((*MARKDOWN_SOURCE_ROLES, "primary")),
     )))
-    file_ids = [file.id for file in files]
+    file_ids = {file.id for file in files}
     files_by_item: dict[int, list] = defaultdict(list)
     for file in files:
         files_by_item[file.oa_item_id].append(file)
     exports_by_file: dict[int, list] = defaultdict(list)
     indexes_by_item: dict[int, list] = defaultdict(list)
-    for export in session.scalars(select(MarkdownExport).where(or_(
+    for export in session.execute(select(
+        MarkdownExport.oa_item_id, MarkdownExport.source_file_id, MarkdownExport.document_kind,
+        MarkdownExport.status, MarkdownExport.source_sha256, MarkdownExport.markdown_relpath,
+    ).where(or_(
         MarkdownExport.oa_item_id.in_(item_ids), MarkdownExport.source_file_id.in_(file_ids),
     )).order_by(MarkdownExport.updated_at.desc(), MarkdownExport.id.desc())):
         if export.document_kind == "item_index":
@@ -55,9 +59,9 @@ def delivery_facts_map(
         elif export.source_file_id in file_ids:
             exports_by_file[export.source_file_id].append(export)
     jobs_by_file: dict[int, list] = defaultdict(list)
-    for job in session.scalars(select(ParseJob).where(ParseJob.file_id.in_(file_ids))):
+    for job in session.execute(select(ParseJob.file_id, ParseJob.status).where(ParseJob.file_id.in_(file_ids))):
         jobs_by_file[job.file_id].append(job)
-    for task in session.scalars(select(MarkdownTask).where(MarkdownTask.source_file_id.in_(file_ids))):
+    for task in session.execute(select(MarkdownTask.source_file_id, MarkdownTask.status).where(MarkdownTask.source_file_id.in_(file_ids))):
         jobs_by_file[task.source_file_id].append(task)
 
     result = {}

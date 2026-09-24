@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.config import load_settings
 from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
-from oa_knowledge.db.models import OAManifestItem, OperationJob
+from oa_knowledge.db.models import OAItem, OAManifestItem, OperationJob, PipelineTask
 from oa_knowledge.web.worker import OperationWorker
 from oa_knowledge.cli import is_systemic_browser_closed
 from oa_knowledge.web.simple_status import _done_summary
@@ -150,6 +150,11 @@ def test_done_summary_reports_download_queue_and_download_issues_separately(conf
                            processing_status="download_failed"),
             OAManifestItem(oa_item_key="done:excluded", title="合成排除", list_page=1,
                            processing_status="skipped"),
+            OAItem(oa_item_key="done:ok", source_channel="done", title="合成完成",
+                   archive_relpath="originals/synthetic", pipeline_status="downloaded"),
+            PipelineTask(queue_name="markdown_delivery", priority=50,
+                         logical_item_key="done:ok", stage="classify", status="queued",
+                         idempotency_key="synthetic-md:done:ok"),
         ])
         session.commit()
         summary = _done_summary(session, {})

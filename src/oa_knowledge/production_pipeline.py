@@ -570,9 +570,12 @@ class ProductionQueue:
         with Session(self.engine) as session:
             row = self._owned(session, task_id, owner)
             auth_retry = recoverable and error_code in {"OA_AUTH_EXPIRED", "AUTH_REQUIRED"}
-            can_retry = auth_retry or recoverable and row.attempts < row.max_attempts
+            transient_retry = recoverable and error_code in {
+                "PIPELINE_RESOURCE_BUSY", "BROWSER_CLOSED", "OA_TIMEOUT",
+            }
+            can_retry = auth_retry or transient_retry or recoverable and row.attempts < row.max_attempts
             row.status = "queued" if can_retry else "failed"; row.error_code = error_code; row.last_error = detail[:1000]; row.recoverable = recoverable
-            retry_minutes = 1 if auth_retry else min(30, 2 ** row.attempts)
+            retry_minutes = 1 if auth_retry else min(30, 2 ** min(row.attempts, 5))
             row.next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=retry_minutes) if can_retry else None
             row.finished_at = None if can_retry else datetime.now(timezone.utc); row.lease_owner = None; row.lease_expires_at = None
             session.add(PipelineEvent(task_id=row.id, event_type="retry_scheduled" if can_retry else "failed", stage=row.stage, status=row.status,

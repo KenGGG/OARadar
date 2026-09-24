@@ -19,9 +19,37 @@ from oa_knowledge.db.engine import create_db_engine
 from oa_knowledge.db.migrate import upgrade_database
 from oa_knowledge.db.models import (
     ArchivedFile, ItemOccurrence, ItemSnapshot, LogicalItem, MarkdownExport,
-    OAItem, OAManifestItem, SummaryVersion,
+    OAItem, OAManifestItem, PipelineTask, SummaryVersion,
 )
 from oa_knowledge.web import create_web_app
+
+
+def test_overview_reads_delivery_evidence_once(config_file: Path) -> None:
+    """Refreshing the overview must not scan all export evidence three times."""
+    from sqlalchemy import event, Engine
+    from oa_knowledge.web.simple_status import simple_status
+
+    settings = load_settings(config_file)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    upgrade_database(settings.database_path)
+    engine = create_db_engine(settings.database_path)
+    with Session(engine) as session:
+        _add_completed_item(session, "synthetic-overview")
+    queries = []
+
+    def record(_connection, _cursor, statement, _parameters, _context, _many):
+        if "FROM markdown_exports" in statement and "markdown_exports.source_sha256" in statement:
+            queries.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", record)
+    try:
+        result = simple_status(settings)
+    finally:
+        event.remove(Engine, "before_cursor_execute", record)
+        engine.dispose()
+    assert result["done"]["published_items"] == 1
+    assert result["markdown"]["complete"] == 1
+    assert len(queries) == 1
 
 
 def _client(config_file: Path) -> TestClient:
@@ -69,7 +97,7 @@ def _add_completed_item(session: Session, key: str, *, depth_limited: bool = Fal
     session.commit()
 
 
-def _add_markdown_only_item(session: Session, key: str) -> None:
+def _add_markdown_only_item(session: Session, key: str, *, queued: bool = True) -> None:
     """已下载 + 有效 Markdown，但没有 CuratedRun（不能算发布完成）。"""
     oa_item = OAItem(oa_item_key=key, source_channel="done", title=f"{key} 标题", pipeline_status="downloaded")
     session.add(oa_item)
@@ -92,6 +120,11 @@ def _add_markdown_only_item(session: Session, key: str) -> None:
         parse_config_hash="cfg", schema_version=1, status="success",
         generated_at=datetime.now(timezone.utc),
     ))
+    if queued:
+        session.add(PipelineTask(
+            queue_name="markdown_delivery", priority=50, logical_item_key=key,
+            stage="classify", status="queued", idempotency_key=f"synthetic-md:{key}",
+        ))
     session.commit()
 
 
@@ -173,7 +206,7 @@ def test_simple_status_completes_done_item_from_item_index_without_curation(conf
     client = _client(config_file)
     engine = _seed(config_file)
     with Session(engine) as session:
-        _add_markdown_only_item(session, "oa:index-complete")
+        _add_markdown_only_item(session, "oa:index-complete", queued=False)
         item = session.scalar(select(OAItem).where(OAItem.oa_item_key == "oa:index-complete"))
         session.add(MarkdownExport(
             oa_item_id=item.id, document_kind="item_index", source_sha256="2" * 64,
@@ -210,6 +243,10 @@ def test_simple_status_keeps_items_without_an_index_in_markdown_queue(config_fil
             markdown_relpath="oa:partial.md", parse_engine="mineru", parse_engine_version="v1",
             parse_config_hash="cfg", schema_version=1, status="success",
             generated_at=datetime.now(timezone.utc),
+        ))
+        session.add(PipelineTask(
+            queue_name="markdown_delivery", priority=50, logical_item_key="oa:partial",
+            stage="index_publish", status="queued", idempotency_key="synthetic-md:oa:partial",
         ))
         session.commit()
 
