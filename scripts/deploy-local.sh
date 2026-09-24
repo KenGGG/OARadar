@@ -130,17 +130,17 @@ if [[ "$SKIP_SYSTEMD" -eq 1 ]]; then
 elif [[ "$SYSTEMD_AVAILABLE" -eq 0 ]]; then
   echo "WARNING: 当前环境无可用 systemd 用户管理器，跳过 systemd 步骤。" >&2
 else
+  if [[ "$BOOTSTRAP" -eq 1 ]]; then
+    step "首次部署：执行待办基线扫描"
+    "$UV_BIN" run oa schedule bootstrap --config "$CONFIG"
+  fi
+
   step "6/8 安装/更新 systemd 服务"
   "$PROJECT_ROOT/scripts/install-systemd-user.sh" \
     --project-root "$PROJECT_ROOT" --config "$CONFIG" --timezone "$TIMEZONE"
 
   step "7/8 重启 Web 与 Worker"
   systemctl --user restart oaradar-web.service oaradar-worker.service oaradar-markdown-worker.service
-
-  if [[ "$BOOTSTRAP" -eq 1 ]]; then
-    step "首次部署：执行待办基线扫描"
-    "$UV_BIN" run oa schedule bootstrap --config "$CONFIG"
-  fi
 fi
 
 # 8. Status + access address.

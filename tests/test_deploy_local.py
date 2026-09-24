@@ -67,3 +67,37 @@ def test_deploy_runs_tests_as_python_module(tmp_path: Path, monkeypatch: pytest.
 
     assert result.returncode == 0, result.stderr
     assert "run python -m pytest -q" in log.read_text(encoding="utf-8").splitlines()
+
+
+def test_bootstrap_finishes_before_install_enables_timers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    config = project / "config.yaml"
+    config.write_text("app:\n  data_root: data\n", encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "deploy-order.log"
+    for name in ("uv", "systemctl"):
+        command = bin_dir / name
+        command.write_text(
+            "#!/bin/sh\n"
+            f"printf '{name} %s\\n' \"$*\" >> \"$FAKE_DEPLOY_LOG\"\n"
+            "exit 0\n", encoding="utf-8",
+        )
+        command.chmod(0o755)
+    installer = scripts / "install-systemd-user.sh"
+    installer.write_text(
+        "#!/bin/sh\nprintf 'installer\\n' >> \"$FAKE_DEPLOY_LOG\"\n",
+        encoding="utf-8",
+    )
+    installer.chmod(0o755)
+    monkeypatch.setenv("FAKE_DEPLOY_LOG", str(log))
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    result = _run(["--project-root", str(project), "--config", str(config), "--bootstrap", "--skip-tests"])
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    bootstrap = f"uv run oa schedule bootstrap --config {config}"
+    assert calls.index(bootstrap) < calls.index("installer")
