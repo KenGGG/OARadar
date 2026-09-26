@@ -8,11 +8,11 @@ from typing import Literal
 
 from .evidence_dossier import OAEvidenceDossier
 from .internal_classification import BusinessCategory, classify_by_content
-from .metadata_rules import resolve_configured_document_issuer, resolve_issuer_from_text
+from .metadata_rules import configured_document_candidates, normalize_issuer
 from .schemas import PrivateClassificationConfig
 
 _SELF_ISSUER = "广州凯得融资租赁有限公司"
-CLASSIFIER_VERSION = "per-item-v3"
+CLASSIFIER_VERSION = "per-item-v4"
 _FILE_TRANSFER = re.compile(r"文件传阅|传阅件|【传阅】")
 _STRONG_INTERNAL = re.compile(
     r"内部事项呈批|印鉴(?:使用)?申请|印章使用申请|用印申请|部门章使用申请|"
@@ -81,7 +81,14 @@ def classify_dossier(
     issuer_evidence = _strong_external_issuer(dossier, config)
     issuer = issuer_evidence[0] if issuer_evidence is not None else None
     internal_lock = _strong_internal_lock(dossier, document_match, issuer_evidence)
+    if internal_lock is None and document_match is None and issuer_evidence is None:
+        templates = [t for t in config.title_templates if re.search(t.pattern, dossier.normalized_title)]
+        if templates and all(t.content_origin == "internal" for t in templates):
+            internal_lock = ("title_template", dossier.normalized_title)
     conflict = None
+    title_numbers = configured_document_candidates(dossier.title, config)
+    if internal_lock is None and (len(title_numbers) > 1 or dossier.primary_attachment_conflict):
+        return _review(None, "main_evidence_conflict", dossier)
 
     if internal_lock is not None:
         origin, origin_source, origin_quote = "internal", internal_lock[0], internal_lock[1]
@@ -95,7 +102,7 @@ def classify_dossier(
     elif document_match is not None:
         origin, origin_source, origin_quote = "external", document_match[3], document_match[0]
         issuer = document_match[1]
-    elif _FILE_TRANSFER.search(dossier.title):
+    elif _FILE_TRANSFER.search(dossier.title) and issuer_evidence is None:
         match = _FILE_TRANSFER.search(dossier.title)
         origin, origin_source, origin_quote = "external", "title_rule", match.group(0)  # type: ignore[union-attr]
     elif issuer_evidence is not None:
@@ -111,7 +118,7 @@ def classify_dossier(
             return _review("external", "issuer_missing", dossier, origin_source, origin_quote)
         document_type = document_match[2] if document_match else None
         return ProposedClassification(
-            "classified", "external", None, issuer, issuer,
+            "classified", "external", None, issuer_evidence[2] if issuer_evidence and issuer_evidence[0] == issuer else issuer, issuer,
             document_match[0] if document_match else dossier.document_number,
             document_type, origin_source, 0.99, origin_source, origin_quote,
             origin_source, issuer, None, conflict,
@@ -136,7 +143,10 @@ def _strong_internal_lock(
     document_match: tuple[str, str, str | None, str] | None,
     issuer_evidence: tuple[str, str, str] | None,
 ) -> tuple[str, str] | None:
-    match = _STRONG_INTERNAL.search(dossier.title)
+    form_title = re.sub(r"《[^》]*》|〈[^〉]*〉", "", dossier.normalized_title)
+    match = _STRONG_INTERNAL.search(form_title)
+    if match is not None and re.search(r"关于.*(?:印发|转发)|管理办法|管理制度|议事规则", form_title):
+        match = None
     if match is not None:
         return "title_rule", match.group(0)
     own_title = _SELF_INTERNAL_DOCUMENT.search(dossier.title)
@@ -148,7 +158,7 @@ def _strong_internal_lock(
         return issuer_evidence[1], issuer_evidence[2]
     # An initiator is only weak context; it cannot reverse the direct issuer
     # shown by this OA's own title/header/signature.
-    if issuer_evidence is not None:
+    if issuer_evidence is not None or document_match is not None:
         return None
     if dossier.initiator_profile == "internal" and not _FILE_TRANSFER.search(dossier.title):
         subject = classify_by_content(dossier.title, ())
@@ -243,9 +253,9 @@ def _canonical_issuer(
         return "、".join(sorted(set(parts), reverse=True)) if all(parts) else None
     if raw_issuer == _SELF_ISSUER:
         return _SELF_ISSUER
-    resolved = resolve_issuer_from_text(raw_issuer, (), config)
-    if resolved is not None:
-        return resolved
+    resolved = normalize_issuer(raw_issuer, config.issuer_aliases)
+    if resolved.canonical_issuer is not None:
+        return resolved.canonical_issuer
     if _is_formal_issuer(raw_issuer):
         return raw_issuer
     return None
@@ -278,16 +288,8 @@ def _direct_document_match(
 def _configured_document_match(
     text: str, config: PrivateClassificationConfig
 ) -> tuple[str, str, str | None] | None:
-    external = resolve_configured_document_issuer(text, config)
-    if external is not None:
-        return _clean_document_match(external)
-    for rule in config.document_number_issuers:
-        match = re.search(rule.pattern, text)
-        if match is not None:
-            return _clean_document_match(
-                (match.group(0), rule.canonical_issuer, rule.document_type)
-            )
-    return None
+    candidates = configured_document_candidates(text, config)
+    return _clean_document_match(candidates[0]) if len(candidates) == 1 else None
 
 
 def _clean_document_match(

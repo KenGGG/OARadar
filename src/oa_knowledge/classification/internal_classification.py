@@ -108,6 +108,16 @@ def _subject_match(
     text = re.sub(r"经(?:公司)?董事会(?:审议|审批|批准)(?:通过)?", "", text)
     # Remove only the generic form name, not the parenthesized business topic.
     text = re.sub(r"(?:业务|采购)?合同审批表", "", text)
+    # Specific business subjects precede generic audit/procedure vocabulary.
+    for category, pattern in (
+        ("04_财务资金与融资", r"财务审计|财务报表审计|税务|会计核算"),
+        ("02_业务项目与投放租后", r"项目.{0,20}(?:专项审查|设备采购|诉讼|清收)"),
+        ("05_经营计划与绩效考核", r"年度投资计划|经营业绩考核|年度总结|经营例会"),
+        ("06_人力资源", r"薪酬制度"),
+    ):
+        match = re.search(pattern, text)
+        if match and (not exclude or category not in exclude):
+            return category, match.group(0)
     for category, patterns in _TITLE_SUBJECT_RULES:
         if exclude and category in exclude:
             continue
@@ -115,6 +125,32 @@ def _subject_match(
             match = re.search(pattern, text)
             if match:
                 return category, match.group(0)
+    return None
+
+
+def internal_display_group(category: BusinessCategory | None, title: str = "") -> str | None:
+    """Six display groups without migrating stored categories or archive paths.
+
+    Ambiguous legacy buckets require subject evidence; unknown is not comprehensive.
+    """
+    groups = {
+        "01_公司治理与决策": "治理制度",
+        "02_业务项目与投放租后": "业务项目",
+        "04_财务资金与融资": "财务资金",
+        "05_经营计划与绩效考核": "经营管理",
+        "06_人力资源": "人事行政与党群",
+        "07_党建纪检与工会": "人事行政与党群",
+        "08_行政采购与信息化": "人事行政与党群",
+    }
+    if category in groups:
+        return groups[category]
+    if category is None:
+        return None
+    subject = _subject_match(re.sub(r"报送|回复|反馈", "", title))
+    if subject:
+        return groups.get(subject[0], "治理制度" if subject[0] == "03_风险合规审计法务" else None)
+    if re.search(r"多主题综合材料|综合信息汇编", title):
+        return "综合信息"
     return None
 
 

@@ -58,6 +58,33 @@ def test_document_number_beats_original_sender_marker() -> None:
     assert result.canonical_issuer == "甲金融服务集团有限公司"
 
 
+def test_quoted_project_regulation_does_not_lock_internal():
+    result = classify_dossier(_dossier("甲集团〔2026〕8号关于印发《项目立项议事规则》的通知"), _rules())
+    assert result.content_origin == "external"
+
+
+def test_longer_issuer_is_not_truncated_to_alias():
+    assert normalize_canonical_issuer("甲集团子公司", _rules()) == "甲集团子公司"
+
+
+def test_multiple_numbers_and_citations_do_not_select_first_rule():
+    from oa_knowledge.classification.metadata_rules import resolve_configured_document_issuer
+    assert resolve_configured_document_issuer("甲集团〔2026〕1号；甲集团〔2026〕2号", _rules()) is None
+    assert resolve_configured_document_issuer("根据甲集团〔2026〕1号办理", _rules()) is None
+
+
+def test_internal_form_keeps_origin_with_external_reference():
+    result = classify_dossier(_dossier("业务合同审批表—甲项目保密协议（根据甲集团〔2026〕1号）"), _rules())
+    assert result.content_origin == "internal"
+
+
+def test_six_groups_require_evidence_for_legacy_ambiguous_categories():
+    from oa_knowledge.classification.internal_classification import internal_display_group
+    assert internal_display_group("03_风险合规审计法务", "财务报表审计") == "财务资金"
+    assert internal_display_group("99_其他内部", "未识别材料") is None
+    assert internal_display_group("06_人力资源") == "人事行政与党群"
+
+
 def test_original_sender_marker_does_not_alone_make_an_item_external() -> None:
     result = classify_dossier(_dossier("业务一部工作会议纪要（由经办人原发）"), _rules())
 

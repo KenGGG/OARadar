@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from oa_knowledge.db.engine import create_db_engine
+from oa_knowledge.classification.internal_classification import internal_display_group
 from oa_knowledge.db.models import ArchivedFile, ClassificationDecision, MarkdownExport, OAItem, OAManifestItem, ParseJob, PipelineEvent, PipelineTask
 from oa_knowledge.done_archive import DONE_ARCHIVE_PREFIXES
 from oa_knowledge.source_roles import MARKDOWN_SOURCE_ROLES
@@ -53,6 +54,7 @@ def _item_detail(session, settings, item):
         "id": item.id, "title": item.title, "manifest_id": manifest.id if manifest else None,
         "source_relpath": item.archive_relpath, "source_type": item.source_type or "unknown",
         "internal_category": item.internal_category, "external_issuer": item.external_issuer,
+        "internal_display_group": internal_display_group(item.internal_category, item.title) if item.source_type == "internal" else None,
         "delivery": facts, "delivery_status": DELIVERY_LABELS[facts["status"]],
         "can_retry": archive_ready and not local_active and not blocked and facts["status"] not in {"excluded", "needs_review"},
         "retry_blocked_reason": "任务正在执行或排队" if local_active else "请先处理不可自动恢复的错误" if blocked else "请先完成原件校验" if not archive_ready else None,

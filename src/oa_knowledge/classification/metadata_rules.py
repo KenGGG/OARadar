@@ -337,11 +337,22 @@ def find_configured_document_number(
     text: str, config: PrivateClassificationConfig
 ) -> str | None:
     """Return the first configured formal number present in existing metadata."""
+    candidates = configured_document_candidates(text, config)
+    return candidates[0][0] if len(candidates) == 1 else None
+
+
+def configured_document_candidates(
+    text: str, config: PrivateClassificationConfig
+) -> list[tuple[str, str, str | None]]:
+    """Collect independent matches; cited numbers cannot select the main issuer."""
+    candidates: set[tuple[str, str, str | None]] = set()
     for rule in config.document_number_issuers:
-        match = re.search(rule.pattern, text)
-        if match is not None:
-            return match.group(0).strip()
-    return None
+        for match in re.finditer(rule.pattern, text):
+            context = re.split(r"[。；;\n]", text[:match.start()])[-1]
+            if re.search(r"根据|依据|参照|按照|附件[:：]", context):
+                continue
+            candidates.add((match.group(0).strip(), rule.canonical_issuer, rule.document_type))
+    return sorted(candidates, key=lambda entry: (entry[0], entry[1], entry[2] or ""))
 
 
 def resolve_configured_document_issuer(
@@ -353,10 +364,9 @@ def resolve_configured_document_issuer(
     A self-issued number is deliberately not returned as an external issuer:
     callers must keep that item on the internal classification path.
     """
-    for rule in config.document_number_issuers:
-        match = re.search(rule.pattern, text)
-        if match is not None and rule.canonical_issuer not in _SELF_ISSUERS:
-            return match.group(0).strip(), rule.canonical_issuer, rule.document_type
+    candidates = configured_document_candidates(text, config)
+    if len(candidates) == 1 and candidates[0][1] not in _SELF_ISSUERS:
+        return candidates[0]
     return None
 
 

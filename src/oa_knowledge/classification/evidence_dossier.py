@@ -26,7 +26,7 @@ from oa_knowledge.db.models import (
     OAManifestItem,
 )
 
-from .metadata_rules import normalize_person
+from .metadata_rules import normalize_person, configured_document_candidates
 from .schemas import PrivateClassificationConfig
 from .semantic_package_loader import DatabaseSemanticPackageLoader
 
@@ -313,15 +313,14 @@ def _preliminary_origin_hint(
     config: PrivateClassificationConfig,
 ) -> Literal["internal", "external"] | None:
     evidence = "\n".join((title, document_number or ""))
-    for rule in config.document_number_issuers:
-        if re.search(rule.pattern, evidence):
-            return (
-                "internal"
-                if rule.canonical_issuer == "广州凯得融资租赁有限公司"
-                else "external"
-            )
-    if _INTERNAL_FORM.search(title):
+    form_title = re.sub(r"《[^》]*》|〈[^〉]*〉", "", title)
+    if _INTERNAL_FORM.search(form_title) and not re.search(r"关于.*(?:印发|转发)|管理办法|议事规则", form_title):
         return "internal"
+    candidates = configured_document_candidates(evidence, config)
+    if len(candidates) == 1:
+        return "internal" if candidates[0][1] == "广州凯得融资租赁有限公司" else "external"
+    if len(candidates) > 1:
+        return None
     if re.search(r"文件传阅|传阅件|【传阅】", title):
         return "external"
     return None
