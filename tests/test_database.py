@@ -32,12 +32,12 @@ from oa_knowledge.db.models import (
 )
 
 
-def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path) -> None:
+def test_migration_is_idempotent_and_wal_enabled(tmp_path: Path, migration_head: str) -> None:
     db = tmp_path / "state" / "oa.db"
     upgrade_database(db)
     upgrade_database(db)
     with sqlite3.connect(db) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0041_agnes_semantic_decision_source"
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == migration_head
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {

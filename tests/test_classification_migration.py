@@ -34,7 +34,7 @@ def test_latest_schema_allows_agnes_as_a_versioned_decision_source(tmp_path: Pat
     assert "'agnes'" in sql
 
 
-def test_0040_upgrades_to_0041_without_losing_existing_rows(tmp_path: Path) -> None:
+def test_0040_upgrades_to_head_without_losing_existing_rows(tmp_path: Path, migration_head: str) -> None:
     database_path = tmp_path / "upgrade-from-0040.db"
     config = _alembic_config(database_path)
     command.upgrade(config, "0040_external_review_without_issuer")
@@ -59,7 +59,7 @@ def test_0040_upgrades_to_0041_without_losing_existing_rows(tmp_path: Path) -> N
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == "0041_agnes_semantic_decision_source"
+        ).fetchone()[0] == migration_head
         assert connection.execute(
             "SELECT COUNT(*) FROM oa_items WHERE oa_item_key = ?",
             ("done:synthetic-retained",),

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,18 +139,20 @@ def _last_json(output: str) -> dict:
     raise AssertionError(f"no JSON line in output: {output!r}")
 
 
-def test_init_is_idempotent_and_status_works(config_file: Path) -> None:
+def test_init_is_idempotent_and_status_works(config_file: Path, migration_head: str) -> None:
     first = runner.invoke(app, ["init", "--config", str(config_file)])
     second = runner.invoke(app, ["init", "--config", str(config_file)])
     assert first.exit_code == second.exit_code == 0, first.output + second.output
     data_root = config_file.parent / "data"
     database_path = load_settings(config_file).database_path
-    assert oct(data_root.stat().st_mode & 0o777) == "0o700"
-    assert oct(database_path.stat().st_mode & 0o777) == "0o600"
+    # Windows protects these paths with ACLs; stat() mode bits are POSIX-only.
+    if os.name != 'nt':
+        assert oct(data_root.stat().st_mode & 0o777) == "0o700"
+        assert oct(database_path.stat().st_mode & 0o777) == "0o600"
     assert {path.name for path in data_root.iterdir()} == {"originals", "markdown"}
     status = runner.invoke(app, ["status", "--config", str(config_file)])
     assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "0041_agnes_semantic_decision_source"
+    assert json.loads(status.output)["schema"] == migration_head
 
 
 def test_backfill_mvp_cli_exposes_sample_and_full_modes() -> None:

@@ -10,10 +10,13 @@ from oa_knowledge.config import Settings
 def test_browser_session_enables_download_events(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict = {}
 
+    class Page:
+        def is_closed(self): return True
+
     class Context:
         pages = []
         def set_default_timeout(self, _timeout): pass
-        def new_page(self): return object()
+        def new_page(self): return Page()
         def close(self): pass
 
     class Chromium:
