@@ -37,6 +37,23 @@ def test_manifest_requires_exact_source_reconciliation_before_classification(tmp
             raise AssertionError("incomplete manifest must block classification")
 
 
+def test_manifest_preserves_time_range_in_csv(tmp_path: Path) -> None:
+    raw_time = "08-21 09:00 - 10:00"
+    source = DoneAdapter._items_from_grid_rows([
+        {"id": "synthetic-range", "subject": "Synthetic", "completeTime": raw_time}
+    ], 1, 0)[0]
+    assert source.completed_at is None
+    assert source.completed_at_text == raw_time
+    db = tmp_path / "oa.db"
+    upgrade_database(db)
+    with Session(create_db_engine(db)) as session:
+        synchronize_manifest(session, DoneDiscovery((source,), 1, 1, 1, 1, 1))
+        session.commit()
+        assert session.query(OAManifestItem).one().completed_at_text == raw_time
+        path = export_manifest_csv(session, tmp_path)
+        assert raw_time in path.read_text(encoding="utf-8-sig")
+
+
 def test_manifest_refresh_propagates_initiation_time_to_existing_archive(tmp_path: Path) -> None:
     db = tmp_path / "oa.db"; upgrade_database(db); engine = create_db_engine(db)
     initiated = datetime(2022, 4, 22, 9, 0)

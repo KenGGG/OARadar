@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import yaml
+from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Keys whose presence in YAML means a plaintext credential is being stored inline.
@@ -135,6 +136,7 @@ class MineruConfig(StrictModel):
     workers: int = 1
     model_source: str = "local"
     output_content_list: bool = True
+    tier: Literal["flash", "basic", "standard", "advanced"] = "standard"
 
     @field_validator("api_url")
     @classmethod
@@ -337,6 +339,19 @@ class ConversionConfig(StrictModel):
     force_rebuild: bool = False
 
 
+class DailyDoneConfig(StrictModel):
+    enabled: bool = False
+    at_local_time: str = '02:00'
+    poll_seconds: int = Field(default=30, ge=5, le=300)
+
+    @field_validator('at_local_time')
+    @classmethod
+    def valid_time(cls, value: str) -> str:
+        if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', value):
+            raise ValueError('daily time must be HH:MM')
+        return value
+
+
 class OnlineAuditConfig(StrictModel):
     item_timeout_seconds: int = Field(default=120, ge=30, le=600)
     download_timeout_seconds: int = Field(default=30, ge=5, le=120)
@@ -390,6 +405,7 @@ class Settings(StrictModel):
     curation: CurationConfig = CurationConfig()
     markdown_export: MarkdownExportConfig = MarkdownExportConfig()
     conversion: ConversionConfig = ConversionConfig()
+    daily_done: DailyDoneConfig = DailyDoneConfig()
     online_audit: OnlineAuditConfig = OnlineAuditConfig()
     pending_cleanup: PendingCleanupConfig = PendingCleanupConfig()
     web: WebConfig = WebConfig()
@@ -466,7 +482,7 @@ class Settings(StrictModel):
 
 
 def ensure_relative(value: Path, field: str) -> Path:
-    if value.is_absolute() or ".." in value.parts or re.match(r"^[A-Za-z]:[\\/]", str(value)):
+    if value.is_absolute() or value.anchor or ".." in value.parts or re.match(r"^[A-Za-z]:[\\/]", str(value)):
         raise ValueError(f"{field} must be a safe relative path")
     return value
 
@@ -497,6 +513,29 @@ def load_settings(path: Path | None = None) -> Settings:
         llm_raw.pop("agnes_base_url", None)
         llm_raw.pop("agnes_model", None)
     _reject_secrets(raw)
+    # Read on each load so edits take effect for the next collection operation.
+    # Do not populate os.environ: that would retain stale values in the worker.
+    env_path = path.resolve().parent / ".env" if path else Path.cwd() / ".env"
+    local_env = dotenv_values(env_path, encoding="utf-8-sig", interpolate=False) if env_path.is_file() else {}
+    for variable, field in {
+        "OA_BASE_URL": "base_url", "OA_CONTEXT_PATH": "context_path",
+        "OA_LOGIN_PATH": "login_path", "OA_DONE_LIST_PATH": "done_list_path",
+    }.items():
+        # Magika loads .env into os.environ during import. The file is the
+        # authoritative local connection config, so prefer its current value.
+        value = local_env[variable] if variable in local_env else os.getenv(variable)
+        if value:
+            raw.setdefault("browser", {})[field] = value.strip()
+    from urllib.parse import urlsplit
+    connection = raw.get("browser", {})
+    if connection.get("base_url"):
+        origin = urlsplit(connection["base_url"])
+        if origin.scheme not in {"http", "https"} or not origin.hostname or origin.username or origin.password or origin.path not in {"", "/"} or origin.query or origin.fragment:
+            raise ValueError("OA_BASE_URL must contain only the HTTP(S) origin")
+    for field in ("context_path", "login_path", "done_list_path"):
+        value = connection.get(field)
+        if value and (not value.startswith("/") or value.startswith("//") or "\\" in value):
+            raise ValueError(f"browser.{field} must be a local application path")
     env_root = os.getenv("OA_APP__DATA_ROOT")
     if env_root:
         raw.setdefault("app", {})["data_root"] = env_root
@@ -515,4 +554,13 @@ def load_settings(path: Path | None = None) -> Settings:
     env_classification_private_dir = os.getenv("OA_CLASSIFICATION_PRIVATE_DIR")
     if env_classification_private_dir:
         raw["classification_private_dir"] = env_classification_private_dir
-    return Settings.model_validate(raw)
+    settings = Settings.model_validate(raw)
+    # A machine-local enable switch lets an existing long-running worker keep
+    # reading its older strict YAML schema until a normal restart. The daily
+    # coordinator is independent and uses the latest settings loader.
+    daily_override = settings.runtime_root / 'daily-done-settings.json'
+    if daily_override.is_file():
+        import json
+        overrides=json.loads(daily_override.read_text(encoding='utf8'))
+        settings.daily_done=DailyDoneConfig.model_validate({**settings.daily_done.model_dump(),**overrides})
+    return settings

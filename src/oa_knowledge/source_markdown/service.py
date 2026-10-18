@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
+import yaml
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, object_session
@@ -70,10 +71,20 @@ def _source_tree(settings: Settings, local_relpath: str) -> PurePosixPath:
     return tree
 
 
-def _destination(settings: Settings, source: ArchivedFile, item: OAItem | None) -> Path:
+def _destination(settings: Settings, source: ArchivedFile, item: OAItem | None, *, library_decision=None) -> Path:
     if not source.local_relpath:
         raise FileNotFoundError("verified source path unavailable")
     tree = _source_tree(settings, source.local_relpath)
+    from oa_knowledge.title_screening import safe_segment
+    name = safe_segment(source.original_name or tree.name, 160)
+    source_session=object_session(source)
+    if source_session is not None:
+        peers = source_session.scalars(select(ArchivedFile).where(
+            ArchivedFile.oa_item_id == source.oa_item_id).order_by(ArchivedFile.id)).all()
+        matches = [peer for peer in peers if safe_segment(peer.original_name or Path(peer.local_relpath or '').name,160).casefold() == name.casefold()]
+        rank = next((n for n,peer in enumerate(matches,1) if peer.id == source.id),1)
+        if rank > 1:
+            name += f'_{rank}'
     from oa_knowledge.markdown_delivery import (
         _classification_directory,
         _item_leaf,
@@ -82,6 +93,29 @@ def _destination(settings: Settings, source: ArchivedFile, item: OAItem | None) 
     if item is None:
         raise FileNotFoundError("source OA item unavailable")
     session = object_session(item)
+    from oa_knowledge.db.models import ArchiveClassificationPlan
+    plan = session.scalar(select(ArchiveClassificationPlan).where(ArchiveClassificationPlan.active.is_(True))) if session else None
+    if plan is not None:
+        from oa_knowledge.db.models import OAManifestItem
+        from oa_knowledge.source_library import source_directory, classify_library_item
+        manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == item.oa_item_key))
+        if manifest is not None:
+            directory = settings.markdown_root / source_directory(library_decision or classify_library_item(session,settings,manifest,plan=plan))
+            # Windows on this machine has no long-path support. Reserve space
+            # for image asset subdirectories and disambiguate truncated names.
+            budget = max(12, min(160, 210 - len(str(directory.resolve())) - 4))
+            used = set()
+            for peer in peers if source_session else [source]:
+                base = safe_segment(peer.original_name or Path(peer.local_relpath or '').name,budget)
+                candidate, number = base, 1
+                while candidate.casefold() in used:
+                    number += 1
+                    candidate = f'{base}_{number}'
+                used.add(candidate.casefold())
+                if peer.id == source.id:
+                    name = candidate
+                    break
+            return directory / f"{name}.md"
     decision = session.scalar(select(ClassificationDecision).where(
         ClassificationDecision.oa_item_key == item.oa_item_key,
         ClassificationDecision.is_current.is_(True),
@@ -91,23 +125,52 @@ def _destination(settings: Settings, source: ArchivedFile, item: OAItem | None) 
         and decision.classification_status == "classified"
         and decision.content_origin in {"internal", "external"}
     ):
-        return settings.markdown_root / _package_directory(item, decision) / _item_leaf(item) / f"{tree.name}.md"
+        return settings.markdown_root / _package_directory(item, decision) / _item_leaf(item) / f"{name}.md"
     # Legacy/local utilities can publish pre-classification artifacts; normal
     # classified delivery always takes the frozen-decision path above.
-    return settings.markdown_root / _classification_directory(item) / _item_leaf(item) / f"{tree.name}.md"
+    year = str((item.initiated_at or item.completed_at).year) if (item.initiated_at or item.completed_at) else "年份待确认"
+    return settings.markdown_root / "05_待确认" / year / _item_leaf(item) / f"{name}.md"
+
+
+def _document_classification(settings: Settings, source: ArchivedFile, item: OAItem | None):
+    from oa_knowledge.markdown_classification import classify_document
+    body = ""
+    session = object_session(source)
+    artifact = _active_artifact(session, source) if session else None
+    if artifact is not None:
+        product = _artifact_path(settings, artifact)
+        if product.is_file() and sha256_file(product) == artifact.product_sha256:
+            with product.open(encoding="utf-8") as stream:
+                body = stream.read(4000)
+    return classify_document(item.title if item else "", filename=source.original_name or "", body=body)
 
 
 def _existing_is_current(record: MarkdownExport, artifact: ParseArtifact, destination: Path) -> bool:
     assets = destination.with_name(destination.stem + '.assets')
     if assets.is_dir() and any(assets.rglob('*.md')):
         return False  # Older exports copied unrelated sibling cache products.
-    return bool(
+    current = bool(
         record.status == "success"
         and record.parse_artifact_id == artifact.id
         and destination.is_file()
         and record.markdown_sha256
         and sha256_file(destination) == record.markdown_sha256
     )
+    if not current:
+        return False
+    from oa_knowledge.markdown_classification import VERSION
+    try:
+        header = yaml.safe_load(destination.read_text(encoding="utf-8")[4:].split("\n---\n", 1)[0])
+        from oa_knowledge.archive_classification import CLASSIFIER_REVISION
+        from oa_knowledge.db.models import ArchiveClassificationPlan
+        session=object_session(record)
+        plan=session.scalar(select(ArchiveClassificationPlan).where(ArchiveClassificationPlan.active.is_(True))) if session else None
+        return (header.get("document_classification_version") == VERSION
+                and (plan is None or header.get("classification_version")==plan.version)
+                and (plan is None or "source_organizations" in header)
+                and header.get("library_revision") == CLASSIFIER_REVISION)
+    except (ValueError, IndexError, yaml.YAMLError, AttributeError):
+        return False
 
 
 def publish_active_artifact(
@@ -120,6 +183,8 @@ def publish_active_artifact(
     if source is None or source.download_status != "verified" or not source.local_relpath:
         raise FileNotFoundError("verified source unavailable")
     item = session.get(OAItem, source.oa_item_id)
+    from oa_knowledge.title_screening import assert_attachment_eligible
+    assert_attachment_eligible(session, item)
     if item is not None and item.source_type == "external":
         from oa_knowledge.markdown_delivery import resolve_external_document_metadata
         decision = session.scalar(select(ClassificationDecision).where(
@@ -135,6 +200,8 @@ def publish_active_artifact(
         MarkdownExport.source_file_id == source.id,
         MarkdownExport.schema_version == SCHEMA_VERSION,
     ))
+    old_relpath = record.markdown_relpath if record else None
+    old_sha256 = record.markdown_sha256 if record else None
     artifact = _active_artifact(session, source)
     if artifact is not None and record is not None and _existing_is_current(record, artifact, destination):
         return record
@@ -175,6 +242,10 @@ def publish_active_artifact(
     record.quality_score = artifact.quality_score
 
     body = sanitize_parser_markdown(parsed_path.read_text(encoding="utf-8", errors="replace"))
+    # Exported OA forms reference this server UI icon rather than an attachment
+    # image. Preserve a textual marker; never fetch the server resource.
+    import re
+    body = re.sub(r'!\[[^\]]*\]\(/seeyon/common/content/images/checkbox_(checked_)?browse\.png(?:\?[^)]*)?\)', lambda match: '[已勾选]' if match.group(1) else '[未勾选]', body)
     page_map = json.loads(artifact.page_map_json or "{}")
     metadata = ExportMetadata(
         source_relpath=source.local_relpath,
@@ -216,6 +287,29 @@ def publish_active_artifact(
             if missing_images:
                 metadata = replace(metadata, parse_status='failed', last_error_code='MISSING_IMAGE_ASSET')
             content = render_markdown(metadata, body)
+            from oa_knowledge.markdown_classification import VERSION
+            topic = _document_classification(settings, source, item)
+            header, rest = content[4:].split("\n---\n", 1)
+            frontmatter = yaml.safe_load(header)
+            frontmatter.update(document_category=topic.category, document_type=topic.document_type,
+                document_classification_rule=topic.rule_id, document_classification_version=VERSION,
+                document_classification_needs_review=topic.needs_review)
+            from oa_knowledge.archive_classification import CLASSIFIER_REVISION
+            from oa_knowledge.db.models import OAManifestItem, ArchiveClassificationPlan
+            frontmatter.update(tags=[topic.document_type] if not topic.needs_review else [], library_revision=CLASSIFIER_REVISION)
+            plan = session.scalar(select(ArchiveClassificationPlan).where(ArchiveClassificationPlan.active.is_(True)))
+            manifest = session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key == item.oa_item_key)) if item else None
+            if item:
+                frontmatter.update(oa_title=manifest.title if manifest else item.title,
+                    oa_initiated_at=manifest.initiated_at.isoformat() if manifest and manifest.initiated_at else None,
+                    oa_sender=manifest.sender if manifest else None)
+            if plan is not None and manifest is not None:
+                from oa_knowledge.source_library import classify_library_item
+                origin = classify_library_item(session,settings,manifest,plan=plan)
+                frontmatter.update({key:origin.get(key) for key in ("archive_category_id", "archive_organization",
+                    "archive_series", "related_publication_series", "archive_region", "archive_agency", "source_organizations", "archive_year", "classification_version", "classification_source",
+                    "classification_reason", "classification_status", "needs_review", "virtual_archive_path")})
+            content = "---\n" + yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False).rstrip() + "\n---\n" + rest
             original_link = quote(os.path.relpath(resolve_original_path(settings, source.local_relpath), destination.parent), safe="/")
             content = content.replace("## 文档内容\n", f"[查看原件]({original_link})\n\n## 文档内容\n", 1)
             publish_markdown(destination, content, record.source_sha256, assets if has_assets else None)
@@ -229,6 +323,9 @@ def publish_active_artifact(
         record.last_error_code = 'MISSING_IMAGE_ASSET' if missing_images else None
         record.last_error = 'Parser image assets unavailable; delivery incomplete.' if missing_images else None
         record.generated_at = datetime.now(UTC)
+        if record.status == "success" and old_relpath and old_sha256:
+            from oa_knowledge.markdown_relocation import retire_rendered_output
+            retire_rendered_output(settings,old_relpath,old_sha256,record.markdown_relpath,record.markdown_sha256)
         session.flush()
         # The valid artifact is also classification evidence and the parse
         # idempotency checkpoint. Publishing must not invalidate that cache.

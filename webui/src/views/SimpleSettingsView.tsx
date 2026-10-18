@@ -3,6 +3,8 @@ import {
   Archive, Bell, BookOpen, BrainCircuit, Pencil, Save, Trash2, X,
 } from "lucide-react"
 import type { SettingsData } from "../App"
+import { ArchiveClassificationSettings } from "./ArchiveClassificationSettings"
+import { TitleRuleSettings } from "./TitleRuleSettings"
 import {
   api, postApi, patchApi, putApi, deleteApi, Field, NumberField, Toggle, SecretState,
 } from "../App"
@@ -23,11 +25,14 @@ export function SimpleSettingsView({ initial, onDirtyChange }: {
   const [policies, setPolicies] = useState<TitleExclusionPolicy[]>([])
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editingPattern, setEditingPattern] = useState("")
+  const [archiveDirty, setArchiveDirty] = useState(false)
+  const [ruleDirty, setRuleDirty] = useState(false)
+  const [rulePlanActive, setRulePlanActive] = useState(true)
 
   const [baseline, setBaseline] = useState(() => editableSettings(initial))
   const [restartRequired, setRestartRequired] = useState(!!initial.restart_required)
   const [policyError, setPolicyError] = useState("")
-  const dirty = editableSettings(form) !== baseline || !!titleKeywords.trim()
+  const dirty = archiveDirty || ruleDirty || editableSettings(form) !== baseline || !!titleKeywords.trim()
     || (editingId !== null && editingPattern !== policies.find(policy => policy.id === editingId)?.pattern)
   const dirtyRef = useRef(dirty)
   dirtyRef.current = dirty
@@ -127,8 +132,8 @@ export function SimpleSettingsView({ initial, onDirtyChange }: {
 
   return <section className="settings-stack settings-page">
     <header className="settings-page-header">
-      <div><h2>系统设置</h2><p>调整本地处理与通知规则；修改后统一保存。</p></div>
-      <button className="button-primary" onClick={() => void save()} disabled={saving}><Save size={16}/>{saving ? "保存中" : "保存设置"}</button>
+      <div><h2>系统设置</h2><p>调整本地处理与通知设置；下载筛选规则在下方预演并单独保存。</p></div>
+      <button className="button-primary" onClick={() => void save()} disabled={saving}><Save size={16}/>{saving ? "保存中" : "保存通用设置"}</button>
     </header>
     {message && <div className="settings-message settings-page-message" role="status">{message}</div>}
 
@@ -180,7 +185,9 @@ export function SimpleSettingsView({ initial, onDirtyChange }: {
         <div className="info"><span>计算 SHA256</span><strong>{initial.done_archive.compute_sha256 ? "是" : "否"}</strong></div>
         <div className="info"><span>压缩包展开深度</span><strong>{String(initial.done_archive.max_attachment_depth)}</strong></div>
       </div>
-      <div className="settings-sub settings-sub-card policy-manager"><h3>标题排除关键词</h3>
+      <TitleRuleSettings onDirtyChange={setRuleDirty} onActive={setRulePlanActive}/>
+      <ArchiveClassificationSettings onDirtyChange={setArchiveDirty}/>
+      {!rulePlanActive && <div className="settings-sub settings-sub-card policy-manager"><h3>标题排除关键词</h3>
         <p className="settings-help">命中关键词的已办事项不会进入详情页，也不会下载附件。每行一个关键词。</p>
         <textarea className="settings-textarea" value={titleKeywords} onChange={e => setTitleKeywords(e.target.value)} placeholder="例如：会议通知" />
         <div className="policy-actions"><button className="button-primary" onClick={() => void saveTitleKeywords()} disabled={saving || !titleKeywords.trim()}><Save size={16}/>保存关键词</button></div>
@@ -194,7 +201,7 @@ export function SimpleSettingsView({ initial, onDirtyChange }: {
           </div>)}
           {!policies.length && !policyError && <span className="settings-help">尚未设置标题排除关键词。</span>}
         </div>
-      </div>
+      </div>}
     </div>
 
     <div className="settings-panel"><header className="settings-panel-header"><span><BookOpen size={18}/></span><div><h2>Source Markdown 生成</h2><p>原件转换与发布目录设置。</p></div></header>

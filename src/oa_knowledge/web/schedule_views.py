@@ -214,7 +214,10 @@ def schedule_status(settings, limit: int = 10) -> dict:
     finally:
         engine.dispose()
 
+    from oa_knowledge.daily_done import daily_done_status
+    daily = daily_done_status(settings)
     return {
+        "daily_done": daily,
         "recent_runs": recent,
         "last_scan_at": last_hourly["finished_at"] if last_hourly else None,
         "overall_status": _overall_status(systemd, latest_job, feishu_state),

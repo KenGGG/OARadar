@@ -149,7 +149,7 @@ def _sidecar_document_number(path: Path) -> tuple[DocumentNumberMatch, int | Non
         elif isinstance(value, list):
             for child in value:
                 yield from walk(child, page)
-    for sidecar in path.parent.glob("*middle.json"):
+    for sidecar in sorted(set(path.parent.glob("*middle.json")) | set(path.parent.glob("middle_json.json"))):
         try:
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -266,6 +266,14 @@ def publish_item_index(session: Session, settings, oa_item_key: str) -> Path:
     ))
     if item is None or not item.archive_relpath:
         raise FileNotFoundError("done archive directory unavailable")
+    from oa_knowledge.db.models import ArchiveClassificationPlan, OAManifestItem
+    plan=session.scalar(select(ArchiveClassificationPlan).where(ArchiveClassificationPlan.active.is_(True)))
+    if plan is not None:
+        from oa_knowledge.source_library import classify_library_item, publish_library_index
+        manifest=session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key==oa_item_key))
+        if manifest is not None:
+            decision=classify_library_item(session,settings,manifest,plan=plan)
+            return publish_library_index(session,settings,item,manifest,decision)[0]
     decision = require_current_classified_decision(session, oa_item_key)
     external_metadata = resolve_external_document_metadata(session, settings, item, decision)
     if decision.content_origin == "external" and item.document_number != external_metadata.document_number:

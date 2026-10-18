@@ -124,6 +124,8 @@ def convert_file_id(session: Session, settings: Settings, file_id: int, *, engin
     file = session.get(ArchivedFile, file_id)
     if not file or file.download_status != "verified" or not file.local_relpath:
         raise FileNotFoundError("verified source unavailable")
+    from oa_knowledge.title_screening import assert_attachment_eligible
+    assert_attachment_eligible(session, session.get(OAItem, file.oa_item_id))
     source = settings.data_root / file.local_relpath
     if not source.exists():
         candidate = settings.archive_root / file.local_relpath

@@ -10,6 +10,8 @@ def isolate_xdg_runtime_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     home = tmp_path.parent / f"{tmp_path.name}-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    # Windows expanduser uses USERPROFILE rather than HOME.
+    monkeypatch.setenv("USERPROFILE", str(home))
 
 
 @pytest.fixture

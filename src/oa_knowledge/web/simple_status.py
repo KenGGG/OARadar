@@ -1,7 +1,7 @@
 """极简状态聚合接口（plan-0808 WebUI 简化，spec §4-§5）。
 
-本模块只负责把现有事实表聚合成业务口径的结果，不读取任何 OA 正文、附件名、
-凭据或模型输入输出。所有数字均来自数据库聚合，绝不硬编码验收值。
+本模块聚合现有事实表和本地任务快照，不读取 OA 正文、凭据或模型输入输出。
+已登记的本地转换任务可显示当前事项标题与附件名。所有数字均来自数据库事实。
 
 暴露：
 - ``simple_status(settings) -> dict``：供 ``GET /api/simple-status`` 调用。
@@ -114,6 +114,8 @@ def _latest_done_task_facts(session: Session, keys: list[str]) -> dict[str, dict
         PipelineTask.stage.in_((*download_stages, *markdown_stages)),
     ).order_by(PipelineTask.logical_item_key, PipelineTask.created_at.desc(), PipelineTask.id.desc()))
     for key, stage, status, recoverable in rows:
+        if status == 'local_queued':
+            status = 'queued'
         phase = "download" if stage in download_stages else "markdown"
         result.setdefault(key, {}).setdefault(phase, (status, recoverable))
     return result
@@ -274,7 +276,8 @@ def _workflow_summaries(session: Session, settings: Settings, schedule: dict, *,
         for row in manifests
     )
     archive_pending = len(manifests) - len(archive_complete) - archive_excluded - archive_failed
-    archive_enabled = schedule.get("hourly_enabled")
+    daily = schedule.get('daily_done',{})
+    archive_enabled = bool(daily.get('enabled')and daily.get('active'))or schedule.get("hourly_enabled")
     archive_last_success = session.scalar(
         select(func.max(ArchivedFile.verified_at)).join(OAItem).where(OAItem.source_channel == "done")
     )
@@ -285,7 +288,9 @@ def _workflow_summaries(session: Session, settings: Settings, schedule: dict, *,
         "failed": archive_failed, "excluded": archive_excluded,
         "no_attachment": sum(row.processing_status == "no_attachment" for row in manifests),
         "last_success_at": archive_last_success.isoformat() if archive_last_success else None,
-        "last_scan_at": schedule.get("last_scan_at"), "next_run_at": schedule.get("next_run_at"),
+        "last_scan_at": daily.get('last_scan_at')or schedule.get("last_scan_at"),
+        "next_run_at": daily.get('next_run_at')or schedule.get("next_run_at"),
+        "daily_sync": daily,
     }
     states = {key: 0 for key in ("pending", "working", "partial", "failed", "complete", "needs_review", "excluded")}
     for manifest in manifests:
@@ -440,6 +445,11 @@ def _pending_summary(session: Session, settings: Settings, schedule: dict) -> di
 def _oa_activity_card(base: dict, schedule: dict) -> dict[str, Any]:
     """隐私安全的 OA 后台活动卡，不含标题或凭据（spec §5 / §8）。"""
     runtime = base.get("worker_runtime") or {}
+    daily=schedule.get('daily_done',{})
+    if daily.get('status')=='auth_required':
+        return {'status':'disconnected','label':'每日已办更新等待 OA 登录',
+                'detail':'请在本机完成 OA 登录，系统会沿用断点继续同步、下载并转换分类。',
+                'heartbeat_at':daily.get('heartbeat_at'),'progress_current':None,'progress_total':None}
     if runtime.get("status") == "logging_in":
         return {
             "status": "logging_in", "label": "正在登录 OA",
@@ -520,8 +530,12 @@ def _overall_status(done: dict, pending: dict, attention: list[dict]) -> str:
     return "working"
 
 
-def local_delivery_progress(settings: Settings) -> dict[str, Any]:
+def local_delivery_progress(settings: Settings, session=None) -> dict[str, Any]:
     """Read one atomic batch snapshot; never infer success from processing count."""
+    from oa_knowledge.web.local_conversion import read_local_conversion
+    live = read_local_conversion(settings, session)
+    if live is not None:
+        return live
     try:
         paths = list((settings.data_root / 'runs').glob('local-markdown-*/summary.json'))
         if not paths:
@@ -581,7 +595,7 @@ def simple_status(settings: Settings) -> dict[str, Any]:
                 **workflows,
                 "oa_activity": oa_activity,
                 "attention": attention,
-                "local_delivery": local_delivery_progress(settings),
+                "local_delivery": local_delivery_progress(settings, session),
             }
     finally:
         engine.dispose()

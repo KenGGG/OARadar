@@ -133,6 +133,9 @@ def detect_format(path: Path) -> FormatDecision:
         return FormatDecision("tiff", "file_signature", filename_normalized)
     if header.startswith(b"BM"):
         return FormatDecision("bmp", "file_signature", filename_normalized)
+    markup = header.lstrip(b'\xef\xbb\xbf\x00\t\r\n ').lower()
+    if markup.startswith((b'<!doctype html', b'<html', b'<head', b'<body')):
+        return FormatDecision('html', 'file_signature', filename_normalized)
     office_type = _zip_office_type(source) if header.startswith(b"PK\x03\x04") else None
     if office_type is not None:
         return FormatDecision(office_type, "office_container", filename_normalized)

@@ -10,6 +10,7 @@ from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwrigh
 
 from oa_knowledge.config import Settings
 from oa_knowledge.collector.credentials import load_chrome_saved_credential
+from oa_knowledge.collector.windows_credentials import load_credential
 
 
 class LoginState(StrEnum):
@@ -45,12 +46,19 @@ class BrowserSession:
             accept_downloads=True,
         )
         self.context.set_default_timeout(self.settings.browser.navigation_timeout_seconds * 1000)
+        from .session_cache import restore_session
+        restore_session(self.settings, self.context)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         return self
 
     def __exit__(self, *_args) -> None:
         if self.context:
-            self.context.close()
+            try:
+                if self.page and not self.page.is_closed() and self.login_state() == LoginState.AUTHENTICATED:
+                    from .session_cache import save_session
+                    save_session(self.settings, self.context)
+            finally:
+                self.context.close()
         if self._playwright:
             self._playwright.stop()
 
@@ -67,9 +75,9 @@ class BrowserSession:
         assert self.page
         url = self.page.url
         login_controls = self.page.locator("#login_username, #login_password1, #login_button")
-        if "/seeyon/index.jsp" in url or login_controls.count() >= 2:
+        if self.settings.browser.login_path in url or "/seeyon/index.jsp" in url or login_controls.count() >= 2:
             return LoginState.AUTH_REQUIRED
-        if "/seeyon/main.do" in url and self.page.get_by_text("个人空间", exact=True).count() > 0:
+        if f"{self.settings.browser.context_path}/main.do" in url and self.page.get_by_text("个人空间", exact=True).count() > 0:
             return LoginState.AUTHENTICATED
         return LoginState.UNKNOWN
 
@@ -101,6 +109,16 @@ class BrowserSession:
         button = self.page.locator("#login_button")
         if not username.count() or not password.count() or not button.count():
             return False
+
+        # Never send a stored credential to a redirected, unrelated origin.
+        if urlsplit(self.page.url)[:2] != urlsplit(self.base_url)[:2]:
+            return False
+        credential = load_credential(self.base_url)
+        if credential:
+            username.fill(credential.username)
+            password.fill(credential.password)
+            button.click()
+            return True
 
         # Autofill is asynchronous and sometimes starts only after the login
         # control receives a real focus/click sequence.

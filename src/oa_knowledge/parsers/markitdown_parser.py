@@ -37,7 +37,18 @@ def parse_with_markitdown(
     Returns ParseResult with all metrics.
     """
     md = MarkItDown()
-    result = md.convert(str(file_path))
+    from oa_knowledge.parsers.format_router import detect_format
+    import tempfile
+    import shutil
+    decision = detect_format(file_path)
+    # Route disguised HTML/Office documents by bytes without renaming originals.
+    if decision.status_code == 'parseable' and file_path.suffix.lower() != '.' + decision.actual_file_type:
+        with tempfile.TemporaryDirectory(prefix='oaradar-format-') as temporary:
+            normalized = Path(temporary) / ('source.' + decision.actual_file_type)
+            shutil.copyfile(file_path, normalized)
+            result = md.convert(str(normalized))
+    else:
+        result = md.convert(str(file_path))
     text = result.text_content or ""
 
     quality = assess_quality(text, file_path)

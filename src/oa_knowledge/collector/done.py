@@ -20,6 +20,7 @@ class DiscoveredDoneItem:
     category: str | None
     ordinal: int
     list_page: int = 1
+    completed_at_text: str | None = None
 
     @property
     def oa_item_key(self) -> str:
@@ -205,15 +206,16 @@ class DoneAdapter:
             raise ValueError("target page must be positive")
         frame = self.open_list()
         current = self._current_page(frame)
-        if target_page < current:
+        if target_page != current and (target_page < current or target_page > current + 1):
             field = frame.locator("[id$='_page_number']").first
             go = frame.locator("a.common_over_page_go").first
-            if not field.count() or not go.count():
+            if (not field.count() or not go.count()) and target_page < current:
                 raise RuntimeError("done list page jump controls not found")
-            previous = frame.locator("input[name='workitemId']").first.get_attribute("value")
-            field.fill(str(target_page)); go.click(force=True)
-            self._wait_page_changed(frame, previous, page_delay_seconds)
-            current = target_page
+            if field.count() and go.count():
+                previous = frame.locator("input[name='workitemId']").first.get_attribute("value")
+                field.fill(str(target_page)); go.click(force=True)
+                self._wait_page_changed(frame, previous, page_delay_seconds)
+                current = target_page
         while current < target_page:
             if not self._next_page(frame, page_delay_seconds):
                 raise RuntimeError(f"cannot navigate to done list page {target_page}")
@@ -337,6 +339,7 @@ class DoneAdapter:
                     category=(texts[6] or None) if len(texts) > 6 else None,
                     ordinal=ordinal_offset + index + 1,
                     list_page=page_number,
+                    completed_at_text=(texts[3] or None) if len(texts) > 3 else None,
                 )
             )
         return items
@@ -353,6 +356,7 @@ class DoneAdapter:
             category=(str(row.get("categoryLabel") or "").strip() or None),
             ordinal=ordinal_offset + index + 1,
             list_page=page_number,
+            completed_at_text=str(row.get("completeTime") or "").strip() or None,
         ) for index, row in enumerate(rows)]
 
     @staticmethod
@@ -412,7 +416,7 @@ class DoneDiscovery:
 def _parse_time(value: str) -> datetime | None:
     if not value:
         return None
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             return datetime.strptime(value, fmt)
         except ValueError:

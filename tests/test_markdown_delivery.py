@@ -287,3 +287,14 @@ def test_classified_external_decision_mirrors_confirmed_document_number_to_deliv
         session.add(decision); session.flush()
         ClassificationService._mirror_compatibility(session, item.oa_item_key, decision)
         assert item.document_number == '合成发〔2026〕7号'
+
+
+def test_v4_middle_json_retains_document_number_page(tmp_path):
+    import json
+    from oa_knowledge.markdown_delivery import _sidecar_document_number
+    md = tmp_path / "markdown.md"
+    md.write_text("Synthetic document", encoding="utf-8")
+    (tmp_path / "middle_json.json").write_text(json.dumps({"pages": [{"page_idx": 2, "blocks": [{"content": [{"type": "text", "content": "合成发〔2026〕7号\n关于合成测试工作的通知"}]}]}]}, ensure_ascii=False), encoding="utf-8")
+    match, page = _sidecar_document_number(md)
+    assert match.normalized == "合成发〔2026〕7号"
+    assert page == 3

@@ -96,6 +96,8 @@ class ParsePipeline:
             file_rec = session.get(ArchivedFile, file_id)
             if file_rec is None or file_rec.download_status != "verified":
                 return None
+            from oa_knowledge.title_screening import assert_attachment_eligible
+            assert_attachment_eligible(session, session.get(OAItem, file_rec.oa_item_id))
 
             file_path = self._verified_original_path(file_rec)
             if file_path is None:
@@ -115,15 +117,37 @@ class ParsePipeline:
                     and artifact.product_sha256):
                     product = resolve_cache_path(self.settings, artifact.output_relpath)
                     if product.is_file() and sha256_file(product) == artifact.product_sha256:
-                        return artifact.parse_job_id
+                        from oa_knowledge.parsers.format_router import detect_format
+                        from oa_knowledge.parsers.libreoffice_parser import office_executable,needs_word_pdf_ocr
+                        import zipfile
+                        kind=detect_format(file_path).actual_file_type
+                        incomplete_native=False
+                        if artifact.engine=='markitdown' and office_executable():
+                            if kind=='docx' and zipfile.is_zipfile(file_path):
+                                incomplete_native=needs_word_pdf_ocr(file_path,artifact.engine,'')
+                            elif kind in {'doc','ppt','pptx'}:
+                                incomplete_native=True
+                        old_archive_listing=kind in {'zip','rar','7z'} and artifact.engine!='archive'
+                        if not incomplete_native and not old_archive_listing:
+                            return artifact.parse_job_id
 
             eligibility = evaluate_eligibility(file_path)
-            if not eligibility.eligible:
+            if not eligibility.eligible and not (engine=='archive' and eligibility.detected_type in {'zip','rar','7z'}):
                 return None
 
             # Compute idempotency key from file_id + sha256 + engine
             file_sha = file_rec.sha256 or sha256_file(file_path)
             target_engine = engine or self.settings.parser.default_engine
+            if engine is None and eligibility.routing_hint=='archive':
+                target_engine='archive'
+            elif engine is None and eligibility.routing_hint=='mineru' and self.settings.mineru.enabled:
+                target_engine='mineru'
+            elif engine is None and target_engine=='markitdown':
+                from oa_knowledge.parsers.libreoffice_parser import office_executable,needs_word_pdf_ocr
+                import zipfile
+                office_format=eligibility.detected_type in {'doc','xls','ppt','pptx'}
+                scan_word=eligibility.detected_type=='docx' and zipfile.is_zipfile(file_path) and needs_word_pdf_ocr(file_path,'markitdown','')
+                if (office_format or scan_word) and office_executable():target_engine='libreoffice'
 
             content = session.execute(
                 select(ContentObject).where(ContentObject.sha256 == file_sha)
@@ -213,6 +237,30 @@ class ParsePipeline:
                 owner_session.close()
 
     def run(self, job_id: int) -> ParseResult:
+        # A durable job can be observed by both a maintenance runner and the
+        # daily queue. Serialize across processes before checking its status.
+        import time
+        from oa_knowledge.platform_lock import lock_exclusive
+        directory = self.settings.runtime_root / 'parse-locks'
+        directory.mkdir(parents=True, exist_ok=True)
+        with Session(self.engine) as session:
+            queued = session.get(ParseJob, job_id)
+            source = session.get(ArchivedFile, queued.file_id) if queued else None
+            content_id = source.content_object_id if source else None
+        key = f'content-{int(content_id)}' if content_id else f'job-{int(job_id)}'
+        with (directory / f'{key}.lock').open('a+') as lock:
+            deadline = time.monotonic() + 1800
+            while True:
+                try:
+                    lock_exclusive(lock.fileno())
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('parse_job_busy')
+                    time.sleep(0.25)
+            return self._run_locked(job_id)
+
+    def _run_locked(self, job_id: int) -> ParseResult:
         """Execute a single parse job by ID. Updates parse_jobs and creates parse_artifacts."""
         with Session(self.engine) as session:
             job = session.execute(
@@ -227,6 +275,8 @@ class ParsePipeline:
             file_rec = job.file
             if file_rec is None or file_rec.local_relpath is None:
                 raise ValueError(f"File for job {job_id} not found")
+            from oa_knowledge.title_screening import assert_attachment_eligible
+            assert_attachment_eligible(session, session.get(OAItem, file_rec.oa_item_id))
 
             file_path = self._verified_original_path(file_rec)
             if file_path is None:
@@ -250,6 +300,21 @@ class ParsePipeline:
             content = session.get(ContentObject, file_rec.content_object_id) if file_rec.content_object_id else None
             if content is None:
                 raise RuntimeError(f"File {file_rec.id} has no content object")
+            shared = session.scalar(select(ParseArtifact).where(
+                ParseArtifact.content_object_id == content.id,
+                ParseArtifact.engine == job.engine,
+                ParseArtifact.lifecycle_status == 'valid',
+                ParseArtifact.source_sha256 == file_rec.sha256,
+            ).order_by(ParseArtifact.id.desc()).limit(1))
+            if shared is not None:
+                product = resolve_cache_path(self.settings, shared.output_relpath)
+                if product.is_file() and shared.product_sha256 and sha256_file(product) == shared.product_sha256:
+                    job.status = 'completed'; job.quality_score = shared.quality_score
+                    job.output_relpath = shared.output_relpath; job.config_hash = shared.config_hash
+                    job.error_code = None
+                    session.commit()
+                    return ParseResult(product, shared.engine, shared.engine_version, shared.quality_score,
+                        text_length=len(product.read_text(encoding='utf8')), profile_version=shared.profile_version)
             output_dir = output_base / str(content.id) / f"artifact-{job.id}"
             # Never hold the SQLite writer while Office/OCR runs. A conversion
             # may take minutes; persist the attempt before invoking it.
@@ -267,9 +332,20 @@ class ParsePipeline:
                 elif engine_name == "libreoffice":
                     from oa_knowledge.parsers.libreoffice_parser import parse_with_libreoffice
                     result = parse_with_libreoffice(file_path, output_dir, settings=self.settings)
+                elif engine_name == 'archive':
+                    from oa_knowledge.parsers.archive_parser import parse_with_archive
+                    result=parse_with_archive(file_path,output_dir,settings=self.settings)
                 else:
                     raise ValueError(f"Unsupported parser engine: {engine_name}")
             except RuntimeError as exc:
+                if 'depth_limit_reached' in str(exc):
+                    from oa_knowledge.db.models import ReviewEntry
+                    job.status='failed';job.error_code='depth_limit_reached'
+                    existing=session.scalar(select(ReviewEntry).where(ReviewEntry.kind=='depth_limit_reached',ReviewEntry.file_id==file_rec.id))
+                    if existing is None:
+                        session.add(ReviewEntry(kind='depth_limit_reached',item_id=item_id,file_id=file_rec.id,depth=10,
+                            details_json=json.dumps({'source':'archive_parser','has_unvisited_children':True})))
+                    session.commit();raise
                 if "encrypted" in str(exc):
                     job.status = "failed"
                     job.error_code = "encrypted_document"
@@ -317,10 +393,11 @@ class ParsePipeline:
 
             output_relpath = str(result.output_path.relative_to(self.settings.cache_root))
             artifact = session.scalar(select(ParseArtifact).where(
-                ParseArtifact.parse_job_id == job.id,
+                ParseArtifact.content_object_id == content.id,
                 ParseArtifact.engine == result.engine,
                 ParseArtifact.engine_version == result.engine_version,
-                ParseArtifact.output_relpath == output_relpath,
+                ParseArtifact.profile_version == result.profile_version,
+                ParseArtifact.config_hash == result.config_hash,
             ))
             if artifact is None:
                 artifact = ParseArtifact(
@@ -343,6 +420,8 @@ class ParsePipeline:
                 # retaining its immutable ledger row. Restore that same product
                 # identity instead of violating the artifact uniqueness key.
                 artifact.content_object_id = content.id
+                artifact.parse_job_id = job.id
+                artifact.output_relpath = output_relpath
                 artifact.source_sha256 = source_sha
                 artifact.product_sha256 = product_sha
                 artifact.config_hash = result.config_hash
@@ -353,7 +432,8 @@ class ParsePipeline:
             session.flush()
 
             current = session.get(ParseArtifact, content.active_parse_artifact_id) if content.active_parse_artifact_id else None
-            if result.quality_score >= 0.5 and (current is None or (current.quality_score or 0) <= result.quality_score):
+            preferred_office = engine_name == 'libreoffice' and current is not None and current.engine == 'markitdown'
+            if result.quality_score >= 0.5 and (current is None or preferred_office or (current.quality_score or 0) <= result.quality_score):
                 if current is not None:
                     current.lifecycle_status = "superseded"
                 artifact.lifecycle_status = "valid"

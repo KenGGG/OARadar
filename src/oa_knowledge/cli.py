@@ -5,7 +5,7 @@ import re
 import os
 import hashlib
 import sqlite3
-import fcntl
+from oa_knowledge.platform_lock import lock_exclusive
 import signal
 from threading import Event, Thread
 from dataclasses import asdict
@@ -890,7 +890,7 @@ def manifest_classify(
 
 @manifest_app.command("download")
 def manifest_download(
-    max_items: int = typer.Option(20, "--max-items", min=1, max=10000),
+    max_items: int = typer.Option(20, "--max-items", min=1),
     headed: bool = typer.Option(False, "--headed"),
     config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
     error_type: str | None = typer.Option(None, "--error-type"),
@@ -899,9 +899,19 @@ def manifest_download(
     failed_only: bool = typer.Option(False, "--failed-only"),
     recheck_no_attachment: bool = typer.Option(False, "--recheck-no-attachment"),
     audit_all: bool = typer.Option(False, "--audit-all"),
+    collection_job: int | None = typer.Option(None, "--collection-job", hidden=True),
 ) -> None:
     """Download pending/failed items or recheck items previously marked no_attachment."""
     settings = settings_option(config); engine = require_engine(settings)
+    collection_keys = None
+    if collection_job is not None:
+        with Session(engine) as session:
+            job = session.get(OperationJob, collection_job)
+            if job is None or job.job_type != "done_download":
+                raise typer.Exit(2)
+            collection_params = json.loads(job.parameters_json)
+            deferred = set(collection_params.get("deferred_keys", []))
+            collection_keys = [key for key in collection_params["keys"] if key not in deferred]
     with Session(engine) as session:
         latest = session.scalar(select(OAManifestSync).order_by(OAManifestSync.id.desc()).limit(1))
         local_count = session.scalar(select(func.count()).select_from(OAManifestItem)) or 0
@@ -909,10 +919,19 @@ def manifest_download(
             typer.echo("manifest_incomplete: download is blocked", err=True); raise typer.Exit(4)
         # Re-evaluate every existing row against the latest config + Web policy
         # list, without rescanning OA. Successful/skipped rows remain terminal.
-        classify_manifest(session, effective_exclusion_keywords(session), settings.data_root)
+        # Recheck only this collection's items. Rewalking every historical file
+        # held SQLite's writer for minutes and blocked progress heartbeats.
+        if collection_keys is not None:
+            from oa_knowledge.full_manifest import classify_manifest_rows
+            rows=list(session.scalars(select(OAManifestItem).where(OAManifestItem.oa_item_key.in_(collection_keys))))
+            classify_manifest_rows(session,rows,effective_exclusion_keywords(session),settings.data_root)
+        else:
+            classify_manifest(session, effective_exclusion_keywords(session), settings.data_root)
         session.commit()
     processed = 0
     attempted_ids: set[int] = set()
+    auth_retries: dict[int, int] = {}
+    auth_failed = False
     with BrowserSession(settings, headed=headed) as browser:
         if browser.login_with_saved_credentials(30) != LoginState.AUTHENTICATED:
             typer.echo("OA authentication required", err=True); raise typer.Exit(3)
@@ -924,6 +943,10 @@ def manifest_download(
         )
         current_page = 1
         while processed < max_items:
+            if collection_job is not None:
+                from oa_knowledge.done_collection import pause_requested
+                if pause_requested(engine, collection_job):
+                    break
             with Session(engine) as session:
                 if audit_all:
                     statuses = None
@@ -932,6 +955,8 @@ def manifest_download(
                 else:
                     statuses = ("download_failed",) if failed_only else ("pending_download", "download_failed")
                 query = select(OAManifestItem)
+                if collection_keys is not None:
+                    query = query.where(OAManifestItem.oa_item_key.in_(collection_keys))
                 if statuses is not None:
                     query = query.where(OAManifestItem.processing_status.in_(statuses))
                 selected_item_ids = [value.strip() for value in (item_ids or "").split(",") if value.strip()]
@@ -1083,13 +1108,15 @@ def manifest_download(
                 typer.echo("browser_closed: retry with a fresh browser session", err=True)
                 raise typer.Exit(5)
             except AuthRequiredError as exc:
-                if browser.login_with_saved_credentials(30) == LoginState.AUTHENTICATED:
+                auth_retries[row_id] = auth_retries.get(row_id, 0) + 1
+                if auth_retries[row_id] <= 2 and browser.login_with_saved_credentials(30) == LoginState.AUTHENTICATED:
                     with Session(engine) as session:
                         row = session.get(OAManifestItem, row_id)
                         if row is not None:
                             row.processing_status = previous_status
                             row.last_error = None; row.failure_stage = None
                             row.last_retry_at = datetime.now(timezone.utc); session.commit()
+                    current_page = 0
                     attempted_ids.discard(row_id)
                     continue
                 with Session(engine) as session:
@@ -1097,6 +1124,7 @@ def manifest_download(
                     if row is not None:
                         row.processing_status = "auth_required"; row.last_error = str(exc); row.failure_stage = "authentication"
                         row.last_retry_at = datetime.now(timezone.utc); session.commit()
+                auth_failed = True
                 break
             except Exception as exc:
                 with Session(engine) as session:
@@ -1112,6 +1140,8 @@ def manifest_download(
     with Session(engine) as session:
         counts = manifest_counts(session); report_path = export_manifest_csv(session, settings.data_root); session.commit()
     typer.echo(json.dumps(counts | {"processed": processed, "report": report_path.relative_to(settings.data_root).as_posix()}, ensure_ascii=False))
+    if auth_failed:
+        raise typer.Exit(3)
 
 
 @app.command("retry-failed")
@@ -1123,7 +1153,8 @@ def retry_failed(
     config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
 ) -> None:
     """Retry only rows currently marked download_failed."""
-    manifest_download(max_items=max_items, headed=headed, config=config, error_type=error_type, item_id=item_id, failed_only=True)
+    manifest_download(max_items=max_items, headed=headed, config=config, error_type=error_type, item_id=item_id,
+                      item_ids=None, failed_only=True, recheck_no_attachment=False, audit_all=False, collection_job=None)
 
 
 @manifest_app.command("report")
@@ -1355,7 +1386,7 @@ def worker(
     secure_dir(lock_path.parent)
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(lock_file.fileno())
         except BlockingIOError as exc:
             typer.echo("another operation worker is already running", err=True)
             raise typer.Exit(1) from exc
@@ -1374,6 +1405,51 @@ def worker(
             operation_worker.close()
 
 
+@app.command("daily-done")
+def daily_done_command(
+    watch: bool = typer.Option(False,'--watch'),
+    force: bool = typer.Option(False,'--force'),
+    enable: bool = typer.Option(False,'--enable'),
+    disable: bool = typer.Option(False,'--disable'),
+    config: Path | None = typer.Option(None,'--config',exists=True,dir_okay=False),
+) -> None:
+    """Coordinate daily Done-only inventory, download and local conversion jobs."""
+    from oa_knowledge.daily_done import DailyDoneRunner,ensure_operation_worker,ensure_desktop_collection,ensure_local_delivery
+    settings=settings_option(config);require_engine(settings).dispose()
+    settings.runtime_root.mkdir(parents=True,exist_ok=True)
+    if enable and disable:raise typer.BadParameter('enable and disable are mutually exclusive')
+    if enable or disable:
+        from oa_knowledge.archive.writer import atomic_write_bytes
+        atomic_write_bytes(json.dumps({'enabled':enable}).encode('utf8'),settings.runtime_root,'daily-done-settings.json')
+        if not watch:
+            typer.echo('Daily Done enabled.'if enable else'Daily Done disabled.');return
+        settings.daily_done.enabled=enable
+    with(settings.runtime_root/'daily-done.lock').open('a+')as lock_file:
+        try:lock_exclusive(lock_file.fileno())
+        except BlockingIOError:raise typer.Exit(0)
+        runner=DailyDoneRunner(settings)
+        try:
+            first=True
+            while True:
+                try:
+                    if watch:
+                        settings.daily_done=load_settings(config).daily_done
+                        ensure_operation_worker(settings,config)
+                        ensure_desktop_collection(settings,config)
+                        ensure_local_delivery(settings,config)
+                    result=runner.tick(force=force and first)
+                except Exception as exc:
+                    if not watch:raise
+                    runner.state.update(status='controller_error',last_error='自动同步暂遇异常，将保留断点重试：'+type(exc).__name__)
+                    result=runner._save(datetime.now(timezone.utc))
+                first=False
+                # The full state contains a private baseline; output summary only.
+                typer.echo(json.dumps({key:result.get(key)for key in ('status','inventory_job_id','download_job_id','local_tasks_enqueued','last_error','next_run_at')},ensure_ascii=False))
+                if not watch:break
+                Event().wait(settings.daily_done.poll_seconds)
+        finally:runner.close()
+
+
 @app.command("markdown-worker")
 def markdown_worker_command(
     once: bool = typer.Option(False, "--once"),
@@ -1384,7 +1460,7 @@ def markdown_worker_command(
     settings = settings_option(config); require_engine(settings).dispose()
     lock_path=settings.runtime_root / "markdown-worker.lock"; secure_dir(lock_path.parent)
     with lock_path.open("a+", encoding="utf-8") as lock_file:
-        try: fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try: lock_exclusive(lock_file.fileno())
         except BlockingIOError as exc: raise typer.Exit(1) from exc
         from oa_knowledge.markdown_worker import MarkdownWorker
         runner=MarkdownWorker(settings)
@@ -1482,7 +1558,7 @@ def batch_discover(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     discovery_lock = lock_path.open("a+")
     try:
-        fcntl.flock(discovery_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_exclusive(discovery_lock.fileno())
     except BlockingIOError:
         discovery_lock.close()
         typer.echo("another discovery process is already running", err=True)

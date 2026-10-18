@@ -49,6 +49,11 @@ markdown_export:
   keep_last_success_on_failure: true
   generate_failure_stub: true
 
+daily_done:
+  enabled: false
+  at_local_time: '02:00'
+  poll_seconds: 30
+
 conversion:
   incremental: true
   workers: 1
@@ -92,6 +97,7 @@ feishu:
   retry_attempts: 3
 
 mineru:
+  tier: standard
   enabled: false
   api_url: http://127.0.0.1:58000
   connect_timeout_seconds: 5

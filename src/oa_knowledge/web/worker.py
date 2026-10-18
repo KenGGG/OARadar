@@ -93,7 +93,19 @@ def _run_piped(command: list[str], cwd: Path, poll_callback, poll_interval: floa
     out_thread.start()
     err_thread.start()
     while process.poll() is None:
-        poll_callback()
+        if poll_callback() is False:
+            # Download completion APIs can wait indefinitely. The parent owns
+            # the durable checkpoint and can stop only its own child tree.
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            break
         time.sleep(poll_interval)
     process.wait()
     out_thread.join()
@@ -113,7 +125,11 @@ class OperationWorker:
 
     def close(self) -> None:
         self.engine.dispose()
-        (self.settings.runtime_root / "operation-worker.json").unlink(missing_ok=True)
+        try:
+            (self.settings.runtime_root / "operation-worker.json").unlink(missing_ok=True)
+        except PermissionError:
+            if os.name != "nt":
+                raise
 
     @staticmethod
     def _retry_progress(total_targets: int, resumed: int, completed_after_resume: int) -> int:
@@ -197,6 +213,24 @@ class OperationWorker:
             return False
         try:
             pid = int(owner.removeprefix("worker-"))
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+                api = ctypes.WinDLL("kernel32", use_last_error=True)
+                api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                api.OpenProcess.restype = wintypes.HANDLE
+                api.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+                api.GetExitCodeProcess.restype = wintypes.BOOL
+                api.CloseHandle.argtypes = [wintypes.HANDLE]
+                handle = api.OpenProcess(0x1000, False, pid)
+                if not handle:
+                    # Access denied means the PID exists, so do not steal its lease.
+                    return ctypes.get_last_error() == 5
+                try:
+                    code = wintypes.DWORD()
+                    return bool(api.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 259)
+                finally:
+                    api.CloseHandle(handle)
             command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
         except (ValueError, OSError):
             return False
@@ -243,6 +277,9 @@ class OperationWorker:
                 self._execute_full_manifest(job_id)
             elif job_type == "full_manifest_retry":
                 self._execute_full_manifest_retry(job_id)
+            elif job_type in {"done_inventory", "done_download", "done_login", "done_review"}:
+                from oa_knowledge.done_collection import run_inventory, run_download, run_login, run_review
+                {"done_inventory": run_inventory, "done_download": run_download, "done_login": run_login, "done_review": run_review}[job_type](self, job_id)
             elif job_type == "done_incremental":
                 self._execute_done_incremental(job_id)
             elif job_type == "online_audit":
@@ -943,6 +980,27 @@ class OperationWorker:
     def _pipeline_classify(self, task: PipelineTask) -> None:
         from oa_knowledge.markdown_delivery import require_current_classified_decision
         from oa_knowledge.source_markdown.service import publish_active_artifact
+
+        from oa_knowledge.db.models import ArchiveClassificationPlan, OAManifestItem
+        with Session(self.engine) as session:
+            plan=session.scalar(select(ArchiveClassificationPlan).where(ArchiveClassificationPlan.active.is_(True)))
+            if plan is not None:
+                from oa_knowledge.source_library import classify_library_item
+                manifest=session.scalar(select(OAManifestItem).where(OAManifestItem.oa_item_key==task.logical_item_key))
+                item=session.scalar(select(OAItem).where(OAItem.oa_item_key==task.logical_item_key))
+                if manifest is not None and item is not None:
+                    excluded=manifest.processing_status=='skipped' or bool(manifest.matched_exclusion_keyword)
+                    decision=classify_library_item(session,self.settings,manifest,'skip' if excluded else 'download',plan=plan)
+                    if not excluded:
+                        for source in session.scalars(select(ArchivedFile).where(ArchivedFile.oa_item_id==item.id,
+                                ArchivedFile.download_status=='verified',ArchivedFile.content_object_id.is_not(None))):
+                            if session.scalar(select(ParseArtifact.id).where(ParseArtifact.content_object_id==source.content_object_id,
+                                    ParseArtifact.lifecycle_status=='valid').limit(1)) is not None:
+                                publish_active_artifact(session,self.settings,source.id)
+                    session.commit()
+                    if excluded:self.production_queue.complete(task.id,self.owner)
+                    else:self.production_queue.advance(task.id,self.owner,'index_publish')
+                    return
 
         status = self._classify_archived_item(task.logical_item_key)
         if status == "excluded":
@@ -1768,8 +1826,14 @@ class OperationWorker:
             "activity": activity,
             "heartbeat_at": datetime.now(timezone.utc).isoformat(),
         }).encode("utf-8")
-        destination = atomic_write_bytes(payload, self.settings.state_root, "runtime/operation-worker.json")
-        os.chmod(destination, 0o600)
+        try:
+            destination = atomic_write_bytes(payload, self.settings.state_root, "runtime/operation-worker.json")
+            os.chmod(destination, 0o600)
+        except PermissionError:
+            # Windows readers/antivirus can momentarily deny atomic replacement.
+            # This advisory heartbeat must not stop the durable download worker.
+            if os.name != "nt":
+                raise
 
     def _claim_next(self) -> int | None:
         now = datetime.now(timezone.utc)

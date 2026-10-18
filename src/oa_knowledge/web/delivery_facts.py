@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 from typing import Any
 from collections.abc import Callable
 
@@ -30,6 +31,8 @@ def delivery_facts_map(
         return {}
     item_ids = [item.id for item in items]
     keys = [item.oa_item_key for item in items]
+    from oa_knowledge.source_library import attachment_only_library
+    attachments_only = attachment_only_library(session)
     manifests = {row.oa_item_key: row for row in session.execute(
         select(OAManifestItem.oa_item_key, OAManifestItem.processing_status,
                OAManifestItem.no_attachment_confirmed).where(OAManifestItem.oa_item_key.in_(keys))
@@ -39,6 +42,20 @@ def delivery_facts_map(
             ClassificationDecision.oa_item_key.in_(keys), ClassificationDecision.is_current.is_(True),
         )
     )}
+    source_decisions = {}
+    if attachments_only:
+        from oa_knowledge.db.models import ArchiveClassificationPlan, ArchiveClassificationResult
+        plan = session.scalar(select(ArchiveClassificationPlan).where(ArchiveClassificationPlan.active.is_(True)))
+        for record in session.scalars(select(ArchiveClassificationResult).where(
+            ArchiveClassificationResult.plan_id == plan.id, ArchiveClassificationResult.oa_item_key.in_(keys)
+        ).order_by(ArchiveClassificationResult.id)):
+            from oa_knowledge.archive_classification import CLASSIFIER_REVISION
+            payload=json.loads(record.result_json)
+            previous=source_decisions.get(record.oa_item_key,{})
+            previous_enriched=previous.get('library_revision')==CLASSIFIER_REVISION and previous.get('library_metadata')
+            enriched=payload.get('library_revision')==CLASSIFIER_REVISION and payload.get('library_metadata')
+            if previous_enriched and not enriched:continue
+            source_decisions[record.oa_item_key] = payload
     # "primary" is the pre-role-migration source attachment role.
     files = list(session.execute(select(ArchivedFile.id, ArchivedFile.oa_item_id, ArchivedFile.sha256).where(
         ArchivedFile.oa_item_id.in_(item_ids),
@@ -72,6 +89,11 @@ def delivery_facts_map(
         decision = decisions.get(item.oa_item_key)
         processing = manifest.processing_status if manifest else item.pipeline_status
         classification = decision.classification_status if decision else "unknown"
+        source_decision = source_decisions.get(item.oa_item_key,{})
+        if source_decision:
+            classification = source_decision.get('classification_status','unknown')
+            if classification in {'needs_confirmation','source_pending'}:
+                classification = 'needs_review'
         indexes = indexes_by_item[item.id]
         index = indexes[0] if indexes else None
         sources = files_by_item[item.id]
@@ -94,6 +116,8 @@ def delivery_facts_map(
             index_status = "pending"
         index_failed = index_status == "failed"
         has_index = index_status == "success"
+        if attachments_only:
+            index_status, index_failed, has_index = 'not_required', False, False
         no_attachment = bool(manifest and processing == "no_attachment" and manifest.no_attachment_confirmed)
         if processing == "depth_limit_reached":
             status, reason = "needs_review", "容器层级超过上限，需人工确认"
@@ -104,17 +128,17 @@ def delivery_facts_map(
         elif classification == "needs_review":
             status, reason = "needs_review", "分类需要人工复核"
         elif failed or index_failed:
-            status, reason = "failed", "Markdown 转换或索引交付失败"
+            status, reason = "failed", "附件 Markdown 转换失败" if attachments_only else "Markdown 转换或索引交付失败"
         elif unsupported:
             status, reason = "partial", "存在暂不支持转换的附件"
         elif running or index_status == "running":
             status, reason = "working", "正在转换 Markdown"
         elif manifest and processing not in {"downloaded", "no_attachment"}:
             status, reason = "pending", "等待原件归档核验"
-        elif has_index and successful == len(sources) and (sources or no_attachment):
+        elif (attachments_only or has_index) and successful == len(sources) and (sources or no_attachment):
             status, reason = "complete", None
         elif successful or (has_index and sources):
-            status, reason = "partial", "附件 Markdown 或事项索引尚未全部交付"
+            status, reason = "partial", "附件 Markdown 尚未全部交付" if attachments_only else "附件 Markdown 或事项索引尚未全部交付"
         else:
             status, reason = "pending", "等待附件交付证据或无附件确认" if has_index else "等待 Markdown 交付"
         result[item.id] = {
@@ -122,6 +146,8 @@ def delivery_facts_map(
             "unsupported": unsupported, "failed": failed,
             "index_status": index_status,
             "index_relpath": index.markdown_relpath if index and has_index else None,
+            "index_required": not attachments_only,
             "classification_status": classification, "reason": reason,
+            "archive_category_id": source_decision.get('archive_category_id'),
         }
     return result

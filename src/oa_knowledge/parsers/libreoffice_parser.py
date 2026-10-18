@@ -20,21 +20,49 @@ import os
 import signal
 
 
+def office_executable():
+    executable=shutil.which('libreoffice') or shutil.which('soffice')
+    if executable:return executable
+    portable=Path(__file__).resolve().parents[3]/'runtime'/'tools'/'libreoffice'
+    for candidate in (portable/'program'/'soffice.com',portable/'LibreOffice'/'program'/'soffice.com',portable/'program'/'soffice.exe',portable/'LibreOffice'/'program'/'soffice.exe'):
+        if candidate.is_file():return str(candidate)
+    return None
+
+
 def _run_office_process(command: list[str], *, timeout: int | float) -> subprocess.CompletedProcess[str]:
     """Run Office in its own process group so a timeout also stops children."""
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, start_new_session=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
     )
+    job=None;kernel=None
+    if os.name=='nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+        kernel.CreateJobObjectW.argtypes=[ctypes.c_void_p,wintypes.LPCWSTR];kernel.CreateJobObjectW.restype=wintypes.HANDLE
+        kernel.AssignProcessToJobObject.argtypes=[wintypes.HANDLE,wintypes.HANDLE];kernel.AssignProcessToJobObject.restype=wintypes.BOOL
+        kernel.TerminateJobObject.argtypes=[wintypes.HANDLE,wintypes.UINT];kernel.TerminateJobObject.restype=wintypes.BOOL
+        kernel.CloseHandle.argtypes=[wintypes.HANDLE];kernel.CloseHandle.restype=wintypes.BOOL
+        job=kernel.CreateJobObjectW(None,None)
+        if job and not kernel.AssignProcessToJobObject(job,wintypes.HANDLE(int(process._handle))):
+            kernel.CloseHandle(job);job=None
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            if job:
+                kernel.TerminateJobObject(job,1)
+            elif os.name=='nt':
+                subprocess.run(['taskkill.exe','/PID',str(process.pid),'/T','/F'],capture_output=True,timeout=20)
+            else:os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.communicate()
         raise
+    finally:
+        if job:kernel.CloseHandle(job)
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
@@ -54,23 +82,35 @@ def restore_terminal_text(pdf: Path, markdown: Path) -> bool:
     """Preserve native terminal imprint text discarded by PDF layout analysis."""
     import fitz
     content_list = next(markdown.parent.glob('*_content_list.json'), None)
-    if content_list is None:
+    middle_json = markdown.parent / 'middle_json.json'
+    if content_list is None and not middle_json.is_file():
         return False
-    entries = json.loads(content_list.read_text())
+    entries = json.loads(content_list.read_text(encoding='utf8')) if content_list else []
     with fitz.open(pdf) as document:
         last = len(document) - 1
         native = '\n'.join(line for line in document[last].get_text().splitlines()
                            if not re.fullmatch(r'[—\-\s]*\d+[—\-\s]*', line))
     parsed = sum(len(x.get('text','')) + len(x.get('table_body',''))
                  for x in entries if x.get('page_idx') == last)
+    if content_list is None:
+        def text_length(value):
+            if isinstance(value, dict):
+                return sum(len(child) if key in {'content', 'text', 'html'} and isinstance(child, str)
+                           else text_length(child) for key, child in value.items())
+            if isinstance(value, list):
+                return sum(text_length(child) for child in value)
+            return 0
+        middle = json.loads(middle_json.read_text(encoding='utf-8'))
+        parsed = sum(text_length(page.get('blocks', [])) for page in middle.get('pages', [])
+                     if page.get('page_idx') == last)
     if parsed > 20 or not 40 < len(native.strip()) < 500:
         return False
-    body = markdown.read_text()
+    body = markdown.read_text(encoding='utf8')
     normalized = re.sub(r'\W|_', '', native)
     existing = re.sub(r'\W|_', '', body)
     if normalized[:20] in existing and normalized[-20:] in existing:
         return False
-    markdown.write_text(body.rstrip() + f'\n\n<!-- PDF 第 {last+1} 页原文 -->\n\n' + native.strip() + '\n')
+    markdown.write_text(body.rstrip() + f'\n\n<!-- PDF 第 {last+1} 页原文 -->\n\n' + native.strip() + '\n',encoding='utf8')
     return True
 
 
@@ -118,12 +158,12 @@ def word_to_pdf(file_path: Path, output_dir: Path) -> Path:
     kind = detect_format(file_path).actual_file_type
     if kind not in {'doc', 'docx'}:
         raise ValueError('word_pdf_requires_actual_word_file')
-    executable = shutil.which('libreoffice') or shutil.which('soffice')
+    executable = office_executable()
     if executable is None:
         raise RuntimeError('libreoffice_unavailable')
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='word-input-', dir=output_dir) as name:
+    with tempfile.TemporaryDirectory(prefix='word-input-', dir=output_dir,ignore_cleanup_errors=True) as name:
         temporary = Path(name)
         source = temporary / f'document.{kind}'
         shutil.copyfile(file_path, source)
@@ -151,12 +191,18 @@ def word_to_pdf(file_path: Path, output_dir: Path) -> Path:
 
 
 def libreoffice_engine_version() -> str:
-    executable = shutil.which("libreoffice") or shutil.which("soffice")
+    executable = office_executable()
     if executable is None:
         return "unavailable"
     try:
+        args=[executable,'--version']
+        portable=Path(__file__).resolve().parents[3]/'runtime'/'tools'/'libreoffice'
+        if Path(executable).resolve().is_relative_to(portable.resolve()):
+            profile=portable/'version-profile'
+            args.insert(1,f'-env:UserInstallation={profile.as_uri()}')
         output = subprocess.run(
-            [executable, "--version"], check=False, capture_output=True, text=True, timeout=10
+            args, check=False, capture_output=True, text=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt'else 0,
         )
         match = re.search(r'\b\d+(?:\.\d+)+\b', output.stdout or output.stderr)
         return match.group(0) if match else "unknown"
@@ -172,7 +218,7 @@ def parse_with_libreoffice(
     settings=None,
 ) -> ParseResult:
     """Use PDF OCR for Word, retaining the existing XLS-to-XLSX fallback."""
-    executable = shutil.which("libreoffice") or shutil.which("soffice")
+    executable = office_executable()
     if executable is None:
         raise RuntimeError("libreoffice_unavailable")
     from oa_knowledge.parsers.format_router import detect_format
@@ -189,23 +235,38 @@ def parse_with_libreoffice(
         if pdf.with_name('word-layout.pdf').exists():
             shutil.copy2(pdf.with_name('word-layout.pdf'), result.output_path.parent / 'word-layout.pdf')
         return replace(result, engine='libreoffice', engine_version=libreoffice_engine_version())
+    if detect_format(file_path).actual_file_type in {'ppt','pptx'}:
+        if settings is None or output_dir is None:raise ValueError('presentation_pdf_requires_settings_and_output')
+        from oa_knowledge.parsers.mineru_parser import parse_with_mineru
+        output_dir=Path(output_dir).resolve();temporary=output_dir/'presentation-input';temporary.mkdir(parents=True,exist_ok=True)
+        kind=detect_format(file_path).actual_file_type
+        source=temporary/f'document.{kind}';shutil.copyfile(file_path,source)
+        command=[executable,f'-env:UserInstallation={(temporary/"profile").as_uri()}','--headless','--norestore',
+                 '--convert-to','pdf:impress_pdf_Export','--outdir',str(temporary),str(source)]
+        completed=_run_office_process(command,timeout=180);pdf=temporary/'document.pdf'
+        if completed.returncode or not pdf.is_file():raise RuntimeError('presentation_pdf_conversion_failed')
+        result=parse_with_mineru(pdf,settings,output_dir/'ocr',profile_version=profile_version,parse_method='ocr')
+        return replace(result,engine='libreoffice',engine_version=libreoffice_engine_version())
     from oa_knowledge.parsers.markitdown_parser import parse_with_markitdown
 
-    with tempfile.TemporaryDirectory(prefix="oaradar-xls-") as temp_name:
+    with tempfile.TemporaryDirectory(prefix="oaradar-xls-",ignore_cleanup_errors=True) as temp_name:
         temporary = Path(temp_name)
+        source=temporary/'document.xls';shutil.copyfile(file_path,source)
         command = [
             executable,
+            f'-env:UserInstallation={(temporary/"profile").as_uri()}',
             "--headless",
             "--convert-to",
             "xlsx",
             "--outdir",
             str(temporary),
-            str(file_path),
+            str(source),
         ]
         completed = _run_office_process(command, timeout=120)
-        converted = temporary / f"{file_path.stem}.xlsx"
+        converted = temporary / 'document.xlsx'
         if completed.returncode != 0 or not converted.is_file():
             raise RuntimeError("libreoffice_conversion_failed")
-        return parse_with_markitdown(
+        result = parse_with_markitdown(
             converted, output_dir, profile_version=profile_version
         )
+        return replace(result,engine='libreoffice',engine_version=libreoffice_engine_version())

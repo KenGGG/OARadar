@@ -52,6 +52,7 @@ def upsert_manifest_page(
                 sender=source.sender,
                 initiated_at=source.created_at,
                 completed_at=source.completed_at,
+                completed_at_text=source.completed_at_text,
                 list_page=source.list_page,
                 list_ordinal=source.ordinal,
                 first_seen_at=now,
@@ -65,6 +66,7 @@ def upsert_manifest_page(
             row.sender = source.sender
             row.initiated_at = source.created_at or row.initiated_at
             row.completed_at = source.completed_at
+            row.completed_at_text = source.completed_at_text
             row.list_page = source.list_page
             row.list_ordinal = source.ordinal
             row.last_synced_at = now
@@ -108,12 +110,18 @@ def classify_manifest(session: Session, keywords: tuple[str, ...], data_root: Pa
 
 def classify_manifest_rows(session: Session, rows: list[OAManifestItem], keywords: tuple[str, ...], data_root: Path) -> None:
     """Classify a persisted page and verify reuse without requiring final reconciliation."""
+    from oa_knowledge.title_screening import active_context
+    screening = active_context(session)
     for row in rows:
-        if row.processing_status == "skipped" and (row.matched_exclusion_keyword or "").startswith("manual:"):
+        decision = screening.decision(row) if screening else None
+        if row.processing_status == "skipped" and (row.matched_exclusion_keyword or "").startswith("manual:") and not (decision and decision.get("manual_override")):
             continue
-        keyword = next((word for word in keywords if word and word in row.title), None)
+        keyword = (f"title-plan:{decision['version']}:{decision['rule_id']}" if decision and decision["action"] == "skip" else None) if screening else next((word for word in keywords if word and word in row.title), None)
         if keyword:
-            row.processing_status = "skipped"
+            # An exclusion controls future retrieval; verified historical
+            # originals retain their independently established state.
+            if not reuse_existing_archive(session, row, data_root):
+                row.processing_status = "skipped"
             row.matched_exclusion_keyword = keyword
             row.last_error = None
             row.failure_stage = None
@@ -217,11 +225,12 @@ def export_manifest_csv(session: Session, data_root: Path) -> Path:
     temporary = destination.with_suffix(".csv.tmp")
     with temporary.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(("事项ID", "标题", "发起人", "办理时间", "处理状态", "命中的排除关键词", "是否需要下载", "本地归档目录", "重试次数", "最后错误"))
+        writer.writerow(("事项ID", "标题", "发起人", "发起时间", "处理时间", "处理状态", "命中的排除关键词", "是否需要下载", "本地归档目录", "重试次数", "最后错误"))
         for row in session.scalars(select(OAManifestItem).order_by(OAManifestItem.list_page, OAManifestItem.id)):
             writer.writerow((
                 row.workitem_id_text or row.oa_item_key, row.title, row.sender or "",
-                row.completed_at.isoformat(sep=" ") if row.completed_at else "", row.processing_status,
+                row.initiated_at.isoformat(sep=" ") if row.initiated_at else "",
+                row.completed_at.isoformat(sep=" ") if row.completed_at else row.completed_at_text or "", row.processing_status,
                 row.matched_exclusion_keyword or "", "否" if row.processing_status == "skipped" else "是",
                 row.archive_relpath or "", row.retry_count, row.last_error or "",
             ))

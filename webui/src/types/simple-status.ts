@@ -77,6 +77,7 @@ export interface SimpleAttentionItem {
 }
 
 export interface WorkflowSummary {
+  daily_sync?: { enabled: boolean; active: boolean; status: string; next_run_at?: string | null; last_scan_at?: string | null; last_error?: string | null; local_tasks_enqueued?: number }
   status: BusinessTone; headline: string; enabled: boolean | null; total: number; eligible: number
   complete: number; pending: number; failed: number; excluded: number
   last_success_at: string | null; last_scan_at: string | null; next_run_at: string | null
@@ -86,6 +87,8 @@ export interface SimpleStatusResponse {
   archive: WorkflowSummary
   markdown: WorkflowSummary
   local_delivery?: {
+    live?: boolean; status?: "running" | "stopped" | "blocked" | "finished" | "unknown"
+    current_title?: string | null; current_attachment?: string | null; parser?: string; actual_format?: string
     available: boolean; message?: string; updated_at?: string; stale?: boolean; stage?: string
     scope_done_items?: number; processed?: number; excluded?: number
     complete_new_or_updated?: number; complete_reused?: number; partial?: number
@@ -107,6 +110,7 @@ export interface SimpleDoneItem {
   sender: string | null
   initiated_at: string | null
   completed_at: string | null
+  completed_at_text?: string | null
   pipeline_status: string
   archive_relpath: string | null
   file_count: number | null

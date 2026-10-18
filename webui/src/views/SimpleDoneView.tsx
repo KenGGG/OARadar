@@ -3,6 +3,8 @@ import { ChevronRight, Download, Search } from "lucide-react"
 import type { SimpleDoneFilter, SimpleDoneItem, SimpleDoneState, SimpleDonePage } from "../types/simple-status"
 import { time } from "../App"
 import { WorkflowDrawer } from "./WorkflowDrawer"
+import { DoneCollectionPanel } from "./DoneCollectionPanel"
+import { TitleScreeningPanel } from "./TitleScreeningPanel"
 
 type Tone = "good" | "warn" | "bad" | "neutral"
 
@@ -78,6 +80,8 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
   }
 
   return <section className="done-page">
+    <DoneCollectionPanel refresh={refresh}/>
+    <TitleScreeningPanel refresh={refresh} onSelect={onSelect}/>
     <div className="metrics compact-metrics">
       <div className="metric"><span>已办总数</span><strong>{metrics.oa_done_total.toLocaleString()}</strong></div>
       <div className="metric"><span>成功下载</span><strong>{metrics.downloaded_items.toLocaleString()}</strong></div>
@@ -96,6 +100,7 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
       <th className="title-col">事项标题</th>
       <th>发起人</th>
       <th>发起时间</th>
+      <th>处理时间</th>
       <th>附件数量</th>
       <th>当前状态</th>
       <th>最近成功同步</th>
@@ -106,8 +111,9 @@ export function SimpleDoneView({ rows, total, metrics, page, setPage, query, set
           <td className="title-cell"><strong>{row.title}</strong></td>
           <td>{row.sender || "-"}</td>
           <td className="nowrap">{time(row.initiated_at)}</td>
+          <td className="nowrap">{row.completed_at ? time(row.completed_at) : row.completed_at_text || "-"}</td>
           <td className={row.pipeline_status === "no_attachment" ? "review-zero" : ""}>{row.attachment_review_label || (row.file_count == null ? "-" : row.file_count)}</td>
-          <td><div style={{ display: "grid", gap: 4 }}><span className={`status status-${statusTone(row.simple_status)}`}>{row.simple_status_label}</span><small>原件：{originalLabel(row)} · Markdown：{MARKDOWN_LABELS[row.delivery?.status || "pending"] || "待处理"} · 分类：{CLASSIFICATION_LABELS[row.delivery?.classification_status || "unknown"] || "待确认"}</small></div></td>
+          <td><div style={{ display: "grid", gap: 4 }}><span className={`status status-${statusTone(row.simple_status)}`}>{row.simple_status_label}</span>{row.simple_status === "excluded" ? <small>仅保留标题记录 · 不下载、不转换、不分类</small> : <small>原件：{originalLabel(row)} · Markdown：{MARKDOWN_LABELS[row.delivery?.status || "pending"] || "待处理"} · 分类：{CLASSIFICATION_LABELS[row.delivery?.classification_status || "unknown"] || "待确认"}</small>}</div></td>
           <td className="nowrap">{time(row.updated_at)}</td>
           <td><ChevronRight size={17}/></td>
         </tr>

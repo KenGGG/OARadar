@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.archive import atomic_write_bytes, inspect_file, safe_filename, sha256_file
 from oa_knowledge.archive.manifest import ContainerManifest, FileManifest, ItemManifest
 from oa_knowledge.archive_paths import done_archive_collision_directory, done_archive_directory
-from oa_knowledge.collector.detail import DetailCapture
+from oa_knowledge.collector.detail import DetailCapture, deduplicate_attachment_views
 from oa_knowledge.constants import FileRole, PipelineStatus
 from oa_knowledge.db.models import ArchivedFile, BatchItem, OAItem, ReviewEntry
 
@@ -44,7 +44,7 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     root_container_key = f"{capture.page_family}:{item.workitem_id_text}"
     # Detail metadata and page snapshots are process evidence.  Keeping them
     # in data would violate the two-tree data contract (originals + markdown).
-    for attachment in capture.attachments:
+    for attachment in deduplicate_attachment_views(capture.attachments):
         files.append(_write_attachment(data_root, directory / _attachment_relname(attachment), oa_item, attachment, root_container_key))
 
     containers = [ContainerManifest(
@@ -56,7 +56,7 @@ def archive_collaboration_detail(session: Session, item: BatchItem, capture: Det
     )]
     for related in capture.related_containers:
         related_files: list[FileManifest] = []
-        for attachment in related.attachments:
+        for attachment in deduplicate_attachment_views(related.attachments):
             relpath = directory / _attachment_relname(attachment)
             related_files.append(_write_attachment(data_root, relpath, oa_item, attachment, related.container_key, related.depth))
         containers.append(ContainerManifest(
@@ -181,6 +181,16 @@ def _write_attachment(data_root, relpath: PurePosixPath, oa_item: OAItem, attach
         ArchivedFile.attachment_key == attachment.attachment_key,
         ArchivedFile.file_role == str(role),
     ))
+    if archived is None and role in {FileRole.DIRECT_ATTACHMENT, FileRole.OFFICIAL_BODY, FileRole.OFFICIAL_ATTACHMENT}:
+        compatible = (str(FileRole.OFFICIAL_BODY), str(FileRole.OFFICIAL_ATTACHMENT)) if role == FileRole.DIRECT_ATTACHMENT else (str(FileRole.DIRECT_ATTACHMENT),)
+        archived = session.scalar(select(ArchivedFile).where(
+            ArchivedFile.oa_item_id == oa_item.id,
+            ArchivedFile.attachment_key == attachment.attachment_key,
+            ArchivedFile.file_role.in_(compatible),
+            ArchivedFile.source_container_key == container_key,
+        ).order_by(ArchivedFile.id).limit(1))
+        if archived is not None and role == FileRole.DIRECT_ATTACHMENT:
+            role = FileRole(archived.file_role)
     if archived is None:
         # CAP4 exposes a batch URL on one run and an individual download
         # control on the next. Reconcile an old failed row by filename so a
@@ -244,4 +254,9 @@ def _attachment_relname(attachment) -> str:
     suffix = original.suffix
     stem = original.name[:-len(suffix)] if suffix else original.name
     key_digest = hashlib.sha256(attachment.attachment_key.encode("utf-8")).hexdigest()[:12]
-    return safe_filename(f"{stem}_{key_digest}{suffix}")
+    # Reserve space for identity before truncating a long display name.
+    # Truncating the combined name can discard the key and overwrite siblings.
+    tail = f"_{key_digest}{suffix}"
+    from oa_knowledge.archive.naming import _truncate_utf8
+    stem = _truncate_utf8(stem, max(1, 160 - len(tail.encode("utf-8"))))
+    return safe_filename(f"{stem}{tail}")

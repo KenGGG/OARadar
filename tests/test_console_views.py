@@ -20,6 +20,18 @@ from oa_knowledge.db.models import (
 )
 
 
+def test_excluded_item_has_no_pending_processing_stages():
+    from types import SimpleNamespace
+    from oa_knowledge.web.console_views import _done_pipeline_stages, _markdown_status_for_item, _handoff_status_for_item
+    manifest = SimpleNamespace(processing_status='skipped', matched_exclusion_keyword='title-only')
+    stages = _done_pipeline_stages(None, manifest, None, {})
+    assert stages['discovery'] == 'done'
+    assert all(state == 'skipped' for stage, state in stages.items() if stage != 'discovery')
+    md = _markdown_status_for_item(None, {}, manifest)
+    assert md['status'] == 'excluded'
+    assert _handoff_status_for_item(None, md)['status'] == 'excluded'
+
+
 def _client(config_file: Path) -> TestClient:
     settings = load_settings(config_file)
     settings.data_root.mkdir(parents=True, exist_ok=True)

@@ -79,7 +79,7 @@ Markdown content.
 The default configuration uses local processing and disables LLM enrichment. When enabled, text enrichment uses only the installed local `qwen3.5:9b`. A loopback MinerU service can be started with:
 
 ```bash
-docker compose -f mineru/docker-compose.yaml up -d mineru-api
+docker compose -f mineru/docker-compose.yaml up -d --build mineru-api
 ```
 
 Pending summaries can use local Ollama when enabled and otherwise use a deterministic rule fallback. New attachment Markdown is published only from an active, valid ParseArtifact; it is never reparsed from the original during publishing.
@@ -116,3 +116,7 @@ OA products and deployments differ. The included selectors and adapters may requ
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+## Local OA connection
+
+Copy `.env.example` to `.env` and set `OA_BASE_URL` to the HTTP(S) origin. Adjust the optional application paths if needed. `.env` is ignored by Git; the example contains reserved values only. Save login credentials through the collapsed Login section of the local console. Every inventory synchronization reads the current OA total dynamically.

@@ -219,6 +219,7 @@ def done_list(
                     "id": row.id, "item_id": row.workitem_id_text, "title": row.title, "sender": row.sender,
                     "initiated_at": row.initiated_at.isoformat() if row.initiated_at else None,
                     "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                    "completed_at_text": row.completed_at_text,
                     "pipeline_status": row.processing_status,
                     "archive_relpath": archive_relpath,
                     "file_count": count_original_files(
@@ -287,7 +288,7 @@ def system_view(settings: Settings) -> dict:
                 "failed_or_retry": _counts(session, SourceAttachment, SourceAttachment.download_status != "verified") + _counts(session, ArchiveMember, ArchiveMember.status != "verified"),
             }
             try:
-                with urlopen(f"{settings.mineru.api_url}/health", timeout=settings.mineru.health_timeout_seconds) as response:
+                with urlopen(f"{settings.mineru.api_url}/v1/health", timeout=settings.mineru.health_timeout_seconds) as response:
                     mineru = json.loads(response.read().decode("utf-8"))
             except Exception:
                 mineru = {"status": "unavailable"}

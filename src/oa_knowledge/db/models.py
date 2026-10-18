@@ -52,6 +52,7 @@ class OAManifestItem(Base):
     sender: Mapped[str | None] = mapped_column(Text)
     initiated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at_text: Mapped[str | None] = mapped_column(Text)
     list_page: Mapped[int] = mapped_column(Integer, nullable=False)
     # OA list order is page order plus the row position observed on that page.
     # It is deliberately independent from initiation/completion timestamps.
@@ -67,6 +68,69 @@ class OAManifestItem(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     failure_stage: Mapped[str | None] = mapped_column(String)
     last_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TitleScreeningPlan(Base):
+    __tablename__ = "title_screening_plans"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    spec_json: Mapped[str] = mapped_column(Text, nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TitleScreeningDecision(Base):
+    __tablename__ = "title_screening_decisions"
+    __table_args__ = (UniqueConstraint("plan_id", "oa_item_key", "title_sha256"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("title_screening_plans.id"), nullable=False)
+    oa_item_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    title_sha256: Mapped[str] = mapped_column(String, nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TitleScreeningOverride(Base):
+    """Append-only manual changes; inheritance is a new audit event."""
+    __tablename__ = "title_screening_overrides"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    oa_item_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    folder: Mapped[str | None] = mapped_column(Text)
+    previous_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TitleReviewEvidence(Base):
+    __tablename__ = "title_review_evidence"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    oa_item_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    title_sha256: Mapped[str] = mapped_column(String, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArchiveClassificationPlan(Base):
+    __tablename__ = "archive_classification_plans"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    spec_json: Mapped[str] = mapped_column(Text, nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArchiveClassificationResult(Base):
+    __tablename__ = "archive_classification_results"
+    __table_args__ = (UniqueConstraint("plan_id", "oa_item_key", "input_sha256"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("archive_classification_plans.id"), nullable=False)
+    oa_item_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    input_sha256: Mapped[str] = mapped_column(String, nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class OAManifestSync(Base):

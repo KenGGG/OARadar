@@ -649,6 +649,7 @@ def done_archives_list(
                         "sender": row.sender,
                         "initiated_at": row.initiated_at.isoformat() if row.initiated_at else None,
                         "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                        "completed_at_text": row.completed_at_text,
                         "pipeline_status": row.processing_status,
                         "no_attachment_confirmed": row.no_attachment_confirmed,
                         "archive_relpath": row.archive_relpath or (archived.archive_relpath if archived else None),
@@ -767,7 +768,7 @@ def export_done_archives_csv(
                     manifest.title,
                     manifest.sender,
                     manifest.initiated_at.isoformat() if manifest.initiated_at else None,
-                    manifest.completed_at.isoformat() if manifest.completed_at else None,
+                    manifest.completed_at.isoformat() if manifest.completed_at else manifest.completed_at_text,
                     file_count,
                     visible_status,
                     manifest.last_synced_at.isoformat() if manifest.last_synced_at else None,
@@ -872,6 +873,9 @@ def _done_pipeline_stages(
     archived: OAItem | None,
     markdown: dict,
 ) -> dict[str, str]:
+    if manifest and (manifest.processing_status == "skipped" or manifest.matched_exclusion_keyword):
+        return {"discovery": "done", **{stage: "skipped" for stage in
+                ("download", "verification", "markdown", "classification", "publication")}}
     tasks = list(session.scalars(select(PipelineTask).where(
         PipelineTask.logical_item_key == (manifest.oa_item_key if manifest else ""),
         PipelineTask.stage.in_(tuple(_DONE_STAGE_ORDER)),
@@ -920,6 +924,8 @@ def _done_pipeline_stages(
 
 
 def _markdown_status_for_item(session: Session, it: dict, manifest: OAManifestItem | None) -> dict:
+    if manifest and (manifest.processing_status == "skipped" or manifest.matched_exclusion_keyword):
+        return {"label": "已排除", "status": "excluded"}
     if manifest is None:
         return {"label": "待转换", "status": "pending"}
     archived = session.scalar(select(OAItem).where(OAItem.oa_item_key == manifest.oa_item_key))
@@ -940,6 +946,8 @@ def _markdown_status_for_item(session: Session, it: dict, manifest: OAManifestIt
 
 
 def _handoff_status_for_item(settings: Settings, md: dict) -> dict:
+    if md["status"] == "excluded":
+        return {"label": "已排除", "status": "excluded"}
     # A successfully converted Markdown file (status "success") is published to
     # markdown_root, so it counts as delivered. "exported" is the display label
     # only.
@@ -961,9 +969,13 @@ def markdown_outputs_list(
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
-            total = _counts(session, MarkdownExport)
+            from oa_knowledge.source_library import attachment_only_library
+            attachments_only = attachment_only_library(session)
+            condition = MarkdownExport.document_kind != 'item_index' if attachments_only else True
+            total = session.scalar(select(func.count()).select_from(MarkdownExport).where(condition)) or 0
             exports = session.scalars(
                 select(MarkdownExport)
+                .where(condition)
                 .order_by(MarkdownExport.generated_at.desc(), MarkdownExport.id.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
@@ -998,12 +1010,15 @@ def markdown_outputs_list(
             if query and query.strip():
                 pattern = f"%{query.strip()}%"
                 stmt = stmt.where(or_(OAItem.title.ilike(pattern), OAItem.external_issuer.ilike(pattern)))
-            if category:
+            source_category = category if attachments_only and category in {'SELF','GROUP','EXTERNAL','PUBLICATION','UNKNOWN'} else None
+            if category and not source_category:
                 stmt = stmt.where(OAItem.internal_category == category)
             if issuer and issuer.strip():
                 stmt = stmt.where(OAItem.external_issuer.ilike(f"%{issuer.strip()}%"))
             candidates = session.scalars(stmt.order_by(OAItem.completed_at.desc(), OAItem.id.desc())).all()
             facts_map = delivery_facts_map(session, candidates)
+            if source_category:
+                candidates = [item for item in candidates if facts_map[item.id].get('archive_category_id') == source_category]
             if status:
                 candidates = [item for item in candidates if facts_map[item.id]["status"] == status]
             item_total = len(candidates)
@@ -1019,7 +1034,7 @@ def markdown_outputs_list(
                     item_exports = session.scalars(select(MarkdownExport).join(
                         ArchivedFile, ArchivedFile.id == MarkdownExport.source_file_id,
                     ).where(ArchivedFile.oa_item_id == item.id)).all()
-                index = next((row for row in item_exports if row.document_kind == "item_index"), None)
+                index = next((row for row in item_exports if row.document_kind == "item_index"), None) if not attachments_only else None
                 attachments = [row for row in item_exports if row.document_kind != "item_index"]
                 facts = facts_map[item.id]
                 delivery_status = DELIVERY_LABELS[facts["status"]]
@@ -1034,8 +1049,9 @@ def markdown_outputs_list(
                     "delivery": facts,
                     "status": facts["status"],
                     "index_relpath": index.markdown_relpath if index else None,
+                    "archive_category_id": facts.get('archive_category_id'),
                     "source_relpath": item.archive_relpath,
-                    "updated_at": (index.generated_at.isoformat() if index and index.generated_at else None),
+                    "updated_at": max((row.generated_at.isoformat() for row in attachments if row.generated_at),default=None),
                     "documents": [
                         {"id": row.id, "relpath": row.markdown_relpath, "status": row.status,
                          "source_file_id": row.source_file_id, "error_code": row.last_error_code}

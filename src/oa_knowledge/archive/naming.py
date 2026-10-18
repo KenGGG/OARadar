@@ -17,7 +17,9 @@ def safe_filename(name: str, max_length: int = 160) -> str:
     if len(value.encode("utf-8")) > max_length:
         suffix_bytes = len(suffix.encode("utf-8"))
         value = f"{_truncate_utf8(Path(value).stem, max(1, max_length - suffix_bytes))}{suffix}"
-    return value
+    # Truncation can expose a trailing space/dot that Windows strips while
+    # creating a directory, then rejects when replacing a file below it.
+    return value.rstrip(". ") or "unnamed"
 
 
 def _truncate_utf8(value: str, max_bytes: int) -> str:

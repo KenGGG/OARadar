@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
@@ -49,11 +50,26 @@ def publish_markdown(destination: Path, content: str, expected_sha256: str, asse
     destination.parent.mkdir(parents=True, exist_ok=True)
     _validate(content, destination, expected_sha256, assets_dir)
     stage_root = Path(tempfile.mkdtemp(prefix=".oaradar-md-", dir=destination.parent))
-    staged_md = stage_root / destination.name
-    staged_assets = stage_root / (destination.name.removesuffix(".md") + ".assets")
+    # Staging adds a directory level. Repeating a long attachment name here
+    # can exceed Windows' path limit even when the final path fits.
+    staged_md = stage_root / "document.md"
+    staged_assets = stage_root / "assets"
     try:
-        staged_md.write_text(content, encoding="utf-8")
-        with staged_md.open("rb") as handle:
+        if os.name == "nt":
+            # tempfile creates a private Windows ACL. Assets renamed out of
+            # that tree otherwise retain permissions excluding the user who
+            # owns the library. Inherit the destination directory's ACL before
+            # creating any publication files; do not grant additional rights.
+            result = subprocess.run(
+                ["icacls.exe", str(stage_root), "/reset", "/Q"],
+                capture_output=True, timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode:
+                raise PublicationError("could not inherit publication directory permissions")
+        staged_md.write_text(content, encoding="utf-8", newline="\n")
+        # Windows requires a writable descriptor for FlushFileBuffers/fsync.
+        with staged_md.open("r+b") as handle:
             os.fsync(handle.fileno())
         if assets_dir and assets_dir.exists():
             shutil.copytree(assets_dir, staged_assets)

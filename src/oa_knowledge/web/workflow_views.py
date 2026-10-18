@@ -67,7 +67,7 @@ def _item_detail(session, settings, item):
         "documents": [{"id": e.id, "name": next((s.original_name for s in sources if s.id == e.source_file_id), "事项索引"),
                        "kind": e.document_kind, "relpath": e.markdown_relpath, "status": e.status,
                        "source_file_id": e.source_file_id, "engine": e.parse_engine,
-                       "error_code": e.last_error_code, "error": e.last_error, "generated_at": _iso(e.generated_at)} for e in exports],
+                       "error_code": e.last_error_code, "error": e.last_error, "generated_at": _iso(e.generated_at)} for e in exports if e.status != 'retired'],
     }
 
 
@@ -246,7 +246,7 @@ def update_item_classification(
             active = session.scalar(select(PipelineTask).where(
                 PipelineTask.logical_item_key == item_key,
                 PipelineTask.stage.in_(LOCAL_STAGES),
-                PipelineTask.status.in_(("queued", "running")),
+                PipelineTask.status.in_(("queued", "local_queued", "running")),
             ).order_by(PipelineTask.id.desc()))
         task_id = active.id if active else ProductionQueue(engine).enqueue(
             "markdown_delivery", item_key, "classify",

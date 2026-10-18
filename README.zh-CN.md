@@ -87,7 +87,7 @@ Markdown 内容。
 默认配置使用本地处理并关闭 LLM 内容加工。可以通过以下命令启动仅监听回环地址的 MinerU 服务：
 
 ```bash
-docker compose -f mineru/docker-compose.yaml up -d mineru-api
+docker compose -f mineru/docker-compose.yaml up -d --build mineru-api
 ```
 
 待办摘要在启用本地模型时使用 Ollama，关闭或失败时使用确定性规则兜底。新附件 Markdown 只允许从 active ParseArtifact 发布，发布时不会重新解析原件。
@@ -124,3 +124,7 @@ GitHub Actions 会执行相同检查。如发现问题，必须删除相关内�
 ## 许可证
 
 MIT License，详见 [LICENSE](LICENSE)。
+
+## 本机 OA 连接配置
+
+复制 `.env.example` 为 `.env`，填写 `OA_BASE_URL`（协议、主机和可选端口）。默认路径适用于致远 OA，其他路径可在同一文件调整。`.env` 不会纳入 Git，示例文件只使用保留域名。密码在网页折叠的“登录账号”中保存到 Windows 凭据管理器。已办总数在每次同步时自动读取，后续新增事项可再次更新清单。

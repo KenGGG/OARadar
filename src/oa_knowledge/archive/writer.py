@@ -3,9 +3,21 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from .naming import validate_relative_path
+
+
+def _replace(source: Path, destination: Path) -> None:
+    for attempt in range(10):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 9:
+                raise
+            time.sleep(0.05)
 
 
 def atomic_commit(source: Path, root: Path, relative_target: str | Path) -> Path:
@@ -17,7 +29,7 @@ def atomic_commit(source: Path, root: Path, relative_target: str | Path) -> Path
     temp_path = Path(temp_name)
     try:
         shutil.copyfile(source, temp_path)
-        os.replace(temp_path, destination)
+        _replace(temp_path, destination)
     finally:
         temp_path.unlink(missing_ok=True)
     return destination
@@ -34,7 +46,7 @@ def atomic_write_bytes(content: bytes, root: Path, relative_target: str | Path) 
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, destination)
+        _replace(temp_path, destination)
     finally:
         temp_path.unlink(missing_ok=True)
     return destination

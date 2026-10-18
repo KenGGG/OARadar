@@ -50,6 +50,8 @@ class ProductionQueue:
                 return existing.id
             task = PipelineTask(queue_name=queue_name, priority=QUEUE_PRIORITY[queue_name], logical_item_key=logical_item_key,
                                 stage=stage, idempotency_key=idempotency_key, payload_json=json.dumps(payload or {}, ensure_ascii=False))
+            if (payload or {}).get('local_delivery'):
+                task.status = 'local_queued'
             session.add(task)
             try:
                 session.commit()
@@ -552,6 +554,8 @@ class ProductionQueue:
         with Session(self.engine) as session:
             row = self._owned(session, task_id, owner)
             row.stage = stage; row.status = "queued"; row.progress_current = progress_current; row.progress_total = progress_total
+            if json.loads(row.payload_json or '{}').get('local_delivery'):
+                row.status = 'local_queued'
             row.attempts = 0
             row.error_code = None; row.last_error = None; row.next_retry_at = None
             row.lease_owner = None; row.lease_expires_at = None
@@ -575,6 +579,8 @@ class ProductionQueue:
             }
             can_retry = auth_retry or transient_retry or recoverable and row.attempts < row.max_attempts
             row.status = "queued" if can_retry else "failed"; row.error_code = error_code; row.last_error = detail[:1000]; row.recoverable = recoverable
+            if can_retry and json.loads(row.payload_json or '{}').get('local_delivery'):
+                row.status = 'local_queued'
             retry_minutes = 1 if auth_retry else min(30, 2 ** min(row.attempts, 5))
             row.next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=retry_minutes) if can_retry else None
             row.finished_at = None if can_retry else datetime.now(timezone.utc); row.lease_owner = None; row.lease_expires_at = None

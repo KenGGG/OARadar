@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import html
 import io
 import json
 import re
+import unicodedata
 from time import monotonic
 from typing import Callable
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
@@ -35,6 +36,62 @@ class DirectAttachment:
     file_role: str = "direct_attachment"
     content: bytes | None = field(default=None, repr=False)
     download_status: str = "discovered"
+
+
+def same_attachment_filename(first: str, second: str) -> bool:
+    def normalize(value):
+        return "".join(unicodedata.normalize("NFKC", html.unescape(value)).split())
+    first, second = normalize(first), normalize(second)
+    if first == second:
+        return True
+    for shortened, full in ((first, second), (second, first)):
+        if "..." in shortened:
+            parts = shortened.split("...")
+            if any(parts) and re.fullmatch(".+".join(re.escape(part) for part in parts), full):
+                return True
+    return False
+
+
+def deduplicate_attachment_views(attachments) -> tuple[DirectAttachment, ...]:
+    """Merge alternate UI representations, never distinct canonical file IDs.
+
+    Identity is scoped to this container and requires both filename and bytes.
+    CAP4 widget/batch keys identify UI entries, not independently proven files.
+    """
+    groups = {}
+    for index, attachment in enumerate(attachments):
+        if attachment.content is None:
+            signature = ("unverified", index)
+        else:
+            signature = hashlib.sha256(attachment.content).digest()
+        groups.setdefault(signature, []).append(attachment)
+    result = []
+    priority = {"official_body": 3, "official_attachment": 2, "direct_attachment": 1}
+    for group in groups.values():
+        canonical = [a for a in group if not a.attachment_key.startswith(("cap4-widget:", "cap4:"))]
+        aliases = [a for a in group if a not in canonical]
+        if not aliases or len(group) == 1:
+            result.extend(group)
+            continue
+        if not canonical:
+            # Two separate controls in the same UI may be separate OA files.
+            strategies = {a.attachment_key.split(":", 1)[0] for a in aliases}
+            if len(strategies) == 1:
+                result.extend(group)
+                continue
+            canonical = [aliases[0]]
+            aliases = aliases[1:]
+        for alias in aliases:
+            candidates = [i for i, a in enumerate(canonical) if same_attachment_filename(a.filename, alias.filename)]
+            if not candidates:
+                canonical.append(alias)
+            elif len(candidates) == 1:
+                index = candidates[0]
+                current = canonical[index]
+                filename = alias.filename if "..." in unicodedata.normalize("NFKC", current.filename) and "..." not in unicodedata.normalize("NFKC", alias.filename) else current.filename
+                canonical[index] = replace(current, filename=filename, file_role=max((current.file_role, alias.file_role), key=lambda role: priority.get(role, 0)))
+        result.extend(canonical)
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -655,7 +712,7 @@ class CollaborationDetailAdapter:
                     content=content, download_status="downloaded" if content is not None else "download_failed",
                 ))
         if self._capture_timed_out(deadline, "attachments"):
-            return tuple(files)
+            return deduplicate_attachment_views(files)
         cap4_files = self._download_cap4_widgets(page, default_role, seen, deadline, download_timeout_seconds)
         files.extend(cap4_files)
         if (
@@ -672,7 +729,7 @@ class CollaborationDetailAdapter:
             if not files and not confirmed_empty:
                 confirmed_empty = self._meeting_inventory_confirmed_empty(page)
             self._last_attachment_inventory_confirmed_empty = confirmed_empty
-        return tuple(files)
+        return deduplicate_attachment_views(files)
 
     @staticmethod
     def _meeting_inventory_confirmed_empty(page: Page) -> bool:

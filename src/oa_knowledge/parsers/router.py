@@ -64,6 +64,7 @@ def resolve_parser_version(engine: str, settings) -> str:
         from oa_knowledge.parsers.libreoffice_parser import libreoffice_engine_version
 
         return libreoffice_engine_version()
+    if engine=='archive':return 'archive-v1'
     raise ValueError(f"Unknown engine: {engine}")
 
 
@@ -243,12 +244,21 @@ def parse_file(
             return parse_with_libreoffice(
                 file_path, output_dir, profile_version=profile_version, settings=settings
             )
+        if engine=='archive':
+            from oa_knowledge.parsers.archive_parser import parse_with_archive
+            return parse_with_archive(file_path,output_dir,settings=settings,profile_version=profile_version)
         raise ValueError(f"Unknown engine: {engine}")
 
+    if decision.actual_file_type in {'zip','rar','7z'}:
+        from oa_knowledge.parsers.archive_parser import parse_with_archive
+        return parse_with_archive(file_path,output_dir,settings=settings,profile_version=profile_version)
     if decision.status_code != "parseable":
         raise RuntimeError(decision.status_code)
     if decision.is_direct_text:
         return parse_with_markitdown(file_path, output_dir, profile_version=profile_version)
+    from oa_knowledge.parsers.libreoffice_parser import office_executable,needs_word_pdf_ocr,parse_with_libreoffice
+    if office_executable() and (decision.actual_file_type in {'doc','xls','ppt','pptx'} or (decision.actual_file_type=='docx' and needs_word_pdf_ocr(file_path,'markitdown',''))):
+        return parse_with_libreoffice(file_path,output_dir,settings=settings,profile_version=profile_version)
     engines = parser_attempts(decision, mineru_enabled=mineru_available(settings))
     if not engines:
         raise RuntimeError("unsupported_file_type")

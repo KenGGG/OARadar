@@ -41,6 +41,21 @@ class AuthLoginRequest(BaseModel):
     token: str = Field(min_length=1, max_length=200)
 
 
+class OACredentialRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=1024, repr=False)
+
+
+class DoneCollectionRequest(BaseModel):
+    operation: str = Field(pattern="^(done_inventory|done_download|done_login|done_review)$")
+
+
+class TitleOverrideRequest(BaseModel):
+    action: str = Field(pattern="^(download|skip|review|inherit)$")
+    reason: str = Field(min_length=3, max_length=400)
+    folder: str | None = Field(default=None, max_length=220)
+
+
 class DeliveryReconciliationRequest(BaseModel):
     delivery_id: int = Field(gt=0)
     outcome: str = Field(pattern="^(sent|failed)$")
@@ -127,6 +142,52 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
     app = FastAPI(title="OA Knowledge Hub", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.bootstrap_token = bootstrap_token
+
+    # Validation errors must not echo submitted OA credentials back to the client.
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.exception_handlers import request_validation_exception_handler
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path == "/api/done-collection/credentials":
+            return JSONResponse({"detail": "用户名或密码格式无效"}, status_code=422)
+        return await request_validation_exception_handler(request, exc)
+
+    def current_collection_settings() -> Settings:
+        return load_settings(config_path) if config_path else settings
+
+    @app.get("/api/done-collection")
+    def get_done_collection() -> dict:
+        from oa_knowledge.done_collection import collection_status
+        return collection_status(current_collection_settings())
+
+    @app.post("/api/done-collection/credentials")
+    def post_oa_credentials(payload: OACredentialRequest) -> dict:
+        from oa_knowledge.collector.windows_credentials import save_credential
+        try:
+            current = current_collection_settings()
+            if ".invalid" in current.browser.base_url:
+                raise ValueError("请在项目 .env 中填写 OA_BASE_URL")
+            save_credential(current.browser.base_url, payload.username, payload.password)
+            return {"saved": True}
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc)) from exc
+
+    @app.post("/api/done-collection/start", status_code=202)
+    def post_done_collection(payload: DoneCollectionRequest) -> dict:
+        from oa_knowledge.done_collection import start_collection
+        try:
+            return start_collection(current_collection_settings(), payload.operation)
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+
+    @app.post("/api/done-collection/{job_id}/{action}")
+    def post_done_collection_control(job_id: int, action: str) -> dict:
+        from oa_knowledge.done_collection import control_collection
+        try:
+            return control_collection(current_collection_settings(), job_id, action)
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
 
     @app.middleware("http")
     async def local_security(request: Request, call_next):
@@ -632,6 +693,88 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             return item_detail(settings, item_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/title-screening/settings")
+    def title_rule_settings() -> dict:
+        from oa_knowledge.title_screening import editor_state
+        return editor_state(settings)
+
+    @app.get("/api/archive-classification/settings")
+    def archive_classification_settings() -> dict:
+        from oa_knowledge.archive_classification import settings_state
+        return settings_state(settings)
+
+    @app.post("/api/archive-classification/settings/{operation}")
+    def edit_archive_classification(operation: str, payload: dict) -> dict:
+        from oa_knowledge.archive_classification import apply_spec
+        import re
+        if operation not in {"preview", "save"}:
+            raise HTTPException(status_code=400, detail="unsupported classification operation")
+        try:
+            return apply_spec(settings, payload["spec"], base_plan_id=int(payload["base_plan_id"]), save=operation == "save")
+        except (ValueError, KeyError, TypeError, re.error) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/archive-classification/{plan_id}/activate")
+    def activate_archive_classification(plan_id: int) -> dict:
+        from oa_knowledge.archive_classification import activate
+        try:
+            return activate(settings, plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/title-screening/settings/{operation}")
+    def edit_title_rule_settings(operation: str, payload: dict) -> dict:
+        from oa_knowledge.title_screening import edit_rules
+        import re
+        if operation not in {"preview", "save"}:
+            raise HTTPException(status_code=400, detail="unsupported rule operation")
+        try:
+            return edit_rules(settings, int(payload["base_plan_id"]), payload["spec"], save=operation == "save")
+        except (ValueError, KeyError, TypeError, re.error) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/title-screening")
+    def get_title_screening(action: str | None = None, query: str = "", page: int = Query(1, ge=1), plan_id: int | None = None, category: str | None = None) -> dict:
+        from oa_knowledge.title_screening import view
+        return view(settings, action=action, query=query, page=page, plan_id=plan_id, category=category)
+
+    @app.post("/api/title-screening/{plan_id}/activate")
+    def activate_title_screening(plan_id: int) -> dict:
+        from oa_knowledge.title_screening import set_active
+        try:
+            return set_active(settings, plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/title-screening/items/{manifest_id}/override")
+    def override_title_screening(manifest_id: int, payload: TitleOverrideRequest) -> dict:
+        from oa_knowledge.title_screening import override
+        try:
+            return override(settings, manifest_id, **payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/title-screening/export.csv")
+    def export_title_screening() -> Response:
+        from oa_knowledge.title_screening import export_csv
+        return Response(export_csv(settings), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="title-screening.csv"'})
+
+    @app.get("/api/title-screening/items/{manifest_id}/review")
+    def get_title_review(manifest_id: int) -> dict:
+        from oa_knowledge.title_screening import review_detail
+        try:
+            return review_detail(settings, manifest_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/title-screening/publish-index")
+    def publish_title_index() -> dict:
+        from oa_knowledge.title_screening import publish_confirmed_index
+        try:
+            return publish_confirmed_index(settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/manifest/items")
     def get_manifest_items(

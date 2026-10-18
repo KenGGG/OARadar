@@ -64,6 +64,77 @@ def _seed(tmp_path: Path):
     return settings, engine, source_id, artifact_path
 
 
+def test_screening_exclusion_blocks_conversion_and_publication(tmp_path: Path):
+    from oa_knowledge.db.models import OAManifestItem
+    from oa_knowledge.markdown_export.service import convert_file_id
+    from oa_knowledge.pipeline import ParsePipeline
+    settings, engine, source_id, artifact_path = _seed(tmp_path)
+    with Session(engine) as session:
+        session.add(OAManifestItem(oa_item_key='done:synthetic', title='合成排除流程',
+                                  list_page=1, processing_status='skipped', matched_exclusion_keyword='synthetic-rule'))
+        session.commit()
+        for operation in (lambda: publish_active_artifact(session, settings, source_id),
+                          lambda: convert_file_id(session, settings, source_id),
+                          lambda: ParsePipeline(settings).enqueue(source_id, session=session)):
+            with pytest.raises(ValueError, match='ATTACHMENT_EXCLUDED_BY_SCREENING'):
+                operation()
+        assert not session.query(MarkdownExport).count()
+        assert artifact_path.is_file()
+
+
+def test_duplicate_attachment_views_have_distinct_markdown_paths(tmp_path: Path) -> None:
+    settings,engine,source_id,_=_seed(tmp_path)
+    with Session(engine) as session:
+        source=session.get(ArchivedFile,source_id)
+        twin=ArchivedFile(oa_item_id=source.oa_item_id,attachment_key='synthetic-second',
+            file_role=source.file_role,source_container_key=source.source_container_key,
+            original_name=source.original_name,local_relpath=source.local_relpath,
+            sha256=source.sha256,download_status='verified',content_object_id=source.content_object_id)
+        session.add(twin);session.flush()
+        first=publish_active_artifact(session,settings,source.id)
+        second=publish_active_artifact(session,settings,twin.id)
+        assert first.markdown_relpath!=second.markdown_relpath
+        assert (settings.workspace_root/first.markdown_relpath).is_file()
+        assert (settings.workspace_root/second.markdown_relpath).is_file()
+
+
+def test_oa_form_checkbox_icons_preserve_state_without_network_assets(tmp_path: Path):
+    settings, engine, source_id, artifact_path = _seed(tmp_path)
+    body = '# Synthetic form\n\n![a](/seeyon/common/content/images/checkbox_browse.png?V=1) Option A\n\n![b](/seeyon/common/content/images/checkbox_checked_browse.png?V=1) Option B'
+    artifact_path.write_text(body, encoding='utf8')
+    with Session(engine) as session:
+        artifact = session.query(ParseArtifact).one()
+        artifact.product_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        record = publish_active_artifact(session, settings, source_id)
+        assert record.status == 'success'
+        delivered = (settings.workspace_root/record.markdown_relpath).read_text(encoding='utf8')
+        assert '[未勾选] Option A' in delivered
+        assert '[已勾选] Option B' in delivered
+        assert '/seeyon/common/content/images/' not in delivered
+    engine.dispose()
+
+
+def test_shared_content_reuses_artifact_across_distinct_parse_jobs(tmp_path: Path, monkeypatch):
+    from oa_knowledge.pipeline import ParsePipeline
+    settings, engine, source_id, artifact_path = _seed(tmp_path)
+    monkeypatch.setattr('oa_knowledge.pipeline.preflight', lambda path: {})
+    with Session(engine) as session:
+        original = session.get(ArchivedFile, source_id)
+        other = ArchivedFile(oa_item_id=original.oa_item_id, attachment_key='synthetic-shared',
+            original_name=original.original_name, local_relpath=original.local_relpath,
+            sha256=original.sha256, content_object_id=original.content_object_id,
+            download_status='verified', file_role='direct_attachment', source_container_key='root')
+        session.add(other);session.flush()
+        job = ParseJob(file_id=other.id,engine='synthetic',engine_version='1',config_hash='',status='queued')
+        session.add(job);session.flush();job_id=job.id;session.commit()
+    result = ParsePipeline(settings,engine).run(job_id)
+    assert result.output_path == artifact_path
+    with Session(engine) as session:
+        assert session.get(ParseJob,job_id).status == 'completed'
+        assert session.query(ParseArtifact).count() == 1
+    engine.dispose()
+
+
 def test_publish_uses_active_artifact_and_never_reparses_original(monkeypatch, tmp_path: Path) -> None:
     settings, engine, source_id, artifact_path = _seed(tmp_path)
     (artifact_path.parent / 'other-oa.md').write_text('Unrelated synthetic OA', encoding='utf-8')

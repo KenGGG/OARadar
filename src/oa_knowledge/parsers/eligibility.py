@@ -35,6 +35,8 @@ def evaluate_eligibility(file_path: Path, *, duplicate_content: bool = False) ->
     detected = decision.actual_file_type
     evidence["detected_by"] = decision.detection_source
     evidence["filename_normalized"] = decision.filename_normalized
+    if detected in {'zip','rar','7z'}:
+        return KnowledgeEligibilityDecision(True,'KNOWLEDGE_ELIGIBLE',detected,'archive',evidence)
     if path.name.lower() in TECHNICAL_NAMES:
         return KnowledgeEligibilityDecision(False, "OA_TECHNICAL_METADATA", detected, "source_evidence_only", evidence)
     if suffix in {".html", ".htm"} and any(marker in path.stem.lower() for marker in FRAME_MARKERS):

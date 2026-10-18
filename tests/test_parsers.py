@@ -457,138 +457,91 @@ def test_extract_mineru_zip_rejects_empty_markdown(tmp_path: Path) -> None:
         _extract_mineru_zip(payload, tmp_path / "output")
 
 
-def test_parse_with_mineru_rejects_html_response(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _v1_handler(payload, *, upload_url="/v1/uploads/u/content", job_status="completed"):
     import httpx
+    import json
+    def handler(request):
+        path = request.url.path
+        if path == "/v1/health":
+            return httpx.Response(200, json={"version": "4.0.11"})
+        if path == "/v1/uploads":
+            return httpx.Response(200, json={"id": "u", "status": "pending", "upload_url": upload_url})
+        if path == "/v1/uploads/u/content":
+            assert request.method == "PUT"
+            assert request.read()
+            return httpx.Response(200)
+        if path == "/v1/uploads/u/complete":
+            return httpx.Response(200, json={"status": "completed", "file": {"id": "f"}})
+        if path == "/v1/parse/jobs":
+            body = json.loads(request.read())
+            assert body["tier"] == "standard" and body["output_formats"] == ["zip"]
+            return httpx.Response(200, json={"job_id": "j", "status": "queued"})
+        if path == "/v1/parse/jobs/j":
+            return httpx.Response(200, json={"job_id": "j", "status": job_status, "files": [{"status": "completed", "output_files": {"zip": {"file_id": "z"}}}]})
+        assert path == "/v1/files/z/content"
+        return httpx.Response(200, content=payload)
+    return handler
 
-    pdf = _make_synthetic_pdf(tmp_path)
-    settings = Settings(mineru={"enabled": True, "api_url": "http://127.0.0.1:58000"})
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json={"status": "ok"})
-        return httpx.Response(
-            200,
-            content=b"<!doctype html><title>Error</title>",
-            headers={"content-type": "text/html"},
-        )
-
-    monkeypatch.setattr(
-        "oa_knowledge.parsers.mineru_parser._transport_for_settings",
-        lambda _settings: httpx.MockTransport(handler),
-    )
-
-    with pytest.raises(MineruResponseError, match="HTML"):
-        parse_with_mineru(pdf, settings, tmp_path / "parse")
-
-
-def test_parse_with_mineru_extracts_zip_atomically(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_parse_with_mineru_extracts_zip_atomically(tmp_path, monkeypatch):
     import httpx
-
-    pdf = _make_synthetic_pdf(tmp_path)
-    settings = Settings(mineru={"enabled": True, "api_url": "http://127.0.0.1:58000"})
-    payload = _mineru_zip(
-        {
-            "result/document.md": "# Synthetic document\n\nParsed locally.",
-            "result/content_list.json": "[]",
-        }
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json={"protocol_version": "1"})
-        assert request.url.path == "/file_parse"
-        assert b'name="files"' in request.read()
-        assert b'name="return_images"\r\n\r\ntrue' in request.read()
-        return httpx.Response(
-            200, content=payload, headers={"content-type": "application/zip"}
-        )
-
-    monkeypatch.setattr(
-        "oa_knowledge.parsers.mineru_parser._transport_for_settings",
-        lambda _settings: httpx.MockTransport(handler),
-    )
-
-    result = parse_with_mineru(pdf, settings, tmp_path / "parse")
-
-    assert result.engine == "mineru"
-    assert result.output_path.read_text(encoding="utf-8").startswith("# Synthetic")
+    payload = _mineru_zip({"result/document.md": "# Synthetic document", "result/content_list.json": "[]"})
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser._transport_for_settings", lambda _: httpx.MockTransport(_v1_handler(payload)))
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _: None)
+    result = parse_with_mineru(_make_synthetic_pdf(tmp_path), Settings(mineru={"enabled": True}), tmp_path / "parse")
+    assert result.engine_version == "4.0.11"
+    assert result.output_path.read_text().startswith("# Synthetic")
     assert (result.output_path.parent / "content_list.json").is_file()
     assert not list((tmp_path / "parse").glob(".mineru-staging-*"))
 
 
-def test_parse_with_mineru_retries_transient_health_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mineru_normalizes_decorated_filename_without_changing_original(tmp_path, monkeypatch):
     import httpx
-
-    pdf = _make_synthetic_pdf(tmp_path)
-    settings = Settings(mineru={"enabled": True, "api_url": "http://127.0.0.1:58000"})
-    payload = _mineru_zip({"result/document.md": "# Retried successfully"})
-    health_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal health_calls
-        if request.url.path == "/health":
-            health_calls += 1
-            if health_calls == 1:
-                raise httpx.ConnectError("busy", request=request)
-            return httpx.Response(200, json={"protocol_version": "1"})
-        return httpx.Response(
-            200, content=payload, headers={"content-type": "application/zip"}
-        )
-
-    monkeypatch.setattr(
-        "oa_knowledge.parsers.mineru_parser._transport_for_settings",
-        lambda _settings: httpx.MockTransport(handler),
-    )
-    monkeypatch.setattr(
-        "oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None
-    )
-
-    result = parse_with_mineru(pdf, settings, tmp_path / "parse")
-
-    assert result.engine == "mineru"
-    assert health_calls == 2
+    import hashlib
+    import json
+    source = _make_synthetic_pdf(tmp_path)
+    decorated = source.with_name("synthetic.pdf (1M)")
+    source.rename(decorated)
+    before = hashlib.sha256(decorated.read_bytes()).hexdigest()
+    uploaded = []
+    handler = _v1_handler(_mineru_zip({"markdown.md": "# Synthetic local result"}))
+    def capture(request):
+        if request.url.path == "/v1/uploads":
+            uploaded.append(json.loads(request.content))
+        return handler(request)
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser._transport_for_settings", lambda _: httpx.MockTransport(capture))
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _: None)
+    parse_with_mineru(decorated, Settings(mineru={"enabled": True}), tmp_path / "parse")
+    assert uploaded[0]["filename"].endswith(".pdf")
+    assert uploaded[0]["mime_type"] == "application/pdf"
+    assert decorated.is_file()
+    assert hashlib.sha256(decorated.read_bytes()).hexdigest() == before
 
 
-def test_parse_with_mineru_retries_transient_parse_disconnect(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.parametrize("target", ["https://example.com/upload", "http://127.0.0.1:9999/upload"])
+def test_mineru_rejects_remote_upload(tmp_path, monkeypatch, target):
     import httpx
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser._transport_for_settings", lambda _: httpx.MockTransport(_v1_handler(b"", upload_url=target)))
+    with pytest.raises(MineruResponseError, match="local origin"):
+        parse_with_mineru(_make_synthetic_pdf(tmp_path), Settings(mineru={"enabled": True}), tmp_path / "parse")
 
-    pdf = _make_synthetic_pdf(tmp_path)
-    settings = Settings(mineru={"enabled": True, "api_url": "http://127.0.0.1:58000"})
-    payload = _mineru_zip({"result/document.md": "# Request retry succeeded"})
-    parse_calls = 0
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal parse_calls
-        if request.url.path == "/health":
-            return httpx.Response(200, json={"protocol_version": "1"})
-        parse_calls += 1
-        if parse_calls == 1:
-            raise httpx.RemoteProtocolError("server disconnected", request=request)
-        request.read()
-        return httpx.Response(
-            200, content=payload, headers={"content-type": "application/zip"}
-        )
+@pytest.mark.parametrize("status", ["partial", "failed", "canceled", "unknown"])
+def test_mineru_rejects_incomplete_job(tmp_path, monkeypatch, status):
+    import httpx
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser._transport_for_settings", lambda _: httpx.MockTransport(_v1_handler(b"", job_status=status)))
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _: None)
+    with pytest.raises(MineruResponseError, match="ended as"):
+        parse_with_mineru(_make_synthetic_pdf(tmp_path), Settings(mineru={"enabled": True}), tmp_path / "parse")
 
-    monkeypatch.setattr(
-        "oa_knowledge.parsers.mineru_parser._transport_for_settings",
-        lambda _settings: httpx.MockTransport(handler),
-    )
-    monkeypatch.setattr(
-        "oa_knowledge.parsers.mineru_parser.time.sleep", lambda _seconds: None
-    )
 
-    result = parse_with_mineru(pdf, settings, tmp_path / "parse")
+def test_parse_with_mineru_rejects_html_response(tmp_path, monkeypatch):
+    import httpx
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser._transport_for_settings", lambda _: httpx.MockTransport(_v1_handler(b"<!doctype html><title>Error</title>")))
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _: None)
+    with pytest.raises(MineruResponseError, match="HTML"):
+        parse_with_mineru(_make_synthetic_pdf(tmp_path), Settings(mineru={"enabled": True}), tmp_path / "parse")
 
-    assert result.engine == "mineru"
-    assert parse_calls == 2
 
 
 # --- ParsePipeline tests ---
@@ -989,3 +942,53 @@ def test_pipeline_runs_queued_libreoffice_job(tmp_path: Path, monkeypatch: pytes
         artifact = session.scalar(select(ParseArtifact).where(ParseArtifact.parse_job_id == job_id))
         assert artifact.engine == "libreoffice"
         assert (settings.cache_root / artifact.output_relpath).read_text() == "synthetic converted content"
+
+
+def test_mineru_poll_disconnect_resumes_same_job(tmp_path, monkeypatch):
+    import httpx
+    handler = _v1_handler(_mineru_zip({"markdown.md": "# Synthetic retry"}))
+    polls = 0
+    submissions = 0
+    def transient(request):
+        nonlocal polls, submissions
+        if request.url.path == "/v1/parse/jobs":
+            submissions += 1
+        if request.url.path == "/v1/parse/jobs/j":
+            polls += 1
+            if polls == 1:
+                raise httpx.RemoteProtocolError("synthetic disconnect")
+        return handler(request)
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser._transport_for_settings", lambda _: httpx.MockTransport(transient))
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _: None)
+    result = parse_with_mineru(_make_synthetic_pdf(tmp_path), Settings(mineru={"enabled": True}), tmp_path / "parse")
+    assert result.output_path.is_file()
+    assert polls == 2 and submissions == 1
+
+
+def test_mineru_output_redirect_is_rejected(tmp_path, monkeypatch):
+    import httpx
+    handler = _v1_handler(b"")
+    def redirect(request):
+        if request.url.path == "/v1/files/z/content":
+            return httpx.Response(302, headers={"location": "https://example.com/result"})
+        return handler(request)
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser._transport_for_settings", lambda _: httpx.MockTransport(redirect))
+    monkeypatch.setattr("oa_knowledge.parsers.mineru_parser.time.sleep", lambda _: None)
+    with pytest.raises(MineruResponseError, match="redirects"):
+        parse_with_mineru(_make_synthetic_pdf(tmp_path), Settings(mineru={"enabled": True}), tmp_path / "parse")
+
+
+def test_word_ocr_v4_keeps_terminal_text_when_last_page_empty(tmp_path):
+    import fitz, json
+    from oa_knowledge.parsers.libreoffice_parser import restore_terminal_text
+    doc = fitz.open(); page = doc.new_page()
+    page.insert_text((50,700), "Synthetic issuing authority printed on 2026-10-10")
+    pdf = tmp_path / "test.pdf"; doc.save(pdf); doc.close()
+    md = tmp_path / "markdown.md"; md.write_text("Main body")
+    middle = tmp_path / "middle_json.json"
+    middle.write_text(json.dumps({"pages": [{"page_idx": 0, "blocks": []}]}))
+    assert restore_terminal_text(pdf, md)
+    assert "2026-10-10" in md.read_text()
+    md.write_text("Main body")
+    middle.write_text(json.dumps({"pages": [{"page_idx": 0, "blocks": [{"content": [{"content": "Synthetic issuing authority already parsed"}]}]}]}))
+    assert not restore_terminal_text(pdf, md)
