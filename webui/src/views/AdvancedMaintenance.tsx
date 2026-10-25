@@ -57,6 +57,9 @@ const AUDIT_LABELS: Record<string, string> = {
   depth_limit_reached: "达到十层深度上限", access_failed: "OA 访问失败",
 }
 const AUDIT_REASON_LABELS: Record<string, string> = {
+  "inventory_only:online_counts:bytes_not_compared": "在线附件数量与标识核对；未重新比对文件内容",
+  "inventory_only:excluded_from_download": "已在线检查，按规则排除下载",
+  "inventory_only:attachment_identifiers_differ": "附件数量一致，标识仍需核实",
   exact_match: "附件身份与内容均一致",
   attachment_identity_changed: "附件标识发生变化，角色、大小与内容一致",
   attachment_role_changed: "附件角色发生变化，标识、大小与内容一致",
@@ -212,7 +215,7 @@ function OnlineVerificationView({ data, reload }: { data: OnlineAuditData | null
   }
   return <section>
     <div className="governance-hero">
-      <div><span className="eyebrow">OA 只读核验</span><h2>线上逐项一致性核验</h2><p>建议先在系统设置中执行“立即扫描已办”，同步完整线上清单。核验会重新读取线上附件，在内存中比对附件身份、大小和 SHA256；不覆盖本地原件。</p></div>
+      <div><span className="eyebrow">OA 只读核验</span><h2>线上逐项一致性核验</h2><p>{run?.verification_mode === "inventory" ? "逐条打开 OA 已办详情，核对附件数量与标识；缺失附件进入补下载队列。本轮不重新比对全部附件的字节内容。" : "建议先在系统设置中执行“立即扫描已办”，同步完整线上清单。核验会重新读取线上附件，在内存中比对附件身份、大小和 SHA256；不覆盖本地原件。"}</p></div>
       <div className="toolbar-actions">
         {!active && <button className="button-primary" onClick={() => void action("start")}><ShieldCheck size={16}/>启动逐项核验</button>}
         {run?.status === "paused" && <button onClick={() => void action("resume")}><RefreshCw size={16}/>继续核验</button>}
@@ -223,7 +226,7 @@ function OnlineVerificationView({ data, reload }: { data: OnlineAuditData | null
     <div className="metrics">
       <Metric label="核验状态" value={run ? (AUDIT_LABELS[run.status] || run.status) : "尚未运行"}/>
       <Metric label="总事项" value={run?.total_items || 0}/><Metric label="已核验" value={run?.completed_items || 0}/>
-      <Metric label="完全一致" value={run?.matched_items || 0}/><Metric label="待补下载" value={run?.missing_download_items || 0} bad={(run?.missing_download_items || 0) > 0}/>
+      <Metric label={run?.verification_mode === "inventory" ? "清单一致" : "完全一致"} value={run?.matched_items || 0}/><Metric label="待补下载" value={run?.missing_download_items || 0} bad={(run?.missing_download_items || 0) > 0}/>
       <Metric label="本地历史保留" value={run?.local_extra_items || 0}/><Metric label="待人工复核" value={reviewCount} bad={reviewCount > 0}/>
       <Metric label="访问失败" value={run?.access_failed_items || 0}/>
     </div>

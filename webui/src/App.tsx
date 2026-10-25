@@ -43,7 +43,7 @@ type ProcessingData = {
 type OnlineAuditData = {
   run: null | {
     id: number; status: string; total_items: number; completed_items: number
-    matched_items: number; mismatch_items: number; access_failed_items: number
+    matched_items: number; mismatch_items: number; access_failed_items: number; verification_mode?: "inventory" | "content"
     current_oa_item_key: string | null; missing_download_items: number
     local_extra_items: number; markdown_pending_items: number
   }
@@ -383,7 +383,7 @@ export function App() {
     <main className="workspace">
       <header className="topbar">
         <button className="icon-button menu-button" title="打开导航" aria-expanded={mobileNav} onClick={() => setMobileNav(!mobileNav)}><Menu size={19}/></button>
-        <div><h1>{NAV.find(item => item.id === view)?.label}</h1><p>{view === "overview" ? "待办通知、原件归档与 Markdown 交付的独立进展" : view === "settings" ? "本地处理、通知与输出设置" : "查看事项进展、结果和需要处理的问题"}</p></div>
+        <div><h1>{NAV.find(item => item.id === view)?.label}</h1><p>{view === "overview" ? "优先处理异常，查看在线核验、原件归档与交付进度" : view === "settings" ? "本地处理、通知与输出设置" : "查看事项进展、结果和需要处理的问题"}</p></div>
         <button className="icon-button refresh" title="刷新当前页面" onClick={() => void load()} disabled={loading}><RefreshCw size={18} className={loading ? "spin" : ""}/></button>
       </header>
       {error && <div className="error-banner" role="alert"><CircleAlert size={18}/><span>{error}</span><button title="关闭" onClick={() => setError("")}><X size={17}/></button></div>}

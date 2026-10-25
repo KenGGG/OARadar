@@ -38,10 +38,18 @@ class DirectAttachment:
     download_status: str = "discovered"
 
 
+def attachment_display_filename(value: str) -> str:
+    """Remove CAP4's display size badge, including legacy '(1M)' labels."""
+    value = unicodedata.normalize('NFKC', html.unescape(value)).strip()
+    return re.sub(r'\s*\(\s*\d+(?:\.\d+)?\s*(?:[KMGT](?:I?B)?|B)\s*\)\s*$', '', value, flags=re.I).strip()
+
+
+def attachment_filename_identity(value: str) -> str:
+    return ''.join(attachment_display_filename(value).split())
+
+
 def same_attachment_filename(first: str, second: str) -> bool:
-    def normalize(value):
-        return "".join(unicodedata.normalize("NFKC", html.unescape(value)).split())
-    first, second = normalize(first), normalize(second)
+    first, second = attachment_filename_identity(first), attachment_filename_identity(second)
     if first == second:
         return True
     for shortened, full in ((first, second), (second, first)):
@@ -83,13 +91,20 @@ def deduplicate_attachment_views(attachments) -> tuple[DirectAttachment, ...]:
             aliases = aliases[1:]
         for alias in aliases:
             candidates = [i for i, a in enumerate(canonical) if same_attachment_filename(a.filename, alias.filename)]
+            exact = [i for i in candidates if attachment_filename_identity(canonical[i].filename) == attachment_filename_identity(alias.filename)]
+            if exact:
+                candidates = exact
             if not candidates:
                 canonical.append(alias)
             elif len(candidates) == 1:
                 index = candidates[0]
                 current = canonical[index]
-                filename = alias.filename if "..." in unicodedata.normalize("NFKC", current.filename) and "..." not in unicodedata.normalize("NFKC", alias.filename) else current.filename
+                filename = attachment_display_filename(alias.filename) if "..." in unicodedata.normalize("NFKC", current.filename) and "..." not in unicodedata.normalize("NFKC", alias.filename) else attachment_display_filename(current.filename)
                 canonical[index] = replace(current, filename=filename, file_role=max((current.file_role, alias.file_role), key=lambda role: priority.get(role, 0)))
+            else:
+                # A display alias that matches multiple genuine OA IDs cannot
+                # safely be assigned by its bytes or a shortened label alone.
+                canonical.append(alias)
         result.extend(canonical)
     return tuple(result)
 
@@ -174,9 +189,27 @@ class CollaborationDetailAdapter:
     def _browser_download_payload(self, page: Page, trigger, timeout_ms: int) -> bytes | None:
         self._last_download_failure = None
         try:
-            with page.expect_download(timeout=timeout_ms) as download_info:
+            with page.expect_download(timeout=min(timeout_ms, 30_000)) as download_info:
                 trigger()
             download = download_info.value
+            # failure() and path() wait for completion without a timeout. Local
+            # Chromium uses a .crdownload file until it renames the finished
+            # file to the artifact path. Poll while pumping browser events,
+            # then consult Playwright's completion result before reading bytes.
+            artifact = getattr(getattr(download, '_impl_obj', None), '_artifact', None)
+            artifact_path = getattr(artifact, 'absolute_path', None)
+            if not artifact_path:
+                download.cancel()
+                self._last_download_failure = 'download completion path unavailable'
+                return None
+            path = Path(artifact_path)
+            deadline = monotonic() + timeout_ms / 1000
+            while not path.is_file() or Path(str(path) + '.crdownload').exists():
+                if monotonic() >= deadline:
+                    download.cancel()
+                    self._last_download_failure = 'download completion timed out'
+                    return None
+                page.wait_for_timeout(100)
             self._last_download_failure = download.failure()
             payload = self._completed_download_payload(download)
             if payload is None and self._last_download_failure is None:
@@ -191,7 +224,7 @@ class CollaborationDetailAdapter:
         """Remove CAP4's display-only size suffix and identify plain 0-byte labels."""
         raw = value.strip()
         zero_byte_label = bool(re.search(r"\(\s*0\s*B\s*\)\s*$", raw, re.IGNORECASE))
-        filename = re.sub(r"\s*\(\s*\d+(?:\.\d+)?\s*(?:B|KB|MB|GB)\s*\)\s*$", "", raw, flags=re.IGNORECASE).strip()
+        filename = attachment_display_filename(raw)
         return filename or raw, zero_byte_label
 
     @classmethod
@@ -659,7 +692,7 @@ class CollaborationDetailAdapter:
                         download_status="downloaded" if content is not None else "known_download_failed",
                     ))
                     continue
-                absolute = page.url.split("/seeyon/")[0] + file_url if file_url.startswith("/seeyon/") else file_url
+                absolute = urljoin(getattr(frame, 'url', None) or page.url, file_url)
                 content = None
                 content_type = ""
                 candidates = frame.locator("a[_temp]")
@@ -668,7 +701,10 @@ class CollaborationDetailAdapter:
                     if candidate.get_attribute("_temp") == file_url:
                         content = self._browser_download_payload(
                             page,
-                            lambda: candidate.evaluate("node => node.click()"),
+                            # Legacy onclick code may perform synchronous I/O.
+                            # Return from evaluate before invoking it so the
+                            # download event timeout can still take effect.
+                            lambda: candidate.evaluate("node => { setTimeout(() => node.click(), 0); }"),
                             download_timeout_seconds * 1000,
                         )
                         break
@@ -680,18 +716,24 @@ class CollaborationDetailAdapter:
                                 absolute, timeout=download_timeout_seconds * 1000
                             )
                             break
-                        except PlaywrightError:
+                        except PlaywrightError as exc:
+                            self._last_download_failure = f'{type(exc).__name__}: {exc}'
                             continue
                     try:
                         content = response.body() if response is not None and response.ok else None
                     except PlaywrightError:
                         content = None
                     content_type = self._response_content_type(response)
+                    if response is not None and not response.ok:
+                        self._last_download_failure = f'attachment API returned HTTP {response.status}'
                     if content is not None and (
                         "text/html" in content_type
                         or content.lstrip().lower().startswith((b"<!doctype", b"<html"))
                     ):
+                        self._last_download_failure = 'attachment API returned HTML instead of attachment'
                         content = None
+                    if content == b'':
+                        self._last_download_failure = 'attachment API returned an empty body'
                 if content is None and Path(filename).suffix.lower() in {".htm", ".html"}:
                     try:
                         content = frame.content().encode("utf-8")

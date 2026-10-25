@@ -27,7 +27,7 @@ FORBIDDEN_PARTS = {
     "runtime",
     "vault",
 }
-FORBIDDEN_NAMES = {"config.yaml", "Cookies"}
+FORBIDDEN_NAMES = {"config.yaml", "Cookies", "Login Data", "Login Data-journal", "Local State"}
 FORBIDDEN_SUFFIXES = {
     ".db",
     ".db-shm",
@@ -83,6 +83,7 @@ def _forbidden_path(relative: str) -> bool:
     path = Path(relative)
     return (
         bool(FORBIDDEN_PARTS.intersection(path.parts))
+        or any(part.startswith("browser-profile") for part in path.parts)
         or path.name in FORBIDDEN_NAMES
         or any(path.name.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES)
     )

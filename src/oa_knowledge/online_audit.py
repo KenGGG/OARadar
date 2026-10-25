@@ -29,6 +29,35 @@ class AuditObservation:
     online_content_sha256: str | None = None
     depth_limit_reached: bool = False
     attachment_evidence: tuple[AttachmentEvidence, ...] | None = None
+    inventory_only: bool = False
+
+
+def observe_inventory_capture(capture) -> AuditObservation:
+    """Count actual UI entries without fetching file bodies or hashing local bytes."""
+    from oa_knowledge.collector.detail import attachment_filename_identity, same_attachment_filename
+    if any(issue.get('kind') not in {'depth_limit_reached'} for issue in capture.capture_issues):
+        raise ValueError('Online attachment inventory is incomplete; item needs verification')
+    evidence = {}
+    containers = [capture.attachments] + [c.attachments for c in capture.related_containers]
+    for attachments in containers:
+        real = [a for a in attachments if not a.attachment_key.startswith(('cap4-widget:', 'cap4:'))]
+        for attachment in attachments:
+            if attachment.file_role not in ATTACHMENT_ROLES:
+                continue
+            key = attachment.attachment_key
+            if key.startswith(('cap4-widget:', 'cap4:')):
+                matches = [a for a in real if same_attachment_filename(a.filename, attachment.filename)]
+                exact = [a for a in matches if attachment_filename_identity(a.filename) == attachment_filename_identity(attachment.filename)]
+                matches = exact or matches
+                if len(matches) > 1:
+                    raise ValueError('Online attachment identity is ambiguous; manual verification required')
+                if len(matches) == 1:
+                    key = matches[0].attachment_key
+            evidence.setdefault(key, (attachment.file_role, key, None, None))
+    depth = any(c.has_unvisited_children for c in capture.related_containers) or any(
+        issue.get('kind') == 'depth_limit_reached' for issue in capture.capture_issues)
+    return AuditObservation(len(evidence), depth_limit_reached=depth,
+                            attachment_evidence=tuple(evidence.values()), inventory_only=True)
 
 
 def _sorted_evidence(rows: list[AttachmentEvidence] | tuple[AttachmentEvidence, ...]) -> list[AttachmentEvidence]:
@@ -202,7 +231,7 @@ def _sanitize_error(exc: Exception) -> str:
     return text
 
 
-def start_audit(settings: Settings) -> dict:
+def start_audit(settings: Settings, *, inventory_only: bool = False) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
@@ -210,6 +239,8 @@ def start_audit(settings: Settings) -> dict:
             if active:
                 active_job = session.get(OperationJob, active.job_id) if active.job_id else None
                 if active_job is not None and active_job.status in {"queued", "running", "paused"}:
+                    if bool(json.loads(active_job.parameters_json or '{}').get('inventory_only')) != inventory_only:
+                        raise ValueError('An existing online audit uses a different verification mode')
                     return {"run_id": active.id, "status": active.status, "total_items": active.total_items, "created": False}
                 active.status = "failed"
                 active.finished_at = datetime.now(timezone.utc)
@@ -222,7 +253,7 @@ def start_audit(settings: Settings) -> dict:
                 session.flush()
             manifests = session.scalars(select(OAManifestItem).order_by(OAManifestItem.id)).all()
             job = OperationJob(job_key=f"online-audit-{uuid4().hex[:12]}", job_type="online_audit", status="queued",
-                               idempotency_key=f"online-audit-{uuid4().hex}", parameters_json="{}", progress_total=len(manifests))
+                               idempotency_key=f"online-audit-{uuid4().hex}", parameters_json=json.dumps({'inventory_only': inventory_only}), progress_total=len(manifests))
             job.events.append(OperationEvent(sequence=1, event_type="created", status="queued", details_json=json.dumps({"target_count": len(manifests)})))
             session.add(job); session.flush()
             run = OnlineAuditRun(job_id=job.id, status="queued", total_items=len(manifests))
@@ -255,9 +286,11 @@ def resume_audit(settings: Settings, run_id: int) -> dict:
     try:
         with Session(engine) as session:
             run = session.get(OnlineAuditRun, run_id)
-            if not run or run.status not in {"paused", "pause_requested"}: raise ValueError("audit is not paused")
-            run.status = "queued"; run.pause_requested_at = None
+            if not run or run.status not in {"paused", "pause_requested", "failed"}: raise ValueError("audit cannot be resumed in its current state")
             job = session.get(OperationJob, run.job_id) if run.job_id else None
+            if job is None or job.status == "running":
+                raise ValueError("audit worker must be stopped before resuming")
+            run.status = "queued"; run.pause_requested_at = None; run.finished_at = None
             if job: job.status = "queued"; job.finished_at = None; job.lease_owner = None; job.lease_expires_at = None
             _event(session, run.id, "audit_resumed", "在线审计已继续")
             session.commit(); return {"run_id": run.id, "status": run.status}
@@ -397,6 +430,9 @@ def enroll_new_manifest_items(session: Session, run: OnlineAuditRun) -> int:
 def _enqueue_missing_download(session: Session, run: OnlineAuditRun, item: OnlineAuditItem) -> bool:
     """Queue a read-only recapture without overwriting mismatch evidence."""
     if not item.workitem_id_text:
+        return False
+    manifest = session.get(OAManifestItem, item.manifest_item_id) if item.manifest_item_id else None
+    if manifest and (manifest.processing_status == 'skipped' or manifest.matched_exclusion_keyword):
         return False
     digest = hashlib.sha256(f"{run.id}:{item.oa_item_key}".encode()).hexdigest()[:24]
     key = f"online-audit:{run.id}:{digest}:supplement-v1"
@@ -571,6 +607,7 @@ def execute_audit(
                 OnlineAuditItem.online_evidence_json.is_not(None),
                 OnlineAuditItem.local_evidence_json.is_not(None),
                 OnlineAuditItem.comparison_reason.is_not(None),
+                ~OnlineAuditItem.comparison_reason.like('inventory_only:%'),
             )).all()
             for item in candidates:
                 repaired_evidence += int(_repair_item_from_persisted_evidence(item))
@@ -625,7 +662,34 @@ def execute_audit(
                         explain_evidence_difference(online_evidence, local_evidence)
                         if online_evidence is not None else "evidence_unavailable"
                     )
-                    if observation.online_inventory_sha256 is None:
+                    if observation.inventory_only:
+                        # Count actual verified records, never collapse them by
+                        # their hash: that would hide duplicate local downloads.
+                        oa = session.scalar(select(OAItem).where(OAItem.oa_item_key == item.oa_item_key))
+                        verified = list(session.scalars(select(ArchivedFile).where(
+                            ArchivedFile.oa_item_id == oa.id,
+                            ArchivedFile.file_role.in_(ATTACHMENT_ROLES),
+                            ArchivedFile.download_status == 'verified',
+                        ))) if oa else []
+                        item.downloaded_attachments = sum(bool(f.local_relpath and (settings.data_root / f.local_relpath).is_file()) for f in verified)
+                        manifest = session.get(OAManifestItem, item.manifest_item_id) if item.manifest_item_id else None
+                        item.comparison_reason = 'inventory_only:online_counts'
+                        if observation.depth_limit_reached:
+                            item.status = 'depth_limit_reached'
+                        elif manifest and (manifest.processing_status == 'skipped' or manifest.matched_exclusion_keyword):
+                            item.status = 'content_unverified'
+                            item.comparison_reason = 'inventory_only:excluded_from_download'
+                        elif observation.attachment_evidence is None:
+                            item.status = 'content_unverified'
+                        else:
+                            item.status = classify_attachment_counts(item.recognized_attachments, item.database_attachments, item.downloaded_attachments, item.markdown_attachments)
+                            item.comparison_reason += ':bytes_not_compared'
+                            online_ids = {row[1] for row in observation.attachment_evidence}
+                            local_ids = {f.attachment_key for f in verified if f.local_relpath and (settings.data_root / f.local_relpath).is_file()}
+                            if item.status == 'matched' and online_ids != local_ids:
+                                item.status = 'inventory_mismatch'
+                                item.comparison_reason = 'inventory_only:attachment_identifiers_differ'
+                    elif observation.online_inventory_sha256 is None:
                         item.status = classify_attachment_counts(
                             item.recognized_attachments, item.database_attachments,
                             item.downloaded_attachments, item.markdown_attachments,
@@ -739,7 +803,7 @@ def execute_audit(
     finally: engine.dispose()
 
 
-def audit_view(settings: Settings, run_id: int | None = None, *, item_page: int = 1, item_page_size: int = 50) -> dict:
+def audit_view(settings: Settings, run_id: int | None = None, *, item_page: int = 1, item_page_size: int = 50, item_filter: str = "all", include_related: bool = True) -> dict:
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
@@ -747,10 +811,23 @@ def audit_view(settings: Settings, run_id: int | None = None, *, item_page: int 
             if not run:
                 from oa_knowledge.markdown_queue import queue_view
                 from oa_knowledge.web.status import archive_date_status
-                return {"run": None, "items": [], "events": [], "errors": [], "comparison_reasons": {}, "markdown_queue": queue_view(settings), "archive_dates": archive_date_status(settings), "item_pagination": {"page": item_page, "page_size": item_page_size, "total": 0, "pages": 0}}
-            item_total = session.scalar(select(func.count()).select_from(OnlineAuditItem).where(OnlineAuditItem.run_id == run.id)) or 0
+                return {"run": None, "items": [], "events": [], "errors": [], "comparison_reasons": {}, "markdown_queue": queue_view(settings) if include_related else None, "archive_dates": archive_date_status(settings) if include_related else None, "item_pagination": {"page": item_page, "page_size": item_page_size, "total": 0, "pages": 0}}
+            predicates = [OnlineAuditItem.run_id == run.id]
+            if item_filter == "review":
+                predicates.extend([
+                    OnlineAuditItem.status.in_(("inventory_mismatch", "content_mismatch", "content_unverified", "depth_limit_reached")),
+                    func.coalesce(OnlineAuditItem.comparison_reason, "") != "inventory_only:excluded_from_download",
+                ])
+            elif item_filter in {"access_failed", "missing_download", "historical_retained"}:
+                predicates.append(OnlineAuditItem.status == item_filter)
+            elif item_filter != "all":
+                raise ValueError("Unknown audit item filter")
+            item_total = session.scalar(select(func.count()).select_from(OnlineAuditItem).where(*predicates)) or 0
             page_count = (item_total + item_page_size - 1) // item_page_size
-            items = session.scalars(select(OnlineAuditItem).where(OnlineAuditItem.run_id == run.id).order_by(OnlineAuditItem.id).offset((item_page - 1) * item_page_size).limit(item_page_size)).all()
+            items = session.scalars(select(OnlineAuditItem).where(*predicates).order_by(OnlineAuditItem.id).offset((item_page - 1) * item_page_size).limit(item_page_size)).all()
+            archive_ids = dict(session.execute(select(OAItem.oa_item_key, OAItem.id).where(OAItem.oa_item_key.in_([row.oa_item_key for row in items]))).all())
+            status_counts = dict(session.execute(select(OnlineAuditItem.status, func.count()).where(OnlineAuditItem.run_id == run.id).group_by(OnlineAuditItem.status)).all())
+            excluded_count = session.scalar(select(func.count()).select_from(OnlineAuditItem).where(OnlineAuditItem.run_id == run.id, OnlineAuditItem.comparison_reason == "inventory_only:excluded_from_download")) or 0
             events = session.scalars(select(OnlineAuditEvent).where(OnlineAuditEvent.run_id == run.id).order_by(OnlineAuditEvent.sequence.desc()).limit(200)).all()
             error_rows = session.execute(select(OnlineAuditItem.error_code, func.count()).where(OnlineAuditItem.run_id == run.id, OnlineAuditItem.error_code.is_not(None)).group_by(OnlineAuditItem.error_code)).all()
             reason_rows = session.execute(
@@ -763,12 +840,16 @@ def audit_view(settings: Settings, run_id: int | None = None, *, item_page: int 
             markdown_pending_items = session.scalar(select(func.count()).select_from(OnlineAuditItem).where(OnlineAuditItem.run_id == run.id, OnlineAuditItem.downloaded_attachments > OnlineAuditItem.markdown_attachments, OnlineAuditItem.status != "pending")) or 0
             from oa_knowledge.markdown_queue import queue_view
             from oa_knowledge.web.status import archive_date_status
+            operation = session.get(OperationJob, run.job_id) if run.job_id else None
+            inventory_mode = bool(operation and json.loads(operation.parameters_json or '{}').get('inventory_only'))
             return {"run": {**{key: getattr(run, key) for key in ("id", "status", "total_items", "completed_items", "matched_items", "mismatch_items", "access_failed_items", "current_oa_item_key")},
+                    "verification_mode": "inventory" if inventory_mode else "content",
                     "missing_download_items": missing_download_items, "local_extra_items": local_extra_items, "markdown_pending_items": markdown_pending_items,
                     "started_at": run.started_at.isoformat() if run.started_at else None, "finished_at": run.finished_at.isoformat() if run.finished_at else None},
-                "items": [{key: getattr(row, key) for key in ("id", "oa_item_key", "title", "status", "recognized_attachments", "database_attachments", "downloaded_attachments", "markdown_attachments", "online_inventory_sha256", "local_inventory_sha256", "online_content_sha256", "local_content_sha256", "comparison_reason", "depth_limit_reached", "error_code", "error_detail", "elapsed_seconds")} for row in items],
+                "status_counts": status_counts, "excluded_items": excluded_count,
+                "items": [{"archive_item_id": archive_ids.get(row.oa_item_key), **{key: getattr(row, key) for key in ("id", "oa_item_key", "title", "status", "recognized_attachments", "database_attachments", "downloaded_attachments", "markdown_attachments", "online_inventory_sha256", "local_inventory_sha256", "online_content_sha256", "local_content_sha256", "comparison_reason", "depth_limit_reached", "error_code", "error_detail", "elapsed_seconds")}} for row in items],
                 "events": [{"sequence": row.sequence, "event_type": row.event_type, "level": row.level, "message": row.message, "details": json.loads(row.details_json), "created_at": row.created_at.isoformat() if row.created_at else None} for row in events],
                 "errors": [{"error_code": code, "count": count} for code, count in error_rows],
                 "comparison_reasons": {reason: count for reason, count in reason_rows},
-                "markdown_queue": queue_view(settings), "archive_dates": archive_date_status(settings), "item_pagination": {"page": item_page, "page_size": item_page_size, "total": item_total, "pages": page_count}}
+                "markdown_queue": queue_view(settings) if include_related else None, "archive_dates": archive_date_status(settings) if include_related else None, "item_pagination": {"page": item_page, "page_size": item_page_size, "total": item_total, "pages": page_count}}
     finally: engine.dispose()

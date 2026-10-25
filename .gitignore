@@ -4,6 +4,7 @@
 .uv-cache/
 __pycache__/
 .pytest_cache/
+.test-tmp*/
 .coverage
 .ruff_cache/
 *.py[cod]
@@ -36,6 +37,10 @@ oa.html
 !.env.example
 config.yaml
 browser-profile/
+browser-profile*/
+**/Login Data
+**/Login Data-journal
+**/Local State
 runtime/
 logs/
 codebuddy/

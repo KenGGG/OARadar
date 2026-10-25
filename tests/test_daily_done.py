@@ -81,14 +81,22 @@ def test_successful_new_items_are_handed_off_without_requeueing_old_backlog_or_e
     with Session(runner.engine)as db:assert db.scalar(select(func.count()).select_from(PipelineTask))==1
 
 
-def test_auth_expiry_keeps_checkpoint_and_does_not_retry_passwords(runner,monkeypatch):
+@pytest.mark.parametrize('phase', ['inventory', 'download'])
+def test_auth_failure_retries_saved_login_daily_and_keeps_checkpoint(runner,monkeypatch,phase):
     identity=job(runner,'done_inventory','auth_required',heartbeat_at=NOW)
-    runner.state=dict(run_date=NOW.date().isoformat(),phase='inventory',inventory_job_id=identity)
+    runner.state=dict(run_date=NOW.date().isoformat(),phase=phase,**{phase+'_job_id':identity})
     called=[];monkeypatch.setattr('oa_knowledge.daily_done.control_collection',lambda *args:called.append(args))
-    assert runner.tick(now=NOW)['status']=='auth_required'
-    runner.tick(now=NOW+timedelta(days=1));assert not called
+    assert runner.tick(now=NOW)['status']==('syncing' if phase=='inventory' else 'downloading')
+    assert called==[(runner.settings,identity,'resume')]
+    assert runner.tick(now=NOW+timedelta(minutes=1))['status']=='auth_required'
+    assert len(called)==1
+    # The retry marker survives restarting the coordinator.
+    runner.state=json.loads(runner.path.read_text(encoding='utf8'))
+    runner.tick(now=NOW+timedelta(minutes=2));assert len(called)==1
+    runner.tick(now=NOW+timedelta(days=1));assert len(called)==2
     job(runner,'done_login','completed',finished_at=NOW+timedelta(minutes=1))
-    runner.tick(now=NOW+timedelta(minutes=2));assert called[0][1:]==(identity,'resume')
+    runner.tick(now=NOW+timedelta(days=1,minutes=2));assert len(called)==3
+    assert runner.state[phase+'_job_id']==identity
 
 
 def test_new_attachment_on_existing_item_is_handed_off(runner):

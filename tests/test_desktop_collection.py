@@ -7,6 +7,22 @@ from oa_knowledge.config import load_settings
 from oa_knowledge.desktop_collection import desktop_owner, reserve_desktop
 
 
+def test_desktop_download_releases_profile_and_uses_watchdog(monkeypatch):
+    from oa_knowledge.desktop_collection import run_desktop_download
+    events = []
+    worker = SimpleNamespace()
+    browser = SimpleNamespace(__exit__=lambda *args: events.append('closed'))
+    def download(actual_worker, job_id):
+        assert actual_worker is worker and job_id == 123
+        events.append('watchdog')
+    monkeypatch.setattr('oa_knowledge.done_collection.run_download', download)
+    run_desktop_download(worker, 123, browser)
+    assert events == ['closed', 'watchdog']
+    events.clear()
+    run_desktop_download(worker, 123)
+    assert events == ['watchdog']
+
+
 def test_reservation_requires_live_recent_desktop(config_file, monkeypatch):
     import oa_knowledge.desktop_collection as module
     settings = load_settings(config_file)

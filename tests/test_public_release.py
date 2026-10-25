@@ -43,6 +43,8 @@ def test_public_private_git_boundary() -> None:
         ".playwright-cli/page.yml",
         ".claude/settings.local.json",
         "runtime/browser-profile/Cookies",
+        "browser-profile-desktop/Default/Login Data",
+        "browser-profile-recovery/Local State",
         "deploy/systemd/local.service",
         "webui/tsconfig.app.tsbuildinfo",
         "src/oa_knowledge/__pycache__/module.pyc",
@@ -92,6 +94,7 @@ def test_release_scanner_rejects_forbidden_paths(tmp_path: Path) -> None:
         tmp_path / "runtime.log",
         tmp_path / "private" / "report.md",
         tmp_path / "browser-profile" / "Cookies",
+        tmp_path / "browser-profile-desktop" / "Default" / "Login Data",
     ]
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +107,7 @@ def test_release_scanner_rejects_forbidden_paths(tmp_path: Path) -> None:
         ("runtime.log", "forbidden_path"),
         ("private/report.md", "forbidden_path"),
         ("browser-profile/Cookies", "forbidden_path"),
+        ("browser-profile-desktop/Default/Login Data", "forbidden_path"),
     }
 
 

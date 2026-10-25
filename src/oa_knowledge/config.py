@@ -129,6 +129,8 @@ class ParserConfig(StrictModel):
 
 class MineruConfig(StrictModel):
     enabled: bool = False
+    on_demand: bool = False
+    startup_timeout_seconds: float = Field(default=180.0, gt=0, le=900)
     api_url: str = "http://127.0.0.1:58000"
     connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     read_timeout_seconds: float = Field(default=1800.0, gt=0, le=7200)

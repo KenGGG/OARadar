@@ -4,7 +4,7 @@ import { api, postApi } from "../App"
 type Job = { id: number; status: string; current: number; total: number | null;
   pause_requested: boolean; last_error: string | null; active_item: string | null; failed: number; deferred?: number }
 type State = { inventory: Job | null; download: Job | null; login: Job | null; review: Job | null;
-  inventory_complete: boolean; connection_configured: boolean; credentials_saved: boolean;
+  inventory_complete: boolean; connection_configured: boolean; credential_storage: string;
   suggestions: { keyword: string; count: number; examples: string[] }[] }
 const LABELS: Record<string, string> = { queued: "等待执行", running: "执行中", paused: "已暂停",
   auth_required: "需要登录", completed: "已完成", failed: "需要重试" }
@@ -15,8 +15,6 @@ export function DoneCollectionPanel({ refresh }: { refresh: () => Promise<void> 
   const [error, setError] = useState("")
   const [message, setMessage] = useState("")
   const [busy, setBusy] = useState(false)
-  const [username, setUsername] = useState("")
-  const [password, setPassword] = useState("")
   useEffect(() => {
     let live = true
     const poll = async () => {
@@ -61,17 +59,6 @@ export function DoneCollectionPanel({ refresh }: { refresh: () => Promise<void> 
     {taskRow(state?.inventory || null, "清单同步", "done_inventory")}
     {taskRow(state?.download || null, "原件下载", "done_download", !state?.inventory_complete)}
     <div className="collection-options">
-      <form className="collection-browser-login" onSubmit={event => {
-        event.preventDefault()
-        void action('/api/done-collection/credentials', { username, password }, '已保存到本机 Windows 凭据管理器，自动同步将使用此账号。').then(() => setPassword(''))
-      }}>
-        <strong>本机自动登录</strong>
-        <span role="status">{state?.credentials_saved ? '自动登录凭据已保存' : '尚未保存自动登录凭据'}</span>
-        <label>OA 用户名 <input name="oa-username" autoComplete="username" value={username} onChange={event => setUsername(event.target.value)} required /></label>
-        <label>OA 密码 <input name="oa-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required /></label>
-        <button disabled={busy || !username.trim() || !password}>保存自动登录账号</button>
-        <p className="collection-note">账号密码仅保存在当前 Windows 用户的本机凭据管理器中。Chrome 的“保存密码”与这里是独立的；更改 OA 密码后请在此更新。</p>
-      </form>
       <div className="collection-browser-login">
         <button type="button" disabled={busy || running || !state?.connection_configured} onClick={() => void runJob(state?.login || null, "done_login")}>打开浏览器登录</button>
         <span role="status">{state?.login ? state.login.status === "completed" ? "上次登录成功" : LABELS[state.login.status] : "尚未检查登录"}</span>

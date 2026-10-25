@@ -68,6 +68,9 @@ def _health_payload(settings: Settings, *, attempts: int = 1) -> dict:
 def mineru_available(settings: Settings) -> bool:
     if not settings.mineru.enabled:
         return False
+    if settings.mineru.on_demand:
+        from .mineru_runtime import python_path
+        return python_path().is_file()
     try:
         _health_payload(settings)
     except MineruResponseError:
@@ -77,6 +80,9 @@ def mineru_available(settings: Settings) -> bool:
 
 def mineru_engine_version(settings: Settings) -> str:
     """Return the local MinerU protocol/version used in a parse cache identity."""
+    if settings.mineru.on_demand:
+        from .mineru_runtime import installed_version
+        return installed_version()
     health = _health_payload(settings)
     return str(health.get("version") or "api-v1")
 
@@ -226,6 +232,18 @@ def parse_with_mineru(
     profile_version: str = "legacy",
     parse_method: str = "auto",
 ) -> ParseResult:
+    from .mineru_runtime import runtime
+    if not settings.mineru.enabled:
+        raise RuntimeError("MinerU is not enabled in configuration")
+    if not Path(file_path).is_file():
+        raise FileNotFoundError(file_path)
+    with runtime(settings):
+        return _parse_with_running_mineru(file_path, settings, output_dir,
+            profile_version=profile_version, parse_method=parse_method)
+
+
+def _parse_with_running_mineru(file_path, settings, output_dir=None, *,
+                              profile_version="legacy", parse_method="auto") -> ParseResult:
     if not settings.mineru.enabled:
         raise RuntimeError("MinerU is not enabled in configuration")
     file_path = Path(file_path)

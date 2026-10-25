@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+import os
 import time
 from urllib.parse import urlsplit
 
@@ -10,7 +11,6 @@ from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwrigh
 
 from oa_knowledge.config import Settings
 from oa_knowledge.collector.credentials import load_chrome_saved_credential
-from oa_knowledge.collector.windows_credentials import load_credential
 
 
 class LoginState(StrEnum):
@@ -40,7 +40,7 @@ class BrowserSession:
             # Chrome suppresses password-manager autofill when it detects the
             # automation switch. Playwright still controls the browser through
             # DevTools without this visible command-line marker.
-            ignore_default_args=["--enable-automation"],
+            ignore_default_args=["--enable-automation", "--password-store=basic", "--use-mock-keychain"],
             args=browser_args,
             ignore_https_errors=self.settings.browser.ignore_https_errors,
             accept_downloads=True,
@@ -92,7 +92,15 @@ class BrowserSession:
             self.page.wait_for_timeout(250)
             state = self.login_state()
         if state == LoginState.AUTH_REQUIRED:
-            self._submit_saved_credentials()
+            submitted = self._submit_saved_credentials()
+            if not submitted and not self.headed and os.name == 'nt':
+                # Chrome's Windows password manager may require a desktop
+                # window. Reopen the same persistent profile, never a temporary
+                # profile or a separate system credential store.
+                self.__exit__()
+                self.headed = True
+                self.__enter__()
+                return self.login_with_saved_credentials(wait_seconds)
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
             state = self.login_state()
@@ -113,13 +121,6 @@ class BrowserSession:
         # Never send a stored credential to a redirected, unrelated origin.
         if urlsplit(self.page.url)[:2] != urlsplit(self.base_url)[:2]:
             return False
-        credential = load_credential(self.base_url)
-        if credential:
-            username.fill(credential.username)
-            password.fill(credential.password)
-            button.click()
-            return True
-
         # Autofill is asynchronous and sometimes starts only after the login
         # control receives a real focus/click sequence.
         username.click()

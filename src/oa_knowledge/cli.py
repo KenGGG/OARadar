@@ -802,7 +802,7 @@ def manifest_run(
                         else:
                             row.processing_status = "download_failed"; row.retry_count += 1
                             row.no_attachment_confirmed = False
-                            row.last_error = proxy.last_error or _attachment_failure_summary(capture); row.failure_stage = "attachment"
+                            row.last_error = _attachment_failure_summary(capture); row.failure_stage = "attachment"
                         session.commit()
                 except AuthRequiredError as exc:
                     # OA sessions can expire during a long full scan.  Restore
@@ -970,6 +970,10 @@ def manifest_download(
                     query = query.where(OAManifestItem.last_error.like("%attachment verification failed%"))
                 if attempted_ids:
                     query = query.where(OAManifestItem.id.not_in(attempted_ids))
+                if collection_keys is not None:
+                    # A repeatedly stalled early row must not starve older
+                    # failures whenever the same collection is resumed.
+                    query = query.order_by(OAManifestItem.last_retry_at.asc())
                 row = session.scalar(query.order_by(
                     OAManifestItem.list_ordinal.asc(), OAManifestItem.id.asc(),
                 ).limit(1))
@@ -1069,7 +1073,7 @@ def manifest_download(
                         row.processing_status = "download_failed"
                         row.no_attachment_confirmed = False
                         row.retry_count += 1
-                        row.last_error = proxy.last_error or _attachment_failure_summary(capture)
+                        row.last_error = _attachment_failure_summary(capture)
                         row.failure_stage = "attachment"
                     if done_identifiers and done_identifiers.affair_id_text:
                         candidate = session.scalar(select(ItemOccurrence.id).where(
@@ -2153,7 +2157,7 @@ def is_systemic_browser_closed(exc: Exception) -> bool:
 
 def _attachment_failure_summary(capture) -> str:
     failures = [
-        str(issue.get("error")) for issue in capture.capture_issues
+        _sanitize_operational_error(RuntimeError(str(issue.get("error")))) for issue in capture.capture_issues
         if issue.get("kind") == "attachment_download_failed" and issue.get("error")
     ]
     return "; ".join(dict.fromkeys(failures))[:1000] or "attachment verification failed"

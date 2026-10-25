@@ -97,6 +97,8 @@ feishu:
   retry_attempts: 3
 
 mineru:
+  on_demand: false # true: start local .mineru only during each parse
+  startup_timeout_seconds: 180
   tier: standard
   enabled: false
   api_url: http://127.0.0.1:58000

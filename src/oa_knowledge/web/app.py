@@ -163,15 +163,7 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
 
     @app.post("/api/done-collection/credentials")
     def post_oa_credentials(payload: OACredentialRequest) -> dict:
-        from oa_knowledge.collector.windows_credentials import save_credential
-        try:
-            current = current_collection_settings()
-            if ".invalid" in current.browser.base_url:
-                raise ValueError("请在项目 .env 中填写 OA_BASE_URL")
-            save_credential(current.browser.base_url, payload.username, payload.password)
-            return {"saved": True}
-        except ValueError as exc:
-            raise HTTPException(400, detail=str(exc)) from exc
+        raise HTTPException(410, detail="请点击打开浏览器登录，在 OA 登录页输入账号密码并由浏览器保存")
 
     @app.post("/api/done-collection/start", status_code=202)
     def post_done_collection(payload: DoneCollectionRequest) -> dict:
@@ -246,12 +238,15 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
             raise HTTPException(status_code=401, detail="invalid bootstrap token")
         request.session["authenticated"] = True
 
+    @app.get("/api/overview/online-audit")
     @app.get("/api/audits/online")
     def get_online_audit(
         item_page: int = Query(1, ge=1),
         item_page_size: int = Query(50, ge=10, le=200),
+        item_filter: str = Query("all", pattern="^(all|review|access_failed|missing_download|historical_retained)$"),
     ) -> dict:
-        return audit_view(settings, item_page=item_page, item_page_size=item_page_size)
+        from oa_knowledge.online_audit import audit_view
+        return audit_view(settings, item_page=item_page, item_page_size=item_page_size, item_filter=item_filter, include_related=False)
 
     @app.post("/api/audits/online", status_code=202)
     def post_online_audit() -> dict:
@@ -264,8 +259,10 @@ def create_web_app(settings: Settings, config_path: Path | None = None) -> FastA
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/overview/online-audit/{run_id}/resume")
     @app.post("/api/audits/online/{run_id}/resume")
     def post_online_audit_resume(run_id: int) -> dict:
+        from oa_knowledge.online_audit import resume_audit
         try:
             return resume_audit(settings, run_id)
         except ValueError as exc:

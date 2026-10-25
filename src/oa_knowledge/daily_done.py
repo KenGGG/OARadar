@@ -148,11 +148,20 @@ class DailyDoneRunner:
                 with Session(self.engine)as db:
                     login=db.scalar(select(OperationJob).where(OperationJob.job_type=='done_login',OperationJob.status=='completed').order_by(OperationJob.id.desc()))
                     after=bool(login and login.finished_at and job['auth_since']and login.finished_at>job['auth_since'])
-                if after:
-                    control_collection(self.settings,job['id'],'resume')
+                # Resume through the normal collection path, which already
+                # logs in using locally saved credentials. Never leave a
+                # transient login failure blocking every future daily run.
+                retry_due = self.state.get('auth_retry_date') != date
+                if after or retry_due:
+                    try:
+                        control_collection(self.settings,job['id'],'resume')
+                    except ValueError:
+                        self.state.update(status='waiting',last_error='等待当前 OA 操作结束后自动恢复登录')
+                        return self._save(now)
+                    self.state['auth_retry_date'] = date
                     self.state.update(status='syncing'if phase=='inventory'else'downloading',last_error=None)
                 else:
-                    self.state.update(status='auth_required',last_error='OA 登录已过期，请在本机完成登录；同步断点保留')
+                    self.state.update(status='auth_required',last_error='使用本机保存的凭据自动登录未成功；同步断点保留，将于次日自动重试，也可在本机登录后继续')
                     return self._save(now)
             elif job['status']=='paused':
                 self.state.update(status='paused',last_error='同步任务已暂停，等待继续');return self._save(now)

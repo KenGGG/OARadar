@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import PurePosixPath
@@ -11,7 +12,7 @@ from sqlalchemy.orm import Session
 from oa_knowledge.archive import atomic_write_bytes, inspect_file, safe_filename, sha256_file
 from oa_knowledge.archive.manifest import ContainerManifest, FileManifest, ItemManifest
 from oa_knowledge.archive_paths import done_archive_collision_directory, done_archive_directory
-from oa_knowledge.collector.detail import DetailCapture, deduplicate_attachment_views
+from oa_knowledge.collector.detail import DetailCapture, deduplicate_attachment_views, same_attachment_filename, attachment_display_filename, attachment_filename_identity
 from oa_knowledge.constants import FileRole, PipelineStatus
 from oa_knowledge.db.models import ArchivedFile, BatchItem, OAItem, ReviewEntry
 
@@ -192,6 +193,43 @@ def _write_attachment(data_root, relpath: PurePosixPath, oa_item: OAItem, attach
         if archived is not None and role == FileRole.DIRECT_ATTACHMENT:
             role = FileRole(archived.file_role)
     if archived is None:
+        # Separate scans may expose only the widget or only the canonical
+        # download link. Reconcile across scans with content AND filename AND
+        # container evidence; two genuine OA IDs must always remain distinct.
+        if attachment.content is not None:
+            digest = hashlib.sha256(attachment.content).hexdigest()
+            candidates = list(session.scalars(select(ArchivedFile).where(
+                ArchivedFile.oa_item_id == oa_item.id,
+                ArchivedFile.source_container_key == container_key,
+                ArchivedFile.download_status == 'verified',
+                ArchivedFile.sha256 == digest,
+            )))
+            candidates = [f for f in candidates if same_attachment_filename(f.original_name, attachment.filename)]
+            exact = [f for f in candidates if attachment_filename_identity(f.original_name) == attachment_filename_identity(attachment.filename)]
+            if exact:
+                candidates = exact
+            real = [f for f in candidates if not f.attachment_key.startswith(('cap4-widget:', 'cap4:'))]
+            aliases = [f for f in candidates if f.attachment_key.startswith(('cap4-widget:', 'cap4:'))]
+            incoming_alias = attachment.attachment_key.startswith(('cap4-widget:', 'cap4:'))
+            if incoming_alias and len(real) == 1:
+                archived = real[0]
+            elif not incoming_alias and not real and len(aliases) == 1:
+                archived = aliases[0]
+            if archived is not None:
+                previous = data_root / archived.local_relpath if archived.local_relpath else None
+                if previous is None or not previous.is_file() or sha256_file(previous) != digest:
+                    archived = None
+                else:
+                    if incoming_alias:
+                        attachment = replace(attachment, attachment_key=archived.attachment_key)
+                    priority = {'official_body': 3, 'official_attachment': 2, 'direct_attachment': 1}
+                    role = FileRole(max((str(role), archived.file_role), key=lambda r: priority.get(r, 0)))
+                    name = attachment_display_filename(attachment.filename)
+                    previous_name = attachment_display_filename(archived.original_name)
+                    if '...' in name and '...' not in previous_name:
+                        name = previous_name
+                    attachment = replace(attachment, filename=name)
+    if archived is None:
         # CAP4 exposes a batch URL on one run and an individual download
         # control on the next. Reconcile an old failed row by filename so a
         # successful retry does not inflate attachment totals.
@@ -227,7 +265,17 @@ def _write_attachment(data_root, relpath: PurePosixPath, oa_item: OAItem, attach
             attachment_key=attachment.attachment_key, original_name=attachment.filename,
             file_role=role, source_container_key=container_key, download_status="download_failed",
         )
-    destination = atomic_write_bytes(attachment.content, data_root, relpath)
+    # A richer UI label must not create another physical copy on recapture.
+    # Preserve the established archive path for the same verified identity.
+    previous = data_root / archived.local_relpath if archived.local_relpath else None
+    incoming_hash = hashlib.sha256(attachment.content).hexdigest()
+    if (archived.download_status == 'verified' and previous is not None
+            and previous.is_file() and archived.sha256 == incoming_hash
+            and sha256_file(previous) == incoming_hash):
+        relpath = PurePosixPath(archived.local_relpath)
+        destination = previous
+    else:
+        destination = atomic_write_bytes(attachment.content, data_root, relpath)
     expected_kind = "pdf" if relpath.suffix.lower() == ".pdf" else "html_attachment" if relpath.suffix.lower() in {".htm", ".html"} else None
     integrity = inspect_file(destination, expected_kind)
     archived.size_bytes = integrity.size_bytes
@@ -250,7 +298,7 @@ def _write_attachment(data_root, relpath: PurePosixPath, oa_item: OAItem, attach
 
 
 def _attachment_relname(attachment) -> str:
-    original = PurePosixPath(safe_filename(attachment.filename))
+    original = PurePosixPath(safe_filename(attachment_display_filename(attachment.filename)))
     suffix = original.suffix
     stem = original.name[:-len(suffix)] if suffix else original.name
     key_digest = hashlib.sha256(attachment.attachment_key.encode("utf-8")).hexdigest()[:12]

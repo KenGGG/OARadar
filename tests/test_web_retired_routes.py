@@ -54,6 +54,16 @@ def test_retired_v2_routes_are_not_registered(client: TestClient) -> None:
     ]
 
 
+def test_overview_online_audit_is_available_and_validates_filter(client: TestClient, monkeypatch) -> None:
+    def reject_queue_write(*args, **kwargs):
+        raise AssertionError('Overview must not initialize or alter the Markdown queue')
+    monkeypatch.setattr('oa_knowledge.markdown_queue.queue_view', reject_queue_write)
+    response = client.get('/api/overview/online-audit?item_filter=review&item_page_size=10')
+    assert response.status_code == 200
+    assert response.json()['run'] is None
+    assert client.get('/api/overview/online-audit?item_filter=invalid').status_code == 422
+
+
 def test_title_exclusion_policy_routes_are_available_from_system_settings(client: TestClient) -> None:
     """Removing the live policy route would make title exclusions uneditable."""
     csrf = client.get("/").cookies.get("oa_csrf")

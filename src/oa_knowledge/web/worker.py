@@ -669,6 +669,25 @@ class OperationWorker:
             session.commit()
 
     def _execute_online_audit(self, job_id: int) -> None:
+        from oa_knowledge.resources import ResourceCoordinator
+        coordinator = ResourceCoordinator(self.engine)
+        lease = coordinator.acquire('oa_browser', self.owner, ttl_seconds=1800, uses_local_gpu=False)
+        if lease is None:
+            with Session(self.engine) as session:
+                job = session.get(OperationJob, job_id)
+                if job:
+                    job.status = 'queued'
+                    job.lease_owner = None
+                    job.lease_expires_at = None
+                    job.finished_at = None
+                    session.commit()
+            return
+        try:
+            self._execute_online_audit_with_browser(job_id)
+        finally:
+            coordinator.release(lease, self.owner)
+
+    def _execute_online_audit_with_browser(self, job_id: int) -> None:
         from oa_knowledge.collector.browser import BrowserSession, LoginState
         from oa_knowledge.collector.detail import CollaborationDetailAdapter
         from oa_knowledge.db.models import OnlineAuditRun
@@ -679,6 +698,7 @@ class OperationWorker:
                 self._finish(job_id, "failed", "audit_run_not_found"); return
             run_id = run.id
             job = session.get(OperationJob, job_id)
+            inventory_only = bool(json.loads(job.parameters_json or '{}').get('inventory_only')) if job else False
             if job:
                 job.status = "running"; job.started_at = job.started_at or datetime.now(timezone.utc)
                 session.commit()
@@ -692,7 +712,8 @@ class OperationWorker:
             # Strict verification deliberately downloads fresh OA bytes instead
             # of resolving from the local archive cache. The capture remains in
             # memory and never overwrites an existing original.
-            verification_adapter = CollaborationDetailAdapter(browser.page)
+            verification_adapter = (CollaborationDetailAdapter(browser.page, inventory_only=True)
+                                    if inventory_only else CollaborationDetailAdapter(browser.page))
 
             def inspect(item) -> AuditObservation:
                 if not item.workitem_id_text:
@@ -708,6 +729,9 @@ class OperationWorker:
                     for issue in capture.capture_issues
                 ):
                     raise TimeoutError("online audit item capture timed out")
+                if inventory_only:
+                    from oa_knowledge.online_audit import observe_inventory_capture
+                    return observe_inventory_capture(capture)
                 attachments = list(capture.attachments)
                 for container in capture.related_containers:
                     attachments.extend(container.attachments)

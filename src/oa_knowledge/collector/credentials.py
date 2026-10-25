@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import base64
+import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Iterable
@@ -17,7 +20,7 @@ class SavedCredential:
 
 
 def load_chrome_saved_credential(profile: Path, origin: str) -> SavedCredential | None:
-    """Load one Linux Chrome mock-keychain login without logging its values."""
+    """Load an origin-matched local Chrome login without logging its values."""
     database = profile / "Default" / "Login Data"
     if not database.is_file():
         return None
@@ -34,8 +37,28 @@ def load_chrome_saved_credential(profile: Path, origin: str) -> SavedCredential 
         ).fetchone()
     if not row or not row[0] or not row[1]:
         return None
-    password = _decrypt_linux_chrome_password(bytes(row[1]))
+    password = (_decrypt_windows_chrome_password(bytes(row[1]), profile)
+                if os.name == 'nt' else _decrypt_linux_chrome_password(bytes(row[1])))
     return SavedCredential(username=str(row[0]), password=password)
+
+
+def _decrypt_windows_chrome_password(value: bytes, profile: Path) -> str:
+    """Use the signed-in user's DPAPI key; never persist decrypted material."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.exceptions import InvalidTag
+    from .session_cache import _crypt
+
+    if not value.startswith(b'v10'):
+        raise ValueError('unsupported Windows Chrome credential format')
+    try:
+        state = json.loads((profile / 'Local State').read_text(encoding='utf8'))
+        wrapped = base64.b64decode(state['os_crypt']['encrypted_key'], validate=True)
+        if not wrapped.startswith(b'DPAPI'):
+            raise ValueError('unsupported Windows Chrome key format')
+        key = _crypt(wrapped[5:], decrypt=True)
+        return AESGCM(key).decrypt(value[3:15], value[15:], None).decode('utf8')
+    except (OSError, KeyError, TypeError, ValueError, InvalidTag):
+        raise ValueError('Windows Chrome credential is unavailable') from None
 
 
 def _decrypt_linux_v10(value: bytes) -> str:

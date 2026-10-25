@@ -208,8 +208,25 @@ def test_browser_never_fills_saved_password_on_redirected_origin(setup, monkeypa
         def count(self): return 1
     page = SimpleNamespace(url="https://unrelated.test/login", locator=lambda selector: Control())
     browser = BrowserSession(settings, page=page)
-    monkeypatch.setattr("oa_knowledge.collector.browser.load_credential", lambda origin: pytest.fail("must not read saved credentials"))
+    monkeypatch.setattr("oa_knowledge.collector.browser.load_chrome_saved_credential", lambda *args: pytest.fail("must not read saved credentials"))
     assert browser._submit_saved_credentials() is False
+
+
+@pytest.mark.skipif(__import__('os').name != 'nt', reason='Windows browser password manager')
+def test_headless_login_reopens_same_profile_for_browser_autofill(setup, monkeypatch):
+    from oa_knowledge.collector.browser import BrowserSession, LoginState
+    settings, _worker = setup
+    browser = BrowserSession(settings, page=SimpleNamespace())
+    events = []
+    states = iter([LoginState.AUTH_REQUIRED, LoginState.AUTHENTICATED])
+    monkeypatch.setattr(browser, 'goto_home', lambda: next(states))
+    monkeypatch.setattr(browser, 'login_state', lambda: LoginState.AUTHENTICATED)
+    monkeypatch.setattr(browser, '_submit_saved_credentials', lambda: False)
+    monkeypatch.setattr(BrowserSession, '__exit__', lambda *args: events.append('closed'))
+    monkeypatch.setattr(BrowserSession, '__enter__', lambda self: events.append(self.settings.browser_profile_path) or self)
+    assert browser.login_with_saved_credentials(1) == LoginState.AUTHENTICATED
+    assert browser.headed
+    assert events == ['closed', settings.browser_profile_path]
 
 
 def test_download_pause_request_is_not_lost_in_heartbeat(setup, monkeypatch):
@@ -296,9 +313,9 @@ def test_api_requires_csrf_and_never_echoes_credentials(setup, monkeypatch):
     monkeypatch.setattr("oa_knowledge.collector.windows_credentials.save_credential", lambda *args: saved.append(args))
     response = client.post("/api/done-collection/credentials", headers=headers,
                            json={"username": "synthetic", "password": "synthetic-secret"})
-    assert response.json() == {"saved": True}
+    assert response.status_code == 410
     assert "synthetic-secret" not in response.text
-    assert saved[0][0] == settings.browser.base_url
+    assert not saved
 
 
 @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows Credential Manager integration")

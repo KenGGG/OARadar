@@ -1,4 +1,5 @@
 import sqlite3
+import pytest
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
@@ -45,3 +46,26 @@ def test_decrypts_v11_chrome_password_with_keyring_secret() -> None:
     encrypted = b"v11" + encryptor.update(padded) + encryptor.finalize()
 
     assert _decrypt_linux_chrome_password(encrypted, keyring_secret=secret) == password
+
+
+def test_windows_chrome_v10_uses_local_dpapi_key(tmp_path, monkeypatch):
+    import base64
+    import json
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from oa_knowledge.collector.credentials import _decrypt_windows_chrome_password
+    key = b'k' * 32
+    nonce = b'n' * 12
+    wrapped = b'synthetic-wrapped-key'
+    (tmp_path / 'Local State').write_text(json.dumps({
+        'os_crypt': {'encrypted_key': base64.b64encode(b'DPAPI' + wrapped).decode()}
+    }))
+    def unprotect(payload, *, decrypt=False):
+        assert payload == wrapped and decrypt
+        return key
+    monkeypatch.setattr('oa_knowledge.collector.session_cache._crypt', unprotect)
+    value = b'v10' + nonce + AESGCM(key).encrypt(nonce, b'synthetic-password', None)
+    assert _decrypt_windows_chrome_password(value, tmp_path) == 'synthetic-password'
+    with pytest.raises(ValueError, match='unavailable'):
+        _decrypt_windows_chrome_password(value[:-1] + bytes([value[-1] ^ 1]), tmp_path)
+    with pytest.raises(ValueError, match='unsupported'):
+        _decrypt_windows_chrome_password(b'v20' + value[3:], tmp_path)

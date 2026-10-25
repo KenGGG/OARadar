@@ -36,6 +36,8 @@ def test_browser_session_enables_download_events(monkeypatch: pytest.MonkeyPatch
         pass
 
     assert captured["accept_downloads"] is True
+    assert '--password-store=basic' in captured['ignore_default_args']
+    assert '--use-mock-keychain' in captured['ignore_default_args']
     assert Path(captured["profile"]) == settings.cache_root / "browser-profile"
 
 
@@ -71,6 +73,45 @@ def test_browser_download_is_accepted_only_after_chromium_reports_completion(tmp
 
 def test_missing_api_response_has_empty_content_type() -> None:
     assert CollaborationDetailAdapter._response_content_type(None) == ""
+
+
+def test_browser_download_completion_is_bounded(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    ticks = iter([0, 1])
+    monkeypatch.setattr('oa_knowledge.collector.detail.monotonic', lambda: next(ticks))
+    canceled = []
+    download = SimpleNamespace(
+        _impl_obj=SimpleNamespace(_artifact=SimpleNamespace(absolute_path=str(tmp_path / 'unfinished'))),
+        cancel=lambda: canceled.append(True),
+        failure=lambda: pytest.fail('must not block on unfinished download'),
+    )
+    class Event:
+        value = download
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    page = SimpleNamespace(expect_download=lambda **kwargs: Event())
+    adapter = CollaborationDetailAdapter(page)
+    assert adapter._browser_download_payload(page, lambda: None, 100) is None
+    assert canceled == [True]
+    assert adapter._last_download_failure == 'download completion timed out'
+
+
+def test_browser_download_reads_only_completed_artifact(tmp_path):
+    from types import SimpleNamespace
+    source = tmp_path / 'finished'
+    source.write_bytes(b'PK\x03\x04synthetic')
+    download = SimpleNamespace(
+        _impl_obj=SimpleNamespace(_artifact=SimpleNamespace(absolute_path=str(source))),
+        cancel=lambda: pytest.fail('completed download must not be canceled'),
+        failure=lambda: None, path=lambda: source,
+    )
+    class Event:
+        value = download
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    page = SimpleNamespace(expect_download=lambda **kwargs: Event())
+    adapter = CollaborationDetailAdapter(page)
+    assert adapter._browser_download_payload(page, lambda: None, 100) == source.read_bytes()
 
 
 def test_unavailable_associated_document_blocks_no_attachment_confirmation() -> None:
@@ -225,6 +266,7 @@ def test_direct_attachment_prefers_completed_browser_download_over_api() -> None
         def click(self, **_kwargs): raise AssertionError("hidden OA links must not use locator click")
         def evaluate(self, script):
             assert "node.click" in script
+            assert "setTimeout" in script
     class Locator:
         def __init__(self, candidates=False): self.candidates = candidates
         def evaluate_all(self, *_args): return [descriptor]

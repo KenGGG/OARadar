@@ -51,7 +51,6 @@ def _job_dict(job: OperationJob | None) -> dict | None:
 
 
 def collection_status(settings: Settings) -> dict:
-    from oa_knowledge.collector.windows_credentials import load_credential
     engine = create_db_engine(settings.database_path)
     try:
         with Session(engine) as session:
@@ -70,14 +69,10 @@ def collection_status(settings: Settings) -> dict:
                 func.count().filter(OAManifestItem.completed_at.is_(None), OAManifestItem.completed_at_text.is_(None)),
                 func.count().filter(OAManifestItem.sender.is_(None)),
             )).one()
-        try:
-            saved = load_credential(settings.browser.base_url) is not None
-        except ValueError:
-            saved = False
         return {"inventory": _job_dict(jobs["done_inventory"]), "download": _job_dict(jobs["done_download"]),
                 "login": _job_dict(jobs["done_login"]), "inventory_complete": complete,
                 "review": _job_dict(jobs["done_review"]),
-                "counts": counts, "local_total": sum(counts.values()), "credentials_saved": saved,
+                "counts": counts, "local_total": sum(counts.values()), "credential_storage": "browser",
                 "connection_configured": ".invalid" not in settings.browser.base_url,
                 "missing_fields": {"initiated_at": missing[0], "completed_at": missing[1], "sender": missing[2]},
                 "suggestions": suggestions}

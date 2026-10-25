@@ -60,6 +60,14 @@ def claim_desktop_job(engine, owner, job_types):
     return None
 
 
+def run_desktop_download(worker, job_id, browser=None):
+    """Release the shared profile before the watchdog-owned download child."""
+    from oa_knowledge.done_collection import run_download
+    if browser is not None:
+        browser.__exit__(None, None, None)
+    run_download(worker, job_id)
+
+
 def run_desktop_collection(settings, config_path):
     import oa_knowledge.done_collection as collection
     from oa_knowledge.collector.browser import BrowserSession
@@ -132,34 +140,8 @@ def run_desktop_collection(settings, config_path):
                 job_id, kind = claimed
                 try:
                     if kind == 'done_download':
-                        import oa_knowledge.cli as cli
-                        from oa_knowledge.done_collection import _finish_collection
-                        from oa_knowledge.db.models import OAManifestItem
-                        from oa_knowledge.resources import ResourceCoordinator
-                        coordinator = ResourceCoordinator(engine)
-                        lease = coordinator.acquire('oa_browser', owner, ttl_seconds=1800, uses_local_gpu=False)
-                        if lease is None:
-                            _finish_collection(engine, job_id, 'queued')
-                            continue
-                        cli.BrowserSession = SharedBrowser
-                        try:
-                            with Session(engine) as db:
-                                params = json.loads(db.get(OperationJob, job_id).parameters_json)
-                            cli.manifest_download(max_items=max(1, len(params['keys'])), headed=False, config=config_path,
-                                error_type=None, item_id=None, item_ids=None, failed_only=False,
-                                recheck_no_attachment=False, audit_all=False, collection_job=job_id)
-                            with Session(engine) as db:
-                                job = db.get(OperationJob, job_id)
-                                rows = list(db.scalars(select(OAManifestItem).where(OAManifestItem.oa_item_key.in_(params['keys']))))
-                                job.progress_current = sum(r.processing_status in {'downloaded','no_attachment','skipped'} for r in rows)
-                                paused = json.loads(job.parameters_json).get('pause_requested')
-                                status = 'paused' if paused else 'completed' if job.progress_current == len(rows) else 'failed'
-                                db.commit()
-                            _finish_collection(engine, job_id, status, None if status == 'completed' else '有未完成附件，可继续重试')
-                        except Exception as exc:
-                            _finish_collection(engine, job_id, 'auth_required' if getattr(exc, 'exit_code', None) == 3 else 'failed', 'desktop_download_' + type(exc).__name__)
-                        finally:
-                            coordinator.release(lease, owner)
+                        previous_browser, browser = browser, None
+                        run_desktop_download(worker, job_id, previous_browser)
                     else:
                         {'done_inventory': run_inventory, 'done_login': run_login, 'done_review': run_review}[kind](worker, job_id)
                 except Exception as exc:
@@ -170,7 +152,7 @@ def run_desktop_collection(settings, config_path):
                     if job.status == 'queued':
                         reserve_desktop(settings, job)
                         db.commit()
-                    completed_download = kind == 'done_download' and job.status in {'completed','failed'}
+                    completed_download = (kind == 'done_download' and job.status in {'completed','failed'}) or (kind == 'done_inventory' and job.status == 'completed')
                 if completed_download and browser is not None:
                     # An explicit login may show Chrome; release it only after
                     # the batch finishes. The next scheduled batch starts hidden.
